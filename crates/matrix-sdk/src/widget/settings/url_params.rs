@@ -88,24 +88,25 @@ mod tests {
     use url::Url;
 
     use super::{replace_properties, QueryProperties};
+
     const EXAMPLE_URL: &str = "\
-    https://my.widget.org/custom/path/using/$matrix_display_name/in/it\
-    ?widgetId=$matrix_widget_id\
-    &deviceId=$org.matrix.msc2873.matrix_device_id\
-    &avatarUrl=$matrix_avatar_url\
-    &displayname=$matrix_display_name\
-    &lang=$org.matrix.msc2873.client_language\
-    &theme=$org.matrix.msc2873.client_theme\
-    &clientId=$org.matrix.msc2873.client_id\
-    &baseUrl=$org.matrix.msc4039.matrix_base_url\
-    #andAHashWithA$org.matrix.msc2873.client_themeThemeAndTheClientId:$org.matrix.msc2873.client_id\
+        https://my.widget.org/custom/path/using/$matrix_display_name/in/it\
+            ?widgetId=$matrix_widget_id\
+            &deviceId=$org.matrix.msc2873.matrix_device_id\
+            &avatarUrl=$matrix_avatar_url\
+            &displayName=$matrix_display_name\
+            &lang=$org.matrix.msc2873.client_language\
+            &theme=$org.matrix.msc2873.client_theme\
+            &clientId=$org.matrix.msc2873.client_id\
+            &baseUrl=$org.matrix.msc4039.matrix_base_url\
+            #andAHashWithA$org.matrix.msc2873.client_themeThemeAndTheClientId:$org.matrix.msc2873.client_id\
     ";
 
     fn get_example_props() -> QueryProperties {
         QueryProperties {
             widget_id: String::from("!@/abc_widget_id"),
             avatar_url: "!@/abc_avatar_url".to_owned(),
-            display_name: "I_AM_THEuser".to_owned(),
+            display_name: "I_AM_THE_user".to_owned(),
             user_id: "!@/abc_user_id".to_owned(),
             room_id: "!@/abc_room_id".to_owned(),
             language: "!@/abc_language".to_owned(),
@@ -124,7 +125,18 @@ mod tests {
     fn replace_all_properties() {
         let mut url = get_example_url();
 
-        const CONVERTED_URL: &str = "https://my.widget.org/custom/path/using/I_AM_THEuser/in/it?widgetId=%21%40%2Fabc_widget_id&deviceId=%21%40%2Fabc_device_id&avatarUrl=%21%40%2Fabc_avatar_url&displayname=I_AM_THEuser&lang=%21%40%2Fabc_language&theme=light&clientId=12345678&baseUrl=https%3A%2F%2Fabc_base_url%2F#andAHashWithAlightThemeAndTheClientId:12345678";
+        const CONVERTED_URL: &str = "\
+            https://my.widget.org/custom/path/using/I_AM_THE_user/in/it\
+                ?widgetId=%21%40%2Fabc_widget_id\
+                &deviceId=%21%40%2Fabc_device_id\
+                &avatarUrl=%21%40%2Fabc_avatar_url\
+                &displayName=I_AM_THE_user\
+                &lang=%21%40%2Fabc_language\
+                &theme=light\
+                &clientId=12345678\
+                &baseUrl=https%3A%2F%2Fabc_base_url%2F\
+                #andAHashWithAlightThemeAndTheClientId:12345678\
+        ";
 
         replace_properties(&mut url, get_example_props());
         assert_eq!(url.as_str(), CONVERTED_URL);

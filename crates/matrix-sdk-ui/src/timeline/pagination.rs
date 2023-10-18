@@ -17,7 +17,7 @@ use std::{fmt, ops::ControlFlow, pin::pin, sync::Arc, time::Duration};
 use matrix_sdk::{room::MessagesOptions, Result};
 use matrix_sdk_base::timeout::timeout;
 use ruma::assign;
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{error, info, instrument, trace, warn};
 
 use super::{inner::HandleBackPaginatedEventsError, Timeline};
 
@@ -67,7 +67,7 @@ impl Timeline {
                 match timeout(wait_for_token, WAIT_FOR_TOKEN_TIMEOUT).await {
                     Ok(token) => Some(token),
                     Err(_) => {
-                        debug!("Waiting for prev_batch token timed out after 3s");
+                        warn!("Waiting for prev_batch token timed out after 3s");
                         None
                     }
                 }
@@ -208,7 +208,7 @@ impl<'a> PaginationOptions<'a> {
     /// `ControlFlow::Break(())`).
     pub fn custom(
         initial_event_limit: u16,
-        pagination_strategy: impl Fn(PaginationOutcome) -> ControlFlow<(), u16> + Send + 'a,
+        pagination_strategy: impl Fn(PaginationOutcome) -> ControlFlow<(), u16> + Send + Sync + 'a,
     ) -> Self {
         Self::new(PaginationOptionsInner::Custom {
             event_limit_if_first: Some(initial_event_limit),
@@ -265,7 +265,7 @@ pub enum PaginationOptionsInner<'a> {
     },
     Custom {
         event_limit_if_first: Option<u16>,
-        strategy: Arc<dyn Fn(PaginationOutcome) -> ControlFlow<(), u16> + Send + 'a>,
+        strategy: Arc<dyn Fn(PaginationOutcome) -> ControlFlow<(), u16> + Send + Sync + 'a>,
     },
 }
 

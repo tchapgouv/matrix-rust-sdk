@@ -47,6 +47,7 @@ experimental-oidc = [
     "dep:language-tags",
     "dep:mas-oidc-client",
     "dep:rand",
+    "dep:sha2",
     "dep:tower",
 ]
 experimental-sliding-sync = [
@@ -54,7 +55,7 @@ experimental-sliding-sync = [
     "reqwest/gzip",
     "dep:eyeball-im-util",
 ]
-experimental-widgets = ["dep:language-tags"]
+experimental-widgets = ["dep:language-tags", "dep:uuid"]
 
 docsrs = ["e2e-encryption", "sqlite", "sso-login", "qrcode", "image-proc"]
 
@@ -88,16 +89,18 @@ matrix-sdk-sqlite = { version = "0.1.0", path = "../matrix-sdk-sqlite", default-
 mime = "0.3.16"
 mime2ext = "0.1.52"
 rand = { version = "0.8.5", optional = true }
-ruma = { workspace = true, features = ["rand", "unstable-msc2448", "unstable-msc2965", "unstable-msc3930"] }
+ruma = { workspace = true, features = ["rand", "unstable-msc2448", "unstable-msc2965", "unstable-msc3930", "unstable-msc3245-v1-compat"] }
 serde = { workspace = true }
 serde_html_form = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true, optional = true }
 tempfile = "3.3.0"
 thiserror = { workspace = true }
 tower = { version = "0.4.13", features = ["make"], optional = true }
 tracing = { workspace = true, features = ["attributes"] }
 url = "2.2.2"
 urlencoding = "2.1.3"
+uuid = { version = "1.4.1", features = ["serde", "v4"], optional = true }
 zeroize = { workspace = true }
 
 [dependencies.image]
