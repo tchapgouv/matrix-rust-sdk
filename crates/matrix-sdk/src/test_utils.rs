@@ -1,9 +1,18 @@
-//!  Testing utilities - DO NOT USE IN PRODUCTION.
+//! Testing utilities - DO NOT USE IN PRODUCTION.
 
 #![allow(dead_code)]
 
-use matrix_sdk_base::SessionMeta;
-use ruma::{api::MatrixVersion, device_id, user_id};
+use assert_matches2::assert_let;
+use matrix_sdk_base::{deserialized_responses::SyncTimelineEvent, SessionMeta};
+use ruma::{
+    api::MatrixVersion,
+    device_id,
+    events::{room::message::MessageType, AnySyncMessageLikeEvent, AnySyncTimelineEvent},
+    user_id,
+};
+use url::Url;
+
+pub mod events;
 
 use crate::{
     config::RequestConfig,
@@ -11,12 +20,31 @@ use crate::{
     Client, ClientBuilder,
 };
 
-pub(crate) fn test_client_builder(homeserver_url: Option<String>) -> ClientBuilder {
-    let homeserver = homeserver_url.as_deref().unwrap_or("http://localhost:1234");
+/// Checks that an event is a message-like text event with the given text.
+#[track_caller]
+pub fn assert_event_matches_msg<E: Clone + Into<SyncTimelineEvent>>(event: &E, expected: &str) {
+    let event: SyncTimelineEvent = event.clone().into();
+    let event = event.event.deserialize().unwrap();
+    assert_let!(
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(message)) = event
+    );
+    let message = message.as_original().unwrap();
+    assert_let!(MessageType::Text(text) = &message.content.msgtype);
+    assert_eq!(text.body, expected);
+}
+
+/// A [`ClientBuilder`] fit for testing, using the given `homeserver_url` (or
+/// localhost:1234).
+pub fn test_client_builder(homeserver_url: Option<String>) -> ClientBuilder {
+    let homeserver = homeserver_url
+        .map(|url| Url::try_from(url.as_str()).unwrap())
+        .unwrap_or_else(|| Url::try_from("http://localhost:1234").unwrap());
     Client::builder().homeserver_url(homeserver).server_versions([MatrixVersion::V1_0])
 }
 
-pub(crate) async fn no_retry_test_client(homeserver_url: Option<String>) -> Client {
+/// A [`Client`] using the given `homeserver_url` (or localhost:1234), that will
+/// never retry any failed requests.
+pub async fn no_retry_test_client(homeserver_url: Option<String>) -> Client {
     test_client_builder(homeserver_url)
         .request_config(RequestConfig::new().disable_retry())
         .build()
@@ -24,16 +52,47 @@ pub(crate) async fn no_retry_test_client(homeserver_url: Option<String>) -> Clie
         .unwrap()
 }
 
-pub(crate) async fn logged_in_client(homeserver_url: Option<String>) -> Client {
-    let session = MatrixSession {
-        meta: SessionMeta {
-            user_id: user_id!("@example:localhost").to_owned(),
-            device_id: device_id!("DEVICEID").to_owned(),
-        },
-        tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
-    };
+/// A [`Client`] using the given `homeserver_url` (or localhost:1234), that will
+/// never retry any failed requests, and already logged in with an hardcoded
+/// Matrix authentication session (the user id and device id are hardcoded too).
+pub async fn logged_in_client(homeserver_url: Option<String>) -> Client {
     let client = no_retry_test_client(homeserver_url).await;
-    client.matrix_auth().restore_session(session).await.unwrap();
 
     client
+        .matrix_auth()
+        .restore_session(MatrixSession {
+            meta: SessionMeta {
+                user_id: user_id!("@example:localhost").to_owned(),
+                device_id: device_id!("DEVICEID").to_owned(),
+            },
+            tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
+        })
+        .await
+        .unwrap();
+
+    client
+}
+
+/// Like [`test_client_builder`], but with a mocked server too.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn test_client_builder_with_server() -> (ClientBuilder, wiremock::MockServer) {
+    let server = wiremock::MockServer::start().await;
+    let builder = test_client_builder(Some(server.uri().to_string()));
+    (builder, server)
+}
+
+/// Like [`no_retry_test_client`], but with a mocked server too.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn no_retry_test_client_with_server() -> (Client, wiremock::MockServer) {
+    let server = wiremock::MockServer::start().await;
+    let client = no_retry_test_client(Some(server.uri().to_string())).await;
+    (client, server)
+}
+
+/// Like [`logged_in_client`], but with a mocked server too.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn logged_in_client_with_server() -> (Client, wiremock::MockServer) {
+    let server = wiremock::MockServer::start().await;
+    let client = logged_in_client(Some(server.uri().to_string())).await;
+    (client, server)
 }

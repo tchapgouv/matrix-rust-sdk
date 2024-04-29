@@ -19,7 +19,8 @@
 
 use std::fmt;
 
-use hmac::{digest::MacError, Hmac};
+pub use hmac::digest::MacError;
+use hmac::Hmac;
 use pbkdf2::pbkdf2;
 use rand::{
     distributions::{Alphanumeric, DistString},
@@ -35,6 +36,7 @@ use ruma::{
             },
             secret::SecretEncryptedData,
         },
+        EventContent, GlobalAccountDataEventType,
     },
     serde::Base64,
     UInt,
@@ -48,6 +50,12 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::ciphers::{AesHmacSha2Key, HmacSha256Mac, IV_SIZE, KEY_SIZE, MAC_SIZE};
 
 /// Error type for the decoding of a [`SecretStorageKey`].
+///
+/// The [`SecretStorageKey`] can be restored from a Base58 encoded string or
+/// from a string containing a passphrase.
+///
+/// This error type is used to report errors when trying to restore from either
+/// of those strings.
 #[derive(Debug, Error)]
 pub enum DecodeError {
     /// The decoded secret storage key has an invalid prefix.
@@ -137,6 +145,7 @@ pub struct SecretStorageKey {
     secret_key: Box<[u8; 32]>,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl fmt::Debug for SecretStorageKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SecretStorageKey")
@@ -146,7 +155,7 @@ impl fmt::Debug for SecretStorageKey {
 }
 
 /// Encrypted data for the AES-CTR/HMAC-SHA-256 secret storage algorithm.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct AesHmacSha2EncryptedData {
     /// The initialization vector that was used to encrypt the ciphertext.
     pub iv: [u8; IV_SIZE],
@@ -236,29 +245,40 @@ impl SecretStorageKey {
     fn check_zero_message(&self) -> Result<(), DecodeError> {
         match &self.storage_key_info.algorithm {
             SecretStorageEncryptionAlgorithm::V1AesHmacSha2(properties) => {
-                if properties.iv.as_bytes().len() != IV_SIZE {
-                    Err(DecodeError::IvLength(IV_SIZE, properties.iv.as_bytes().len()))
-                } else {
-                    let mut iv_array = [0u8; 16];
-                    iv_array.copy_from_slice(properties.iv.as_bytes());
-
-                    // I'm not particularly convinced that this couldn't have been done simpler. Why
-                    // do we need to reproduce the ciphertext? Couldn't we just generate the MAC tag
-                    // using the `ZERO_MESSAGE`?
+                let (Some(iv), Some(mac)) = (&properties.iv, &properties.mac) else {
+                    // The IV and/or MAC are missing from the account data
+                    // content. As the [spec] says, we have to assume that the
+                    // key is valid.
                     //
-                    // If someone is reading this and is designing a new secret encryption
-                    // algorithm, please consider the above suggestion.
-                    let key = AesHmacSha2Key::from_secret_storage_key(&self.secret_key, "");
-                    let ciphertext = key.apply_keystream(Self::ZERO_MESSAGE.to_vec(), &iv_array);
-                    let expected_mac = HmacSha256Mac::from_slice(properties.mac.as_bytes())
-                        .ok_or_else(|| {
-                            DecodeError::MacLength(MAC_SIZE, properties.mac.as_bytes().len())
-                        })?;
+                    // [spec]: https://spec.matrix.org/unstable/client-server-api/#msecret_storagev1aes-hmac-sha2
+                    return Ok(());
+                };
 
-                    key.verify_mac(&ciphertext, expected_mac.as_bytes())?;
+                let iv = iv.as_bytes();
+                let iv_length = iv.len();
 
-                    Ok(())
+                if iv_length != IV_SIZE {
+                    return Err(DecodeError::IvLength(IV_SIZE, iv_length));
                 }
+
+                let mut iv_array = [0u8; 16];
+                iv_array.copy_from_slice(iv);
+
+                // I'm not particularly convinced that this couldn't have been done simpler.
+                // Why do we need to reproduce the ciphertext?
+                // Couldn't we just generate the MAC tag
+                // using the `ZERO_MESSAGE`?
+                //
+                // If someone is reading this and is designing a new secret encryption
+                // algorithm, please consider the above suggestion.
+                let key = AesHmacSha2Key::from_secret_storage_key(&self.secret_key, "");
+                let ciphertext = key.apply_keystream(Self::ZERO_MESSAGE.to_vec(), &iv_array);
+                let expected_mac = HmacSha256Mac::from_slice(mac.as_bytes())
+                    .ok_or_else(|| DecodeError::MacLength(MAC_SIZE, mac.as_bytes().len()))?;
+
+                key.verify_mac(&ciphertext, expected_mac.as_bytes())?;
+
+                Ok(())
             }
             custom => Err(DecodeError::UnsupportedAlgorithm(custom.algorithm().to_owned())),
         }
@@ -274,7 +294,7 @@ impl SecretStorageKey {
         SecretStorageKeyEventContent::new(
             key_id,
             SecretStorageEncryptionAlgorithm::V1AesHmacSha2(
-                SecretStorageV1AesHmacSha2Properties::new(iv, mac),
+                SecretStorageV1AesHmacSha2Properties::new(Some(iv), Some(mac)),
             ),
         )
     }
@@ -554,14 +574,15 @@ impl SecretStorageKey {
     /// The type is equal to the concatenation of the string
     /// `"m.secret_storage.key."` and the key ID from the
     /// [`SecretStorageKey::key_id()`] method.
-    pub fn event_type(&self) -> String {
-        format!("m.secret_storage.key.{}", self.key_id())
+    pub fn event_type(&self) -> GlobalAccountDataEventType {
+        self.event_content().event_type()
     }
 }
 
 #[cfg(test)]
 mod test {
     use assert_matches::assert_matches;
+    use assert_matches2::assert_let;
     use ruma::events::EventContentFromType;
     use serde_json::{json, value::to_raw_value};
 
@@ -603,9 +624,11 @@ mod test {
         let content = to_raw_value(key.event_content())
             .expect("We should be able to serialize the secret storage key event content");
 
-        let content = SecretStorageKeyEventContent::from_parts(&key.event_type(), &content).expect(
-            "We should be able to parse our, just serialized, secret storage key event content",
-        );
+        let content =
+            SecretStorageKeyEventContent::from_parts(&key.event_type().to_string(), &content)
+                .expect(
+                "We should be able to parse our, just serialized, secret storage key event content",
+            );
 
         let key = SecretStorageKey::from_account_data(passphrase, content)
             .expect("We should be able to restore our secret storage key");
@@ -632,9 +655,11 @@ mod test {
         let content = to_raw_value(key.event_content())
             .expect("We should be able to serialize the secret storage key event content");
 
-        let content = SecretStorageKeyEventContent::from_parts(&key.event_type(), &content).expect(
-            "We should be able to parse our, just serialized, secret storage key event content",
-        );
+        let content =
+            SecretStorageKeyEventContent::from_parts(&key.event_type().to_string(), &content)
+                .expect(
+                "We should be able to parse our, just serialized, secret storage key event content",
+            );
 
         let base58_key = key.to_base58();
 
@@ -679,6 +704,7 @@ mod test {
     #[test]
     fn from_account_data_and_base58() {
         let base58_key = "EsTj 3yST y93F SLpB jJsz eAXc 2XzA ygD3 w69H fGaN TKBj jXEd";
+        let key_id = "bmur2d9ypPUH1msSwCxQOJkuKRmJI55e";
 
         let json = to_raw_value(&json!({
             "algorithm": "m.secret_storage.v1.aes-hmac-sha2",
@@ -688,13 +714,15 @@ mod test {
         .unwrap();
 
         let content = SecretStorageKeyEventContent::from_parts(
-            "m.secret_storage.key.bmur2d9ypPUH1msSwCxQOJkuKRmJI55e",
+            &format!("m.secret_storage.key.{key_id}"),
             &json,
         )
         .expect("We should be able to deserialize our static secret storage key");
 
-        SecretStorageKey::from_account_data(base58_key, content)
+        let key = SecretStorageKey::from_account_data(base58_key, content)
             .expect("We should be able to restore the secret storage key");
+
+        assert_eq!(key_id, key.key_id(), "The key should correctly remember the key ID");
     }
 
     #[test]
@@ -704,9 +732,11 @@ mod test {
         let content = to_raw_value(key.event_content())
             .expect("We should be able to serialize the secret storage key event content");
 
-        let content = SecretStorageKeyEventContent::from_parts(&key.event_type(), &content).expect(
-            "We should be able to parse our, just serialized, secret storage key event content",
-        );
+        let content =
+            SecretStorageKeyEventContent::from_parts(&key.event_type().to_string(), &content)
+                .expect(
+                "We should be able to parse our, just serialized, secret storage key event content",
+            );
 
         assert_matches!(
             SecretStorageKey::from_account_data("It's a secret to nobody", content.to_owned()),
@@ -722,6 +752,24 @@ mod test {
             Err(DecodeError::Mac(_)),
             "Using the wrong base58 key should throw a MAC error"
         );
+    }
+
+    /// The `iv` and `mac` properties within the `m.secret_storage.key.*`
+    /// content are optional, and the spec says we must assume the
+    /// passphrase is correct in that case.
+    #[test]
+    fn accepts_any_passphrase_if_mac_and_iv_are_missing() {
+        let mut content = SecretStorageKeyEventContent::new(
+            "my_new_key_id".to_owned(),
+            SecretStorageEncryptionAlgorithm::V1AesHmacSha2(
+                SecretStorageV1AesHmacSha2Properties::new(None, None),
+            ),
+        );
+        content.passphrase =
+            Some(PassPhrase::new("salty goodness".to_owned(), UInt::new_saturating(100)));
+
+        SecretStorageKey::from_account_data("It's a secret to nobody", content.to_owned())
+            .expect("Should accept any passphrase");
     }
 
     #[test]
@@ -796,6 +844,16 @@ mod test {
             [109, 215, 194, 194, 239, 132, 9, 136, 25, 254, 53, 147, 144, 106, 208, 252]
         );
 
+        let secret_encrypted_data: SecretEncryptedData = encrypted_data.to_owned().into();
+
+        assert_let!(
+            SecretEncryptedData::AesHmacSha2EncryptedData { iv, ciphertext, mac } =
+                secret_encrypted_data
+        );
+        assert_eq!(mac.as_bytes(), encrypted_data.mac.as_slice());
+        assert_eq!(iv.as_bytes(), encrypted_data.iv.as_slice());
+        assert_eq!(ciphertext, encrypted_data.ciphertext);
+
         let invalid_mac_json = json!({
               "iv": "bdfCwu+ECYgZ/jWTkGrQ/A==",
               "ciphertext": "lCRSSA1lChONEXj/8RyogsgAa8ouQwYDnLr4XBCheRikrZykLRzPCx3doCE=",
@@ -822,6 +880,62 @@ mod test {
         let encrypted_data: Result<AesHmacSha2EncryptedData, _> = content.try_into();
         encrypted_data.expect_err(
             "We should be able to detect if a SecretEncryptedData content has an invalid IV",
+        );
+    }
+
+    #[test]
+    fn invalid_key_info() {
+        let base58_key = "EsTj 3yST y93F SLpB jJsz eAXc 2XzA ygD3 w69H fGaN TKBj jXEd";
+
+        let content = SecretStorageKeyEventContent::new(
+            "bmur2d9ypPUH1msSwCxQOJkuKRmJI55e".to_owned(),
+            SecretStorageEncryptionAlgorithm::V1AesHmacSha2(
+                SecretStorageV1AesHmacSha2Properties::new(
+                    Some(Base64::new(vec![0u8; 14])),
+                    Some(Base64::new(vec![0u8; 32])),
+                ),
+            ),
+        );
+
+        assert_matches!(
+            SecretStorageKey::from_account_data(base58_key, content),
+            Err(DecodeError::IvLength(..)),
+            "We should correctly detect an invalid IV"
+        );
+
+        let content = SecretStorageKeyEventContent::new(
+            "bmur2d9ypPUH1msSwCxQOJkuKRmJI55e".to_owned(),
+            SecretStorageEncryptionAlgorithm::V1AesHmacSha2(
+                SecretStorageV1AesHmacSha2Properties::new(
+                    Some(Base64::new(vec![0u8; 16])),
+                    Some(Base64::new(vec![0u8; 10])),
+                ),
+            ),
+        );
+
+        assert_matches!(
+            SecretStorageKey::from_account_data(base58_key, content),
+            Err(DecodeError::MacLength(..)),
+            "We should correctly detect an invalid MAC"
+        );
+
+        let json = to_raw_value(&json!({
+            "algorithm": "m.secret_storage.custom",
+            "iv": "xv5b6/p3ExEw++wTyfSHEg==",
+            "mac": "ujBBbXahnTAMkmPUX2/0+VTfUh63pGyVRuBcDMgmJC8="
+        }))
+        .unwrap();
+
+        let content = SecretStorageKeyEventContent::from_parts(
+            "m.secret_storage.key.bmur2d9ypPUH1msSwCxQOJkuKRmJI55e",
+            &json,
+        )
+        .expect("We should be able to deserialize our static secret storage key");
+
+        assert_matches!(
+            SecretStorageKey::from_account_data(base58_key, content),
+            Err(DecodeError::UnsupportedAlgorithm(..)),
+            "We should correctly detect a unsupported algorithm"
         );
     }
 }

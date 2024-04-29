@@ -13,49 +13,222 @@
 // limitations under the License.
 
 use assert_matches::assert_matches;
-use ruma::serde::JsonObject;
-use serde_json::{json, Value as JsonValue};
+use assert_matches2::assert_let;
+use ruma::owned_room_id;
+use serde_json::{from_value, json};
 
-use crate::widget::machine::{Action, WidgetMachine};
-
-const WIDGET_ID: &str = "test-widget";
-
-fn assert_msg_eq(msg: &str, value: JsonValue) {
-    let object = value.as_object().unwrap();
-    let mut deserialized: JsonObject = serde_json::from_str(msg).unwrap();
-
-    // Messages must have a request ID, but we only want to test its value in
-    // some rare cases.
-    if !object.contains_key("requestId") {
-        let request_id = deserialized.remove("requestId").unwrap();
-        assert!(request_id.is_string());
-    }
-
-    assert_eq!(JsonValue::Object(deserialized), value);
-}
+use super::{parse_msg, WIDGET_ID};
+use crate::widget::machine::{
+    incoming::MatrixDriverResponse, Action, IncomingMessage, MatrixDriverRequestData, WidgetMachine,
+};
 
 #[test]
-fn machine_can_request_capabilities_immediately() {
-    let (_machine, mut actions_recv) = WidgetMachine::new(WIDGET_ID.to_owned(), false);
-    let action = actions_recv.try_recv().unwrap();
-    let msg = assert_matches!(action, Action::SendToWidget(msg) => msg);
-    assert_msg_eq(
-        &msg,
-        json!({
-            "api": "toWidget",
-            "widgetId": WIDGET_ID,
-            "action": "capabilities",
-            "data": {},
-        }),
-    );
-
-    assert_matches!(actions_recv.try_recv(), Err(_));
+fn machine_can_negotiate_capabilities_immediately() {
+    let room_id = owned_room_id!("!a98sd12bjh:example.org");
+    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false, None);
+    assert_capabilities_dance(&mut machine, actions, None);
 }
 
 #[test]
 fn machine_can_request_capabilities_on_content_load() {
-    let (_machine, mut actions_recv) = WidgetMachine::new(WIDGET_ID.to_owned(), true);
-    assert_matches!(actions_recv.try_recv(), Err(_));
+    let room_id = owned_room_id!("!a98sd12bjh:example.org");
+    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, true, None);
+    assert!(actions.is_empty());
 
-    // TODO: Do the actual content load dance
+    // Content loaded event processed.
+    let actions = {
+        let mut actions = machine.process(IncomingMessage::WidgetMessage(json_string!({
+            "api": "fromWidget",
+            "widgetId": WIDGET_ID,
+            "requestId": "content-loaded-request-id",
+            "action": "content_loaded",
+            "data": {},
+        })));
+
+        let action = actions.remove(0);
+        assert_let!(Action::SendToWidget(msg) = action);
+        let (msg, request_id) = parse_msg(&msg);
+        assert_eq!(request_id, "content-loaded-request-id");
+        assert_eq!(
+            msg,
+            json!({
+                "api": "fromWidget",
+                "widgetId": WIDGET_ID,
+                "action": "content_loaded",
+                "data": {},
+                "response": {},
+            }),
+        );
+
+        actions
+    };
+
+    assert_capabilities_dance(&mut machine, actions, None);
+}
+
+#[test]
+fn capabilities_failure_results_into_empty_capabilities() {
+    let room_id = owned_room_id!("!a98sd12bjh:example.org");
+    let (mut machine, actions) = WidgetMachine::new(WIDGET_ID.to_owned(), room_id, false, None);
+
+    // Ask widget to provide desired capabilities.
+    let actions = {
+        let [action]: [Action; 1] = actions.try_into().unwrap();
+        assert_let!(Action::SendToWidget(msg) = action);
+        let (msg, request_id) = parse_msg(&msg);
+        assert_eq!(
+            msg,
+            json!({
+                "api": "toWidget",
+                "widgetId": WIDGET_ID,
+                "action": "capabilities",
+                "data": {},
+            }),
+        );
+
+        machine.process(IncomingMessage::WidgetMessage(json_string!({
+            "api": "toWidget",
+            "widgetId": WIDGET_ID,
+            "requestId": request_id,
+            "action": "capabilities",
+            "data": {},
+            "response": {
+                "capabilities": ["org.matrix.msc2762.receive.state_event:m.room.member"],
+            },
+        })))
+    };
+
+    // Try to acquire capabilities by sending a request to a matrix driver.
+    let actions = {
+        let [action]: [Action; 1] = actions.try_into().unwrap();
+        assert_let!(
+            Action::MatrixDriverRequest {
+                request_id,
+                data: MatrixDriverRequestData::AcquireCapabilities(data)
+            } = action
+        );
+        assert_eq!(
+            data.desired_capabilities,
+            from_value(json!(["org.matrix.msc2762.receive.state_event:m.room.member"])).unwrap()
+        );
+
+        machine.process(IncomingMessage::MatrixDriverResponse {
+            request_id,
+            response: Err("OHMG!".into()),
+        })
+    };
+
+    // Inform the widget about the new capabilities, or lack of thereof :)
+    let [action]: [Action; 1] = actions.try_into().unwrap();
+    assert_let!(Action::SendToWidget(msg) = action);
+    let (msg, _request_id) = parse_msg(&msg);
+    assert_eq!(
+        msg,
+        json!({
+            "api": "toWidget",
+            "widgetId": WIDGET_ID,
+            "action": "notify_capabilities",
+            "data": {
+                "requested": ["org.matrix.msc2762.receive.state_event:m.room.member"],
+                "approved": [],
+            },
+        }),
+    );
+}
+
+/// Performs a capability "dance", if no capability is specified, we assume that
+/// it's: `org.matrix.msc2762.receive.state_event:m.room.member`.
+pub(super) fn assert_capabilities_dance(
+    machine: &mut WidgetMachine,
+    actions: Vec<Action>,
+    capability_str: Option<&str>,
+) {
+    let capability =
+        capability_str.unwrap_or("org.matrix.msc2762.receive.state_event:m.room.member");
+
+    // Ask widget to provide desired capabilities.
+    let actions = {
+        let [action]: [Action; 1] = actions.try_into().unwrap();
+        assert_let!(Action::SendToWidget(msg) = action);
+        let (msg, request_id) = parse_msg(&msg);
+        assert_eq!(
+            msg,
+            json!({
+                "api": "toWidget",
+                "widgetId": WIDGET_ID,
+                "action": "capabilities",
+                "data": {},
+            }),
+        );
+
+        machine.process(IncomingMessage::WidgetMessage(json_string!({
+            "api": "toWidget",
+            "widgetId": WIDGET_ID,
+            "requestId": request_id,
+            "action": "capabilities",
+            "data": {},
+            "response": {
+                "capabilities": [capability],
+            },
+        })))
+    };
+
+    // Try to acquire capabilities by sending a request to a matrix driver.
+    let mut actions = {
+        let [action]: [Action; 1] = actions.try_into().unwrap();
+        assert_let!(
+            Action::MatrixDriverRequest {
+                request_id,
+                data: MatrixDriverRequestData::AcquireCapabilities(data)
+            } = action
+        );
+        let capabilities = data.desired_capabilities;
+        assert_eq!(capabilities, from_value(json!([capability])).unwrap());
+
+        let response = Ok(MatrixDriverResponse::CapabilitiesAcquired(capabilities));
+        let message = IncomingMessage::MatrixDriverResponse { request_id, response };
+        machine.process(message)
+    };
+
+    // We get the `Subscribe` command if we requested some reading capabilities.
+    if ["org.matrix.msc2762.receive.state_event", "org.matrix.msc2762.receive.event"]
+        .into_iter()
+        .any(|c| capability.starts_with(c))
+    {
+        let action = actions.remove(0);
+        assert_matches!(action, Action::Subscribe);
+    }
+
+    // Inform the widget about the acquired capabilities.
+    {
+        let [action]: [Action; 1] = actions.try_into().unwrap();
+        assert_let!(Action::SendToWidget(msg) = action);
+        let (msg, request_id) = parse_msg(&msg);
+        assert_eq!(
+            msg,
+            json!({
+                "api": "toWidget",
+                "widgetId": WIDGET_ID,
+                "action": "notify_capabilities",
+                "data": {
+                    "requested": [capability],
+                    "approved": [capability],
+                },
+            }),
+        );
+
+        let actions = machine.process(IncomingMessage::WidgetMessage(json_string!({
+            "api": "toWidget",
+            "widgetId": WIDGET_ID,
+            "requestId": request_id,
+            "action": "notify_capabilities",
+            "data": {
+                "requested": [capability],
+                "approved": [capability],
+            },
+            "response": {},
+        })));
+
+        assert!(actions.is_empty());
+    }
 }

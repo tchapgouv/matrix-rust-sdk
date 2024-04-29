@@ -12,15 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    borrow::Borrow,
-    collections::HashMap,
-    hash::Hash,
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::num::NonZeroU8;
 
-use matrix_sdk_common::instant::Instant;
+use ruma::MilliSecondsSinceUnixEpoch;
+use time::{
+    format_description::well_known::{iso8601, Iso8601},
+    OffsetDateTime,
+};
 
 #[cfg(test)]
 pub(crate) fn json_convert<T, U>(value: &T) -> serde_json::Result<U>
@@ -32,158 +30,56 @@ where
     serde_json::from_str(&json)
 }
 
-/// A TTL cache where items get inactive instead of discarded.
+const ISO8601_WITH_MILLIS: iso8601::EncodedConfig = iso8601::Config::DEFAULT
+    .set_time_precision(iso8601::TimePrecision::Second { decimal_digits: NonZeroU8::new(3) })
+    .encode();
+
+/// Format the given timestamp into a human-readable timestamp.
 ///
-/// The items need to be explicitly removed from the cache. This allows us to
-/// implement exponential backoff based TTL.
-#[derive(Clone, Debug)]
-pub struct FailuresCache<T: Eq + Hash> {
-    inner: Arc<RwLock<HashMap<T, FailuresItem>>>,
-}
+/// # Returns
+///
+/// Provided the timestamp fits within an `OffsetDateTime` (ie, it is on or
+/// before year 9999), a string that looks like `1970-01-01T00:00:00.000Z`.
+/// Otherwise, `None`.
+pub fn timestamp_to_iso8601(ts: MilliSecondsSinceUnixEpoch) -> Option<String> {
+    let nanos_since_epoch = i128::from(ts.get()) * 1_000_000;
 
-#[derive(Debug, Clone, Copy)]
-struct FailuresItem {
-    insertion_time: Instant,
-    duration: Duration,
-    failure_count: u8,
-}
+    // OffsetDateTime has a max year of 9999, whereas MilliSecondsSinceUnixEpoch has
+    // a max year of 285427, so `from_unix_timestamp_nanos` can overflow for very
+    // large timestamps. (The Y10K problem!)
+    let dt = OffsetDateTime::from_unix_timestamp_nanos(nanos_since_epoch).ok()?;
 
-impl FailuresItem {
-    /// Has the item expired.
-    fn expired(&self) -> bool {
-        self.insertion_time.elapsed() >= self.duration
-    }
-}
+    // SAFETY: `format` can fail if:
+    //   * The input lacks information on a component we have asked it to format
+    //     (eg, it is given a `Time` and we ask it for a date), or
+    //   * The input contains an invalid component (eg 30th February), or
+    //   * An `io::Error` is raised internally.
+    //
+    // The first two cannot occur because we know we are giving it a valid
+    // OffsetDateTime that has all the components we are asking it to print.
+    //
+    // The third should not occur because we are formatting a short string to an
+    // in-memory buffer.
 
-impl<T> FailuresCache<T>
-where
-    T: Eq + Hash,
-{
-    pub fn new() -> Self {
-        Self { inner: Default::default() }
-    }
-
-    const MAX_DELAY: u64 = 15 * 60;
-    const MULTIPLIER: u64 = 15;
-
-    /// Is the given key non-expired and part of the cache.
-    pub fn contains<Q>(&self, key: &Q) -> bool
-    where
-        T: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        let lock = self.inner.read().unwrap();
-
-        let contains = if let Some(item) = lock.get(key) { !item.expired() } else { false };
-
-        contains
-    }
-
-    /// This will calculate a duration that determines how long an item is
-    /// considered to be valid while being in the cache.
-    ///
-    /// The returned duration will follow this sequence, values are in minutes:
-    ///      [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 15.0]
-    fn calculate_delay(failure_count: u8) -> Duration {
-        let exponential_backoff = 2u64.saturating_pow(failure_count.into());
-        let delay = exponential_backoff.saturating_mul(Self::MULTIPLIER).clamp(1, Self::MAX_DELAY);
-
-        Duration::from_secs(delay)
-    }
-
-    /// Add a single item to the cache.
-    pub fn insert(&self, item: T) {
-        self.extend([item]);
-    }
-
-    /// Extend the cache with the given iterator of items.
-    ///
-    /// Items that are already part of the cache, whether they are expired or
-    /// not, will have their TTL extended using an exponential backoff
-    /// algorithm.
-    pub fn extend(&self, iterator: impl IntoIterator<Item = T>) {
-        let mut lock = self.inner.write().unwrap();
-
-        let now = Instant::now();
-
-        for key in iterator {
-            let failure_count = if let Some(value) = lock.get(&key) {
-                value.failure_count.saturating_add(1)
-            } else {
-                0
-            };
-
-            let delay = Self::calculate_delay(failure_count);
-
-            let item = FailuresItem { insertion_time: now, duration: delay, failure_count };
-
-            lock.insert(key, item);
-        }
-    }
-
-    /// Remove the items contained in the iterator from the cache.
-    pub fn remove<'a, I, Q>(&'a self, iterator: I)
-    where
-        I: Iterator<Item = &'a Q>,
-        T: Borrow<Q>,
-        Q: Hash + Eq + 'a + ?Sized,
-    {
-        let mut lock = self.inner.write().unwrap();
-
-        for item in iterator {
-            lock.remove(item);
-        }
-    }
-}
-
-impl<T: Eq + Hash> Default for FailuresCache<T> {
-    fn default() -> Self {
-        Self::new()
-    }
+    Some(dt.format(&Iso8601::<ISO8601_WITH_MILLIS>).unwrap())
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
+pub(crate) mod tests {
+    use ruma::{MilliSecondsSinceUnixEpoch, UInt};
 
-    use proptest::prelude::*;
-
-    use super::FailuresCache;
+    use super::timestamp_to_iso8601;
 
     #[test]
-    fn failures_cache() {
-        let cache = FailuresCache::new();
-
-        assert!(!cache.contains(&1));
-        cache.extend([1u8].iter());
-        assert!(cache.contains(&1));
-
-        cache.inner.write().unwrap().get_mut(&1).unwrap().duration = Duration::from_secs(0);
-        assert!(!cache.contains(&1));
-
-        cache.remove([1u8].iter());
-        assert!(cache.inner.read().unwrap().get(&1).is_none())
-    }
-
-    #[test]
-    fn failures_cache_timeout() {
-        assert_eq!(FailuresCache::<u8>::calculate_delay(0).as_secs(), 15);
-        assert_eq!(FailuresCache::<u8>::calculate_delay(1).as_secs(), 30);
-        assert_eq!(FailuresCache::<u8>::calculate_delay(2).as_secs(), 60);
-        assert_eq!(FailuresCache::<u8>::calculate_delay(3).as_secs(), 120);
-        assert_eq!(FailuresCache::<u8>::calculate_delay(4).as_secs(), 240);
-        assert_eq!(FailuresCache::<u8>::calculate_delay(5).as_secs(), 480);
-        assert_eq!(FailuresCache::<u8>::calculate_delay(6).as_secs(), 900);
-        assert_eq!(FailuresCache::<u8>::calculate_delay(7).as_secs(), 900);
-    }
-
-    proptest! {
-        #[test]
-        fn failures_cache_proptest_timeout(count in 0..10u8) {
-            let delay = FailuresCache::<u8>::calculate_delay(count).as_secs();
-
-            assert!(delay <= 900);
-            assert!(delay >= 15);
-        }
+    fn test_timestamp_to_iso8601() {
+        assert_eq!(
+            timestamp_to_iso8601(MilliSecondsSinceUnixEpoch(UInt::new_saturating(0))),
+            Some("1970-01-01T00:00:00.000Z".to_owned())
+        );
+        assert_eq!(
+            timestamp_to_iso8601(MilliSecondsSinceUnixEpoch(UInt::new_saturating(1709657033012))),
+            Some("2024-03-05T16:43:53.012Z".to_owned())
+        );
+        assert_eq!(timestamp_to_iso8601(MilliSecondsSinceUnixEpoch(UInt::MAX)), None);
     }
 }

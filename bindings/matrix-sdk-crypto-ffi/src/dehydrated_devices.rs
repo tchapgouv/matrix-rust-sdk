@@ -46,20 +46,22 @@ pub struct DehydratedDevices {
 impl Drop for DehydratedDevices {
     fn drop(&mut self) {
         // See the drop implementation for the `crate::OlmMachine` for an explanation.
-        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
         let _guard = self.runtime.enter();
-        drop(inner);
+        unsafe {
+            ManuallyDrop::drop(&mut self.inner);
+        }
     }
 }
 
 #[uniffi::export]
 impl DehydratedDevices {
-    pub fn create(&self) -> Arc<DehydratedDevice> {
-        DehydratedDevice {
-            inner: ManuallyDrop::new(self.inner.create()),
+    pub fn create(&self) -> Result<Arc<DehydratedDevice>, DehydrationError> {
+        let inner = self.runtime.block_on(self.inner.create())?;
+
+        Ok(Arc::new(DehydratedDevice {
+            inner: ManuallyDrop::new(inner),
             runtime: self.runtime.to_owned(),
-        }
-        .into()
+        }))
     }
 
     pub fn rehydrate(
@@ -98,9 +100,10 @@ pub struct RehydratedDevice {
 impl Drop for RehydratedDevice {
     fn drop(&mut self) {
         // See the drop implementation for the `crate::OlmMachine` for an explanation.
-        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
         let _guard = self.runtime.enter();
-        drop(inner);
+        unsafe {
+            ManuallyDrop::drop(&mut self.inner);
+        }
     }
 }
 
@@ -123,9 +126,10 @@ pub struct DehydratedDevice {
 impl Drop for DehydratedDevice {
     fn drop(&mut self) {
         // See the drop implementation for the `crate::OlmMachine` for an explanation.
-        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
         let _guard = self.runtime.enter();
-        drop(inner);
+        unsafe {
+            ManuallyDrop::drop(&mut self.inner);
+        }
     }
 }
 

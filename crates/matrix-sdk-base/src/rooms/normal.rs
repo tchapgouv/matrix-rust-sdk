@@ -17,7 +17,7 @@ use std::sync::RwLock as SyncRwLock;
 use std::{
     collections::{BTreeMap, HashSet},
     mem,
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc},
 };
 
 use bitflags::bitflags;
@@ -30,9 +30,11 @@ use ruma::events::AnySyncTimelineEvent;
 use ruma::{
     api::client::sync::sync_events::v3::RoomSummary as RumaSummary,
     events::{
+        call::member::Membership,
         ignored_user_list::IgnoredUserListEventContent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
+            avatar::RoomAvatarEventContent,
             encryption::RoomEncryptionEventContent,
             guest_access::GuestAccess,
             history_visibility::HistoryVisibility,
@@ -48,24 +50,40 @@ use ruma::{
     },
     room::RoomType,
     serde::Raw,
-    EventId, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedUserId, RoomAliasId,
-    RoomId, RoomVersionId, UserId,
+    EventId, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedUserId,
+    RoomAliasId, RoomId, RoomVersionId, UserId,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{debug, field::debug, info, instrument, trace, warn};
+use tokio::sync::broadcast;
+use tracing::{debug, field::debug, info, instrument, warn};
 
 use super::{
-    members::{MemberInfo, MemberRoomInfo},
-    BaseRoomInfo, DisplayName, RoomCreateWithCreatorEventContent, RoomMember,
+    members::MemberRoomInfo, BaseRoomInfo, DisplayName, RoomCreateWithCreatorEventContent,
+    RoomMember, RoomNotableTags,
 };
 #[cfg(feature = "experimental-sliding-sync")]
 use crate::latest_event::LatestEvent;
 use crate::{
     deserialized_responses::MemberEvent,
+    read_receipts::RoomReadReceipts,
     store::{DynStateStore, Result as StoreResult, StateStoreExt},
     sync::UnreadNotificationsCount,
     MinimalStateEvent, OriginalMinimalStateEvent, RoomMemberships,
 };
+
+/// A summary of changes to room information.
+///
+/// It also indicates whether this update should update the room list.
+#[derive(Debug, Clone)]
+pub struct RoomInfoUpdate {
+    /// The room which was updated.
+    pub room_id: OwnedRoomId,
+    /// Whether this event should trigger the room list to update.
+    ///
+    /// If the change is minor or if another action already causes the room list
+    /// to update, this should be false to avoid duplicate updates.
+    pub trigger_room_list_update: bool,
+}
 
 /// The underlying room data structure collecting state for joined, left and
 /// invited rooms.
@@ -74,6 +92,7 @@ pub struct Room {
     room_id: OwnedRoomId,
     own_user_id: OwnedUserId,
     inner: SharedObservable<RoomInfo>,
+    roominfo_update_sender: broadcast::Sender<RoomInfoUpdate>,
     store: Arc<DynStateStore>,
 
     /// The most recent few encrypted events. When the keys come through to
@@ -131,23 +150,27 @@ impl From<&MembershipState> for RoomState {
 
 impl Room {
     /// The size of the latest_encrypted_events RingBuffer
+    // SAFETY: `new_unchecked` is safe because 10 is not zero.
     #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
-    const MAX_ENCRYPTED_EVENTS: usize = 10;
+    const MAX_ENCRYPTED_EVENTS: std::num::NonZeroUsize =
+        unsafe { std::num::NonZeroUsize::new_unchecked(10) };
 
     pub(crate) fn new(
         own_user_id: &UserId,
         store: Arc<DynStateStore>,
         room_id: &RoomId,
         room_state: RoomState,
+        roominfo_update_sender: broadcast::Sender<RoomInfoUpdate>,
     ) -> Self {
         let room_info = RoomInfo::new(room_id, room_state);
-        Self::restore(own_user_id, store, room_info)
+        Self::restore(own_user_id, store, room_info, roominfo_update_sender)
     }
 
     pub(crate) fn restore(
         own_user_id: &UserId,
         store: Arc<DynStateStore>,
         room_info: RoomInfo,
+        roominfo_update_sender: broadcast::Sender<RoomInfoUpdate>,
     ) -> Self {
         Self {
             own_user_id: own_user_id.into(),
@@ -158,6 +181,7 @@ impl Room {
             latest_encrypted_events: Arc::new(SyncRwLock::new(RingBuffer::new(
                 Self::MAX_ENCRYPTED_EVENTS,
             ))),
+            roominfo_update_sender,
         }
     }
 
@@ -181,9 +205,45 @@ impl Room {
         self.inner.read().room_type().is_some_and(|t| *t == RoomType::Space)
     }
 
+    /// Returns the room's type as defined in its creation event
+    /// (`m.room.create`).
+    pub fn room_type(&self) -> Option<RoomType> {
+        self.inner.read().room_type().map(ToOwned::to_owned)
+    }
+
     /// Get the unread notification counts.
     pub fn unread_notification_counts(&self) -> UnreadNotificationsCount {
         self.inner.read().notification_counts
+    }
+
+    /// Get the number of unread messages (computed client-side).
+    ///
+    /// This might be more precise than [`Self::unread_notification_counts`] for
+    /// encrypted rooms.
+    pub fn num_unread_messages(&self) -> u64 {
+        self.inner.read().read_receipts.num_unread
+    }
+
+    /// Get the detailed information about read receipts for the room.
+    pub fn read_receipts(&self) -> RoomReadReceipts {
+        self.inner.read().read_receipts.clone()
+    }
+
+    /// Get the number of unread notifications (computed client-side).
+    ///
+    /// This might be more precise than [`Self::unread_notification_counts`] for
+    /// encrypted rooms.
+    pub fn num_unread_notifications(&self) -> u64 {
+        self.inner.read().read_receipts.num_notifications
+    }
+
+    /// Get the number of unread mentions (computed client-side), that is,
+    /// messages causing a highlight in a room.
+    ///
+    /// This might be more precise than [`Self::unread_notification_counts`] for
+    /// encrypted rooms.
+    pub fn num_unread_mentions(&self) -> u64 {
+        self.inner.read().read_receipts.num_mentions
     }
 
     /// Check if the room has its members fully synced.
@@ -233,12 +293,7 @@ impl Room {
 
     /// Get the avatar url of this room.
     pub fn avatar_url(&self) -> Option<OwnedMxcUri> {
-        self.inner
-            .read()
-            .base_info
-            .avatar
-            .as_ref()
-            .and_then(|e| e.as_original().and_then(|e| e.content.url.clone()))
+        self.inner.read().avatar_url().map(ToOwned::to_owned)
     }
 
     /// Get the canonical alias of this room.
@@ -308,6 +363,12 @@ impl Room {
         self.inner.read().base_info.dm_targets.clone()
     }
 
+    /// If this room is a direct message, returns the number of members that
+    /// we're sharing the room with.
+    pub fn direct_targets_length(&self) -> usize {
+        self.inner.read().base_info.dm_targets.len()
+    }
+
     /// Is the room encrypted.
     pub fn is_encrypted(&self) -> bool {
         self.inner.read().is_encrypted()
@@ -369,6 +430,24 @@ impl Room {
         self.inner.read().topic().map(ToOwned::to_owned)
     }
 
+    /// Is there a non expired membership with application "m.call" and scope
+    /// "m.room" in this room
+    pub fn has_active_room_call(&self) -> bool {
+        self.inner.read().has_active_room_call()
+    }
+
+    /// Returns a Vec of userId's that participate in the room call.
+    ///
+    /// matrix_rtc memberships with application "m.call" and scope "m.room" are
+    /// considered. A user can occur twice if they join with two devices.
+    /// convert to a set depending if the different users are required or the
+    /// amount of sessions.
+    ///
+    /// The vector is ordered by oldest membership user to newest.
+    pub fn active_room_call_participants(&self) -> Vec<OwnedUserId> {
+        self.inner.read().active_room_call_participants()
+    }
+
     /// Return the cached display name of the room if it was provided via sync,
     /// or otherwise calculate it, taking into account its name, aliases and
     /// members.
@@ -384,13 +463,7 @@ impl Room {
     /// sliding sync.
     #[cfg(feature = "experimental-sliding-sync")]
     pub fn latest_event(&self) -> Option<LatestEvent> {
-        self.inner.read().latest_event.clone()
-    }
-
-    /// Update the last event in the room
-    #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
-    pub(crate) fn set_latest_event(&self, latest_event: Option<LatestEvent>) {
-        self.inner.update(|info| info.latest_event = latest_event);
+        self.inner.read().latest_event.as_deref().cloned()
     }
 
     /// Return the most recent few encrypted events. When the keys come through
@@ -409,10 +482,23 @@ impl Room {
     ///
     /// Panics if index is not a valid index in the latest_encrypted_events
     /// list.
+    ///
+    /// It is the responsibility of the caller to apply the changes into the
+    /// state store after calling this function.
     #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
-    pub(crate) fn on_latest_event_decrypted(&self, latest_event: LatestEvent, index: usize) {
-        self.set_latest_event(Some(latest_event));
+    pub(crate) fn on_latest_event_decrypted(
+        &self,
+        latest_event: Box<LatestEvent>,
+        index: usize,
+        changes: &mut crate::StateChanges,
+    ) {
         self.latest_encrypted_events.write().unwrap().drain(0..=index);
+
+        let room_info = changes
+            .room_infos
+            .entry(self.room_id().to_owned())
+            .or_insert_with(|| self.clone_info());
+        room_info.latest_event = Some(latest_event);
     }
 
     /// Get the list of users ids that are considered to be joined members of
@@ -462,10 +548,7 @@ impl Room {
         for event in member_events {
             let profile = profiles.remove(event.user_id());
             let presence = presences.remove(event.user_id());
-
-            let member_info = MemberInfo { event, profile, presence };
-
-            members.push(RoomMember::from_parts(member_info, &room_info))
+            members.push(RoomMember::from_parts(event, profile, presence, &room_info))
         }
 
         Ok(members)
@@ -558,8 +641,8 @@ impl Room {
         };
 
         debug!(
-            room_id = self.room_id().as_str(),
-            own_user = self.own_user_id.as_str(),
+            room_id = ?self.room_id(),
+            own_user = ?self.own_user_id,
             joined, invited,
             heroes = ?members,
             "Calculating name for a room",
@@ -578,9 +661,17 @@ impl Room {
         self.inner.get()
     }
 
-    /// Update the summary with given RoomInfo
-    pub fn update_summary(&self, summary: RoomInfo) {
-        self.inner.set(summary);
+    /// Update the summary with given RoomInfo.
+    ///
+    /// This also triggers an update for room info observers if
+    /// `trigger_room_list_update` is true.
+    pub fn set_room_info(&self, room_info: RoomInfo, trigger_room_list_update: bool) {
+        self.inner.set(room_info);
+
+        // Ignore error if no receiver exists.
+        let _ = self
+            .roominfo_update_sender
+            .send(RoomInfoUpdate { room_id: self.room_id.clone(), trigger_room_list_update });
     }
 
     /// Get the `RoomMember` with the given `user_id`.
@@ -588,30 +679,23 @@ impl Room {
     /// Returns `None` if the member was never part of this room, otherwise
     /// return a `RoomMember` that can be in a joined, invited, left, banned
     /// state.
-    #[instrument(skip(self))]
     pub async fn get_member(&self, user_id: &UserId) -> StoreResult<Option<RoomMember>> {
-        trace!("Fetching member event");
         let Some(raw_event) = self.store.get_member_event(self.room_id(), user_id).await? else {
-            debug!("Member event not found in state store");
+            debug!(%user_id, "Member event not found in state store");
             return Ok(None);
         };
 
-        trace!("Deserializing member event");
         let event = raw_event.deserialize()?;
 
-        trace!("Fetching presence event");
         let presence =
             self.store.get_presence_event(user_id).await?.and_then(|e| e.deserialize().ok());
 
-        trace!("Fetching profile");
         let profile = self.store.get_profile(self.room_id(), user_id).await?;
 
         let display_names = [event.display_name().to_owned()];
         let room_info = self.member_room_info(&display_names).await?;
 
-        trace!("Got all member information");
-        let member_info = MemberInfo { event, profile, presence };
-        Ok(Some(RoomMember::from_parts(member_info, &room_info)))
+        Ok(Some(RoomMember::from_parts(event, profile, presence, &room_info)))
     }
 
     /// The current `MemberRoomInfo` for this room.
@@ -622,18 +706,15 @@ impl Room {
         let max_power_level = self.max_power_level();
         let room_creator = self.inner.read().creator().map(ToOwned::to_owned);
 
-        trace!("Fetching power levels");
         let power_levels = self
             .store
             .get_state_event_static(self.room_id())
             .await?
             .and_then(|e| e.deserialize().ok());
 
-        trace!("Fetching users based on display names");
         let users_display_names =
             self.store.get_users_with_display_names(self.room_id(), display_names).await?;
 
-        trace!("Fetching ignored users");
         let ignored_users = self
             .store
             .get_account_data_event_static::<IgnoredUserListEventContent>()
@@ -665,9 +746,24 @@ impl Room {
         }
     }
 
+    /// Check whether the room is marked as favourite.
+    ///
+    /// A room is considered favourite if it has received the `m.favourite` tag.
+    pub fn is_favourite(&self) -> bool {
+        self.inner.read().base_info.notable_tags.contains(RoomNotableTags::FAVOURITE)
+    }
+
+    /// Check whether the room is marked as low priority.
+    ///
+    /// A room is considered low priority if it has received the `m.lowpriority`
+    /// tag.
+    pub fn is_low_priority(&self) -> bool {
+        self.inner.read().base_info.notable_tags.contains(RoomNotableTags::LOW_PRIORITY)
+    }
+
     /// Get the receipt as an `OwnedEventId` and `Receipt` tuple for the given
     /// `receipt_type`, `thread` and `user_id` in this room.
-    pub async fn user_receipt(
+    pub async fn load_user_receipt(
         &self,
         receipt_type: ReceiptType,
         thread: ReceiptThread,
@@ -676,9 +772,10 @@ impl Room {
         self.store.get_user_room_receipt_event(self.room_id(), receipt_type, thread, user_id).await
     }
 
-    /// Get the receipts as a list of `OwnedUserId` and `Receipt` tuples for the
-    /// given `receipt_type`, `thread` and `event_id` in this room.
-    pub async fn event_receipts(
+    /// Load from storage the receipts as a list of `OwnedUserId` and `Receipt`
+    /// tuples for the given `receipt_type`, `thread` and `event_id` in this
+    /// room.
+    pub async fn load_event_receipts(
         &self,
         receipt_type: ReceiptType,
         thread: ReceiptThread,
@@ -687,6 +784,12 @@ impl Room {
         self.store
             .get_event_room_receipt_events(self.room_id(), receipt_type, thread, event_id)
             .await
+    }
+
+    /// Returns a boolean indicating if this room has been manually marked as
+    /// unread
+    pub fn is_marked_unread(&self) -> bool {
+        self.inner.read().base_info.is_marked_unread
     }
 }
 
@@ -697,26 +800,48 @@ impl Room {
 pub struct RoomInfo {
     /// The unique room id of the room.
     pub(crate) room_id: OwnedRoomId,
+
     /// The state of the room.
     pub(crate) room_state: RoomState,
-    /// The unread notifications counts.
+
+    /// The unread notifications counts, as returned by the server.
+    ///
+    /// These might be incorrect for encrypted rooms, since the server doesn't
+    /// have access to the content of the encrypted events.
     pub(crate) notification_counts: UnreadNotificationsCount,
+
     /// The summary of this room.
     pub(crate) summary: RoomSummary,
+
     /// Flag remembering if the room members are synced.
     pub(crate) members_synced: bool,
+
     /// The prev batch of this room we received during the last sync.
     pub(crate) last_prev_batch: Option<String>,
+
     /// How much we know about this room.
     pub(crate) sync_info: SyncInfo,
+
     /// Whether or not the encryption info was been synced.
     pub(crate) encryption_state_synced: bool,
+
     /// The last event send by sliding sync
     #[cfg(feature = "experimental-sliding-sync")]
-    pub(crate) latest_event: Option<LatestEvent>,
+    pub(crate) latest_event: Option<Box<LatestEvent>>,
+
+    /// Information about read receipts for this room.
+    #[serde(default)]
+    pub(crate) read_receipts: RoomReadReceipts,
+
     /// Base room info which holds some basic event contents important for the
     /// room state.
-    pub(crate) base_info: BaseRoomInfo,
+    pub(crate) base_info: Box<BaseRoomInfo>,
+
+    /// Did we already warn about an unknown room version in
+    /// [`RoomInfo::room_version_or_default`]? This is done to avoid
+    /// spamming about unknown room versions in the log for the same room.
+    #[serde(skip)]
+    pub(crate) warned_about_unknown_room_version: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -750,7 +875,9 @@ impl RoomInfo {
             encryption_state_synced: false,
             #[cfg(feature = "experimental-sliding-sync")]
             latest_event: None,
-            base_info: BaseRoomInfo::new(),
+            read_receipts: Default::default(),
+            base_info: Box::new(BaseRoomInfo::new()),
+            warned_about_unknown_room_version: Arc::new(false.into()),
         }
     }
 
@@ -867,7 +994,7 @@ impl RoomInfo {
 
         #[cfg(feature = "experimental-sliding-sync")]
         if let Some(latest_event) = &mut self.latest_event {
-            trace!("Checking if redaction applies to latest event");
+            tracing::trace!("Checking if redaction applies to latest event");
             if latest_event.event_id().as_deref() == Some(redacts) {
                 match apply_redaction(&latest_event.event().event, _raw, room_version) {
                     Some(redacted) => {
@@ -885,7 +1012,7 @@ impl RoomInfo {
         self.base_info.handle_redaction(redacts);
     }
 
-    /// Update the room name
+    /// Update the room name.
     pub fn update_name(&mut self, name: String) {
         self.base_info.name = Some(MinimalStateEvent::Original(OriginalMinimalStateEvent {
             content: RoomNameEventContent::new(name),
@@ -893,12 +1020,30 @@ impl RoomInfo {
         }));
     }
 
-    /// Update the notifications count
+    /// Returns the current room avatar.
+    pub fn avatar_url(&self) -> Option<&MxcUri> {
+        self.base_info
+            .avatar
+            .as_ref()
+            .and_then(|e| e.as_original().and_then(|e| e.content.url.as_deref()))
+    }
+
+    /// Update the room avatar.
+    pub fn update_avatar(&mut self, url: Option<OwnedMxcUri>) {
+        self.base_info.avatar = url.map(|url| {
+            let mut content = RoomAvatarEventContent::new();
+            content.url = Some(url);
+
+            MinimalStateEvent::Original(OriginalMinimalStateEvent { content, event_id: None })
+        });
+    }
+
+    /// Update the notifications count.
     pub fn update_notification_count(&mut self, notification_counts: UnreadNotificationsCount) {
         self.notification_counts = notification_counts;
     }
 
-    /// Update the RoomSummary
+    /// Update the RoomSummary.
     ///
     /// Returns true if the Summary modified the info, false otherwise.
     pub fn update_summary(&mut self, summary: &RumaSummary) -> bool {
@@ -966,6 +1111,26 @@ impl RoomInfo {
         self.base_info.room_version()
     }
 
+    /// Get the room version of this room, or a sensible default.
+    ///
+    /// Will warn (at most once) if the room creation event is missing from this
+    /// [`RoomInfo`].
+    pub fn room_version_or_default(&self) -> RoomVersionId {
+        use std::sync::atomic::Ordering;
+
+        self.base_info.room_version().cloned().unwrap_or_else(|| {
+            if self
+                .warned_about_unknown_room_version
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                warn!("Unknown room version, falling back to v10");
+            }
+
+            RoomVersionId::V10
+        })
+    }
+
     /// Get the room type of this room.
     pub fn room_type(&self) -> Option<&RoomType> {
         match self.base_info.create.as_ref()? {
@@ -989,14 +1154,20 @@ impl RoomInfo {
         }
     }
 
-    fn history_visibility(&self) -> &HistoryVisibility {
+    /// Returns the history visibility for this room.
+    ///
+    /// Defaults to `WorldReadable`, if missing.
+    pub fn history_visibility(&self) -> &HistoryVisibility {
         match &self.base_info.history_visibility {
             Some(MinimalStateEvent::Original(ev)) => &ev.content.history_visibility,
             _ => &HistoryVisibility::WorldReadable,
         }
     }
 
-    fn join_rule(&self) -> &JoinRule {
+    /// Returns the join rule for this room.
+    ///
+    /// Defaults to `Public`, if missing.
+    pub fn join_rule(&self) -> &JoinRule {
         match &self.base_info.join_rules {
             Some(MinimalStateEvent::Original(ev)) => &ev.content.join_rule,
             _ => &JoinRule::Public,
@@ -1013,8 +1184,68 @@ impl RoomInfo {
         Some(&self.base_info.tombstone.as_ref()?.as_original()?.content)
     }
 
-    fn topic(&self) -> Option<&str> {
+    /// Returns the topic for this room, if set.
+    pub fn topic(&self) -> Option<&str> {
         Some(&self.base_info.topic.as_ref()?.as_original()?.content.topic)
+    }
+
+    /// Get a list of all the valid (non expired) matrixRTC memberships and
+    /// associated UserId's in this room.
+    ///
+    /// The vector is ordered by oldest membership to newest.
+    fn active_matrix_rtc_memberships(&self) -> Vec<(OwnedUserId, &Membership)> {
+        let mut v = self
+            .base_info
+            .rtc_member
+            .iter()
+            .filter_map(|(user_id, ev)| {
+                ev.as_original().map(|ev| {
+                    ev.content
+                        .active_memberships(None)
+                        .into_iter()
+                        .map(move |m| (user_id.clone(), m))
+                })
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        v.sort_by_key(|(_, m)| m.created_ts);
+        v
+    }
+
+    /// Similar to
+    /// [`matrix_rtc_memberships`](Self::active_matrix_rtc_memberships) but only
+    /// returns Memberships with application "m.call" and scope "m.room".
+    ///
+    /// The vector is ordered by oldest membership user to newest.
+    fn active_room_call_memberships(&self) -> Vec<(OwnedUserId, &Membership)> {
+        self.active_matrix_rtc_memberships()
+            .into_iter()
+            .filter(|(_user_id, m)| m.is_room_call())
+            .collect()
+    }
+
+    /// Is there a non expired membership with application "m.call" and scope
+    /// "m.room" in this room.
+    pub fn has_active_room_call(&self) -> bool {
+        !self.active_room_call_memberships().is_empty()
+    }
+
+    /// Returns a Vec of userId's that participate in the room call.
+    ///
+    /// matrix_rtc memberships with application "m.call" and scope "m.room" are
+    /// considered. A user can occur twice if they join with two devices.
+    /// convert to a set depending if the different users are required or the
+    /// amount of sessions.
+    ///
+    /// The vector is ordered by oldest membership user to newest.
+    pub fn active_room_call_participants(&self) -> Vec<OwnedUserId> {
+        self.active_room_call_memberships().iter().map(|(user_id, _)| user_id.clone()).collect()
+    }
+
+    /// Returns the latest (decrypted) event recorded for this room.
+    #[cfg(feature = "experimental-sliding-sync")]
+    pub fn latest_event(&self) -> Option<&LatestEvent> {
+        self.latest_event.as_deref()
     }
 }
 
@@ -1105,15 +1336,23 @@ impl RoomStateFilter {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        ops::{Not, Sub},
+        str::FromStr,
+        sync::Arc,
+    };
 
     use assign::assign;
     #[cfg(feature = "experimental-sliding-sync")]
     use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
-    use matrix_sdk_test::async_test;
+    use matrix_sdk_test::{async_test, ALICE, BOB, CAROL};
     use ruma::{
         api::client::sync::sync_events::v3::RoomSummary as RumaSummary,
         events::{
+            call::member::{
+                Application, CallApplicationContent, CallMemberEventContent, Focus, LivekitFocus,
+                Membership, MembershipInit, OriginalSyncCallMemberEvent,
+            },
             room::{
                 canonical_alias::RoomCanonicalAliasEventContent,
                 member::{
@@ -1122,13 +1361,15 @@ mod tests {
                 },
                 name::RoomNameEventContent,
             },
-            StateEventType,
+            AnySyncStateEvent, StateEventType, StateUnsigned, SyncStateEvent,
         },
         room_alias_id, room_id,
         serde::Raw,
-        user_id, UserId,
+        user_id, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId, UserId,
     };
     use serde_json::json;
+    use stream_assert::{assert_pending, assert_ready};
+    use web_time::{Duration, SystemTime};
 
     #[cfg(feature = "experimental-sliding-sync")]
     use super::SyncInfo;
@@ -1137,12 +1378,12 @@ mod tests {
     use crate::latest_event::LatestEvent;
     use crate::{
         store::{MemoryStore, StateChanges, StateStore},
-        DisplayName, MinimalStateEvent, OriginalMinimalStateEvent,
+        BaseClient, DisplayName, MinimalStateEvent, OriginalMinimalStateEvent, SessionMeta,
     };
 
     #[test]
     #[cfg(feature = "experimental-sliding-sync")]
-    fn room_info_serialization() {
+    fn test_room_info_serialization() {
         // This test exists to make sure we don't accidentally change the
         // serialized format for `RoomInfo`.
 
@@ -1165,10 +1406,12 @@ mod tests {
             last_prev_batch: Some("pb".to_owned()),
             sync_info: SyncInfo::FullySynced,
             encryption_state_synced: true,
-            latest_event: Some(LatestEvent::new(
+            latest_event: Some(Box::new(LatestEvent::new(
                 Raw::from_json_string(json!({"sender": "@u:i.uk"}).to_string()).unwrap().into(),
-            )),
-            base_info: BaseRoomInfo::new(),
+            ))),
+            base_info: Box::new(BaseRoomInfo::new()),
+            read_receipts: Default::default(),
+            warned_about_unknown_room_version: Arc::new(false.into()),
         };
 
         let info_json = json!({
@@ -1203,11 +1446,19 @@ mod tests {
                 "encryption": null,
                 "guest_access": null,
                 "history_visibility": null,
+                "is_marked_unread": false,
                 "join_rules": null,
                 "max_power_level": 100,
                 "name": null,
                 "tombstone": null,
                 "topic": null,
+            },
+            "read_receipts": {
+                "num_unread": 0,
+                "num_mentions": 0,
+                "num_notifications": 0,
+                "latest_active": null,
+                "pending": []
             }
         });
 
@@ -1216,7 +1467,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "experimental-sliding-sync")]
-    fn room_info_deserialization_without_optional_items() {
+    fn test_room_info_deserialization_without_optional_items() {
         // Ensure we can still deserialize RoomInfos before we added things to its
         // schema
 
@@ -1282,12 +1533,153 @@ mod tests {
         assert!(info.base_info.topic.is_none());
     }
 
+    #[async_test]
+    async fn test_is_favourite() {
+        // Given a room,
+        let client = BaseClient::new();
+
+        client
+            .set_session_meta(SessionMeta {
+                user_id: user_id!("@alice:example.org").into(),
+                device_id: ruma::device_id!("AYEAYEAYE").into(),
+            })
+            .await
+            .unwrap();
+
+        let room_id = room_id!("!test:localhost");
+        let room = client.get_or_create_room(room_id, RoomState::Joined);
+
+        // Sanity checks to ensure the room isn't marked as favourite.
+        assert!(room.is_favourite().not());
+
+        // Subscribe to the `RoomInfo`.
+        let mut room_info_subscriber = room.subscribe_info();
+
+        assert_pending!(room_info_subscriber);
+
+        // Create the tag.
+        let tag_raw = Raw::new(&json!({
+            "content": {
+                "tags": {
+                    "m.favourite": {
+                        "order": 0.0
+                    },
+                },
+            },
+            "type": "m.tag",
+        }))
+        .unwrap()
+        .cast();
+
+        // When the new tag is handled and applied.
+        let mut changes = StateChanges::default();
+        client.handle_room_account_data(room_id, &[tag_raw], &mut changes).await;
+        client.apply_changes(&changes, false);
+
+        // The `RoomInfo` is getting notified.
+        assert_ready!(room_info_subscriber);
+        assert_pending!(room_info_subscriber);
+
+        // The room is now marked as favourite.
+        assert!(room.is_favourite());
+
+        // Now, let's remove the tag.
+        let tag_raw = Raw::new(&json!({
+            "content": {
+                "tags": {},
+            },
+            "type": "m.tag"
+        }))
+        .unwrap()
+        .cast();
+        client.handle_room_account_data(room_id, &[tag_raw], &mut changes).await;
+        client.apply_changes(&changes, false);
+
+        // The `RoomInfo` is getting notified.
+        assert_ready!(room_info_subscriber);
+        assert_pending!(room_info_subscriber);
+
+        // The room is now marked as _not_ favourite.
+        assert!(room.is_favourite().not());
+    }
+
+    #[async_test]
+    async fn test_is_low_priority() {
+        // Given a room,
+        let client = BaseClient::new();
+
+        client
+            .set_session_meta(SessionMeta {
+                user_id: user_id!("@alice:example.org").into(),
+                device_id: ruma::device_id!("AYEAYEAYE").into(),
+            })
+            .await
+            .unwrap();
+
+        let room_id = room_id!("!test:localhost");
+        let room = client.get_or_create_room(room_id, RoomState::Joined);
+
+        // Sanity checks to ensure the room isn't marked as low priority.
+        assert!(!room.is_low_priority());
+
+        // Subscribe to the `RoomInfo`.
+        let mut room_info_subscriber = room.subscribe_info();
+
+        assert_pending!(room_info_subscriber);
+
+        // Create the tag.
+        let tag_raw = Raw::new(&json!({
+            "content": {
+                "tags": {
+                    "m.lowpriority": {
+                        "order": 0.0
+                    },
+                }
+            },
+            "type": "m.tag"
+        }))
+        .unwrap()
+        .cast();
+
+        // When the new tag is handled and applied.
+        let mut changes = StateChanges::default();
+        client.handle_room_account_data(room_id, &[tag_raw], &mut changes).await;
+        client.apply_changes(&changes, false);
+
+        // The `RoomInfo` is getting notified.
+        assert_ready!(room_info_subscriber);
+        assert_pending!(room_info_subscriber);
+
+        // The room is now marked as low priority.
+        assert!(room.is_low_priority());
+
+        // Now, let's remove the tag.
+        let tag_raw = Raw::new(&json!({
+            "content": {
+                "tags": {},
+            },
+            "type": "m.tag"
+        }))
+        .unwrap()
+        .cast();
+        client.handle_room_account_data(room_id, &[tag_raw], &mut changes).await;
+        client.apply_changes(&changes, false);
+
+        // The `RoomInfo` is getting notified.
+        assert_ready!(room_info_subscriber);
+        assert_pending!(room_info_subscriber);
+
+        // The room is now marked as _not_ low priority.
+        assert!(room.is_low_priority().not());
+    }
+
     fn make_room(room_type: RoomState) -> (Arc<MemoryStore>, Room) {
         let store = Arc::new(MemoryStore::new());
         let user_id = user_id!("@me:example.org");
         let room_id = room_id!("!test:localhost");
+        let (sender, _receiver) = tokio::sync::broadcast::channel(1);
 
-        (store.clone(), Room::new(user_id, store, room_id, room_type))
+        (store.clone(), Room::new(user_id, store, room_id, room_type, sender))
     }
 
     fn make_stripped_member_event(user_id: &UserId, name: &str) -> Raw<StrippedRoomMemberEvent> {
@@ -1319,13 +1711,13 @@ mod tests {
     }
 
     #[async_test]
-    async fn display_name_for_joined_room_is_empty_if_no_info() {
+    async fn test_display_name_for_joined_room_is_empty_if_no_info() {
         let (_, room) = make_room(RoomState::Joined);
         assert_eq!(room.display_name().await.unwrap(), DisplayName::Empty);
     }
 
     #[async_test]
-    async fn display_name_for_joined_room_uses_canonical_alias_if_available() {
+    async fn test_display_name_for_joined_room_uses_canonical_alias_if_available() {
         let (_, room) = make_room(RoomState::Joined);
         room.inner
             .update(|info| info.base_info.canonical_alias = Some(make_canonical_alias_event()));
@@ -1333,7 +1725,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn display_name_for_joined_room_prefers_name_over_alias() {
+    async fn test_display_name_for_joined_room_prefers_name_over_alias() {
         let (_, room) = make_room(RoomState::Joined);
         room.inner
             .update(|info| info.base_info.canonical_alias = Some(make_canonical_alias_event()));
@@ -1344,13 +1736,13 @@ mod tests {
     }
 
     #[async_test]
-    async fn display_name_for_invited_room_is_empty_if_no_info() {
+    async fn test_display_name_for_invited_room_is_empty_if_no_info() {
         let (_, room) = make_room(RoomState::Invited);
         assert_eq!(room.display_name().await.unwrap(), DisplayName::Empty);
     }
 
     #[async_test]
-    async fn display_name_for_invited_room_is_empty_if_room_name_empty() {
+    async fn test_display_name_for_invited_room_is_empty_if_room_name_empty() {
         let (_, room) = make_room(RoomState::Invited);
 
         let room_name = MinimalStateEvent::Original(OriginalMinimalStateEvent {
@@ -1363,7 +1755,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn display_name_for_invited_room_uses_canonical_alias_if_available() {
+    async fn test_display_name_for_invited_room_uses_canonical_alias_if_available() {
         let (_, room) = make_room(RoomState::Invited);
         room.inner
             .update(|info| info.base_info.canonical_alias = Some(make_canonical_alias_event()));
@@ -1371,7 +1763,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn display_name_for_invited_room_prefers_name_over_alias() {
+    async fn test_display_name_for_invited_room_prefers_name_over_alias() {
         let (_, room) = make_room(RoomState::Invited);
         room.inner
             .update(|info| info.base_info.canonical_alias = Some(make_canonical_alias_event()));
@@ -1528,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn setting_the_name_on_room_info_creates_a_fake_event() {
+    fn test_setting_the_name_on_room_info_creates_a_fake_event() {
         // Given a room
         let mut room_info = RoomInfo::new(room_id!("!r:e.uk"), RoomState::Joined);
 
@@ -1545,9 +1937,53 @@ mod tests {
         );
     }
 
+    #[async_test]
+    #[cfg(feature = "experimental-sliding-sync")]
+    async fn test_setting_the_latest_event_doesnt_cause_a_room_info_update() {
+        // Given a room,
+
+        let client = BaseClient::new();
+
+        client
+            .set_session_meta(SessionMeta {
+                user_id: user_id!("@alice:example.org").into(),
+                device_id: ruma::device_id!("AYEAYEAYE").into(),
+            })
+            .await
+            .unwrap();
+
+        let room_id = room_id!("!test:localhost");
+        let room = client.get_or_create_room(room_id, RoomState::Joined);
+
+        // That has an encrypted event,
+        add_encrypted_event(&room, "$A");
+        // Sanity: it has no latest_event
+        assert!(room.latest_event().is_none());
+
+        // When I set up an observer on the latest_event,
+        let mut room_info_subscriber = room.subscribe_info();
+
+        // And I provide a decrypted event to replace the encrypted one,
+        let event = make_latest_event("$A");
+
+        let mut changes = StateChanges::default();
+        room.on_latest_event_decrypted(event.clone(), 0, &mut changes);
+
+        // The subscriber isn't notified at this point.
+        assert_pending!(room_info_subscriber);
+
+        // Then updating the room info will store the event,
+        client.apply_changes(&changes, false);
+        assert_eq!(room.latest_event().unwrap().event_id(), event.event_id());
+
+        // And wake up the subscriber.
+        assert_ready!(room_info_subscriber);
+        assert_pending!(room_info_subscriber);
+    }
+
     #[test]
     #[cfg(feature = "experimental-sliding-sync")]
-    fn when_we_provide_a_newly_decrypted_event_it_replaces_latest_event() {
+    fn test_when_we_provide_a_newly_decrypted_event_it_replaces_latest_event() {
         // Given a room with an encrypted event
         let (_store, room) = make_room(RoomState::Joined);
         add_encrypted_event(&room, "$A");
@@ -1556,7 +1992,9 @@ mod tests {
 
         // When I provide a decrypted event to replace the encrypted one
         let event = make_latest_event("$A");
-        room.on_latest_event_decrypted(event.clone(), 0);
+        let mut changes = StateChanges::default();
+        room.on_latest_event_decrypted(event.clone(), 0, &mut changes);
+        room.set_room_info(changes.room_infos.get(room.room_id()).cloned().unwrap(), false);
 
         // Then is it stored
         assert_eq!(room.latest_event().unwrap().event_id(), event.event_id());
@@ -1564,7 +2002,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "experimental-sliding-sync")]
-    fn when_a_newly_decrypted_event_appears_we_delete_all_older_encrypted_events() {
+    fn test_when_a_newly_decrypted_event_appears_we_delete_all_older_encrypted_events() {
         // Given a room with some encrypted events and a latest event
         let (_store, room) = make_room(RoomState::Joined);
         room.inner.update(|info| info.latest_event = Some(make_latest_event("$A")));
@@ -1576,13 +2014,15 @@ mod tests {
         // When I provide a latest event
         let new_event = make_latest_event("$1");
         let new_event_index = 1;
-        room.on_latest_event_decrypted(new_event.clone(), new_event_index);
+        let mut changes = StateChanges::default();
+        room.on_latest_event_decrypted(new_event.clone(), new_event_index, &mut changes);
+        room.set_room_info(changes.room_infos.get(room.room_id()).cloned().unwrap(), false);
 
         // Then the encrypted events list is shortened to only newer events
         let enc_evs = room.latest_encrypted_events();
         assert_eq!(enc_evs.len(), 2);
-        assert_eq!(enc_evs.get(0).unwrap().get_field::<&str>("event_id").unwrap().unwrap(), "$2");
-        assert_eq!(enc_evs.get(1).unwrap().get_field::<&str>("event_id").unwrap().unwrap(), "$3");
+        assert_eq!(enc_evs[0].get_field::<&str>("event_id").unwrap().unwrap(), "$2");
+        assert_eq!(enc_evs[1].get_field::<&str>("event_id").unwrap().unwrap(), "$3");
 
         // And the event is stored
         assert_eq!(room.latest_event().unwrap().event_id(), new_event.event_id());
@@ -1590,7 +2030,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "experimental-sliding-sync")]
-    fn replacing_the_newest_event_leaves_none_left() {
+    fn test_replacing_the_newest_event_leaves_none_left() {
         // Given a room with some encrypted events
         let (_store, room) = make_room(RoomState::Joined);
         add_encrypted_event(&room, "$0");
@@ -1601,7 +2041,9 @@ mod tests {
         // When I provide a latest event and say it was the very latest
         let new_event = make_latest_event("$3");
         let new_event_index = 3;
-        room.on_latest_event_decrypted(new_event, new_event_index);
+        let mut changes = StateChanges::default();
+        room.on_latest_event_decrypted(new_event, new_event_index, &mut changes);
+        room.set_room_info(changes.room_infos.get(room.room_id()).cloned().unwrap(), false);
 
         // Then the encrypted events list ie empty
         let enc_evs = room.latest_encrypted_events();
@@ -1617,9 +2059,123 @@ mod tests {
     }
 
     #[cfg(feature = "experimental-sliding-sync")]
-    fn make_latest_event(event_id: &str) -> LatestEvent {
-        LatestEvent::new(SyncTimelineEvent::new(
+    fn make_latest_event(event_id: &str) -> Box<LatestEvent> {
+        Box::new(LatestEvent::new(SyncTimelineEvent::new(
             Raw::from_json_string(json!({ "event_id": event_id }).to_string()).unwrap(),
-        ))
+        )))
+    }
+
+    fn timestamp(minutes_ago: u32) -> MilliSecondsSinceUnixEpoch {
+        MilliSecondsSinceUnixEpoch::from_system_time(
+            SystemTime::now().sub(Duration::from_secs((60 * minutes_ago).into())),
+        )
+        .expect("date out of range")
+    }
+
+    fn call_member_state_event(
+        memberships: Vec<Membership>,
+        ev_id: &str,
+        user_id: &UserId,
+    ) -> AnySyncStateEvent {
+        let content = CallMemberEventContent::new(memberships);
+
+        AnySyncStateEvent::CallMember(SyncStateEvent::Original(OriginalSyncCallMemberEvent {
+            content,
+            event_id: OwnedEventId::from_str(ev_id).unwrap(),
+            sender: user_id.to_owned(),
+            // we can simply use now here since this will be dropped when using a MinimalStateEvent
+            // in the roomInfo
+            origin_server_ts: timestamp(0),
+            state_key: user_id.to_owned(),
+            unsigned: StateUnsigned::new(),
+        }))
+    }
+
+    fn membership_for_my_call(
+        device_id: &str,
+        membership_id: &str,
+        minutes_ago: u32,
+    ) -> Membership {
+        let application = Application::Call(CallApplicationContent::new(
+            "my_call_id_1".to_owned(),
+            ruma::events::call::member::CallScope::Room,
+        ));
+        let foci_active = vec![Focus::Livekit(LivekitFocus::new(
+            "my_call_foci_alias".to_owned(),
+            "https://lk.org".to_owned(),
+        ))];
+
+        assign!(
+            Membership::from(MembershipInit {
+                application,
+                device_id: device_id.to_owned(),
+                expires: Duration::from_millis(3_600_000),
+                foci_active,
+                membership_id: membership_id.to_owned(),
+            }),
+            { created_ts: Some(timestamp(minutes_ago)) }
+        )
+    }
+
+    fn receive_state_events(room: &Room, events: Vec<&AnySyncStateEvent>) {
+        room.inner.update_if(|info| {
+            let mut res = false;
+            for ev in events {
+                res |= info.handle_state_event(ev);
+            }
+            res
+        });
+    }
+
+    /// `user_a`: empty memberships
+    /// `user_b`: one membership
+    /// `user_c`: two memberships (two devices)
+    fn create_call_with_member_events_for_user(a: &UserId, b: &UserId, c: &UserId) -> Room {
+        let (_, room) = make_room(RoomState::Joined);
+
+        let a_empty = call_member_state_event(Vec::new(), "$1234", a);
+
+        // make b 10min old
+        let m_init_b = membership_for_my_call("0", "0", 1);
+        let b_one = call_member_state_event(vec![m_init_b], "$12345", b);
+
+        // c1 1min old
+        let m_init_c1 = membership_for_my_call("0", "0", 10);
+        // c2 20min old
+        let m_init_c2 = membership_for_my_call("1", "0", 20);
+        let c_two = call_member_state_event(vec![m_init_c1, m_init_c2], "$123456", c);
+
+        // Intentionally use a non time sorted receive order.
+        receive_state_events(&room, vec![&c_two, &a_empty, &b_one]);
+
+        room
+    }
+
+    #[test]
+    fn test_show_correct_active_call_state() {
+        let room = create_call_with_member_events_for_user(&ALICE, &BOB, &CAROL);
+
+        // This check also tests the ordering.
+        // We want older events to be in the front.
+        // user_b (Bob) is 1min old, c1 (CAROL) 10min old, c2 (CAROL) 20min old
+        assert_eq!(
+            vec![CAROL.to_owned(), CAROL.to_owned(), BOB.to_owned()],
+            room.active_room_call_participants()
+        );
+        assert!(room.has_active_room_call());
+    }
+
+    #[test]
+    fn test_active_call_is_false_when_everyone_left() {
+        let room = create_call_with_member_events_for_user(&ALICE, &BOB, &CAROL);
+
+        let b_empty_membership = call_member_state_event(Vec::new(), "$1234_1", &BOB);
+        let c_empty_membership = call_member_state_event(Vec::new(), "$12345_1", &CAROL);
+
+        receive_state_events(&room, vec![&b_empty_membership, &c_empty_membership]);
+
+        // We have no active call anymore after emptying the memberships
+        assert_eq!(Vec::<OwnedUserId>::new(), room.active_room_call_participants());
+        assert!(!room.has_active_room_call());
     }
 }

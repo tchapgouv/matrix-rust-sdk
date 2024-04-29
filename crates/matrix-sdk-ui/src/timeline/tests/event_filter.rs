@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use matrix_sdk_test::{async_test, sync_timeline_event, ALICE, BOB};
 use ruma::{
@@ -28,17 +29,21 @@ use ruma::{
                 MessageType, RedactedRoomMessageEventContent, Relation, RoomMessageEventContent,
             },
             name::RoomNameEventContent,
+            topic::RoomTopicEventContent,
         },
-        AnySyncTimelineEvent,
+        AnySyncTimelineEvent, TimelineEventType,
     },
 };
 use stream_assert::assert_next_matches;
 
 use super::TestTimeline;
-use crate::timeline::{inner::TimelineInnerSettings, TimelineItemContent};
+use crate::timeline::{
+    inner::TimelineInnerSettings, AnyOtherFullStateEventContent, TimelineEventTypeFilter,
+    TimelineItem, TimelineItemContent, TimelineItemKind,
+};
 
 #[async_test]
-async fn default_filter() {
+async fn test_default_filter() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
 
@@ -46,8 +51,8 @@ async fn default_filter() {
     timeline
         .handle_live_message_event(&ALICE, RoomMessageEventContent::text_plain("The first message"))
         .await;
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+    let _day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
     let first_event_id = item.as_event().unwrap().event_id().unwrap();
 
     let edit = assign!(RoomMessageEventContent::text_plain(" * The _edited_ first message"), {
@@ -60,8 +65,8 @@ async fn default_filter() {
 
     // The edit was applied.
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
-    let message = assert_matches!(item.as_event().unwrap().content(), TimelineItemContent::Message(msg) => msg);
-    let text = assert_matches!(message.msgtype(), MessageType::Text(text) => text);
+    assert_let!(TimelineItemContent::Message(message) = item.as_event().unwrap().content());
+    assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(text.body, "The _edited_ first message");
 
     // TODO: After adding raw timeline items, check for one here.
@@ -101,9 +106,9 @@ async fn default_filter() {
 }
 
 #[async_test]
-async fn filter_always_false() {
+async fn test_filter_always_false() {
     let timeline = TestTimeline::new().with_settings(TimelineInnerSettings {
-        event_filter: Arc::new(|_| false),
+        event_filter: Arc::new(|_, _| false),
         ..Default::default()
     });
 
@@ -132,10 +137,10 @@ async fn filter_always_false() {
 }
 
 #[async_test]
-async fn custom_filter() {
+async fn test_custom_filter() {
     // Filter out all state events.
     let timeline = TestTimeline::new().with_settings(TimelineInnerSettings {
-        event_filter: Arc::new(|ev| matches!(ev, AnySyncTimelineEvent::MessageLike(_))),
+        event_filter: Arc::new(|ev, _| matches!(ev, AnySyncTimelineEvent::MessageLike(_))),
         ..Default::default()
     });
     let mut stream = timeline.subscribe().await;
@@ -143,8 +148,8 @@ async fn custom_filter() {
     timeline
         .handle_live_message_event(&ALICE, RoomMessageEventContent::text_plain("The first message"))
         .await;
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let _item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+    let _day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
 
     timeline
         .handle_live_redacted_message_event(&ALICE, RedactedRoomMessageEventContent::new())
@@ -168,7 +173,7 @@ async fn custom_filter() {
 }
 
 #[async_test]
-async fn hide_failed_to_parse() {
+async fn test_hide_failed_to_parse() {
     let timeline = TestTimeline::new()
         .with_settings(TimelineInnerSettings { add_failed_to_parse: false, ..Default::default() });
 
@@ -198,4 +203,149 @@ async fn hide_failed_to_parse() {
         .await;
 
     assert_eq!(timeline.inner.items().await.len(), 0);
+}
+
+#[async_test]
+async fn test_event_type_filter_include_only_room_names() {
+    // Only return room name events
+    let event_filter = TimelineEventTypeFilter::Include(vec![TimelineEventType::RoomName]);
+
+    let timeline = TestTimeline::new().with_settings(TimelineInnerSettings {
+        event_filter: Arc::new(move |event, _| event_filter.filter(event)),
+        ..Default::default()
+    });
+
+    // Add a non-encrypted message event
+    timeline
+        .handle_live_message_event(&ALICE, RoomMessageEventContent::text_plain("The first message"))
+        .await;
+    // Add a couple of room name events
+    timeline
+        .handle_live_state_event(
+            &ALICE,
+            RoomNameEventContent::new("A new room name".to_owned()),
+            None,
+        )
+        .await;
+    timeline
+        .handle_live_state_event(
+            &ALICE,
+            RoomNameEventContent::new("A new room name (again)".to_owned()),
+            None,
+        )
+        .await;
+    // And a different state event
+    timeline
+        .handle_live_state_event(
+            &ALICE,
+            RoomTopicEventContent::new("A new room topic".to_owned()),
+            None,
+        )
+        .await;
+
+    // The timeline should contain only the room name events
+    let event_items: Vec<Arc<TimelineItem>> = timeline.get_event_items().await;
+    let text_message_items_count = event_items.iter().filter(is_text_message_item).count();
+    let room_name_items_count = event_items.iter().filter(is_room_name_item).count();
+    let room_topic_items_count = event_items.iter().filter(is_room_topic_item).count();
+    assert_eq!(event_items.len(), 2);
+    assert_eq!(text_message_items_count, 0);
+    assert_eq!(room_name_items_count, 2);
+    assert_eq!(room_topic_items_count, 0);
+}
+
+#[async_test]
+async fn test_event_type_filter_exclude_messages() {
+    // Don't return any messages
+    let event_filter = TimelineEventTypeFilter::Exclude(vec![TimelineEventType::RoomMessage]);
+
+    let timeline = TestTimeline::new().with_settings(TimelineInnerSettings {
+        event_filter: Arc::new(move |event, _| event_filter.filter(event)),
+        ..Default::default()
+    });
+
+    // Add a message event
+    timeline
+        .handle_live_message_event(&ALICE, RoomMessageEventContent::text_plain("The first message"))
+        .await;
+    // Add a couple of room name state events
+    timeline
+        .handle_live_state_event(
+            &ALICE,
+            RoomNameEventContent::new("A new room name".to_owned()),
+            None,
+        )
+        .await;
+    timeline
+        .handle_live_state_event(
+            &ALICE,
+            RoomNameEventContent::new("A new room name (again)".to_owned()),
+            None,
+        )
+        .await;
+    // And a different state event
+    timeline
+        .handle_live_state_event(
+            &ALICE,
+            RoomTopicEventContent::new("A new room topic".to_owned()),
+            None,
+        )
+        .await;
+
+    // The timeline should contain everything except for the message event.
+    let event_items: Vec<Arc<TimelineItem>> = timeline.get_event_items().await;
+    let text_message_items_count = event_items.iter().filter(is_text_message_item).count();
+    let room_name_items_count = event_items.iter().filter(is_room_name_item).count();
+    let room_topic_items_count = event_items.iter().filter(is_room_topic_item).count();
+    assert_eq!(event_items.len(), 3);
+    assert_eq!(text_message_items_count, 0);
+    assert_eq!(room_name_items_count, 2);
+    assert_eq!(room_topic_items_count, 1);
+}
+
+impl TestTimeline {
+    async fn get_event_items(&self) -> Vec<Arc<TimelineItem>> {
+        self.inner
+            .items()
+            .await
+            .into_iter()
+            .filter(|i| matches!(i.kind, TimelineItemKind::Event(_)))
+            .collect()
+    }
+}
+
+fn is_text_message_item(item: &&Arc<TimelineItem>) -> bool {
+    match item.kind() {
+        TimelineItemKind::Event(event) => match &event.content {
+            TimelineItemContent::Message(message) => {
+                matches!(message.msgtype, MessageType::Text(_))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn is_room_name_item(item: &&Arc<TimelineItem>) -> bool {
+    match item.kind() {
+        TimelineItemKind::Event(event) => match &event.content {
+            TimelineItemContent::OtherState(state) => {
+                matches!(state.content, AnyOtherFullStateEventContent::RoomName(_))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn is_room_topic_item(item: &&Arc<TimelineItem>) -> bool {
+    match item.kind() {
+        TimelineItemKind::Event(event) => match &event.content {
+            TimelineItemContent::OtherState(state) => {
+                matches!(state.content, AnyOtherFullStateEventContent::RoomTopic(_))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }

@@ -16,9 +16,11 @@ use std::sync::Arc;
 
 use as_variant::as_variant;
 use imbl::Vector;
+use matrix_sdk::crypto::types::events::UtdCause;
 use matrix_sdk_base::latest_event::{is_suitable_for_latest_event, PossibleLatestEvent};
 use ruma::{
     events::{
+        call::invite::SyncCallInviteEvent,
         policy::rule::{
             room::PolicyRuleRoomEventContent, server::PolicyRuleServerEventContent,
             user::PolicyRuleUserEventContent,
@@ -106,6 +108,9 @@ pub enum TimelineItemContent {
 
     /// An `m.poll.start` event.
     Poll(PollState),
+
+    /// An `m.call.invite` event
+    CallInvite,
 }
 
 impl TimelineItemContent {
@@ -121,6 +126,9 @@ impl TimelineItemContent {
             }
             PossibleLatestEvent::YesPoll(poll) => {
                 Some(Self::from_suitable_latest_poll_event_content(poll))
+            }
+            PossibleLatestEvent::YesCallInvite(call_invite) => {
+                Some(Self::from_suitable_latest_call_invite_content(call_invite))
             }
             PossibleLatestEvent::NoUnsupportedEventType => {
                 // TODO: when we support state events in message previews, this will need change
@@ -189,6 +197,15 @@ impl TimelineItemContent {
         }
     }
 
+    fn from_suitable_latest_call_invite_content(
+        event: &SyncCallInviteEvent,
+    ) -> TimelineItemContent {
+        match event {
+            SyncCallInviteEvent::Original(_) => TimelineItemContent::CallInvite,
+            SyncCallInviteEvent::Redacted(_) => TimelineItemContent::RedactedMessage,
+        }
+    }
+
     /// If `self` is of the [`Message`][Self::Message] variant, return the inner
     /// [`Message`].
     pub fn as_message(&self) -> Option<&Message> {
@@ -221,18 +238,19 @@ impl TimelineItemContent {
             TimelineItemContent::Message(_) => "a message",
             TimelineItemContent::RedactedMessage => "a redacted messages",
             TimelineItemContent::Sticker(_) => "a sticker",
-            TimelineItemContent::UnableToDecrypt(_) => "a poll",
+            TimelineItemContent::UnableToDecrypt(_) => "an encrypted message we couldn't decrypt",
             TimelineItemContent::MembershipChange(_) => "a membership change",
             TimelineItemContent::ProfileChange(_) => "a profile change",
             TimelineItemContent::OtherState(_) => "a state event",
             TimelineItemContent::FailedToParseMessageLike { .. }
             | TimelineItemContent::FailedToParseState { .. } => "an event that couldn't be parsed",
             TimelineItemContent::Poll(_) => "a poll",
+            TimelineItemContent::CallInvite => "a call invite",
         }
     }
 
-    pub(crate) fn unable_to_decrypt(content: RoomEncryptedEventContent) -> Self {
-        Self::UnableToDecrypt(content.into())
+    pub(crate) fn unable_to_decrypt(content: RoomEncryptedEventContent, cause: UtdCause) -> Self {
+        Self::UnableToDecrypt(EncryptedMessage::from_content(content, cause))
     }
 
     pub(crate) fn room_member(
@@ -306,6 +324,7 @@ impl TimelineItemContent {
             | Self::RedactedMessage
             | Self::Sticker(_)
             | Self::Poll(_)
+            | Self::CallInvite
             | Self::UnableToDecrypt(_) => Self::RedactedMessage,
             Self::MembershipChange(ev) => Self::MembershipChange(ev.redact(room_version)),
             Self::ProfileChange(ev) => Self::ProfileChange(ev.redact()),
@@ -338,21 +357,26 @@ pub enum EncryptedMessage {
 
         /// The ID of the session used to encrypt the message.
         session_id: String,
+
+        /// What we know about what caused this UTD. E.g. was this event sent
+        /// when we were not a member of this room?
+        cause: UtdCause,
     },
     /// No metadata because the event uses an unknown algorithm.
     Unknown,
 }
 
-impl From<RoomEncryptedEventContent> for EncryptedMessage {
-    fn from(c: RoomEncryptedEventContent) -> Self {
-        match c.scheme {
+impl EncryptedMessage {
+    fn from_content(content: RoomEncryptedEventContent, cause: UtdCause) -> Self {
+        match content.scheme {
             EncryptedEventScheme::OlmV1Curve25519AesSha2(s) => {
                 Self::OlmV1Curve25519AesSha2 { sender_key: s.sender_key }
             }
             #[allow(deprecated)]
             EncryptedEventScheme::MegolmV1AesSha2(s) => {
                 let MegolmV1AesSha2Content { sender_key, device_id, session_id, .. } = s;
-                Self::MegolmV1AesSha2 { sender_key, device_id, session_id }
+
+                Self::MegolmV1AesSha2 { sender_key, device_id, session_id, cause }
             }
             _ => Self::Unknown,
         }
@@ -728,7 +752,7 @@ impl OtherState {
 
 #[cfg(test)]
 mod tests {
-    use assert_matches::assert_matches;
+    use assert_matches2::assert_let;
     use matrix_sdk_test::ALICE;
     use ruma::{
         assign,
@@ -755,10 +779,9 @@ mod tests {
         });
 
         let redacted = content.redact(&RoomVersionId::V11);
-        let inner = assert_matches!(redacted, TimelineItemContent::MembershipChange(c) => c);
+        assert_let!(TimelineItemContent::MembershipChange(inner) = redacted);
         assert_eq!(inner.change, Some(MembershipChange::Banned));
-        let inner_content_redacted =
-            assert_matches!(inner.content, FullStateEventContent::Redacted(r) => r);
+        assert_let!(FullStateEventContent::Redacted(inner_content_redacted) = inner.content);
         assert_eq!(inner_content_redacted.membership, MembershipState::Ban);
     }
 }
