@@ -32,12 +32,18 @@ pub enum TimelineItemKind {
 #[derive(Clone, Debug)]
 pub struct TimelineItem {
     pub(crate) kind: TimelineItemKind,
-    pub(crate) internal_id: u64,
+    pub(crate) internal_id: String,
 }
 
 impl TimelineItem {
+    /// Create a new `TimelineItem` with the given kind and internal id.
+    pub(crate) fn new(kind: impl Into<TimelineItemKind>, internal_id: String) -> Arc<Self> {
+        Arc::new(TimelineItem { kind: kind.into(), internal_id })
+    }
+
+    /// Create a clone of the current `TimelineItem` with the given kind.
     pub(crate) fn with_kind(&self, kind: impl Into<TimelineItemKind>) -> Arc<Self> {
-        Arc::new(Self { kind: kind.into(), internal_id: self.internal_id })
+        Arc::new(Self { kind: kind.into(), internal_id: self.internal_id.clone() })
     }
 
     /// Get the [`TimelineItemKind`] of this item.
@@ -65,14 +71,14 @@ impl TimelineItem {
     /// dividers, identity isn't easy to define though and you might
     /// see a new ID getting generated for a day divider that you
     /// perceive to be "the same" as a previous one.
-    pub fn unique_id(&self) -> u64 {
-        self.internal_id
+    pub fn unique_id(&self) -> &str {
+        &self.internal_id
     }
 
     pub(crate) fn read_marker() -> Arc<TimelineItem> {
         Arc::new(Self {
             kind: TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker),
-            internal_id: u64::MAX,
+            internal_id: "__read_marker".to_owned(),
         })
     }
 
@@ -84,11 +90,13 @@ impl TimelineItem {
         matches!(&self.kind, TimelineItemKind::Event(ev) if ev.is_remote_event())
     }
 
-    pub(crate) fn is_virtual(&self) -> bool {
-        matches!(self.kind, TimelineItemKind::Virtual(_))
+    pub(crate) fn is_event(&self) -> bool {
+        matches!(&self.kind, TimelineItemKind::Event(_))
     }
 
-    pub(crate) fn is_day_divider(&self) -> bool {
+    /// Check whether this item is a day divider.
+    #[must_use]
+    pub fn is_day_divider(&self) -> bool {
         matches!(self.kind, TimelineItemKind::Virtual(VirtualTimelineItem::DayDivider(_)))
     }
 
@@ -115,11 +123,4 @@ impl From<VirtualTimelineItem> for TimelineItemKind {
     fn from(item: VirtualTimelineItem) -> Self {
         Self::Virtual(item)
     }
-}
-
-pub(crate) fn timeline_item(
-    kind: impl Into<TimelineItemKind>,
-    internal_id: u64,
-) -> Arc<TimelineItem> {
-    Arc::new(TimelineItem { kind: kind.into(), internal_id })
 }

@@ -16,14 +16,15 @@
 //!
 //! See [`Timeline`] for details.
 
-use std::{ops::ControlFlow, pin::Pin, sync::Arc, task::Poll};
+use std::{pin::Pin, sync::Arc, task::Poll};
 
-use eyeball::{SharedObservable, Subscriber};
+use eyeball::SharedObservable;
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
 use imbl::Vector;
 use matrix_sdk::{
     attachment::AttachmentConfig,
+    event_cache::{EventCacheDropHandles, RoomEventCache},
     event_handler::EventHandlerHandle,
     executor::JoinHandle,
     room::{Receipts, Room},
@@ -35,7 +36,10 @@ use pin_project_lite::pin_project;
 use ruma::{
     api::client::receipt::create_receipt::v3::ReceiptType,
     events::{
-        poll::unstable_start::UnstablePollStartEventContent,
+        poll::unstable_start::{
+            ReplacementUnstablePollStartEventContent, UnstablePollStartContentBlock,
+            UnstablePollStartEventContent,
+        },
         reaction::ReactionEventContent,
         receipt::{Receipt, ReceiptThread},
         relation::Annotation,
@@ -46,20 +50,24 @@ use ruma::{
             },
             redaction::RoomRedactionEventContent,
         },
-        AnyMessageLikeEventContent,
+        AnyMessageLikeEventContent, AnySyncTimelineEvent,
     },
-    uint, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, TransactionId,
-    UserId,
+    uint, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, RoomVersionId,
+    TransactionId, UserId,
 };
 use thiserror::Error;
-use tokio::sync::{mpsc::Sender, Mutex, Notify};
-use tracing::{error, info, instrument, warn};
+use tokio::sync::mpsc::Sender;
+use tracing::{debug, error, instrument, trace, warn};
+
+use self::{event_handler::TimelineEventKind, futures::SendAttachment};
 
 mod builder;
+mod day_dividers;
 mod error;
 mod event_handler;
 mod event_item;
-mod futures;
+pub mod event_type_filter;
+pub mod futures;
 mod inner;
 mod item;
 mod pagination;
@@ -78,16 +86,17 @@ mod virtual_item;
 
 pub use self::{
     builder::TimelineBuilder,
-    error::{Error, UnsupportedEditItem, UnsupportedReplyItem},
+    error::{Error, PaginationError, UnsupportedEditItem, UnsupportedReplyItem},
     event_item::{
         AnyOtherFullStateEventContent, BundledReactions, EncryptedMessage, EventItemOrigin,
         EventSendState, EventTimelineItem, InReplyToDetails, MemberProfileChange, MembershipChange,
         Message, OtherState, Profile, ReactionGroup, RepliedToEvent, RoomMembershipChange, Sticker,
         TimelineDetails, TimelineItemContent,
     },
-    futures::SendAttachment,
+    event_type_filter::TimelineEventTypeFilter,
+    inner::default_event_filter,
     item::{TimelineItem, TimelineItemKind},
-    pagination::{BackPaginationStatus, PaginationOptions, PaginationOutcome},
+    pagination::{PaginationOptions, PaginationOutcome, PaginationStatus},
     polls::PollResult,
     reactions::ReactionSenderData,
     sliding_sync_ext::SlidingSyncRoomExt,
@@ -108,18 +117,22 @@ use self::{
 /// messages.
 #[derive(Debug)]
 pub struct Timeline {
+    /// Clonable, inner fields of the `Timeline`, shared with some background
+    /// tasks.
     inner: TimelineInner,
 
-    /// Mutex that ensures only a single pagination is running at once
-    back_pagination_mtx: Mutex<()>,
-    /// Observable for whether a pagination is currently running
-    back_pagination_status: SharedObservable<BackPaginationStatus>,
+    /// The event cache specialized for this room's view.
+    event_cache: RoomEventCache,
 
-    /// Notifier for handled sync responses.
-    sync_response_notify: Arc<Notify>,
-
+    /// A sender to the task which responsibility is to send messages to the
+    /// current room.
     msg_sender: Sender<LocalMessage>,
+
+    /// References to long-running tasks held by the timeline.
     drop_handle: Arc<TimelineDropHandle>,
+
+    /// Observable for whether a backward pagination is currently running.
+    pub(crate) back_pagination_status: SharedObservable<PaginationStatus>,
 }
 
 // Implements hash etc
@@ -135,54 +148,31 @@ impl From<&Annotation> for AnnotationKey {
     }
 }
 
+/// What should the timeline focus on?
+#[derive(Clone, Debug, PartialEq)]
+pub enum TimelineFocus {
+    /// Focus on live events, i.e. receive events from sync and append them in
+    /// real-time.
+    Live,
+
+    /// Focus on a specific event, e.g. after clicking a permalink.
+    Event { target: OwnedEventId, num_context_events: u16 },
+}
+
 impl Timeline {
-    pub(crate) fn builder(room: &Room) -> TimelineBuilder {
+    /// Create a new [`TimelineBuilder`] for the given room.
+    pub fn builder(room: &Room) -> TimelineBuilder {
         TimelineBuilder::new(room)
     }
 
-    fn room(&self) -> &Room {
+    /// Returns the room for this timeline.
+    pub fn room(&self) -> &Room {
         self.inner.room()
     }
 
     /// Clear all timeline items.
     pub async fn clear(&self) {
         self.inner.clear().await;
-    }
-
-    /// Subscribe to the back-pagination status of the timeline.
-    pub fn back_pagination_status(&self) -> Subscriber<BackPaginationStatus> {
-        self.back_pagination_status.subscribe()
-    }
-
-    /// Add more events to the start of the timeline.
-    #[instrument(skip_all, fields(room_id = ?self.room().room_id(), ?options))]
-    pub async fn paginate_backwards(&self, options: PaginationOptions<'_>) -> Result<()> {
-        if self.back_pagination_status.get() == BackPaginationStatus::TimelineStartReached {
-            warn!("Start of timeline reached, ignoring backwards-pagination request");
-            return Ok(());
-        }
-
-        // Ignore extra back pagination requests if one is already running.
-        let Ok(_guard) = self.back_pagination_mtx.try_lock() else {
-            info!("Couldn't acquire pack pagination mutex, another request must be running");
-            return Ok(());
-        };
-
-        loop {
-            match self.paginate_backwards_impl(options.clone()).await {
-                Ok(ControlFlow::Continue(())) => {
-                    // fall through and continue the loop
-                }
-                Ok(ControlFlow::Break(status)) => {
-                    self.back_pagination_status.set_if_not_eq(status);
-                    return Ok(());
-                }
-                Err(e) => {
-                    self.back_pagination_status.set_if_not_eq(BackPaginationStatus::Idle);
-                    return Err(e);
-                }
-            }
-        }
     }
 
     /// Retry decryption of previously un-decryptable events given a list of
@@ -241,7 +231,11 @@ impl Timeline {
 
     /// Get the latest of the timeline's event items.
     pub async fn latest_event(&self) -> Option<EventTimelineItem> {
-        self.inner.items().await.last()?.as_event().cloned()
+        if self.inner.is_live().await {
+            self.inner.items().await.last()?.as_event().cloned()
+        } else {
+            None
+        }
     }
 
     /// Get the current timeline items, and a stream of changes.
@@ -289,7 +283,15 @@ impl Timeline {
     #[instrument(skip(self, content), fields(room_id = ?self.room().room_id()))]
     pub async fn send(&self, content: AnyMessageLikeEventContent) {
         let txn_id = TransactionId::new();
-        self.inner.handle_local_event(txn_id.clone(), content.clone()).await;
+        self.inner
+            .handle_local_event(
+                txn_id.clone(),
+                TimelineEventKind::Message {
+                    content: content.clone(),
+                    relations: Default::default(),
+                },
+            )
+            .await;
         if self.msg_sender.send(LocalMessage { content, txn_id }).await.is_err() {
             error!("Internal error: timeline message receiver is closed");
         }
@@ -297,14 +299,13 @@ impl Timeline {
 
     /// Send a reply to the given event.
     ///
-    /// Currently only supports events events with an event ID and JSON being
+    /// Currently it only supports events with an event ID and JSON being
     /// available (which can be removed by local redactions). This is subject to
     /// change. Please check [`EventTimelineItem::can_be_replied_to`] to decide
     /// whether to render a reply button.
     ///
-    /// If the `content.mentions` is `Some(_)`, the sender of `reply_item` will
-    /// be added to the mentions of the reply. If `content.mentions` is `None`,
-    /// it will be kept as-is.
+    /// The sender of `reply_item` will be added to the mentions of the reply if
+    /// and only if `reply_item` has not been written by the sender.
     ///
     /// # Arguments
     ///
@@ -328,8 +329,18 @@ impl Timeline {
             return Err(UnsupportedReplyItem::MISSING_EVENT_ID);
         };
 
-        let add_mentions =
-            if content.mentions.is_some() { AddMentions::Yes } else { AddMentions::No };
+        // [The specification](https://spec.matrix.org/v1.10/client-server-api/#user-and-room-mentions) says:
+        //
+        // > Users should not add their own Matrix ID to the `m.mentions` property as
+        // > outgoing messages cannot self-notify.
+        //
+        // If `reply_item` has been written by the current user, let's toggle to
+        // `AddMentions::No`.
+        let mention_the_sender = if self.room().own_user_id() == reply_item.sender {
+            AddMentions::No
+        } else {
+            AddMentions::Yes
+        };
 
         let content = match reply_item.content() {
             TimelineItemContent::Message(msg) => {
@@ -341,7 +352,7 @@ impl Timeline {
                     content: msg.to_content(),
                     unsigned: Default::default(),
                 };
-                content.make_reply_to(&event, forward_thread, add_mentions)
+                content.make_reply_to(&event, forward_thread, mention_the_sender)
             }
             _ => {
                 let Some(raw_event) = reply_item.latest_json() else {
@@ -353,7 +364,7 @@ impl Timeline {
                     event_id.to_owned(),
                     self.room().room_id(),
                     forward_thread,
-                    add_mentions,
+                    mention_the_sender,
                 )
             }
         };
@@ -416,6 +427,28 @@ impl Timeline {
         Ok(())
     }
 
+    pub async fn edit_poll(
+        &self,
+        fallback_text: impl Into<String>,
+        poll: UnstablePollStartContentBlock,
+        edit_item: &EventTimelineItem,
+    ) -> Result<(), UnsupportedEditItem> {
+        let Some(event_id) = edit_item.event_id() else {
+            return Err(UnsupportedEditItem::MISSING_EVENT_ID);
+        };
+        let TimelineItemContent::Poll(_) = edit_item.content() else {
+            return Err(UnsupportedEditItem::NOT_POLL_EVENT);
+        };
+
+        let replacement_poll = ReplacementUnstablePollStartEventContent::plain_text(
+            fallback_text,
+            poll,
+            event_id.into(),
+        );
+        self.send(UnstablePollStartEventContent::from(replacement_poll).into()).await;
+        Ok(())
+    }
+
     /// Toggle a reaction on an event
     ///
     /// Adds or redacts a reaction based on the state of the reaction at the
@@ -456,6 +489,7 @@ impl Timeline {
     async fn redact_reaction(&self, event_id: &EventId) -> ReactionToggleResult {
         let room = self.room();
         if room.state() != RoomState::Joined {
+            warn!("Cannot redact a reaction in a room that is not joined");
             return ReactionToggleResult::RedactFailure { event_id: event_id.to_owned() };
         }
 
@@ -466,7 +500,10 @@ impl Timeline {
 
         match response {
             Ok(_) => ReactionToggleResult::RedactSuccess,
-            Err(_) => ReactionToggleResult::RedactFailure { event_id: event_id.to_owned() },
+            Err(error) => {
+                error!("Failed to redact reaction: {error}");
+                ReactionToggleResult::RedactFailure { event_id: event_id.to_owned() }
+            }
         }
     }
 
@@ -478,18 +515,22 @@ impl Timeline {
     ) -> ReactionToggleResult {
         let room = self.room();
         if room.state() != RoomState::Joined {
+            warn!("Cannot send a reaction in a room that is not joined");
             return ReactionToggleResult::AddFailure { txn_id };
         }
 
         let event_content =
             AnyMessageLikeEventContent::Reaction(ReactionEventContent::from(annotation.clone()));
-        let response = room.send(event_content, Some(&txn_id)).await;
+        let response = room.send(event_content).with_transaction_id(&txn_id).await;
 
         match response {
             Ok(response) => {
                 ReactionToggleResult::AddSuccess { event_id: response.event_id, txn_id }
             }
-            Err(_) => ReactionToggleResult::AddFailure { txn_id },
+            Err(error) => {
+                error!("Failed to send reaction: {error}");
+                ReactionToggleResult::AddFailure { txn_id }
+            }
         }
     }
 
@@ -501,20 +542,22 @@ impl Timeline {
     ///
     /// # Arguments
     ///
-    /// * `url` - The url for the file to be sent
+    /// * `filename` - The filename of the file to be sent
     ///
     /// * `mime_type` - The attachment's mime type
     ///
     /// * `config` - An attachment configuration object containing details about
     ///   the attachment
+    ///
     /// like a thumbnail, its size, duration etc.
+    #[instrument(skip_all)]
     pub fn send_attachment(
         &self,
-        url: String,
+        filename: String,
         mime_type: Mime,
         config: AttachmentConfig,
     ) -> SendAttachment<'_> {
-        SendAttachment::new(self, url, mime_type, config)
+        SendAttachment::new(self, filename, mime_type, config)
     }
 
     /// Retry sending a message that previously failed to send.
@@ -523,6 +566,7 @@ impl Timeline {
     ///
     /// * `txn_id` - The transaction ID of a local echo timeline item that has a
     ///   `send_state()` of `SendState::FailedToSend { .. }`
+    #[instrument(skip(self))]
     pub async fn retry_send(&self, txn_id: &TransactionId) -> Result<(), Error> {
         macro_rules! error_return {
             ($msg:literal) => {{
@@ -557,8 +601,12 @@ impl Timeline {
             TimelineItemContent::Poll(poll_state) => AnyMessageLikeEventContent::UnstablePollStart(
                 UnstablePollStartEventContent::New(poll_state.into()),
             ),
+            TimelineItemContent::CallInvite => {
+                error_return!("Retrying call events is not currently supported");
+            }
         };
 
+        debug!("Retrying failed local echo");
         let txn_id = txn_id.to_owned();
         if self.msg_sender.send(LocalMessage { content, txn_id }).await.is_err() {
             error!("Internal error: timeline message receiver is closed");
@@ -578,6 +626,7 @@ impl Timeline {
     ///   state of `SendState::NotYetSent` might be supported in the future as
     ///   well, but there can be no guarantee for that actually stopping the
     ///   event from reaching the server.
+    #[instrument(skip(self))]
     pub async fn cancel_send(&self, txn_id: &TransactionId) -> bool {
         self.inner.discard_local_echo(txn_id).await
     }
@@ -618,7 +667,7 @@ impl Timeline {
         self.inner.set_sender_profiles_pending().await;
         match self.room().sync_members().await {
             Ok(_) => {
-                self.inner.update_sender_profiles().await;
+                self.inner.update_missing_sender_profiles().await;
             }
             Err(e) => {
                 self.inner.set_sender_profiles_error(Arc::new(e)).await;
@@ -628,7 +677,7 @@ impl Timeline {
 
     /// Get the latest read receipt for the given user.
     ///
-    /// Contrary to [`Room::user_receipt()`] that only keeps track of read
+    /// Contrary to [`Room::load_user_receipt()`] that only keeps track of read
     /// receipts received from the homeserver, this keeps also track of implicit
     /// read receipts in this timeline, i.e. when a room member sends an event.
     #[instrument(skip(self))]
@@ -639,23 +688,45 @@ impl Timeline {
         self.inner.latest_user_read_receipt(user_id).await
     }
 
+    /// Get the ID of the timeline event with the latest read receipt for the
+    /// given user.
+    ///
+    /// In contrary to [`Self::latest_user_read_receipt()`], this allows to know
+    /// the position of the read receipt in the timeline even if the event it
+    /// applies to is not visible in the timeline, unless the event is unknown
+    /// by this timeline.
+    #[instrument(skip(self))]
+    pub async fn latest_user_read_receipt_timeline_event_id(
+        &self,
+        user_id: &UserId,
+    ) -> Option<OwnedEventId> {
+        self.inner.latest_user_read_receipt_timeline_event_id(user_id).await
+    }
+
     /// Send the given receipt.
     ///
     /// This uses [`Room::send_single_receipt`] internally, but checks
     /// first if the receipt points to an event in this timeline that is more
     /// recent than the current ones, to avoid unnecessary requests.
-    #[instrument(skip(self))]
+    ///
+    /// Returns a boolean indicating if it sent the request or not.
+    #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
     pub async fn send_single_receipt(
         &self,
         receipt_type: ReceiptType,
         thread: ReceiptThread,
         event_id: OwnedEventId,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if !self.inner.should_send_receipt(&receipt_type, &thread, &event_id).await {
-            return Ok(());
+            trace!(
+                "not sending receipt, because we already cover the event with a previous receipt"
+            );
+            return Ok(false);
         }
 
-        self.room().send_single_receipt(receipt_type, thread, event_id).await
+        trace!("sending receipt");
+        self.room().send_single_receipt(receipt_type, thread, event_id).await?;
+        Ok(true)
     }
 
     /// Send the given receipts.
@@ -706,6 +777,24 @@ impl Timeline {
 
         self.room().send_multiple_receipts(receipts).await
     }
+
+    /// Mark the room as read by sending an unthreaded read receipt on the
+    /// latest event, be it visible or not.
+    ///
+    /// This works even if the latest event belongs to a thread, as a threaded
+    /// reply also belongs to the unthreaded timeline. No threaded receipt
+    /// will be sent here (see also #3123).
+    ///
+    /// Returns a boolean indicating if we sent the request or not.
+    #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
+    pub async fn mark_as_read(&self, receipt_type: ReceiptType) -> Result<bool> {
+        if let Some(event_id) = self.inner.latest_event_id().await {
+            self.send_single_receipt(receipt_type, ReceiptThread::Unthreaded, event_id).await
+        } else {
+            trace!("can't mark room as read because there's no latest event id");
+            Ok(false)
+        }
+    }
 }
 
 /// Test helpers, likely not very useful in production.
@@ -732,6 +821,8 @@ struct TimelineDropHandle {
     event_handler_handles: Vec<EventHandlerHandle>,
     room_update_join_handle: JoinHandle<()>,
     ignore_user_list_update_join_handle: JoinHandle<()>,
+    room_key_from_backups_join_handle: JoinHandle<()>,
+    _event_cache_drop_handle: Arc<EventCacheDropHandles>,
 }
 
 impl Drop for TimelineDropHandle {
@@ -741,6 +832,7 @@ impl Drop for TimelineDropHandle {
         }
         self.room_update_join_handle.abort();
         self.ignore_user_list_update_join_handle.abort();
+        self.room_key_from_backups_join_handle.abort();
     }
 }
 
@@ -768,3 +860,6 @@ impl<S: Stream> Stream for TimelineStream<S> {
         self.project().inner.poll_next(cx)
     }
 }
+
+pub type TimelineEventFilterFn =
+    dyn Fn(&AnySyncTimelineEvent, &RoomVersionId) -> bool + Send + Sync;

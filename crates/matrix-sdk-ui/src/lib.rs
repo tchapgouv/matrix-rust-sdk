@@ -16,24 +16,20 @@ use ruma::html::HtmlSanitizerMode;
 
 mod events;
 
-pub mod authentication;
 pub mod encryption_sync_service;
 pub mod notification_client;
 pub mod room_list_service;
 pub mod sync_service;
 pub mod timeline;
+pub mod unable_to_decrypt_hook;
 
 pub use self::{room_list_service::RoomListService, timeline::Timeline};
 
 /// The default sanitizer mode used when sanitizing HTML.
 const DEFAULT_SANITIZER_MODE: HtmlSanitizerMode = HtmlSanitizerMode::Compat;
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
-#[ctor::ctor]
-fn init_logging() {
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer().with_test_writer())
-        .init();
-}
+#[cfg(test)]
+matrix_sdk_test::init_tracing_for_tests!();
+
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();

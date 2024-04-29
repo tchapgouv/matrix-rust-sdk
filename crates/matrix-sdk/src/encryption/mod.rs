@@ -21,18 +21,21 @@ use std::{
     io::{Cursor, Read, Write},
     iter,
     path::PathBuf,
+    sync::{Arc, Mutex as StdMutex},
 };
 
-use eyeball::SharedObservable;
+use eyeball::{SharedObservable, Subscriber};
 use futures_core::Stream;
 use futures_util::{
     future::try_join,
     stream::{self, StreamExt},
 };
-use matrix_sdk_base::crypto::{OlmMachine, OutgoingRequest, RoomMessageRequest, ToDeviceRequest};
+use matrix_sdk_base::crypto::{
+    CrossSigningBootstrapRequests, OlmMachine, OutgoingRequest, RoomMessageRequest, ToDeviceRequest,
+};
+use matrix_sdk_common::executor::spawn;
 use ruma::{
     api::client::{
-        backup::add_backup_keys::v3::Response as KeysBackupResponse,
         keys::{
             get_keys, upload_keys, upload_signing_keys::v3::Request as UploadSigningKeysRequest,
         },
@@ -53,10 +56,19 @@ use ruma::{
     DeviceId, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
 };
 use tokio::sync::RwLockReadGuard;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 
+use self::{
+    backups::{types::BackupClientState, Backups},
+    futures::PrepareEncryptedFile,
+    identities::{DeviceUpdates, IdentityUpdates},
+    recovery::{Recovery, RecoveryState},
+    secret_storage::SecretStorage,
+    tasks::{BackupDownloadTask, BackupUploadingTask, ClientTasks},
+};
 use crate::{
-    attachment::{AttachmentInfo, Thumbnail},
+    attachment::{AttachmentConfig, Thumbnail},
+    client::ClientInner,
     encryption::{
         identities::{Device, UserDevices},
         verification::{SasVerification, Verification, VerificationRequest},
@@ -66,8 +78,12 @@ use crate::{
     Client, Error, Result, Room, TransmissionProgress,
 };
 
-mod futures;
+pub mod backups;
+pub mod futures;
 pub mod identities;
+pub mod recovery;
+pub mod secret_storage;
+pub(crate) mod tasks;
 pub mod verification;
 
 pub use matrix_sdk_base::crypto::{
@@ -80,9 +96,124 @@ pub use matrix_sdk_base::crypto::{
     SessionCreationError, SignatureError, VERSION,
 };
 
-pub use self::futures::PrepareEncryptedFile;
-use self::identities::{DeviceUpdates, IdentityUpdates};
 pub use crate::error::RoomKeyImportError;
+
+/// All the data related to the encryption state.
+pub(crate) struct EncryptionData {
+    /// Background tasks related to encryption (key backup, initialization
+    /// tasks, etc.).
+    pub tasks: StdMutex<ClientTasks>,
+
+    /// End-to-end encryption settings.
+    pub encryption_settings: EncryptionSettings,
+
+    /// All state related to key backup.
+    pub backup_state: BackupClientState,
+
+    /// All state related to secret storage recovery.
+    pub recovery_state: SharedObservable<RecoveryState>,
+}
+
+impl EncryptionData {
+    pub fn new(encryption_settings: EncryptionSettings) -> Self {
+        Self {
+            encryption_settings,
+
+            tasks: StdMutex::new(Default::default()),
+            backup_state: Default::default(),
+            recovery_state: Default::default(),
+        }
+    }
+
+    pub fn initialize_room_key_tasks(&self, client: &Arc<ClientInner>) {
+        let weak_client = Arc::downgrade(client);
+
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.upload_room_keys = Some(BackupUploadingTask::new(weak_client.clone()));
+
+        if self.encryption_settings.backup_download_strategy
+            == BackupDownloadStrategy::AfterDecryptionFailure
+        {
+            tasks.download_room_keys = Some(BackupDownloadTask::new(weak_client));
+        }
+    }
+}
+
+/// Settings for end-to-end encryption features.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EncryptionSettings {
+    /// Automatically bootstrap cross-signing for a user once they're logged, in
+    /// case it's not already done yet.
+    ///
+    /// This requires to login with a username and password, or that MSC3967 is
+    /// enabled on the server, as of 2023-10-20.
+    pub auto_enable_cross_signing: bool,
+
+    /// Select a strategy to download room keys from the backup, by default room
+    /// keys won't be downloaded from the backup automatically.
+    ///
+    /// Take a look at the [`BackupDownloadStrategy`] enum for more options.
+    pub backup_download_strategy: BackupDownloadStrategy,
+
+    /// Automatically create a backup version if no backup exists.
+    pub auto_enable_backups: bool,
+}
+
+/// Settings for end-to-end encryption features.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum BackupDownloadStrategy {
+    /// Automatically download all room keys from the backup when the backup
+    /// recovery key has been received. The backup recovery key can be received
+    /// in two ways:
+    ///
+    /// 1. Received as a `m.secret.send` to-device event, after a successful
+    ///    interactive verification.
+    /// 2. Imported from secret storage (4S) using the
+    ///    [`SecretStore::import_secrets()`] method.
+    ///
+    /// [`SecretStore::import_secrets()`]: crate::encryption::secret_storage::SecretStore::import_secrets
+    OneShot,
+
+    /// Attempt to download a single room key if an event fails to be decrypted.
+    AfterDecryptionFailure,
+
+    /// Don't download any room keys automatically. The user can manually
+    /// download room keys using the [`Backups::download_room_key()`] methods.
+    ///
+    /// This is the default option.
+    #[default]
+    Manual,
+}
+
+/// The verification state of our own device
+///
+/// This enum tells us if our own user identity trusts these devices, in other
+/// words it tells us if the user identity has signed the device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerificationState {
+    /// The verification state is unknown for now.
+    Unknown,
+    /// The device is considered to be verified, it has been signed by its user
+    /// identity.
+    Verified,
+    /// The device is unverified.
+    Unverified,
+}
+
+/// Wraps together a `CrossProcessLockStoreGuard` and a generation number.
+#[derive(Debug)]
+pub struct CrossProcessLockStoreGuardWithGeneration {
+    _guard: CrossProcessStoreLockGuard,
+    generation: u64,
+}
+
+impl CrossProcessLockStoreGuardWithGeneration {
+    /// Return the Crypto Store generation associated with this store lock.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
 
 impl Client {
     pub(crate) async fn olm_machine(&self) -> RwLockReadGuard<'_, Option<OlmMachine>> {
@@ -120,6 +251,7 @@ impl Client {
 
         let response = self.send(request, None).await?;
         self.mark_request_as_sent(request_id, &response).await?;
+        self.encryption().update_state_after_keys_query(&response).await;
 
         Ok(response)
     }
@@ -154,7 +286,7 @@ impl Client {
     /// let mut reader = std::io::Cursor::new(b"Hello, world!");
     /// let encrypted_file = client.prepare_encrypted_file(&mime::TEXT_PLAIN, &mut reader).await?;
     ///
-    /// room.send(CustomEventContent { encrypted_file }, None).await?;
+    /// room.send(CustomEventContent { encrypted_file }).await?;
     /// # anyhow::Ok(()) };
     /// ```
     pub fn prepare_encrypted_file<'a, R: Read + ?Sized + 'a>(
@@ -166,18 +298,17 @@ impl Client {
     }
 
     /// Encrypt and upload the file to be read from `reader` and construct an
-    /// attachment message with `body`, `content_type`, `info` and `thumbnail`.
+    /// attachment message.
     pub(crate) async fn prepare_encrypted_attachment_message(
         &self,
-        body: &str,
+        filename: &str,
         content_type: &mime::Mime,
         data: Vec<u8>,
-        info: Option<AttachmentInfo>,
-        thumbnail: Option<Thumbnail>,
+        config: AttachmentConfig,
         send_progress: SharedObservable<TransmissionProgress>,
     ) -> Result<MessageType> {
         let upload_thumbnail =
-            self.upload_encrypted_thumbnail(thumbnail, content_type, send_progress.clone());
+            self.upload_encrypted_thumbnail(config.thumbnail, content_type, send_progress.clone());
 
         let upload_attachment = async {
             let mut cursor = Cursor::new(data);
@@ -189,15 +320,25 @@ impl Client {
         let ((thumbnail_source, thumbnail_info), file) =
             try_join(upload_thumbnail, upload_attachment).await?;
 
+        // if config.caption is set, use it as body, and filename as the file name
+        // otherwise, body is the filename, and the filename is not set
+        // https://github.com/tulir/matrix-spec-proposals/blob/body-as-caption/proposals/2530-body-as-caption.md
+        let (body, filename) = match config.caption {
+            Some(caption) => (caption, Some(filename.to_owned())),
+            None => (filename.to_owned(), None),
+        };
+
         Ok(match content_type.type_() {
             mime::IMAGE => {
-                let info = assign!(info.map(ImageInfo::from).unwrap_or_default(), {
+                let info = assign!(config.info.map(ImageInfo::from).unwrap_or_default(), {
                     mimetype: Some(content_type.as_ref().to_owned()),
                     thumbnail_source,
                     thumbnail_info
                 });
                 let content = assign!(ImageMessageEventContent::encrypted(body.to_owned(), file), {
-                    info: Some(Box::new(info))
+                    info: Some(Box::new(info)),
+                    formatted: config.formatted_caption,
+                    filename
                 });
                 MessageType::Image(content)
             }
@@ -207,22 +348,24 @@ impl Client {
                 MessageType::Audio(crate::media::update_audio_message_event(
                     audio_message_event_content,
                     content_type,
-                    info,
+                    config.info,
                 ))
             }
             mime::VIDEO => {
-                let info = assign!(info.map(VideoInfo::from).unwrap_or_default(), {
+                let info = assign!(config.info.map(VideoInfo::from).unwrap_or_default(), {
                     mimetype: Some(content_type.as_ref().to_owned()),
                     thumbnail_source,
                     thumbnail_info
                 });
                 let content = assign!(VideoMessageEventContent::encrypted(body.to_owned(), file), {
-                    info: Some(Box::new(info))
+                    info: Some(Box::new(info)),
+                    formatted: config.formatted_caption,
+                    filename
                 });
                 MessageType::Video(content)
             }
             _ => {
-                let info = assign!(info.map(FileInfo::from).unwrap_or_default(), {
+                let info = assign!(config.info.map(FileInfo::from).unwrap_or_default(), {
                     mimetype: Some(content_type.as_ref().to_owned()),
                     thumbnail_source,
                     thumbnail_info
@@ -324,7 +467,8 @@ impl Client {
 
         self.get_room(room_id)
             .expect("Can't send a message to a room that isn't known to the store")
-            .send(content, Some(txn_id))
+            .send(content)
+            .with_transaction_id(txn_id)
             .await
     }
 
@@ -397,25 +541,9 @@ impl Client {
                 let response = self.send(request.clone(), None).await?;
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
-            OutgoingRequests::KeysBackup(request) => {
-                let response = self.send_backup_request(request).await?;
-                self.mark_request_as_sent(r.request_id(), &response).await?;
-            }
         }
 
         Ok(())
-    }
-
-    async fn send_backup_request(
-        &self,
-        request: &matrix_sdk_base::crypto::KeysBackupRequest,
-    ) -> Result<KeysBackupResponse> {
-        let request = ruma::api::client::backup::add_backup_keys::v3::Request::new(
-            request.version.clone(),
-            request.rooms.clone(),
-        );
-
-        Ok(self.send(request, None).await?)
     }
 
     pub(crate) async fn send_outgoing_requests(&self) -> Result<()> {
@@ -474,6 +602,11 @@ impl Encryption {
         Self { client }
     }
 
+    /// Returns the current encryption settings for this client.
+    pub(crate) fn settings(&self) -> EncryptionSettings {
+        self.client.inner.e2ee.encryption_settings
+    }
+
     /// Get the public ed25519 key of our own device. This is usually what is
     /// called the fingerprint of the device.
     pub async fn ed25519_key(&self) -> Option<String> {
@@ -500,6 +633,32 @@ impl Encryption {
         } else {
             Ok(HashSet::new())
         }
+    }
+
+    /// Get a [`Subscriber`] for the [`VerificationState`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use matrix_sdk::{encryption, Client};
+    /// use url::Url;
+    ///
+    /// # async {
+    /// let homeserver = Url::parse("http://example.com")?;
+    /// let client = Client::new(homeserver).await?;
+    /// let mut subscriber = client.encryption().verification_state();
+    ///
+    /// let current_value = subscriber.get();
+    ///
+    /// println!("The current verification state is: {current_value:?}");
+    ///
+    /// if let Some(verification_state) = subscriber.next().await {
+    ///     println!("Received verification state update {:?}", verification_state)
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub fn verification_state(&self) -> Subscriber<VerificationState> {
+        self.client.inner.verification_state.subscribe()
     }
 
     /// Get a verification object with the given flow id.
@@ -574,6 +733,19 @@ impl Encryption {
         let olm = self.client.olm_machine().await;
         let Some(machine) = olm.as_ref() else { return Ok(None) };
         let device = machine.get_device(user_id, device_id, None).await?;
+        Ok(device.map(|d| Device { inner: d, client: self.client.clone() }))
+    }
+
+    /// A convenience method to retrieve your own device from the store.
+    ///
+    /// This is the same as calling [`Encryption::get_device()`] with your own
+    /// user and device ID.
+    ///
+    /// This will always return a device, unless you are not logged in.
+    pub async fn get_own_device(&self) -> Result<Option<Device>, CryptoStoreError> {
+        let olm = self.client.olm_machine().await;
+        let Some(machine) = olm.as_ref() else { return Ok(None) };
+        let device = machine.get_device(machine.user_id(), machine.device_id(), None).await?;
         Ok(device.map(|d| Device { inner: d, client: self.client.clone() }))
     }
 
@@ -654,14 +826,7 @@ impl Encryption {
         let Some(olm) = olm.as_ref() else { return Ok(None) };
         let identity = olm.get_identity(user_id, None).await?;
 
-        Ok(identity.map(|i| match i {
-            matrix_sdk_base::crypto::UserIdentities::Own(i) => {
-                UserIdentity::new_own(self.client.clone(), i)
-            }
-            matrix_sdk_base::crypto::UserIdentities::Other(i) => {
-                UserIdentity::new_other(self.client.clone(), i)
-            }
-        }))
+        Ok(identity.map(|i| UserIdentity::new(self.client.clone(), i)))
     }
 
     /// Returns a stream of device updates, allowing users to listen for
@@ -682,7 +847,7 @@ impl Encryption {
     /// let devices_stream = client.encryption().devices_stream().await?;
     /// let user_id = client
     ///     .user_id()
-    ///     .expect("We should know our user id afte we have logged in");
+    ///     .expect("We should know our user id after we have logged in");
     /// pin_mut!(devices_stream);
     ///
     /// for device_updates in devices_stream.next().await {
@@ -777,7 +942,7 @@ impl Encryption {
     ///             .await
     ///             .expect("Couldn't bootstrap cross signing")
     ///     } else {
-    ///         panic!("Error durign cross signing bootstrap {:#?}", e);
+    ///         panic!("Error during cross signing bootstrap {:#?}", e);
     ///     }
     /// }
     /// # anyhow::Ok(()) };
@@ -785,17 +950,103 @@ impl Encryption {
         let olm = self.client.olm_machine().await;
         let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
 
-        let (request, signature_request) = olm.bootstrap_cross_signing(false).await?;
+        let CrossSigningBootstrapRequests {
+            upload_signing_keys_req,
+            upload_keys_req,
+            upload_signatures_req,
+        } = olm.bootstrap_cross_signing(false).await?;
 
-        let request = assign!(UploadSigningKeysRequest::new(), {
+        let upload_signing_keys_req = assign!(UploadSigningKeysRequest::new(), {
             auth: auth_data,
-            master_key: request.master_key.map(|c| c.to_raw()),
-            self_signing_key: request.self_signing_key.map(|c| c.to_raw()),
-            user_signing_key: request.user_signing_key.map(|c| c.to_raw()),
+            master_key: upload_signing_keys_req.master_key.map(|c| c.to_raw()),
+            self_signing_key: upload_signing_keys_req.self_signing_key.map(|c| c.to_raw()),
+            user_signing_key: upload_signing_keys_req.user_signing_key.map(|c| c.to_raw()),
         });
 
-        self.client.send(request, None).await?;
-        self.client.send(signature_request, None).await?;
+        if let Some(req) = upload_keys_req {
+            self.client.send_outgoing_request(req).await?;
+        }
+        self.client.send(upload_signing_keys_req, None).await?;
+        self.client.send(upload_signatures_req, None).await?;
+
+        Ok(())
+    }
+
+    /// Query the user's own device keys, if, and only if, we didn't have their
+    /// identity in the first place.
+    async fn ensure_initial_key_query(&self) -> Result<()> {
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(crate::Error::NoOlmMachine)?;
+
+        let user_id = olm_machine.user_id();
+
+        if self.client.encryption().get_user_identity(user_id).await?.is_none() {
+            let (request_id, request) = olm_machine.query_keys_for_users([olm_machine.user_id()]);
+            self.client.keys_query(&request_id, request.device_keys).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Create and upload a new cross signing identity, if that has not been
+    /// done yet.
+    ///
+    /// This will only create a new cross-signing identity if the user had never
+    /// done it before. If the user did it before, then this is a no-op.
+    ///
+    /// See also the documentation of [`Self::bootstrap_cross_signing`] for the
+    /// behavior of this function.
+    ///
+    /// # Arguments
+    ///
+    /// * `auth_data` - This request requires user interactive auth, the first
+    /// request needs to set this to `None` and will always fail with an
+    /// `UiaaResponse`. The response will contain information for the
+    /// interactive auth and the same request needs to be made but this time
+    /// with some `auth_data` provided.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use std::collections::BTreeMap;
+    /// # use matrix_sdk::{ruma::api::client::uiaa, Client};
+    /// # use url::Url;
+    /// # use serde_json::json;
+    /// # async {
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// if let Err(e) = client.encryption().bootstrap_cross_signing_if_needed(None).await {
+    ///     if let Some(response) = e.as_uiaa_response() {
+    ///         let mut password = uiaa::Password::new(
+    ///             uiaa::UserIdentifier::UserIdOrLocalpart("example".to_owned()),
+    ///             "wordpass".to_owned(),
+    ///         );
+    ///         password.session = response.session.clone();
+    ///
+    ///         // Note, on the failed attempt we can use `bootstrap_cross_signing` immediately, to
+    ///         // avoid checks.
+    ///         client
+    ///             .encryption()
+    ///             .bootstrap_cross_signing(Some(uiaa::AuthData::Password(password)))
+    ///             .await
+    ///             .expect("Couldn't bootstrap cross signing")
+    ///     } else {
+    ///         panic!("Error during cross signing bootstrap {:#?}", e);
+    ///     }
+    /// }
+    /// # anyhow::Ok(()) };
+    pub async fn bootstrap_cross_signing_if_needed(
+        &self,
+        auth_data: Option<AuthData>,
+    ) -> Result<()> {
+        let olm_machine = self.client.olm_machine().await;
+        let olm_machine = olm_machine.as_ref().ok_or(crate::Error::NoOlmMachine)?;
+        let user_id = olm_machine.user_id();
+
+        self.ensure_initial_key_query().await?;
+
+        if self.client.encryption().get_user_identity(user_id).await?.is_none() {
+            self.bootstrap_cross_signing(auth_data).await?;
+        }
 
         Ok(())
     }
@@ -862,7 +1113,7 @@ impl Encryption {
         let olm = self.client.olm_machine().await;
         let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
 
-        let keys = olm.export_room_keys(predicate).await?;
+        let keys = olm.store().export_room_keys(predicate).await?;
         let passphrase = zeroize::Zeroizing::new(passphrase.to_owned());
 
         let encrypt = move || -> Result<()> {
@@ -932,7 +1183,26 @@ impl Encryption {
         let task = tokio::task::spawn_blocking(decrypt);
         let import = task.await.expect("Task join error")?;
 
-        Ok(olm.import_room_keys(import, false, |_, _| {}).await?)
+        let ret = olm.store().import_exported_room_keys(import, |_, _| {}).await?;
+
+        self.backups().maybe_trigger_backup();
+
+        Ok(ret)
+    }
+
+    /// Get the secret storage manager of the client.
+    pub fn secret_storage(&self) -> SecretStorage {
+        SecretStorage { client: self.client.to_owned() }
+    }
+
+    /// Get the backups manager of the client.
+    pub fn backups(&self) -> Backups {
+        Backups { client: self.client.to_owned() }
+    }
+
+    /// Get the recovery manager of the client.
+    pub fn recovery(&self) -> Recovery {
+        Recovery { client: self.client.to_owned() }
     }
 
     /// Enables the crypto-store cross-process lock.
@@ -951,7 +1221,7 @@ impl Encryption {
             if prev_holder == lock_value {
                 return Ok(());
             }
-            warn!("recreating cross-process store lock with a different holder value: prev was {prev_holder}, new is {lock_value}");
+            warn!("Recreating cross-process store lock with a different holder value: prev was {prev_holder}, new is {lock_value}");
         }
 
         let olm_machine = self.client.base_client().olm_machine().await;
@@ -986,21 +1256,30 @@ impl Encryption {
 
     /// Maybe reload the `OlmMachine` after acquiring the lock for the first
     /// time.
-    async fn on_lock_newly_acquired(&self) -> Result<(), Error> {
+    ///
+    /// Returns the current generation number.
+    async fn on_lock_newly_acquired(&self) -> Result<u64, Error> {
         let olm_machine_guard = self.client.olm_machine().await;
         if let Some(olm_machine) = olm_machine_guard.as_ref() {
-            // If the crypto store generation has changed,
-            if olm_machine
+            let (new_gen, generation_number) = olm_machine
                 .maintain_crypto_store_generation(&self.client.locks().crypto_store_generation)
-                .await?
-            {
+                .await?;
+            // If the crypto store generation has changed,
+            if new_gen {
                 // (get rid of the reference to the current crypto store first)
                 drop(olm_machine_guard);
                 // Recreate the OlmMachine.
                 self.client.base_client().regenerate_olm().await?;
             }
+            Ok(generation_number)
+        } else {
+            // XXX: not sure this is reachable. Seems like the OlmMachine should always have
+            // been initialised by the time we get here. Ideally we'd panic, or return an
+            // error, but for now I'm just adding some logging to check if it
+            // happens, and returning the magic number 0.
+            warn!("Encryption::on_lock_newly_acquired: called before OlmMachine initialised");
+            Ok(0)
         }
-        Ok(())
     }
 
     /// If a lock was created with [`Self::enable_cross_process_store_lock`],
@@ -1011,13 +1290,13 @@ impl Encryption {
     pub async fn spin_lock_store(
         &self,
         max_backoff: Option<u32>,
-    ) -> Result<Option<CrossProcessStoreLockGuard>, Error> {
+    ) -> Result<Option<CrossProcessLockStoreGuardWithGeneration>, Error> {
         if let Some(lock) = self.client.locks().cross_process_crypto_store_lock.get() {
             let guard = lock.spin_lock(max_backoff).await?;
 
-            self.on_lock_newly_acquired().await?;
+            let generation = self.on_lock_newly_acquired().await?;
 
-            Ok(Some(guard))
+            Ok(Some(CrossProcessLockStoreGuardWithGeneration { _guard: guard, generation }))
         } else {
             Ok(None)
         }
@@ -1027,15 +1306,19 @@ impl Encryption {
     /// attempts to lock it once.
     ///
     /// Returns a guard to the lock, if it was obtained.
-    pub async fn try_lock_store_once(&self) -> Result<Option<CrossProcessStoreLockGuard>, Error> {
+    pub async fn try_lock_store_once(
+        &self,
+    ) -> Result<Option<CrossProcessLockStoreGuardWithGeneration>, Error> {
         if let Some(lock) = self.client.locks().cross_process_crypto_store_lock.get() {
             let maybe_guard = lock.try_lock_once().await?;
 
-            if maybe_guard.is_some() {
-                self.on_lock_newly_acquired().await?;
-            }
+            let Some(guard) = maybe_guard else {
+                return Ok(None);
+            };
 
-            Ok(maybe_guard)
+            let generation = self.on_lock_newly_acquired().await?;
+
+            Ok(Some(CrossProcessLockStoreGuardWithGeneration { _guard: guard, generation }))
         } else {
             Ok(None)
         }
@@ -1048,6 +1331,101 @@ impl Encryption {
         let olm_machine = olm_machine.as_ref().ok_or(Error::AuthenticationRequired)?;
         Ok(olm_machine.uploaded_key_count().await?)
     }
+
+    /// Bootstrap encryption and enables event listeners for the E2EE support.
+    ///
+    /// Based on the `EncryptionSettings`, this call might:
+    /// - Bootstrap cross-signing if needed (POST `/device_signing/upload`)
+    /// - Create a key backup if needed (POST `/room_keys/version`)
+    /// - Create a secret storage if needed (PUT `/account_data/{type}`)
+    ///
+    /// As part of this process, and if needed, the current device keys would be
+    /// uploaded to the server, new account data would be added, and cross
+    /// signing keys and signatures might be uploaded.
+    ///
+    /// Should be called once we
+    /// created a [`OlmMachine`], i.e. after logging in.
+    ///
+    /// # Arguments
+    ///
+    /// * `auth_data` - Some requests may require re-authentication. To prevent
+    /// the user from having to re-enter their password (or use other methods),
+    /// we can provide the authentication data here. This is necessary for
+    /// uploading cross-signing keys. However, please note that there is a
+    /// proposal (MSC3967) to remove this requirement, which would allow for
+    /// the initial upload of cross-signing keys without authentication,
+    /// rendering this parameter obsolete.
+    pub(crate) async fn run_initialization_tasks(&self, auth_data: Option<AuthData>) -> Result<()> {
+        let mut tasks = self.client.inner.e2ee.tasks.lock().unwrap();
+
+        let this = self.clone();
+        tasks.setup_e2ee = Some(spawn(async move {
+            if this.settings().auto_enable_cross_signing {
+                if let Err(e) = this.bootstrap_cross_signing_if_needed(auth_data).await {
+                    error!("Couldn't bootstrap cross signing {e:?}");
+                }
+            }
+
+            if let Err(e) = this.backups().setup_and_resume().await {
+                error!("Couldn't setup and resume backups {e:?}");
+            }
+            if let Err(e) = this.recovery().setup().await {
+                error!("Couldn't setup and resume recovery {e:?}");
+            }
+
+            this.update_verification_state().await;
+        }));
+
+        Ok(())
+    }
+
+    /// Waits for end-to-end encryption initialization tasks to finish, if any
+    /// was running in the background.
+    pub async fn wait_for_e2ee_initialization_tasks(&self) {
+        let task = self.client.inner.e2ee.tasks.lock().unwrap().setup_e2ee.take();
+
+        if let Some(task) = task {
+            if let Err(err) = task.await {
+                warn!("Error when initializing backups: {err}");
+            }
+        }
+    }
+
+    pub(crate) async fn update_state_after_keys_query(&self, response: &get_keys::v3::Response) {
+        self.recovery().update_state_after_keys_query(response).await;
+
+        // Only update the verification_state if our own devices changed
+        if let Some(user_id) = self.client.user_id() {
+            let contains_own_device = response.device_keys.contains_key(user_id);
+
+            if contains_own_device {
+                self.update_verification_state().await;
+            }
+        }
+    }
+
+    async fn update_verification_state(&self) {
+        match self.get_own_device().await {
+            Ok(device) => {
+                if let Some(device) = device {
+                    let is_verified = device.is_cross_signed_by_owner();
+
+                    if is_verified {
+                        self.client.inner.verification_state.set(VerificationState::Verified);
+                    } else {
+                        self.client.inner.verification_state.set(VerificationState::Unverified);
+                    }
+                } else {
+                    warn!("Couldn't find out own device in the store.");
+                    self.client.inner.verification_state.set(VerificationState::Unknown);
+                }
+            }
+            Err(error) => {
+                warn!("Failed retrieving own device: {error}");
+                self.client.inner.verification_state.set(VerificationState::Unknown);
+            }
+        }
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -1057,7 +1435,7 @@ mod tests {
     use matrix_sdk_base::SessionMeta;
     use matrix_sdk_test::{
         async_test, test_json, GlobalAccountDataTestEvent, JoinedRoomBuilder, StateTestEvent,
-        SyncResponseBuilder,
+        SyncResponseBuilder, DEFAULT_TEST_ROOM_ID,
     };
     use ruma::{
         device_id, event_id,
@@ -1083,7 +1461,6 @@ mod tests {
         let client = logged_in_client(Some(server.uri())).await;
 
         let event_id = event_id!("$2:example.org");
-        let room_id = &test_json::DEFAULT_SYNC_ROOM_ID;
 
         Mock::given(method("GET"))
             .and(path_regex(r"^/_matrix/client/r0/rooms/.*/state/m.*room.*encryption.?"))
@@ -1114,20 +1491,18 @@ mod tests {
 
         client.base_client().receive_sync_response(response).await.unwrap();
 
-        let room = client.get_room(room_id).expect("Room should exist");
+        let room = client.get_room(&DEFAULT_TEST_ROOM_ID).expect("Room should exist");
         assert!(room.is_encrypted().await.expect("Getting encryption state"));
 
         let event_id = event_id!("$1:example.org");
         let reaction = ReactionEventContent::new(Annotation::new(event_id.into(), "🐈".to_owned()));
-        room.send(reaction, None).await.expect("Sending the reaction should not fail");
+        room.send(reaction).await.expect("Sending the reaction should not fail");
 
-        room.send_raw(json!({}), "m.reaction", None)
-            .await
-            .expect("Sending the reaction should not fail");
+        room.send_raw("m.reaction", json!({})).await.expect("Sending the reaction should not fail");
     }
 
     #[async_test]
-    async fn get_dm_room_returns_the_room_we_have_with_this_user() {
+    async fn test_get_dm_room_returns_the_room_we_have_with_this_user() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
         // This is the user ID that is inside MemberAdditional.
@@ -1150,7 +1525,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn get_dm_room_still_finds_room_where_participant_is_only_invited() {
+    async fn test_get_dm_room_still_finds_room_where_participant_is_only_invited() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
         // This is the user ID that is inside MemberInvite
@@ -1171,7 +1546,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn get_dm_room_still_finds_left_room() {
+    async fn test_get_dm_room_still_finds_left_room() {
         // See the discussion in https://github.com/matrix-org/matrix-rust-sdk/issues/2017
         // and the high-level issue at https://github.com/vector-im/element-x-ios/issues/1077
 
@@ -1242,6 +1617,21 @@ mod tests {
         let initial_olm_machine =
             client1.olm_machine().await.clone().expect("must have an olm machine");
 
+        // Also enable backup to check that new machine has the same backup keys.
+        let decryption_key = matrix_sdk_base::crypto::store::BackupDecryptionKey::new()
+            .expect("Can't create new recovery key");
+        let backup_key = decryption_key.megolm_v1_public_key();
+        backup_key.set_version("1".to_owned());
+        initial_olm_machine
+            .backup_machine()
+            .save_decryption_key(Some(decryption_key.to_owned()), Some("1".to_owned()))
+            .await
+            .expect("Should save");
+
+        initial_olm_machine.backup_machine().enable_backup_v1(backup_key.clone()).await.unwrap();
+
+        assert!(client1.encryption().backups().are_enabled().await);
+
         // The other client can't take the lock too.
         let acquired2 = client2.encryption().try_lock_store_once().await.unwrap();
         assert!(acquired2.is_none());
@@ -1276,7 +1666,16 @@ mod tests {
 
         // But now its olm machine has been invalidated and thus regenerated!
         let olm_machine = client1.olm_machine().await.clone().expect("must have an olm machine");
+
         assert!(!initial_olm_machine.same_as(&olm_machine));
+
+        let backup_key_new = olm_machine.backup_machine().get_backup_keys().await.unwrap();
+        assert!(backup_key_new.decryption_key.is_some());
+        assert_eq!(
+            backup_key_new.decryption_key.unwrap().megolm_v1_public_key().to_base64(),
+            backup_key.to_base64()
+        );
+        assert!(client1.encryption().backups().are_enabled().await);
     }
 
     #[cfg(feature = "sqlite")]
