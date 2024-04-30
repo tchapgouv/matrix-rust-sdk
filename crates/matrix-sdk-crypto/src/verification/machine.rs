@@ -14,7 +14,6 @@
 
 use std::{
     collections::HashMap,
-    convert::{TryFrom, TryInto},
     sync::{Arc, RwLock as StdRwLock},
 };
 
@@ -324,7 +323,7 @@ impl VerificationMachine {
                 flow_id = flow_id.as_str(),
                 "Received a verification event with a mismatched flow id, \
                  the verification object was created for a in-room \
-                 verification but a event was received over to-device \
+                 verification but an event was received over to-device \
                  messaging or vice versa"
             );
         };
@@ -411,7 +410,7 @@ impl VerificationMachine {
             AnyVerificationContent::Start(c) => {
                 if let Some(request) = self.get_request(event.sender(), flow_id.as_str()) {
                     if request.flow_id() == &flow_id {
-                        request.receive_start(event.sender(), c).await?
+                        Box::pin(request.receive_start(event.sender(), c)).await?
                     } else {
                         flow_id_mismatch();
                     }
@@ -470,7 +469,7 @@ impl VerificationMachine {
                 let content = s.receive_any_event(event.sender(), &content);
 
                 if s.is_done() {
-                    self.mark_sas_as_done(&s, content.map(|(c, _)| c)).await?;
+                    Box::pin(self.mark_sas_as_done(&s, content.map(|(c, _)| c))).await?;
                 } else {
                     // Even if we are not done (yet), there might be content to
                     // send out, e.g. in the case where we are done with our
@@ -497,12 +496,12 @@ impl VerificationMachine {
                         let content = sas.receive_any_event(event.sender(), &content);
 
                         if sas.is_done() {
-                            self.mark_sas_as_done(&sas, content.map(|(c, _)| c)).await?;
+                            Box::pin(self.mark_sas_as_done(&sas, content.map(|(c, _)| c))).await?;
                         }
                     }
                     #[cfg(feature = "qrcode")]
                     Some(Verification::QrV1(qr)) => {
-                        let (cancellation, request) = qr.receive_done(c).await?;
+                        let (cancellation, request) = Box::pin(qr.receive_done(c)).await?;
 
                         if let Some(c) = cancellation {
                             self.verifications.add_request(c.into())
@@ -602,7 +601,7 @@ mod tests {
         alice_machine.receive_any_event(&event).await.unwrap();
         assert!(!alice_machine.verifications.outgoing_requests().is_empty());
 
-        let request = alice_machine.verifications.outgoing_requests().get(0).cloned().unwrap();
+        let request = alice_machine.verifications.outgoing_requests().first().cloned().unwrap();
         let txn_id = request.request_id().to_owned();
         let content = OutgoingContent::try_from(request).unwrap();
         let content = KeyContent::try_from(&content).unwrap().into();

@@ -16,7 +16,6 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![warn(missing_docs, missing_debug_implementations)]
 
-#[cfg(feature = "backups_v1")]
 pub mod backups;
 mod ciphers;
 pub mod dehydrated_devices;
@@ -34,7 +33,7 @@ pub mod types;
 mod utilities;
 mod verification;
 
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 /// Testing facilities and helpers for crypto tests
 pub mod testing {
     pub use crate::identities::{
@@ -71,7 +70,9 @@ impl RoomKeyImportResult {
     }
 }
 
-pub use error::{EventError, MegolmError, OlmError, SessionCreationError, SignatureError};
+pub use error::{
+    EventError, MegolmError, OlmError, SessionCreationError, SetRoomSettingsError, SignatureError,
+};
 pub use file_encryption::{
     decrypt_room_key_export, encrypt_room_key_export, AttachmentDecryptor, AttachmentEncryptor,
     DecryptorError, KeyExportError, MediaEncryptionInfo,
@@ -81,7 +82,7 @@ pub use identities::{
     Device, LocalTrust, OwnUserIdentity, ReadOnlyDevice, ReadOnlyOwnUserIdentity,
     ReadOnlyUserIdentities, ReadOnlyUserIdentity, UserDevices, UserIdentities, UserIdentity,
 };
-pub use machine::{EncryptionSyncChanges, OlmMachine};
+pub use machine::{CrossSigningBootstrapRequests, EncryptionSyncChanges, OlmMachine};
 #[cfg(feature = "qrcode")]
 pub use matrix_sdk_qrcode;
 pub use olm::{Account, CrossSigningStatus, EncryptionSettings, Session};
@@ -104,13 +105,8 @@ pub use vodozemac;
 /// The version of the matrix-sdk-cypto crate being used
 pub static VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// Enable tracing for tests in this crate
-#[cfg(all(test, not(target_arch = "wasm32")))]
-#[ctor::ctor]
-fn init_logging() {
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(tracing_subscriber::fmt::layer().with_test_writer())
-        .init();
-}
+#[cfg(test)]
+matrix_sdk_test::init_tracing_for_tests!();
+
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();

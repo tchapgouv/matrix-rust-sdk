@@ -14,7 +14,6 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    convert::{TryFrom, TryInto},
     ops::Deref,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -36,7 +35,7 @@ use tracing::{instrument, trace, warn};
 use vodozemac::{olm::SessionConfig, Curve25519PublicKey, Ed25519PublicKey};
 
 use super::{atomic_bool_deserializer, atomic_bool_serializer};
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, feature = "testing", doc))]
 use crate::OlmMachine;
 use crate::{
     error::{EventError, OlmError, OlmResult, SignatureError},
@@ -96,6 +95,7 @@ fn default_timestamp() -> MilliSecondsSinceUnixEpoch {
     MilliSecondsSinceUnixEpoch(UInt::default())
 }
 
+#[cfg(not(tarpaulin_include))]
 impl std::fmt::Debug for ReadOnlyDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadOnlyDevice")
@@ -119,6 +119,7 @@ pub struct Device {
     pub(crate) device_owner_identity: Option<ReadOnlyUserIdentities>,
 }
 
+#[cfg(not(tarpaulin_include))]
 impl std::fmt::Debug for Device {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Device").field("device", &self.inner).finish()
@@ -411,63 +412,12 @@ impl Device {
     /// # Arguments
     ///
     /// * `content` - The content of the event that should be encrypted.
-    #[instrument(
-        skip_all,
-        fields(
-            recipient = %self.user_id(),
-            recipient_device = %self.device_id(),
-            recipient_key = ?self.curve25519_key(),
-            event_type,
-            session,
-            message_id,
-        ))
-    ]
     pub(crate) async fn encrypt(
         &self,
         event_type: &str,
-        content: Value,
+        content: impl Serialize,
     ) -> OlmResult<(Session, Raw<ToDeviceEncryptedEventContent>)> {
-        #[cfg(feature = "message-ids")]
-        let message_id = {
-            #[cfg(not(target_arch = "wasm32"))]
-            let id = ulid::Ulid::new().to_string();
-            #[cfg(target_arch = "wasm32")]
-            let id = ruma::TransactionId::new().to_string();
-
-            tracing::Span::current().record("message_id", &id);
-            Some(id)
-        };
-
-        #[cfg(not(feature = "message-ids"))]
-        let message_id = None;
-
-        self.inner
-            .encrypt(self.verification_machine.store.inner(), event_type, content, message_id)
-            .await
-    }
-
-    pub(crate) async fn maybe_encrypt_room_key(
-        &self,
-        session: OutboundGroupSession,
-    ) -> OlmResult<MaybeEncryptedRoomKey> {
-        let content = session.as_content().await;
-        let message_index = session.message_index().await;
-        let event_type = content.event_type();
-        let content =
-            serde_json::to_value(content).expect("We can always serialize our own room key");
-
-        match self.encrypt(event_type, content).await {
-            Ok((session, encrypted)) => Ok(MaybeEncryptedRoomKey::Encrypted {
-                share_info: ShareInfo::new_shared(session.sender_key().to_owned(), message_index),
-                used_session: session,
-                message: encrypted.cast(),
-            }),
-
-            Err(OlmError::MissingSession | OlmError::EventError(EventError::MissingSenderKey)) => {
-                Ok(MaybeEncryptedRoomKey::Withheld { code: WithheldCode::NoOlm })
-            }
-            Err(e) => Err(e),
-        }
+        self.inner.encrypt(self.verification_machine.store.inner(), event_type, content).await
     }
 
     /// Encrypt the given inbound group session as a forwarded room key for this
@@ -485,10 +435,55 @@ impl Device {
             };
             let content: ForwardedRoomKeyContent = export.try_into()?;
 
-            (content.event_type(), serde_json::to_value(content)?)
+            (content.event_type(), content)
         };
 
         self.encrypt(event_type, content).await
+    }
+
+    /// Encrypt an event for this device.
+    ///
+    /// Beware that the 1-to-1 session must be established prior to this
+    /// call by using the [`OlmMachine::get_missing_sessions`] method.
+    ///
+    /// Notable limitation: The caller is responsible for sending the encrypted
+    /// event to the target device, this encryption method supports out-of-order
+    /// messages to a certain extent (2000 messages), if multiple messages are
+    /// encrypted using this method they should be sent in the same order as
+    /// they are encrypted.
+    ///
+    /// *Note*: To instead encrypt an event meant for a room use the
+    /// [`OlmMachine::encrypt_room_event()`] method instead.
+    ///
+    /// # Arguments
+    /// * `event_type` - The type of the event to be sent.
+    /// * `content` - The content of the event to be sent. This should be a type
+    ///   that implements the `Serialize` trait.
+    ///
+    /// # Returns
+    ///
+    /// The encrypted raw content to be shared with your preferred transport
+    /// layer (usually to-device), [`OlmError::MissingSession`] if there is
+    /// no established session with the device.
+    pub async fn encrypt_event_raw(
+        &self,
+        event_type: &str,
+        content: &Value,
+    ) -> OlmResult<Raw<ToDeviceEncryptedEventContent>> {
+        let (used_session, raw_encrypted) = self.encrypt(event_type, content).await?;
+
+        // perist the used session
+        self.verification_machine
+            .store
+            .save_changes(Changes { sessions: vec![used_session], ..Default::default() })
+            .await?;
+
+        Ok(raw_encrypted)
+    }
+
+    /// Whether or not the device is a dehydrated device.
+    pub fn is_dehydrated(&self) -> bool {
+        self.inner.inner.dehydrated.unwrap_or(false)
     }
 }
 
@@ -550,8 +545,9 @@ impl UserDevices {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// The local trust state of a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum LocalTrust {
     /// The device has been verified and is trusted.
     Verified = 0,
@@ -701,7 +697,7 @@ impl ReadOnlyDevice {
             }
         } else {
             warn!(
-                "Trying to find a Olm session of a device, but the device doesn't have a \
+                "Trying to find an Olm session of a device, but the device doesn't have a \
                 Curve25519 key",
             );
 
@@ -770,25 +766,84 @@ impl ReadOnlyDevice {
         )
     }
 
+    /// Encrypt the given content for this device.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - The crypto store. Used to find an established Olm session
+    ///   for this device.
+    /// * `event_type` - The type of the event that should be encrypted.
+    /// * `content` - The content of the event that should be encrypted.
+    ///
+    /// # Returns
+    ///
+    /// On success, a tuple `(session, content)`, where `session` is the Olm
+    /// [`Session`] that was used to encrypt the content, and `content` is
+    /// the content for the `m.room.encrypted` to-device event.
+    ///
+    /// If an Olm session has not already been established with this device,
+    /// returns `Err(OlmError::MissingSession)`.
+    #[instrument(
+        skip_all,
+        fields(
+            recipient = ?self.user_id(),
+            recipient_device = ?self.device_id(),
+            recipient_key = ?self.curve25519_key(),
+            event_type,
+            message_id,
+        ))
+    ]
     pub(crate) async fn encrypt(
         &self,
         store: &CryptoStoreWrapper,
         event_type: &str,
-        content: Value,
-        message_id: Option<String>,
+        content: impl Serialize,
     ) -> OlmResult<(Session, Raw<ToDeviceEncryptedEventContent>)> {
+        #[cfg(feature = "message-ids")]
+        let message_id = {
+            #[cfg(not(target_arch = "wasm32"))]
+            let id = ulid::Ulid::new().to_string();
+            #[cfg(target_arch = "wasm32")]
+            let id = ruma::TransactionId::new().to_string();
+
+            tracing::Span::current().record("message_id", &id);
+            Some(id)
+        };
+
+        #[cfg(not(feature = "message-ids"))]
+        let message_id = None;
+
         let session = self.get_most_recent_session(store).await?;
 
         if let Some(mut session) = session {
             let message = session.encrypt(self, event_type, content, message_id).await?;
-
-            trace!("Successfully encrypted an event");
-
             Ok((session, message))
         } else {
-            warn!("Trying to encrypt an event for a device, but no Olm session is found.",);
-
+            trace!("Trying to encrypt an event for a device, but no Olm session is found.");
             Err(OlmError::MissingSession)
+        }
+    }
+
+    pub(crate) async fn maybe_encrypt_room_key(
+        &self,
+        store: &CryptoStoreWrapper,
+        session: OutboundGroupSession,
+    ) -> OlmResult<MaybeEncryptedRoomKey> {
+        let content = session.as_content().await;
+        let message_index = session.message_index().await;
+        let event_type = content.event_type();
+
+        match self.encrypt(store, event_type, content).await {
+            Ok((session, encrypted)) => Ok(MaybeEncryptedRoomKey::Encrypted {
+                share_info: ShareInfo::new_shared(session.sender_key().to_owned(), message_index),
+                used_session: session,
+                message: encrypted.cast(),
+            }),
+
+            Err(OlmError::MissingSession | OlmError::EventError(EventError::MissingSenderKey)) => {
+                Ok(MaybeEncryptedRoomKey::Withheld { code: WithheldCode::NoOlm })
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -823,7 +878,6 @@ impl ReadOnlyDevice {
     /// **Note**: Use this method with caution, the `canonical_json` needs to be
     /// correctly canonicalized and make sure that the object you are checking
     /// the signature for is allowed to be signed by a device.
-    #[cfg(feature = "backups_v1")]
     pub(crate) fn has_signed_raw(
         &self,
         signatures: &Signatures,
@@ -869,23 +923,23 @@ impl ReadOnlyDevice {
     pub async fn from_machine_test_helper(
         machine: &OlmMachine,
     ) -> Result<ReadOnlyDevice, crate::CryptoStoreError> {
-        Ok(ReadOnlyDevice::from_account(&machine.store().cache().await?.account).await)
+        Ok(ReadOnlyDevice::from_account(&*machine.store().cache().await?.account().await?))
     }
 
     /// Create a `ReadOnlyDevice` from an `Account`
     ///
-    /// We will have our own device in the store once we receive a keys/query
+    /// We will have our own device in the store once we receive a `/keys/query`
     /// response, but this is useful to create it before we receive such a
     /// response.
     ///
     /// It also makes it easier to check that the server doesn't lie about our
     /// own device.
     ///
-    /// *Don't* use this after we received a keys/query response, other
+    /// *Don't* use this after we received a `/keys/query` response, other
     /// users/devices might add signatures to our own device, which can't be
     /// replicated locally.
-    pub async fn from_account(account: &Account) -> ReadOnlyDevice {
-        let device_keys = account.device_keys().await;
+    pub fn from_account(account: &Account) -> ReadOnlyDevice {
+        let device_keys = account.device_keys();
         let mut device = ReadOnlyDevice::try_from(&device_keys)
             .expect("Creating a device from our own account should always succeed");
         device.first_time_seen_ts = account.creation_local_time();
@@ -923,10 +977,10 @@ impl PartialEq for ReadOnlyDevice {
     }
 }
 
+/// Testing Facilities for Device Management
 #[cfg(any(test, feature = "testing"))]
+#[allow(dead_code)]
 pub(crate) mod testing {
-    //! Testing Facilities for Device Management
-    #![allow(dead_code)]
     use serde_json::json;
 
     use crate::{identities::ReadOnlyDevice, types::DeviceKeys};

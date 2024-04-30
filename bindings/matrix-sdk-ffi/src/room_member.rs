@@ -1,7 +1,7 @@
-use matrix_sdk::room::RoomMember as SdkRoomMember;
+use matrix_sdk::room::{RoomMember as SdkRoomMember, RoomMemberRole};
+use ruma::UserId;
 
-use super::RUNTIME;
-use crate::ClientError;
+use crate::error::ClientError;
 
 #[derive(Clone, uniffi::Enum)]
 pub enum MembershipState {
@@ -35,201 +35,57 @@ impl From<matrix_sdk::ruma::events::room::member::MembershipState> for Membershi
             matrix_sdk::ruma::events::room::member::MembershipState::Leave => {
                 MembershipState::Leave
             }
-            _ => todo!(
+            _ => unimplemented!(
                 "Handle Custom case: https://github.com/matrix-org/matrix-rust-sdk/issues/1254"
             ),
         }
     }
 }
 
-#[derive(uniffi::Object)]
-pub struct RoomMember {
-    pub(crate) inner: SdkRoomMember,
+#[uniffi::export]
+pub fn suggested_role_for_power_level(power_level: i64) -> RoomMemberRole {
+    // It's not possible to expose the constructor on the Enum through Uniffi ☹️
+    RoomMemberRole::suggested_role_for_power_level(power_level)
 }
 
 #[uniffi::export]
-impl RoomMember {
-    pub fn user_id(&self) -> String {
-        self.inner.user_id().to_string()
-    }
-
-    pub fn display_name(&self) -> Option<String> {
-        self.inner.display_name().map(|d| d.to_owned())
-    }
-
-    pub fn avatar_url(&self) -> Option<String> {
-        self.inner.avatar_url().map(ToString::to_string)
-    }
-
-    pub fn membership(&self) -> MembershipState {
-        self.inner.membership().to_owned().into()
-    }
-
-    pub fn is_name_ambiguous(&self) -> bool {
-        self.inner.name_ambiguous()
-    }
-
-    pub fn power_level(&self) -> i64 {
-        self.inner.power_level()
-    }
-
-    pub fn normalized_power_level(&self) -> i64 {
-        self.inner.normalized_power_level()
-    }
-
-    pub fn is_ignored(&self) -> bool {
-        self.inner.is_ignored()
-    }
-
-    pub fn is_account_user(&self) -> bool {
-        self.inner.is_account_user()
-    }
-
-    /// Adds the room member to the current account data's ignore list
-    /// which will ignore the user across all rooms.
-    pub fn ignore(&self) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            self.inner.ignore().await?;
-            Ok(())
-        })
-    }
-
-    /// Removes the room member from the current account data's ignore list
-    /// which will unignore the user across all rooms.
-    pub fn unignore(&self) -> Result<(), ClientError> {
-        RUNTIME.block_on(async move {
-            self.inner.unignore().await?;
-            Ok(())
-        })
-    }
-
-    pub fn can_ban(&self) -> bool {
-        self.inner.can_ban()
-    }
-
-    pub fn can_invite(&self) -> bool {
-        self.inner.can_invite()
-    }
-
-    pub fn can_kick(&self) -> bool {
-        self.inner.can_kick()
-    }
-
-    pub fn can_redact(&self) -> bool {
-        self.inner.can_redact()
-    }
-
-    pub fn can_send_state(&self, state_event: StateEventType) -> bool {
-        self.inner.can_send_state(state_event.into())
-    }
-
-    pub fn can_send_message(&self, event: MessageLikeEventType) -> bool {
-        self.inner.can_send_message(event.into())
-    }
-
-    pub fn can_trigger_room_notification(&self) -> bool {
-        self.inner.can_trigger_room_notification()
-    }
+pub fn suggested_power_level_for_role(role: RoomMemberRole) -> i64 {
+    // It's not possible to expose methods on an Enum through Uniffi ☹️
+    role.suggested_power_level()
 }
 
-impl RoomMember {
-    pub fn new(room_member: SdkRoomMember) -> Self {
-        RoomMember { inner: room_member }
-    }
+/// Generates a `matrix.to` permalink to the given userID.
+#[uniffi::export]
+pub fn matrix_to_user_permalink(user_id: String) -> Result<String, ClientError> {
+    let user_id = UserId::parse(user_id)?;
+    Ok(user_id.matrix_to_uri().to_string())
 }
 
-#[derive(Clone, uniffi::Enum)]
-pub enum StateEventType {
-    PolicyRuleRoom,
-    PolicyRuleServer,
-    PolicyRuleUser,
-    RoomAliases,
-    RoomAvatar,
-    RoomCanonicalAlias,
-    RoomCreate,
-    RoomEncryption,
-    RoomGuestAccess,
-    RoomHistoryVisibility,
-    RoomJoinRules,
-    RoomMemberEvent,
-    RoomName,
-    RoomPinnedEvents,
-    RoomPowerLevels,
-    RoomServerAcl,
-    RoomThirdPartyInvite,
-    RoomTombstone,
-    RoomTopic,
-    SpaceChild,
-    SpaceParent,
+#[derive(uniffi::Record)]
+pub struct RoomMember {
+    pub user_id: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub membership: MembershipState,
+    pub is_name_ambiguous: bool,
+    pub power_level: i64,
+    pub normalized_power_level: i64,
+    pub is_ignored: bool,
+    pub suggested_role_for_power_level: RoomMemberRole,
 }
 
-impl From<StateEventType> for ruma::events::StateEventType {
-    fn from(val: StateEventType) -> Self {
-        match val {
-            StateEventType::PolicyRuleRoom => Self::PolicyRuleRoom,
-            StateEventType::PolicyRuleServer => Self::PolicyRuleServer,
-            StateEventType::PolicyRuleUser => Self::PolicyRuleUser,
-            StateEventType::RoomAliases => Self::RoomAliases,
-            StateEventType::RoomAvatar => Self::RoomAvatar,
-            StateEventType::RoomCanonicalAlias => Self::RoomCanonicalAlias,
-            StateEventType::RoomCreate => Self::RoomCreate,
-            StateEventType::RoomEncryption => Self::RoomEncryption,
-            StateEventType::RoomGuestAccess => Self::RoomGuestAccess,
-            StateEventType::RoomHistoryVisibility => Self::RoomHistoryVisibility,
-            StateEventType::RoomJoinRules => Self::RoomJoinRules,
-            StateEventType::RoomMemberEvent => Self::RoomMember,
-            StateEventType::RoomName => Self::RoomName,
-            StateEventType::RoomPinnedEvents => Self::RoomPinnedEvents,
-            StateEventType::RoomPowerLevels => Self::RoomPowerLevels,
-            StateEventType::RoomServerAcl => Self::RoomServerAcl,
-            StateEventType::RoomThirdPartyInvite => Self::RoomThirdPartyInvite,
-            StateEventType::RoomTombstone => Self::RoomTombstone,
-            StateEventType::RoomTopic => Self::RoomTopic,
-            StateEventType::SpaceChild => Self::SpaceChild,
-            StateEventType::SpaceParent => Self::SpaceParent,
-        }
-    }
-}
-
-#[derive(Clone, uniffi::Enum)]
-pub enum MessageLikeEventType {
-    CallAnswer,
-    CallInvite,
-    CallHangup,
-    CallCandidates,
-    KeyVerificationReady,
-    KeyVerificationStart,
-    KeyVerificationCancel,
-    KeyVerificationAccept,
-    KeyVerificationKey,
-    KeyVerificationMac,
-    KeyVerificationDone,
-    ReactionSent,
-    RoomEncrypted,
-    RoomMessage,
-    RoomRedaction,
-    Sticker,
-}
-
-impl From<MessageLikeEventType> for ruma::events::MessageLikeEventType {
-    fn from(val: MessageLikeEventType) -> Self {
-        match val {
-            MessageLikeEventType::CallAnswer => Self::CallAnswer,
-            MessageLikeEventType::CallInvite => Self::CallInvite,
-            MessageLikeEventType::CallHangup => Self::CallHangup,
-            MessageLikeEventType::CallCandidates => Self::CallCandidates,
-            MessageLikeEventType::KeyVerificationReady => Self::KeyVerificationReady,
-            MessageLikeEventType::KeyVerificationStart => Self::KeyVerificationStart,
-            MessageLikeEventType::KeyVerificationCancel => Self::KeyVerificationCancel,
-            MessageLikeEventType::KeyVerificationAccept => Self::KeyVerificationAccept,
-            MessageLikeEventType::KeyVerificationKey => Self::KeyVerificationKey,
-            MessageLikeEventType::KeyVerificationMac => Self::KeyVerificationMac,
-            MessageLikeEventType::KeyVerificationDone => Self::KeyVerificationDone,
-            MessageLikeEventType::ReactionSent => Self::Reaction,
-            MessageLikeEventType::RoomEncrypted => Self::RoomEncrypted,
-            MessageLikeEventType::RoomMessage => Self::RoomMessage,
-            MessageLikeEventType::RoomRedaction => Self::RoomRedaction,
-            MessageLikeEventType::Sticker => Self::Sticker,
+impl From<SdkRoomMember> for RoomMember {
+    fn from(m: SdkRoomMember) -> Self {
+        RoomMember {
+            user_id: m.user_id().to_string(),
+            display_name: m.display_name().map(|s| s.to_owned()),
+            avatar_url: m.avatar_url().map(|a| a.to_string()),
+            membership: m.membership().clone().into(),
+            is_name_ambiguous: m.name_ambiguous(),
+            power_level: m.power_level(),
+            normalized_power_level: m.normalized_power_level(),
+            is_ignored: m.is_ignored(),
+            suggested_role_for_power_level: m.suggested_role_for_power_level(),
         }
     }
 }

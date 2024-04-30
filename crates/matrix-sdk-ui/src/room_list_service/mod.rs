@@ -66,15 +66,15 @@ mod room;
 mod room_list;
 mod state;
 
-use std::{future::ready, sync::Arc, time::Duration};
+use std::{future::ready, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use async_stream::stream;
 use eyeball::{SharedObservable, Subscriber};
 use futures_util::{pin_mut, Stream, StreamExt};
 pub use matrix_sdk::RoomListEntry;
 use matrix_sdk::{
-    sliding_sync::Ranges, Client, Error as SlidingSyncError, SlidingSync, SlidingSyncList,
-    SlidingSyncListBuilder, SlidingSyncMode,
+    event_cache::EventCacheError, sliding_sync::Ranges, Client, Error as SlidingSyncError,
+    SlidingSync, SlidingSyncList, SlidingSyncListBuilder, SlidingSyncMode,
 };
 use matrix_sdk_base::ring_buffer::RingBuffer;
 pub use room::*;
@@ -82,7 +82,7 @@ pub use room_list::*;
 use ruma::{
     api::client::sync::sync_events::v4::{
         AccountDataConfig, E2EEConfig, ReceiptsConfig, RoomReceiptConfig, SyncRequestListFilters,
-        ToDeviceConfig,
+        ToDeviceConfig, TypingConfig,
     },
     assign,
     events::{StateEventType, TimelineEventType},
@@ -94,6 +94,8 @@ use tokio::{
     sync::{Mutex, RwLock},
     time::timeout,
 };
+
+use crate::timeline;
 
 /// The [`RoomListService`] type. See the module's documentation to learn more.
 #[derive(Debug)]
@@ -125,7 +127,8 @@ impl RoomListService {
     /// This number should be high enough so that navigating to a room
     /// previously visited is almost instant, but also not too high so as to
     /// avoid exhausting memory.
-    const ROOM_OBJECT_CACHE_SIZE: usize = 128;
+    // SAFETY: `new_unchecked` is safe because 128 is not zero.
+    const ROOM_OBJECT_CACHE_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(128) };
 
     /// Create a new `RoomList`.
     ///
@@ -135,7 +138,24 @@ impl RoomListService {
     /// This won't start an encryption sync, and it's the user's responsibility
     /// to create one in this case using `EncryptionSync`.
     pub async fn new(client: Client) -> Result<Self, Error> {
-        Self::new_internal(client, false).await
+        Self::new_internal(
+            client,
+            false,
+            #[cfg(feature = "experimental-room-list-with-unified-invites")]
+            false,
+        )
+        .await
+    }
+
+    /// Create a new `RoomList` that disables encryption, and enables the
+    /// unified invites (i.e. invites are part of the `all_rooms` list; side
+    /// note: the `invites` list is still present).
+    #[cfg(feature = "experimental-room-list-with-unified-invites")]
+    pub async fn new_with_unified_invites(
+        client: Client,
+        with_unified_invites: bool,
+    ) -> Result<Self, Error> {
+        Self::new_internal(client, false, with_unified_invites).await
     }
 
     /// Create a new `RoomList` that enables encryption.
@@ -143,10 +163,20 @@ impl RoomListService {
     /// This will include syncing the encryption information, so there must not
     /// be any instance of `EncryptionSync` running in the background.
     pub async fn new_with_encryption(client: Client) -> Result<Self, Error> {
-        Self::new_internal(client, true).await
+        Self::new_internal(
+            client,
+            true,
+            #[cfg(feature = "experimental-room-list-with-unified-invites")]
+            false,
+        )
+        .await
     }
 
-    async fn new_internal(client: Client, with_encryption: bool) -> Result<Self, Error> {
+    async fn new_internal(
+        client: Client,
+        with_encryption: bool,
+        #[cfg(feature = "experimental-room-list-with-unified-invites")] with_unified_invites: bool,
+    ) -> Result<Self, Error> {
         let mut builder = client
             .sliding_sync("room-list")
             .map_err(Error::SlidingSync)?
@@ -156,6 +186,9 @@ impl RoomListService {
             .with_receipt_extension(assign!(ReceiptsConfig::default(), {
                 enabled: Some(true),
                 rooms: Some(vec![RoomReceiptConfig::AllSubscribed])
+            }))
+            .with_typing_extension(assign!(TypingConfig::default(), {
+                enabled: Some(true),
             }));
 
         if with_encryption {
@@ -178,8 +211,11 @@ impl RoomListService {
                         (StateEventType::RoomAvatar, "".to_owned()),
                         (StateEventType::RoomEncryption, "".to_owned()),
                         (StateEventType::RoomMember, "$LAZY".to_owned()),
+                        (StateEventType::RoomMember, "$ME".to_owned()),
                         (StateEventType::RoomPowerLevels, "".to_owned()),
                     ]),
+                #[cfg(feature = "experimental-room-list-with-unified-invites")]
+                with_unified_invites,
             ))
             .await
             .map_err(Error::SlidingSync)?
@@ -206,6 +242,9 @@ impl RoomListService {
             .await
             .map(Arc::new)
             .map_err(Error::SlidingSync)?;
+
+        // Eagerly subscribe the event cache to sync responses.
+        client.event_cache().subscribe()?;
 
         Ok(Self {
             client,
@@ -471,11 +510,18 @@ impl RoomListService {
 /// properties, so that they are exactly the same.
 fn configure_all_or_visible_rooms_list(
     list_builder: SlidingSyncListBuilder,
+    #[cfg(feature = "experimental-room-list-with-unified-invites")] with_invites: bool,
 ) -> SlidingSyncListBuilder {
+    #[cfg(not(feature = "experimental-room-list-with-unified-invites"))]
+    let with_invites = false;
+
     list_builder
         .sort(vec!["by_recency".to_owned(), "by_name".to_owned()])
         .filters(Some(assign!(SyncRequestListFilters::default(), {
-            is_invite: Some(false),
+            // As defined in the [SlidingSync MSC](https://github.com/matrix-org/matrix-spec-proposals/blob/9450ced7fb9cf5ea9077d029b3adf36aebfa8709/proposals/3575-sync.md?plain=1#L444)
+            // If unset, both invited and joined rooms are returned. If false, no invited rooms are
+            // returned. If true, only invited rooms are returned.
+            is_invite: if with_invites { None } else { Some(false) },
             is_tombstoned: Some(false),
             not_room_types: vec!["m.space".to_owned()],
         })))
@@ -504,6 +550,15 @@ pub enum Error {
     /// The requested room doesn't exist.
     #[error("Room `{0}` not found")]
     RoomNotFound(OwnedRoomId),
+
+    #[error("A timeline instance already exists for room {0}")]
+    TimelineAlreadyExists(OwnedRoomId),
+
+    #[error("An error occurred while initializing the timeline")]
+    InitializingTimeline(#[source] timeline::Error),
+
+    #[error("The attached event cache ran into an error")]
+    EventCache(#[from] EventCacheError),
 }
 
 /// An input for the [`RoomList`]' state machine.

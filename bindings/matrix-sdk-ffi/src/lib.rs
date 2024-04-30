@@ -24,6 +24,7 @@ mod authentication_service;
 mod chunk_iterator;
 mod client;
 mod client_builder;
+mod encryption;
 mod error;
 mod event;
 mod helpers;
@@ -31,23 +32,31 @@ mod notification;
 mod notification_settings;
 mod platform;
 mod room;
+mod room_directory_search;
 mod room_info;
 mod room_list;
 mod room_member;
+mod room_preview;
+mod ruma;
 mod session_verification;
 mod sync_service;
 mod task_handle;
 mod timeline;
+mod timeline_event_filter;
 mod tracing;
+mod utils;
 mod widget;
 
 use async_compat::TOKIO1 as RUNTIME;
 use matrix_sdk::ruma::events::room::{
     message::RoomMessageEventContentWithoutRelation, MediaSource,
 };
-use matrix_sdk_ui::timeline::{BackPaginationStatus, EventItemOrigin};
 
-use self::{error::ClientError, task_handle::TaskHandle, timeline::MediaSourceExt};
+use self::{
+    error::ClientError,
+    ruma::{MediaSourceExt, Mentions, RoomMessageEventContentWithoutRelationExt},
+    task_handle::TaskHandle,
+};
 
 uniffi::include_scaffolding!("api");
 

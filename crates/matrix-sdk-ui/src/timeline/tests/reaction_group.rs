@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use itertools::Itertools;
 use matrix_sdk_test::{ALICE, BOB};
 use ruma::{server_name, uint, user_id, EventId, MilliSecondsSinceUnixEpoch, OwnedUserId, UserId};
@@ -20,7 +20,7 @@ use ruma::{server_name, uint, user_id, EventId, MilliSecondsSinceUnixEpoch, Owne
 use crate::timeline::{event_item::EventItemIdentifier, ReactionGroup, ReactionSenderData};
 
 #[test]
-fn by_sender() {
+fn test_by_sender() {
     let alice = ALICE.to_owned();
     let bob = BOB.to_owned();
 
@@ -33,16 +33,14 @@ fn by_sender() {
 
     let alice_reactions = reaction_group.by_sender(&alice).collect::<Vec<_>>();
 
-    let reaction = *alice_reactions.get(0).unwrap();
+    let reaction = alice_reactions[0];
 
-    assert_matches!(
-        reaction_1,
-        EventItemIdentifier::EventId(event_id) => { assert_eq!(reaction.1.unwrap(), &event_id) }
-    )
+    assert_let!(EventItemIdentifier::EventId(event_id) = reaction_1);
+    assert_eq!(reaction.1.unwrap(), &event_id);
 }
 
 #[test]
-fn by_sender_with_empty_group() {
+fn test_by_sender_with_empty_group() {
     let reaction_group = ReactionGroup::default();
 
     let reactions = reaction_group.by_sender(&ALICE).collect::<Vec<_>>();
@@ -51,7 +49,7 @@ fn by_sender_with_empty_group() {
 }
 
 #[test]
-fn by_sender_with_multiple_users() {
+fn test_by_sender_with_multiple_users() {
     let alice = ALICE.to_owned();
     let bob = BOB.to_owned();
     let carol = user_id!("@carol:other.server");
@@ -78,7 +76,7 @@ fn by_sender_with_multiple_users() {
 /// is still possible for duplicates to be received over federation. And in
 /// that case, clients are expected to treat duplicates as a single annotation.
 #[test]
-fn senders_are_deduplicated() {
+fn test_senders_are_deduplicated() {
     let group = {
         let mut group = ReactionGroup::default();
         insert(&mut group, &ALICE, 3);
@@ -91,7 +89,7 @@ fn senders_are_deduplicated() {
 }
 
 #[test]
-fn timestamps_are_stored() {
+fn test_timestamps_are_stored() {
     let reaction = new_reaction();
     let reaction_2 = new_reaction();
     let timestamp = MilliSecondsSinceUnixEpoch(uint!(0));

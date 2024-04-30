@@ -100,7 +100,7 @@ pub async fn upgrade_meta_db(
         Ok(())
     }));
 
-    let meta_db: IdbDatabase = db_req.into_future().await?;
+    let meta_db: IdbDatabase = db_req.await?;
 
     let store_cipher = if let Some(passphrase) = passphrase {
         let tx: IdbTransaction<'_> = meta_db
@@ -153,7 +153,7 @@ pub async fn upgrade_inner_db(
     migration_strategy: MigrationConflictStrategy,
     meta_db: &IdbDatabase,
 ) -> Result<IdbDatabase> {
-    let mut db = IdbDatabase::open(name)?.into_future().await?;
+    let mut db = IdbDatabase::open(name)?.await?;
 
     // Even if the web-sys bindings expose the version as a f64, the IndexedDB API
     // works with an unsigned integer.
@@ -242,7 +242,7 @@ pub async fn upgrade_inner_db(
                 )
             },
         ));
-        db = db_req.into_future().await?;
+        db = db_req.await?;
     }
 
     Ok(db)
@@ -271,7 +271,7 @@ async fn apply_migration(
         Ok(())
     }));
 
-    let db = db_req.into_future().await?;
+    let db = db_req.await?;
 
     // Finally, we can add data to the newly created tables if needed.
     if !migration.data.is_empty() {
@@ -328,7 +328,7 @@ async fn backup_v1(source: &IdbDatabase, meta: &IdbDatabase) -> Result<()> {
         }
         Ok(())
     }));
-    let target = db_req.into_future().await?;
+    let target = db_req.await?;
 
     for name in V1_STORES {
         let source_tx = source.transaction_on_one_with_mode(name, IdbTransactionMode::Readonly)?;
@@ -417,7 +417,7 @@ async fn migrate_to_v3(db: IdbDatabase, store_cipher: Option<&StoreCipher>) -> R
     db.close();
 
     // Update the version of the database.
-    Ok(IdbDatabase::open_u32(&name, 3)?.into_future().await?)
+    Ok(IdbDatabase::open_u32(&name, 3)?.await?)
 }
 
 /// Move the content of the SYNC_TOKEN and SESSION stores to the new KV store.
@@ -728,7 +728,7 @@ async fn migrate_to_v8(db: IdbDatabase, store_cipher: Option<&StoreCipher>) -> R
     db.close();
 
     // Update the version of the database.
-    Ok(IdbDatabase::open_u32(&name, 8)?.into_future().await?)
+    Ok(IdbDatabase::open_u32(&name, 8)?.await?)
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -736,6 +736,7 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use assert_matches::assert_matches;
+    use assert_matches2::assert_let;
     use indexed_db_futures::prelude::*;
     use matrix_sdk_base::{
         deserialized_responses::RawMemberEvent, store::StateStoreExt,
@@ -830,7 +831,7 @@ mod tests {
                 Ok(())
             },
         ));
-        db_req.into_future().await.map_err(Into::into)
+        db_req.await.map_err(Into::into)
     }
 
     fn room_info_v1_json(
@@ -918,10 +919,7 @@ mod tests {
         // this didn't create any backup
         assert_eq!(store.has_backups().await?, false);
         // Custom data is still there.
-        let stored_data = assert_matches!(
-            store.get_custom_value(CUSTOM_DATA_KEY).await?,
-            Some(d) => d
-        );
+        assert_let!(Some(stored_data) = store.get_custom_value(CUSTOM_DATA_KEY).await?);
         assert_eq!(stored_data, CUSTOM_DATA);
 
         // Check versions.
@@ -1224,15 +1222,15 @@ mod tests {
         // this transparently migrates to the latest version
         let store = IndexeddbStateStore::builder().name(name).build().await?;
 
-        let stored_member_event = assert_matches!(
-            store.get_member_event(room_id, user_id).await,
-            Ok(Some(RawMemberEvent::Sync(e))) => e
+        assert_let!(
+            Ok(Some(RawMemberEvent::Sync(stored_member_event))) =
+                store.get_member_event(room_id, user_id).await
         );
         assert_eq!(stored_member_event.json().get(), member_event.json().get());
 
-        let stored_stripped_member_event = assert_matches!(
-            store.get_member_event(stripped_room_id, stripped_user_id).await,
-            Ok(Some(RawMemberEvent::Stripped(e))) => e
+        assert_let!(
+            Ok(Some(RawMemberEvent::Stripped(stored_stripped_member_event))) =
+                store.get_member_event(stripped_room_id, stripped_user_id).await
         );
         assert_eq!(stored_stripped_member_event.json().get(), stripped_member_event.json().get());
 

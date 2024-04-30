@@ -2,9 +2,9 @@ import XCTest
 @testable import MatrixRustSDK
 
 final class ClientTests: XCTestCase {
-    func testBuildingWithHomeserverURL() {
+    func testBuildingWithHomeserverURL() async {
         do {
-            _ = try ClientBuilder()
+            _ = try await ClientBuilder()
                 .homeserverUrl(url: "https://localhost:8008")
                 .build()
         } catch {
@@ -12,9 +12,9 @@ final class ClientTests: XCTestCase {
         }
     }
 
-    func testBuildingWithHomeserverURLAndUserAgent() {
+    func testBuildingWithHomeserverURLAndUserAgent() async {
         do {
-            _ = try ClientBuilder()
+            _ = try await ClientBuilder()
                 .homeserverUrl(url: "https://localhost:8008")
                 .userAgent(userAgent: "golden-eye/007")
                 .build()
@@ -23,24 +23,14 @@ final class ClientTests: XCTestCase {
         }
     }
     
-    func testBuildingWithUsername() {
+    func testBuildingWithInvalidUsername() async {
         do {
-            _ = try ClientBuilder()
-                .username(username: "@test:matrix.org")
-                .build()
-        } catch {
-            XCTFail("The client should build successfully when given a username.")
-        }
-    }
-    
-    func testBuildingWithInvalidUsername() {
-        do {
-            _ = try ClientBuilder()
+            _ = try await ClientBuilder()
                 .username(username: "@test:invalid")
                 .build()
             
             XCTFail("The client should not build when given an invalid username.")
-        } catch ClientError.Generic(let message) {
+        } catch ClientBuildError.Sdk(let message) {
             XCTAssertTrue(message.contains(".well-known"), "The client should fail to do the well-known lookup.")
         } catch {
             XCTFail("Not expecting any other kind of exception")
