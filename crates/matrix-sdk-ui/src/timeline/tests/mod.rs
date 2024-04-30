@@ -14,15 +14,22 @@
 
 //! Unit tests (based on private methods) for the timeline API.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
-use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use async_trait::async_trait;
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
 use indexmap::IndexMap;
-use matrix_sdk::deserialized_responses::{SyncTimelineEvent, TimelineEvent};
+use matrix_sdk::{
+    deserialized_responses::{SyncTimelineEvent, TimelineEvent},
+    event_cache::paginator::{PaginableRoom, PaginatorError},
+    room::{EventWithContextResponse, Messages, MessagesOptions},
+};
 use matrix_sdk_base::latest_event::LatestEvent;
 use matrix_sdk_test::{EventBuilder, ALICE, BOB};
 use ruma::{
@@ -30,27 +37,28 @@ use ruma::{
     events::{
         receipt::{Receipt, ReceiptThread, ReceiptType},
         relation::Annotation,
-        room::redaction::RoomRedactionEventContent,
         AnyMessageLikeEventContent, AnySyncTimelineEvent, AnyTimelineEvent, EmptyStateKey,
         MessageLikeEventContent, RedactedMessageLikeEventContent, RedactedStateEventContent,
         StaticStateEventContent,
     },
     int,
     power_levels::NotificationPowerLevels,
-    push::{PushConditionRoomCtx, Ruleset},
+    push::{PushConditionPowerLevelsCtx, PushConditionRoomCtx, Ruleset},
     room_id,
     serde::Raw,
     server_name, uint, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId,
-    OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
+    OwnedUserId, RoomId, RoomVersionId, TransactionId, UInt, UserId,
 };
 
 use super::{
-    event_item::EventItemIdentifier,
-    inner::{ReactionAction, TimelineInnerSettings},
+    event_handler::TimelineEventKind,
+    event_item::RemoteEventOrigin,
+    inner::{ReactionAction, TimelineEnd, TimelineInnerSettings},
     reactions::ReactionToggleResult,
     traits::RoomDataProvider,
-    EventTimelineItem, Profile, TimelineInner, TimelineItem,
+    EventTimelineItem, Profile, TimelineFocus, TimelineInner, TimelineItem,
 };
+use crate::unable_to_decrypt_hook::UtdHookManager;
 
 mod basic;
 mod echo;
@@ -73,7 +81,38 @@ struct TestTimeline {
 
 impl TestTimeline {
     fn new() -> Self {
-        Self { inner: TimelineInner::new(TestRoomDataProvider), event_builder: EventBuilder::new() }
+        Self::with_room_data_provider(TestRoomDataProvider::default())
+    }
+
+    fn with_internal_id_prefix(prefix: String) -> Self {
+        Self {
+            inner: TimelineInner::new(
+                TestRoomDataProvider::default(),
+                TimelineFocus::Live,
+                Some(prefix),
+                None,
+            ),
+            event_builder: EventBuilder::new(),
+        }
+    }
+
+    fn with_room_data_provider(room_data_provider: TestRoomDataProvider) -> Self {
+        Self {
+            inner: TimelineInner::new(room_data_provider, TimelineFocus::Live, None, None),
+            event_builder: EventBuilder::new(),
+        }
+    }
+
+    fn with_unable_to_decrypt_hook(hook: Arc<UtdHookManager>) -> Self {
+        Self {
+            inner: TimelineInner::new(
+                TestRoomDataProvider::default(),
+                TimelineFocus::Live,
+                None,
+                Some(hook),
+            ),
+            event_builder: EventBuilder::new(),
+        }
     }
 
     fn with_settings(mut self, settings: TimelineInnerSettings) -> Self {
@@ -196,17 +235,23 @@ impl TestTimeline {
 
     async fn handle_local_event(&self, content: AnyMessageLikeEventContent) -> OwnedTransactionId {
         let txn_id = TransactionId::new();
-        self.inner.handle_local_event(txn_id.clone(), content).await;
+        self.inner
+            .handle_local_event(
+                txn_id.clone(),
+                TimelineEventKind::Message { content, relations: Default::default() },
+            )
+            .await;
         txn_id
     }
 
-    async fn handle_local_redaction_event(
-        &self,
-        redacts: EventItemIdentifier,
-        content: RoomRedactionEventContent,
-    ) -> OwnedTransactionId {
+    async fn handle_local_redaction_event(&self, redacts: &EventId) -> OwnedTransactionId {
         let txn_id = TransactionId::new();
-        self.inner.handle_local_redaction(txn_id.clone(), redacts, content).await;
+        self.inner
+            .handle_local_event(
+                txn_id.clone(),
+                TimelineEventKind::Redaction { redacts: redacts.to_owned() },
+            )
+            .await;
         txn_id
     }
 
@@ -226,9 +271,8 @@ impl TestTimeline {
     async fn handle_back_paginated_custom_event(&self, event: Raw<AnyTimelineEvent>) {
         let timeline_event = TimelineEvent::new(event.cast());
         self.inner
-            .handle_back_paginated_events(vec![timeline_event], Default::default())
-            .await
-            .unwrap();
+            .add_events_at(vec![timeline_event], TimelineEnd::Front, RemoteEventOrigin::Pagination)
+            .await;
     }
 
     async fn handle_read_receipts(
@@ -255,8 +299,42 @@ impl TestTimeline {
     }
 }
 
-#[derive(Clone)]
-struct TestRoomDataProvider;
+type ReadReceiptMap =
+    HashMap<ReceiptType, HashMap<ReceiptThread, HashMap<OwnedUserId, (OwnedEventId, Receipt)>>>;
+
+#[derive(Clone, Default)]
+struct TestRoomDataProvider {
+    initial_user_receipts: ReadReceiptMap,
+    fully_read_marker: Option<OwnedEventId>,
+}
+
+impl TestRoomDataProvider {
+    fn with_initial_user_receipts(mut self, initial_user_receipts: ReadReceiptMap) -> Self {
+        self.initial_user_receipts = initial_user_receipts;
+        self
+    }
+    fn with_fully_read_marker(mut self, event_id: OwnedEventId) -> Self {
+        self.fully_read_marker = Some(event_id);
+        self
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl PaginableRoom for TestRoomDataProvider {
+    async fn event_with_context(
+        &self,
+        _event_id: &EventId,
+        _lazy_load_members: bool,
+        _num_events: UInt,
+    ) -> Result<EventWithContextResponse, PaginatorError> {
+        unimplemented!();
+    }
+
+    async fn messages(&self, _opts: MessagesOptions) -> Result<Messages, PaginatorError> {
+        unimplemented!();
+    }
+}
 
 #[async_trait]
 impl RoomDataProvider for TestRoomDataProvider {
@@ -276,7 +354,20 @@ impl RoomDataProvider for TestRoomDataProvider {
         None
     }
 
-    async fn read_receipts_for_event(&self, event_id: &EventId) -> IndexMap<OwnedUserId, Receipt> {
+    async fn load_user_receipt(
+        &self,
+        receipt_type: ReceiptType,
+        thread: ReceiptThread,
+        user_id: &UserId,
+    ) -> Option<(OwnedEventId, Receipt)> {
+        self.initial_user_receipts
+            .get(&receipt_type)
+            .and_then(|thread_map| thread_map.get(&thread))
+            .and_then(|user_map| user_map.get(user_id))
+            .cloned()
+    }
+
+    async fn load_event_receipts(&self, event_id: &EventId) -> IndexMap<OwnedUserId, Receipt> {
         if event_id == event_id!("$event_with_bob_receipt") {
             [(BOB.to_owned(), Receipt::new(MilliSecondsSinceUnixEpoch(uint!(10))))].into()
         } else {
@@ -286,17 +377,24 @@ impl RoomDataProvider for TestRoomDataProvider {
 
     async fn push_rules_and_context(&self) -> Option<(Ruleset, PushConditionRoomCtx)> {
         let push_rules = Ruleset::server_default(&ALICE);
+        let power_levels = PushConditionPowerLevelsCtx {
+            users: BTreeMap::new(),
+            users_default: int!(0),
+            notifications: NotificationPowerLevels::new(),
+        };
         let push_context = PushConditionRoomCtx {
             room_id: room_id!("!my_room:server.name").to_owned(),
             member_count: uint!(2),
             user_id: ALICE.to_owned(),
             user_display_name: "Alice".to_owned(),
-            users_power_levels: BTreeMap::new(),
-            default_power_level: int!(0),
-            notification_power_levels: NotificationPowerLevels::new(),
+            power_levels: Some(power_levels),
         };
 
         Some((push_rules, push_context))
+    }
+
+    async fn load_fully_read_marker(&self) -> Option<OwnedEventId> {
+        self.fully_read_marker.clone()
     }
 }
 
@@ -305,10 +403,7 @@ pub(super) async fn assert_event_is_updated(
     event_id: &EventId,
     index: usize,
 ) -> EventTimelineItem {
-    let (i, event) = assert_matches!(
-        stream.next().await,
-        Some(VectorDiff::Set { index, value }) => (index, value)
-    );
+    assert_let!(Some(VectorDiff::Set { index: i, value: event }) = stream.next().await);
     assert_eq!(i, index);
     let event = event.as_event().unwrap();
     assert_eq!(event.event_id().unwrap(), event_id);

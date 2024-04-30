@@ -24,8 +24,9 @@ use bytes::Bytes;
 use bytesize::ByteSize;
 use eyeball::SharedObservable;
 use http::header::CONTENT_LENGTH;
+use reqwest::Certificate;
 use ruma::api::{
-    client::error::{ErrorBody as ClientApiErrorBody, ErrorKind as ClientApiErrorKind},
+    client::error::{ErrorBody as ClientApiErrorBody, ErrorKind as ClientApiErrorKind, RetryAfter},
     error::FromHttpResponseError,
     IncomingResponse, OutgoingRequest,
 };
@@ -67,13 +68,15 @@ impl HttpClient {
                             let status_code = match api_error {
                                 RumaApiError::ClientApi(e) => match e.body {
                                     ClientApiErrorBody::Standard {
-                                        kind: ClientApiErrorKind::LimitExceeded { retry_after_ms },
+                                        kind: ClientApiErrorKind::LimitExceeded { retry_after },
                                         ..
                                     } => {
-                                        return RetryError::Transient {
-                                            err,
-                                            retry_after: retry_after_ms,
-                                        };
+                                        let retry_after =
+                                            retry_after.and_then(|retry_after| match retry_after {
+                                                RetryAfter::Delay(d) => Some(d),
+                                                RetryAfter::DateTime(_) => None,
+                                            });
+                                        return RetryError::Transient { err, retry_after };
                                     }
                                     _ => Some(e.status_code),
                                 },
@@ -131,6 +134,7 @@ pub(crate) struct HttpSettings {
     pub(crate) proxy: Option<String>,
     pub(crate) user_agent: Option<String>,
     pub(crate) timeout: Duration,
+    pub(crate) additional_root_certificates: Vec<Certificate>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -141,6 +145,7 @@ impl Default for HttpSettings {
             proxy: None,
             user_agent: None,
             timeout: DEFAULT_REQUEST_TIMEOUT,
+            additional_root_certificates: Default::default(),
         }
     }
 }
@@ -156,6 +161,17 @@ impl HttpSettings {
         if self.disable_ssl_verification {
             warn!("SSL verification disabled in the HTTP client!");
             http_client = http_client.danger_accept_invalid_certs(true)
+        }
+
+        if !self.additional_root_certificates.is_empty() {
+            info!(
+                "Adding {} additional root certificates to the HTTP client",
+                self.additional_root_certificates.len()
+            );
+
+            for cert in &self.additional_root_certificates {
+                http_client = http_client.add_root_certificate(cert.clone());
+            }
         }
 
         if let Some(p) = &self.proxy {

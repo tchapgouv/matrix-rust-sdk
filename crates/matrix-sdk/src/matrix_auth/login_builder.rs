@@ -14,11 +14,11 @@
 // limitations under the License.
 #![cfg_attr(not(target_arch = "wasm32"), deny(clippy::future_not_send))]
 
-use std::{
-    future::{Future, IntoFuture},
-    pin::Pin,
-};
+#[cfg(feature = "sso-login")]
+use std::future::Future;
+use std::future::IntoFuture;
 
+use matrix_sdk_common::boxed_into_future;
 use ruma::{
     api::client::{session::login, uiaa::UserIdentifier},
     assign,
@@ -174,14 +174,22 @@ impl LoginBuilder {
         let homeserver = client.homeserver();
         info!(homeserver = homeserver.as_str(), identifier = ?self.login_method.id(), "Logging in");
 
-        let request = assign!(login::v3::Request::new(self.login_method.into_login_info()), {
+        let login_info = self.login_method.into_login_info();
+
+        let request = assign!(login::v3::Request::new(login_info.clone()), {
             device_id: self.device_id.map(Into::into),
             initial_device_display_name: self.initial_device_display_name,
             refresh_token: self.request_refresh_token,
         });
 
         let response = client.send(request, Some(RequestConfig::short_retry())).await?;
-        self.auth.receive_login_response(&response).await?;
+        self.auth
+            .receive_login_response(
+                &response,
+                #[cfg(feature = "e2e-encryption")]
+                Some(login_info),
+            )
+            .await?;
 
         Ok(response)
     }
@@ -189,8 +197,7 @@ impl LoginBuilder {
 
 impl IntoFuture for LoginBuilder {
     type Output = Result<login::v3::Response>;
-    // TODO: Use impl Trait once allowed in this position on stable
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output>>>;
+    boxed_into_future!();
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.send())
@@ -317,11 +324,15 @@ where
             sync::{Arc, Mutex},
         };
 
-        use http::{Method, StatusCode};
-        use hyper::{server::conn::AddrIncoming, service::service_fn};
+        use axum::{
+            http::{self, Method, StatusCode},
+            response::IntoResponse,
+            routing::any_service,
+        };
         use rand::{thread_rng, Rng};
         use serde::Deserialize;
         use tokio::{net::TcpListener, sync::oneshot};
+        use tower::service_fn;
         use tracing::debug;
         use url::Url;
 
@@ -374,7 +385,7 @@ where
                 data_tx.send(query.login_token).unwrap();
             }
 
-            Ok(http::Response::new(response.clone()))
+            Ok(response.clone())
         };
 
         let listener = {
@@ -404,24 +415,21 @@ where
             }
         };
 
-        let incoming = AddrIncoming::from_listener(listener).unwrap();
-        let server = hyper::Server::builder(incoming)
-            .serve(tower::make::Shared::new(service_fn(move |request| {
-                let handle_request = handle_request.clone();
-                async move {
-                    match handle_request(request) {
-                        Ok(res) => Ok::<_, Infallible>(res.map(hyper::Body::from)),
-                        Err(status_code) => {
-                            let mut res = http::Response::new(hyper::Body::default());
-                            *res.status_mut() = status_code;
-                            Ok(res)
-                        }
-                    }
+        let router = any_service(service_fn(move |request| {
+            let handle_request = handle_request.clone();
+            async move {
+                match handle_request(request) {
+                    Ok(res) => Ok::<_, Infallible>(res.into_response()),
+                    Err(status_code) => Ok(status_code.into_response()),
                 }
-            })))
+            }
+        }));
+
+        let server = axum::serve(listener, router)
             .with_graceful_shutdown(async {
                 signal_rx.await.ok();
-            });
+            })
+            .into_future();
 
         tokio::spawn(server);
 
@@ -456,8 +464,7 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     type Output = Result<login::v3::Response>;
-    // TODO: Use impl Trait once allowed in this position on stable
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output>>>;
+    boxed_into_future!();
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.send())

@@ -34,15 +34,15 @@ impl WidgetDriver {
     pub async fn run(
         &self,
         room: Arc<Room>,
-        permissions_provider: Box<dyn WidgetPermissionsProvider>,
+        capabilities_provider: Box<dyn WidgetCapabilitiesProvider>,
     ) {
         let Some(driver) = self.0.lock().unwrap().take() else {
             error!("Can't call run multiple times on a WidgetDriver");
             return;
         };
 
-        let permissions_provider = PermissionsProviderWrap(permissions_provider.into());
-        if let Err(()) = driver.run(room.inner.clone(), permissions_provider).await {
+        let capabilities_provider = CapabilitiesProviderWrap(capabilities_provider.into());
+        if let Err(()) = driver.run(room.inner.clone(), capabilities_provider).await {
             // TODO
         }
     }
@@ -111,6 +111,34 @@ pub async fn generate_webview_url(
     .map(|url| url.to_string())?)
 }
 
+/// Defines if a call is encrypted and which encryption system should be used.
+///
+/// This controls the url parameters: `perParticipantE2EE`, `password`.
+#[derive(uniffi::Enum, Clone)]
+pub enum EncryptionSystem {
+    /// Equivalent to the element call url parameter: `enableE2EE=false`
+    Unencrypted,
+    /// Equivalent to the element call url parameter:
+    /// `perParticipantE2EE=true`
+    PerParticipantKeys,
+    /// Equivalent to the element call url parameter:
+    /// `password={secret}`
+    SharedSecret {
+        /// The secret/password which is used in the url.
+        secret: String,
+    },
+}
+
+impl From<EncryptionSystem> for matrix_sdk::widget::EncryptionSystem {
+    fn from(value: EncryptionSystem) -> Self {
+        match value {
+            EncryptionSystem::Unencrypted => Self::Unencrypted,
+            EncryptionSystem::PerParticipantKeys => Self::PerParticipantKeys,
+            EncryptionSystem::SharedSecret { secret } => Self::SharedSecret { secret },
+        }
+    }
+}
+
 /// Properties to create a new virtual Element Call widget.
 #[derive(uniffi::Record, Clone)]
 pub struct VirtualElementCallWidgetOptions {
@@ -174,6 +202,11 @@ pub struct VirtualElementCallWidgetOptions {
 
     /// Can be used to pass a PostHog id to element call.
     pub analytics_id: Option<String>,
+
+    /// The encryption system to use.
+    ///
+    /// Use `EncryptionSystem::Unencrypted` to disable encryption.
+    pub encryption: EncryptionSystem,
 }
 
 impl From<VirtualElementCallWidgetOptions> for matrix_sdk::widget::VirtualElementCallWidgetOptions {
@@ -190,6 +223,7 @@ impl From<VirtualElementCallWidgetOptions> for matrix_sdk::widget::VirtualElemen
             confine_to_room: value.confine_to_room,
             font: value.font,
             analytics_id: value.analytics_id,
+            encryption: value.encryption.into(),
         }
     }
 }
@@ -211,6 +245,46 @@ pub fn new_virtual_element_call_widget(
 ) -> Result<WidgetSettings, ParseError> {
     Ok(matrix_sdk::widget::WidgetSettings::new_virtual_element_call_widget(props.into())
         .map(|w| w.into())?)
+}
+
+/// The Capabilities required to run a element call widget.
+///
+/// This is intended to be used in combination with: `acquire_capabilities` of
+/// the `CapabilitiesProvider`.
+///
+/// `acquire_capabilities` can simply return the `WidgetCapabilities` from this
+/// function. Even if there are non intersecting permissions to what the widget
+/// requested.
+///
+/// Editing and extending the capabilities from this function is also possible,
+/// but should only be done as temporal workarounds until this function is
+/// adjusted
+#[uniffi::export]
+pub fn get_element_call_required_permissions() -> WidgetCapabilities {
+    use ruma::events::StateEventType;
+
+    WidgetCapabilities {
+        read: vec![
+            WidgetEventFilter::StateWithType { event_type: StateEventType::CallMember.to_string() },
+            WidgetEventFilter::StateWithType { event_type: StateEventType::RoomMember.to_string() },
+            WidgetEventFilter::MessageLikeWithType {
+                event_type: "org.matrix.rageshake_request".to_owned(),
+            },
+            WidgetEventFilter::MessageLikeWithType {
+                event_type: "io.element.call.encryption_keys".to_owned(),
+            },
+        ],
+        send: vec![
+            WidgetEventFilter::StateWithType { event_type: StateEventType::CallMember.to_string() },
+            WidgetEventFilter::StateWithType {
+                event_type: "org.matrix.rageshake_request".to_owned(),
+            },
+            WidgetEventFilter::StateWithType {
+                event_type: "io.element.call.encryption_keys".to_owned(),
+            },
+        ],
+        requires_client: true,
+    }
 }
 
 #[derive(uniffi::Record)]
@@ -258,14 +332,14 @@ impl WidgetDriverHandle {
     }
 }
 
-/// Permissions that a widget can request from a client.
+/// Capabilities that a widget can request from a client.
 #[derive(uniffi::Record)]
-pub struct WidgetPermissions {
+pub struct WidgetCapabilities {
     /// Types of the messages that a widget wants to be able to fetch.
     pub read: Vec<WidgetEventFilter>,
     /// Types of the messages that a widget wants to be able to send.
     pub send: Vec<WidgetEventFilter>,
-    /// If this permission is requested by the widget, it can not operate
+    /// If this capability is requested by the widget, it can not operate
     /// separately from the matrix client.
     ///
     /// This means clients should not offer to open the widget in a separate
@@ -273,8 +347,8 @@ pub struct WidgetPermissions {
     pub requires_client: bool,
 }
 
-impl From<WidgetPermissions> for matrix_sdk::widget::Permissions {
-    fn from(value: WidgetPermissions) -> Self {
+impl From<WidgetCapabilities> for matrix_sdk::widget::Capabilities {
+    fn from(value: WidgetCapabilities) -> Self {
         Self {
             read: value.read.into_iter().map(Into::into).collect(),
             send: value.send.into_iter().map(Into::into).collect(),
@@ -283,8 +357,8 @@ impl From<WidgetPermissions> for matrix_sdk::widget::Permissions {
     }
 }
 
-impl From<matrix_sdk::widget::Permissions> for WidgetPermissions {
-    fn from(value: matrix_sdk::widget::Permissions) -> Self {
+impl From<matrix_sdk::widget::Capabilities> for WidgetCapabilities {
+    fn from(value: matrix_sdk::widget::Capabilities) -> Self {
         Self {
             read: value.read.into_iter().map(Into::into).collect(),
             send: value.send.into_iter().map(Into::into).collect(),
@@ -347,24 +421,24 @@ impl From<matrix_sdk::widget::EventFilter> for WidgetEventFilter {
 }
 
 #[uniffi::export(callback_interface)]
-pub trait WidgetPermissionsProvider: Send + Sync {
-    fn acquire_permissions(&self, permissions: WidgetPermissions) -> WidgetPermissions;
+pub trait WidgetCapabilitiesProvider: Send + Sync {
+    fn acquire_capabilities(&self, capabilities: WidgetCapabilities) -> WidgetCapabilities;
 }
 
-struct PermissionsProviderWrap(Arc<dyn WidgetPermissionsProvider>);
+struct CapabilitiesProviderWrap(Arc<dyn WidgetCapabilitiesProvider>);
 
 #[async_trait]
-impl matrix_sdk::widget::PermissionsProvider for PermissionsProviderWrap {
-    async fn acquire_permissions(
+impl matrix_sdk::widget::CapabilitiesProvider for CapabilitiesProviderWrap {
+    async fn acquire_capabilities(
         &self,
-        permissions: matrix_sdk::widget::Permissions,
-    ) -> matrix_sdk::widget::Permissions {
+        capabilities: matrix_sdk::widget::Capabilities,
+    ) -> matrix_sdk::widget::Capabilities {
         let this = self.0.clone();
         // This could require a prompt to the user. Ideally the callback
         // interface would just be async, but that's not supported yet so use
         // one of tokio's blocking task threads instead.
         RUNTIME
-            .spawn_blocking(move || this.acquire_permissions(permissions.into()).into())
+            .spawn_blocking(move || this.acquire_capabilities(capabilities.into()).into())
             .await
             // propagate panics from the blocking task
             .unwrap()

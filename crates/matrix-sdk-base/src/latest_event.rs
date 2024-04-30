@@ -9,7 +9,10 @@ use ruma::events::{
     poll::unstable_start::SyncUnstablePollStartEvent, room::message::SyncRoomMessageEvent,
     AnySyncMessageLikeEvent, AnySyncTimelineEvent,
 };
-use ruma::{MxcUri, OwnedEventId};
+use ruma::{
+    events::{call::invite::SyncCallInviteEvent, relation::RelationType},
+    MxcUri, OwnedEventId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::MinimalRoomMemberEvent;
@@ -25,11 +28,15 @@ pub enum PossibleLatestEvent<'a> {
     YesRoomMessage(&'a SyncRoomMessageEvent),
     /// This message is suitable - it is a poll
     YesPoll(&'a SyncUnstablePollStartEvent),
+
+    /// This message is suitable - it is a call invite
+    YesCallInvite(&'a SyncCallInviteEvent),
+
     // Later: YesState(),
     // Later: YesReaction(),
     /// Not suitable - it's a state event
     NoUnsupportedEventType,
-    /// Not suitable - it's not an m.room.message
+    /// Not suitable - it's not a m.room.message or an edit/replacement
     NoUnsupportedMessageLikeType,
     /// Not suitable - it's encrypted
     NoEncrypted,
@@ -40,13 +47,35 @@ pub enum PossibleLatestEvent<'a> {
 #[cfg(feature = "e2e-encryption")]
 pub fn is_suitable_for_latest_event(event: &AnySyncTimelineEvent) -> PossibleLatestEvent<'_> {
     match event {
-        // Suitable - we have an m.room.message that was not redacted
+        // Suitable - we have an m.room.message that was not redacted or edited
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(message)) => {
-            PossibleLatestEvent::YesRoomMessage(message)
+            // Check if this is a replacement for another message. If it is, ignore it
+            if let Some(original_message) = message.as_original() {
+                let is_replacement =
+                    original_message.content.relates_to.as_ref().map_or(false, |relates_to| {
+                        if let Some(relation_type) = relates_to.rel_type() {
+                            relation_type == RelationType::Replacement
+                        } else {
+                            false
+                        }
+                    });
+
+                if is_replacement {
+                    return PossibleLatestEvent::NoUnsupportedMessageLikeType;
+                } else {
+                    return PossibleLatestEvent::YesRoomMessage(message);
+                }
+            }
+
+            return PossibleLatestEvent::YesRoomMessage(message);
         }
 
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::UnstablePollStart(poll)) => {
             PossibleLatestEvent::YesPoll(poll)
+        }
+
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::CallInvite(invite)) => {
+            PossibleLatestEvent::YesCallInvite(invite)
         }
 
         // Encrypted events are not suitable
@@ -221,13 +250,19 @@ mod tests {
     use std::collections::BTreeMap;
 
     use assert_matches::assert_matches;
+    use assert_matches2::assert_let;
     use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
     use ruma::{
         events::{
+            call::{
+                invite::{CallInviteEventContent, SyncCallInviteEvent},
+                SessionDescription,
+            },
             poll::unstable_start::{
                 NewUnstablePollStartEventContent, SyncUnstablePollStartEvent, UnstablePollAnswer,
                 UnstablePollStartContentBlock,
             },
+            relation::Replacement,
             room::{
                 encrypted::{
                     EncryptedEventScheme, OlmV1Curve25519AesSha2Content, RoomEncryptedEventContent,
@@ -235,7 +270,7 @@ mod tests {
                 },
                 message::{
                     ImageMessageEventContent, MessageType, RedactedRoomMessageEventContent,
-                    RoomMessageEventContent, SyncRoomMessageEvent,
+                    Relation, RoomMessageEventContent, SyncRoomMessageEvent,
                 },
                 topic::{RoomTopicEventContent, SyncRoomTopicEvent},
                 ImageInfo, MediaSource,
@@ -248,14 +283,14 @@ mod tests {
         },
         owned_event_id, owned_mxc_uri, owned_user_id,
         serde::Raw,
-        MilliSecondsSinceUnixEpoch, UInt,
+        MilliSecondsSinceUnixEpoch, UInt, VoipVersionId,
     };
     use serde_json::json;
 
     use crate::latest_event::{is_suitable_for_latest_event, LatestEvent, PossibleLatestEvent};
 
     #[test]
-    fn room_messages_are_suitable() {
+    fn test_room_messages_are_suitable() {
         let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
             SyncRoomMessageEvent::Original(OriginalSyncMessageLikeEvent {
                 content: RoomMessageEventContent::new(MessageType::Image(
@@ -270,16 +305,16 @@ mod tests {
                 unsigned: MessageLikeUnsigned::new(),
             }),
         ));
-        let m = assert_matches!(
-            is_suitable_for_latest_event(&event),
-            PossibleLatestEvent::YesRoomMessage(SyncMessageLikeEvent::Original(m)) => m
+        assert_let!(
+            PossibleLatestEvent::YesRoomMessage(SyncMessageLikeEvent::Original(m)) =
+                is_suitable_for_latest_event(&event)
         );
 
         assert_eq!(m.content.msgtype.msgtype(), "m.image");
     }
 
     #[test]
-    fn polls_are_suitable() {
+    fn test_polls_are_suitable() {
         let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::UnstablePollStart(
             SyncUnstablePollStartEvent::Original(OriginalSyncMessageLikeEvent {
                 content: NewUnstablePollStartEventContent::new(UnstablePollStartContentBlock::new(
@@ -293,16 +328,38 @@ mod tests {
                 unsigned: MessageLikeUnsigned::new(),
             }),
         ));
-        let m = assert_matches!(
-            is_suitable_for_latest_event(&event),
-            PossibleLatestEvent::YesPoll(SyncMessageLikeEvent::Original(m)) => m
+        assert_let!(
+            PossibleLatestEvent::YesPoll(SyncMessageLikeEvent::Original(m)) =
+                is_suitable_for_latest_event(&event)
         );
 
         assert_eq!(m.content.poll_start().question.text, "do you like rust?");
     }
 
     #[test]
-    fn different_types_of_messagelike_are_unsuitable() {
+    fn test_call_invites_are_suitable() {
+        let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::CallInvite(
+            SyncCallInviteEvent::Original(OriginalSyncMessageLikeEvent {
+                content: CallInviteEventContent::new(
+                    "call_id".into(),
+                    UInt::new(123).unwrap(),
+                    SessionDescription::new("".into(), "".into()),
+                    VoipVersionId::V1,
+                ),
+                event_id: owned_event_id!("$1"),
+                sender: owned_user_id!("@a:b.c"),
+                origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(2123).unwrap()),
+                unsigned: MessageLikeUnsigned::new(),
+            }),
+        ));
+        assert_let!(
+            PossibleLatestEvent::YesCallInvite(SyncMessageLikeEvent::Original(_)) =
+                is_suitable_for_latest_event(&event)
+        );
+    }
+
+    #[test]
+    fn test_different_types_of_messagelike_are_unsuitable() {
         let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Sticker(
             SyncStickerEvent::Original(OriginalSyncMessageLikeEvent {
                 content: StickerEventContent::new(
@@ -324,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn redacted_messages_are_suitable() {
+    fn test_redacted_messages_are_suitable() {
         // Ruma does not allow constructing UnsignedRoomRedactionEvent instances.
         let room_redaction_event: UnsignedRoomRedactionEvent = serde_json::from_value(json!({
             "content": {},
@@ -352,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_messages_are_unsuitable() {
+    fn test_encrypted_messages_are_unsuitable() {
         let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
             SyncRoomEncryptedEvent::Original(OriginalSyncMessageLikeEvent {
                 content: RoomEncryptedEventContent::new(
@@ -372,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn state_events_are_unsuitable() {
+    fn test_state_events_are_unsuitable() {
         let event = AnySyncTimelineEvent::State(AnySyncStateEvent::RoomTopic(
             SyncRoomTopicEvent::Original(OriginalSyncStateEvent {
                 content: RoomTopicEventContent::new("".to_owned()),
@@ -391,7 +448,31 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_latest_event() {
+    fn test_replacement_events_are_unsuitable() {
+        let mut event_content = RoomMessageEventContent::text_plain("Bye bye, world!");
+        event_content.relates_to = Some(Relation::Replacement(Replacement::new(
+            owned_event_id!("$1"),
+            RoomMessageEventContent::text_plain("Hello, world!").into(),
+        )));
+
+        let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+            SyncRoomMessageEvent::Original(OriginalSyncMessageLikeEvent {
+                content: event_content,
+                event_id: owned_event_id!("$2"),
+                sender: owned_user_id!("@a:b.c"),
+                origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(2123).unwrap()),
+                unsigned: MessageLikeUnsigned::new(),
+            }),
+        ));
+
+        assert_matches!(
+            is_suitable_for_latest_event(&event),
+            PossibleLatestEvent::NoUnsupportedMessageLikeType
+        );
+    }
+
+    #[test]
+    fn test_deserialize_latest_event() {
         #[derive(Debug, serde::Serialize, serde::Deserialize)]
         struct TestStruct {
             latest_event: LatestEvent,

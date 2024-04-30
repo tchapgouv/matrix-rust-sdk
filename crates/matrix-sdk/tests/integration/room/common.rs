@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-use assert_matches::assert_matches;
+use assert_matches2::assert_let;
 use matrix_sdk::{config::SyncSettings, room::RoomMember, DisplayName, RoomMemberships};
 use matrix_sdk_test::{
     async_test, bulk_room_members, sync_timeline_event, test_json, JoinedRoomBuilder,
-    StateTestEvent, SyncResponseBuilder,
+    StateTestEvent, SyncResponseBuilder, DEFAULT_TEST_ROOM_ID,
 };
 use ruma::{
     event_id,
@@ -20,11 +20,11 @@ use wiremock::{
     Mock, ResponseTemplate,
 };
 
-use crate::{logged_in_client, mock_sync};
+use crate::{logged_in_client_with_server, mock_sync};
 
 #[async_test]
 async fn user_presence() {
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
 
     mock_sync(&server, &*test_json::SYNC, None).await;
 
@@ -39,7 +39,7 @@ async fn user_presence() {
 
     let _response = client.sync_once(sync_settings).await.unwrap();
 
-    let room = client.get_room(&test_json::DEFAULT_SYNC_ROOM_ID).unwrap();
+    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
     let members: Vec<RoomMember> = room.members(RoomMemberships::ACTIVE).await.unwrap();
 
     assert_eq!(2, members.len());
@@ -48,20 +48,20 @@ async fn user_presence() {
 
 #[async_test]
 async fn calculate_room_names_from_summary() {
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
 
     mock_sync(&server, &*test_json::DEFAULT_SYNC_SUMMARY, None).await;
 
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
     let _response = client.sync_once(sync_settings).await.unwrap();
-    let room = client.get_room(&test_json::DEFAULT_SYNC_ROOM_ID).unwrap();
+    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
 
     assert_eq!(DisplayName::Calculated("example2".to_owned()), room.display_name().await.unwrap());
 }
 
 #[async_test]
 async fn room_names() {
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
 
     mock_sync(&server, &*test_json::SYNC, None).await;
 
@@ -70,7 +70,7 @@ async fn room_names() {
     let sync_token = client.sync_once(sync_settings).await.unwrap().next_batch;
 
     assert_eq!(client.rooms().len(), 1);
-    let room = client.get_room(&test_json::DEFAULT_SYNC_ROOM_ID).unwrap();
+    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
 
     assert_eq!(DisplayName::Aliased("tutorial".to_owned()), room.display_name().await.unwrap());
 
@@ -89,15 +89,13 @@ async fn room_names() {
 
 #[async_test]
 async fn test_state_event_getting() {
-    let room_id = &test_json::DEFAULT_SYNC_ROOM_ID;
-
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
 
     let sync = json!({
         "next_batch": "1234",
         "rooms": {
             "join": {
-                "!SVkFJHzfwvuaIEawgC:localhost": {
+                *DEFAULT_TEST_ROOM_ID: {
                     "state": {
                       "events": [
                         {
@@ -150,12 +148,12 @@ async fn test_state_event_getting() {
 
     mock_sync(&server, sync, None).await;
 
-    let room = client.get_room(room_id);
+    let room = client.get_room(&DEFAULT_TEST_ROOM_ID);
     assert!(room.is_none());
 
     client.sync_once(SyncSettings::default()).await.unwrap();
 
-    let room = client.get_room(room_id).unwrap();
+    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
 
     let state_events = room.get_state_events(StateEventType::RoomEncryption).await.unwrap();
     assert_eq!(state_events.len(), 1);
@@ -179,11 +177,11 @@ async fn test_state_event_getting() {
 
 #[async_test]
 async fn room_route() {
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let mut ev_builder = SyncResponseBuilder::new();
-    let room_id = room_id!("!test_room:127.0.0.1");
+    let room_id = &*DEFAULT_TEST_ROOM_ID;
 
-    // Without elligible server
+    // Without eligible server
     ev_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
             .add_timeline_event(sync_timeline_event!({
@@ -216,7 +214,7 @@ async fn room_route() {
     let route = room.route().await.unwrap();
     assert_eq!(route.len(), 0);
 
-    // With a single elligible server
+    // With a single eligible server
     let mut batch = 0;
     ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_state_bulk(
         bulk_room_members(batch, 0..1, "localhost", &MembershipState::Join),
@@ -229,7 +227,7 @@ async fn room_route() {
     assert_eq!(route.len(), 1);
     assert_eq!(route[0], "localhost");
 
-    // With two elligible servers
+    // With two eligible servers
     batch += 1;
     ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_state_bulk(
         bulk_room_members(batch, 0..15, "notarealhs", &MembershipState::Join),
@@ -243,7 +241,7 @@ async fn room_route() {
     assert_eq!(route[0], "notarealhs");
     assert_eq!(route[1], "localhost");
 
-    // With three elligible servers
+    // With three eligible servers
     batch += 1;
     ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_state_bulk(
         bulk_room_members(batch, 0..5, "mymatrix", &MembershipState::Join),
@@ -258,7 +256,7 @@ async fn room_route() {
     assert_eq!(route[1], "mymatrix");
     assert_eq!(route[2], "localhost");
 
-    // With four elligible servers
+    // With four eligible servers
     batch += 1;
     ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_state_bulk(
         bulk_room_members(batch, 0..10, "yourmatrix", &MembershipState::Join),
@@ -351,7 +349,7 @@ async fn room_route() {
 
 #[async_test]
 async fn room_permalink() {
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let mut ev_builder = SyncResponseBuilder::new();
     let room_id = room_id!("!test_room:127.0.0.1");
 
@@ -440,7 +438,7 @@ async fn room_permalink() {
 
 #[async_test]
 async fn room_event_permalink() {
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let mut ev_builder = SyncResponseBuilder::new();
     let room_id = room_id!("!test_room:127.0.0.1");
     let event_id = event_id!("$15139375512JaHAW");
@@ -503,17 +501,16 @@ async fn room_event_permalink() {
 
 #[async_test]
 async fn event() {
-    let room_id = room_id!("!a98sd12bjh:example.org");
     let event_id = event_id!("$foun39djjod0f");
 
-    let (client, server) = logged_in_client().await;
+    let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
     let mut ev_builder = SyncResponseBuilder::new();
     ev_builder
         // We need the member event and power levels locally so the push rules processor works.
         .add_joined_room(
-            JoinedRoomBuilder::new(room_id)
+            JoinedRoomBuilder::new(&DEFAULT_TEST_ROOM_ID)
                 .add_state_event(StateTestEvent::Member)
                 .add_state_event(StateTestEvent::PowerLevels),
         );
@@ -522,7 +519,7 @@ async fn event() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
-    let room = client.get_room(room_id).unwrap();
+    let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
 
     let response_json = json!({
         "content": {
@@ -534,7 +531,7 @@ async fn event() {
         "sender": "@bob:localhost",
         "state_key": "",
         "type": "m.room.tombstone",
-        "room_id": room_id,
+        "room_id": *DEFAULT_TEST_ROOM_ID,
     });
     Mock::given(method("GET"))
         .and(path_regex(r"^/_matrix/client/r0/rooms/.*/event/"))
@@ -546,9 +543,9 @@ async fn event() {
         .await;
 
     let timeline_event = room.event(event_id).await.unwrap();
-    let event = assert_matches!(
-        timeline_event.event.deserialize().unwrap(),
-        AnyTimelineEvent::State(AnyStateEvent::RoomTombstone(event)) => event
+    assert_let!(
+        AnyTimelineEvent::State(AnyStateEvent::RoomTombstone(event)) =
+            timeline_event.event.deserialize().unwrap()
     );
     assert_eq!(event.event_id(), event_id);
 

@@ -368,7 +368,7 @@ impl VerificationRequest {
         &self.flow_id
     }
 
-    /// Is this a verification that is veryfying one of our own devices
+    /// Is this a verification that is verifying one of our own devices
     pub fn is_self_verification(&self) -> bool {
         self.account.user_id == self.other_user()
     }
@@ -504,10 +504,7 @@ impl VerificationRequest {
         methods: Vec<VerificationMethod>,
     ) -> Option<OutgoingVerificationRequest> {
         let mut guard = self.inner.write();
-
-        let Some((updated, content)) = guard.accept(methods) else {
-            return None;
-        };
+        let (updated, content) = guard.accept(methods)?;
 
         ObservableWriteGuard::set(&mut guard, updated);
 
@@ -713,7 +710,7 @@ impl VerificationRequest {
             | InnerRequest::Done(_)
             | InnerRequest::Cancelled(_) => {
                 warn!(
-                    sender = sender.as_str(),
+                    ?sender,
                     device_id = content.from_device().as_str(),
                     "Received a key verification start event but we're not yet in the ready state"
                 );
@@ -757,7 +754,7 @@ impl VerificationRequest {
     pub(crate) fn receive_done(&self, sender: &UserId, content: &DoneContent<'_>) {
         if sender == self.other_user() {
             trace!(
-                other_user = self.other_user().as_str(),
+                other_user = ?self.other_user(),
                 flow_id = self.flow_id().as_str(),
                 "Marking a verification request as done"
             );
@@ -775,7 +772,7 @@ impl VerificationRequest {
         }
 
         trace!(
-            sender = sender.as_str(),
+            ?sender,
             code = content.cancel_code().as_str(),
             "Cancelling a verification request, other user has cancelled"
         );
@@ -892,6 +889,7 @@ enum InnerRequest {
     Ready(RequestState<Ready>),
     Transitioned(RequestState<Transitioned>),
     Passive(RequestState<Passive>),
+    #[allow(dead_code)] // The `RequestState` field within `Done` is not currently used.
     Done(RequestState<Done>),
     Cancelled(RequestState<Cancelled>),
 }
@@ -1215,10 +1213,10 @@ async fn generate_qr_code<T: Clone>(
         .await?
     else {
         warn!(
-            user_id = request_state.other_user_id.as_str(),
-            device_id = state.other_device_id.as_str(),
+            user_id = ?request_state.other_user_id,
+            device_id = ?state.other_device_id,
             "Can't create a QR code, the device that accepted the \
-                    verification doesn't exist"
+             verification doesn't exist"
         );
         return Ok(None);
     };
@@ -1241,9 +1239,10 @@ async fn generate_qr_code<T: Clone>(
                             ))
                         } else {
                             warn!(
-                                user_id = request_state.other_user_id.as_str(),
-                                device_id = state.other_device_id.as_str(),
-                                "Can't create a QR code, the other device doesn't have a valid device key"
+                                user_id = ?request_state.other_user_id,
+                                device_id = ?state.other_device_id,
+                                "Can't create a QR code, the other device \
+                                 doesn't have a valid device key"
                             );
                             None
                         }
@@ -1259,10 +1258,10 @@ async fn generate_qr_code<T: Clone>(
                     }
                 } else {
                     warn!(
-                        user_id = request_state.other_user_id.as_str(),
-                        device_id = state.other_device_id.as_str(),
+                        user_id = ?request_state.other_user_id,
+                        device_id = ?state.other_device_id,
                         "Can't create a QR code, our cross signing identity \
-                             doesn't contain a valid master key"
+                         doesn't contain a valid master key"
                     );
                     None
                 }
@@ -1288,19 +1287,19 @@ async fn generate_qr_code<T: Clone>(
                         ))
                     } else {
                         warn!(
-                            user_id = request_state.other_user_id.as_str(),
-                            device_id = state.other_device_id.as_str(),
+                            user_id = ?request_state.other_user_id,
+                            device_id = ?state.other_device_id,
                             "Can't create a QR code, we don't trust our own \
-                                 master key"
+                             master key"
                         );
                         None
                     }
                 } else {
                     warn!(
-                        user_id = request_state.other_user_id.as_str(),
-                        device_id = state.other_device_id.as_str(),
+                        user_id = ?request_state.other_user_id,
+                        device_id = ?state.other_device_id,
                         "Can't create a QR code, the user's identity \
-                             doesn't have a valid master key"
+                         doesn't have a valid master key"
                     );
                     None
                 }
@@ -1308,10 +1307,10 @@ async fn generate_qr_code<T: Clone>(
         }
     } else {
         warn!(
-            user_id = request_state.other_user_id.as_str(),
-            device_id = state.other_device_id.as_str(),
+            user_id = ?request_state.other_user_id,
+            device_id = ?state.other_device_id,
             "Can't create a QR code, the user doesn't have a valid cross \
-                 signing identity."
+             signing identity."
         );
 
         None
@@ -1346,15 +1345,15 @@ async fn receive_start<T: Clone>(
     state: &Ready,
 ) -> Result<Option<RequestState<Transitioned>>, CryptoStoreError> {
     info!(
-        sender = sender.as_str(),
-        device = content.from_device().as_str(),
+        ?sender,
+        device = ?content.from_device(),
         "Received a new verification start event",
     );
 
     let Some(device) = request_state.store.get_device(sender, content.from_device()).await? else {
         warn!(
-            sender = sender.as_str(),
-            device = content.from_device().as_str(),
+            ?sender,
+            device = ?content.from_device(),
             "Received a key verification start event from an unknown device",
         );
 
@@ -1484,10 +1483,10 @@ async fn start_sas<T: Clone>(
         .await?
     else {
         warn!(
-            user_id = request_state.other_user_id.as_str(),
-            device_id = state.other_device_id.as_str(),
+            user_id = ?request_state.other_user_id,
+            device_id = ?state.other_device_id,
             "Can't start the SAS verification flow, the device that \
-                    accepted the verification doesn't exist"
+             accepted the verification doesn't exist"
         );
         return Ok(None);
     };
@@ -1622,12 +1621,10 @@ struct Done {}
 #[cfg(test)]
 mod tests {
 
-    use std::{
-        convert::{TryFrom, TryInto},
-        time::Duration,
-    };
+    use std::time::Duration;
 
     use assert_matches::assert_matches;
+    use assert_matches2::assert_let;
     #[cfg(feature = "qrcode")]
     use matrix_sdk_qrcode::QrVerificationData;
     use matrix_sdk_test::async_test;
@@ -1705,7 +1702,7 @@ mod tests {
         // test what happens when we cancel() a request that we have just received over
         // to-device messages.
         let (_alice, alice_store, bob, bob_store) = setup_stores().await;
-        let bob_device = ReadOnlyDevice::from_account(&bob).await;
+        let bob_device = ReadOnlyDevice::from_account(&bob);
 
         // Set up the pair of verification requests
         let bob_request = build_test_request(&bob_store, alice_id(), None);
@@ -1715,15 +1712,16 @@ mod tests {
 
         // the outgoing message should target bob's device specifically
         {
-            let to_device_request =
-                assert_matches!(&outgoing_request, OutgoingVerificationRequest::ToDevice(r) => r);
+            assert_let!(
+                OutgoingVerificationRequest::ToDevice(to_device_request) = &outgoing_request
+            );
 
             assert_eq!(to_device_request.messages.len(), 1);
             let device_ids: Vec<&DeviceIdOrAllDevices> =
                 to_device_request.messages.values().next().unwrap().keys().collect();
             assert_eq!(device_ids.len(), 1);
 
-            let device_id = assert_matches!(device_ids[0], DeviceIdOrAllDevices::DeviceId(r) => r);
+            assert_let!(DeviceIdOrAllDevices::DeviceId(device_id) = &device_ids[0]);
             assert_eq!(device_id, bob_device.device_id());
         }
 
@@ -1742,7 +1740,7 @@ mod tests {
         let room_id = room_id!("!test:localhost");
 
         let (_alice, alice_store, bob, bob_store) = setup_stores().await;
-        let bob_device = ReadOnlyDevice::from_account(&bob).await;
+        let bob_device = ReadOnlyDevice::from_account(&bob);
 
         let content = VerificationRequest::request(
             &bob_store.account.user_id,
@@ -1797,7 +1795,7 @@ mod tests {
     #[async_test]
     async fn test_requesting_until_sas_to_device() {
         let (_alice, alice_store, bob, bob_store) = setup_stores().await;
-        let bob_device = ReadOnlyDevice::from_account(&bob).await;
+        let bob_device = ReadOnlyDevice::from_account(&bob);
 
         // Set up the pair of verification requests
         let bob_request = build_test_request(&bob_store, alice_id(), None);
@@ -1867,11 +1865,10 @@ mod tests {
         let bob_qr_code = QrVerificationData::from_bytes(bob_qr_code).unwrap();
         let _ = alice_request.scan_qr_code(bob_qr_code).await.unwrap().unwrap();
 
-        let alice_verification = assert_matches!(
-            alice_request.state(),
+        assert_let!(
             VerificationRequestState::Transitioned {
-                verification: Verification::QrV1(v)
-            } => v
+                verification: Verification::QrV1(alice_verification)
+            } = alice_request.state()
         );
 
         // Finally we assert that the verification has been reciprocated rather than
@@ -1917,9 +1914,9 @@ mod tests {
         bob_request.receive_start(alice_id(), &content).await.unwrap();
 
         // Bob should now have transitioned to SAS...
-        let bob_sas = assert_matches!(
-            bob_request.state(),
-            VerificationRequestState::Transitioned { verification: Verification::SasV1(sas) } => sas
+        assert_let!(
+            VerificationRequestState::Transitioned { verification: Verification::SasV1(bob_sas) } =
+                bob_request.state()
         );
         // ... and, more to the point, it should not be cancelled.
         assert!(!bob_sas.is_cancelled());
@@ -1947,11 +1944,9 @@ mod tests {
         let bob_qr_code = QrVerificationData::from_bytes(bob_qr_code).unwrap();
         let _ = alice_request.scan_qr_code(bob_qr_code).await.unwrap().unwrap();
 
-        let alice_qr = assert_matches!(
-            alice_request.state(),
-            VerificationRequestState::Transitioned {
-                verification: Verification::QrV1(v)
-            } => v
+        assert_let!(
+            VerificationRequestState::Transitioned { verification: Verification::QrV1(alice_qr) } =
+                alice_request.state()
         );
         assert!(alice_qr.reciprocated());
 
@@ -1971,9 +1966,10 @@ mod tests {
         assert!(alice_qr.is_cancelled());
 
         // and she should now have a *cancelled* SAS verification
-        let alice_sas = assert_matches!(
-            alice_request.state(),
-            VerificationRequestState::Transitioned { verification: Verification::SasV1(sas) } => sas
+        assert_let!(
+            VerificationRequestState::Transitioned {
+                verification: Verification::SasV1(alice_sas)
+            } = alice_request.state()
         );
         assert!(alice_sas.is_cancelled());
     }
