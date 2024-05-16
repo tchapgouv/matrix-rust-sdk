@@ -1,12 +1,4 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "config:recommended",
-    ":rebaseStalePrs",
-    ":dependencyDashboardApproval"
-  ],
-  "labels": [
-    "dependencies"
-  ],
-  "assigneesFromCodeOwners": true
+  "extends": ["local>bwmessenger/gitlab-pipelines//renovate/app"]
 }
