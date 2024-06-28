@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use async_trait::async_trait;
+use growable_bloom_filter::GrowableBloomBuilder;
 use matrix_sdk_test::test_json;
 use ruma::{
     api::client::media::get_content_thumbnail::v3::Method,
@@ -58,8 +59,12 @@ pub trait StateStoreIntegrationTests {
     async fn test_member_saving(&self);
     /// Test filter saving.
     async fn test_filter_saving(&self);
+    /// Test saving a user avatar URL.
+    async fn test_user_avatar_url_saving(&self);
     /// Test sync token saving.
     async fn test_sync_token_saving(&self);
+    /// Test UtdHookManagerData saving.
+    async fn test_utd_hook_manager_data_saving(&self);
     /// Test stripped room member saving.
     async fn test_stripped_member_saving(&self);
     /// Test room power levels saving.
@@ -537,6 +542,30 @@ impl StateStoreIntegrationTests for DynStateStore {
         assert_matches!(self.get_kv_data(StateStoreDataKey::Filter(filter_name)).await, Ok(None));
     }
 
+    async fn test_user_avatar_url_saving(&self) {
+        let user_id = user_id!("@alice:example.org");
+        let url = "https://example.org";
+
+        self.set_kv_data(
+            StateStoreDataKey::UserAvatarUrl(user_id),
+            StateStoreDataValue::UserAvatarUrl(url.to_owned()),
+        )
+        .await
+        .unwrap();
+
+        assert_let!(
+            Ok(Some(StateStoreDataValue::UserAvatarUrl(stored_url))) =
+                self.get_kv_data(StateStoreDataKey::UserAvatarUrl(user_id)).await
+        );
+        assert_eq!(stored_url, url);
+
+        self.remove_kv_data(StateStoreDataKey::UserAvatarUrl(user_id)).await.unwrap();
+        assert_matches!(
+            self.get_kv_data(StateStoreDataKey::UserAvatarUrl(user_id)).await,
+            Ok(None)
+        );
+    }
+
     async fn test_sync_token_saving(&self) {
         let sync_token_1 = "t392-516_47314_0_7_1";
         let sync_token_2 = "t392-516_47314_0_7_2";
@@ -566,6 +595,37 @@ impl StateStoreIntegrationTests for DynStateStore {
 
         self.remove_kv_data(StateStoreDataKey::SyncToken).await.unwrap();
         assert_matches!(self.get_kv_data(StateStoreDataKey::SyncToken).await, Ok(None));
+    }
+
+    async fn test_utd_hook_manager_data_saving(&self) {
+        // Before any data is written, the getter should return None.
+        assert!(
+            self.get_kv_data(StateStoreDataKey::UtdHookManagerData)
+                .await
+                .expect("Could not read data")
+                .is_none(),
+            "Store was not empty at start"
+        );
+
+        // Put some data in the store...
+        let data = GrowableBloomBuilder::new().build();
+        self.set_kv_data(
+            StateStoreDataKey::UtdHookManagerData,
+            StateStoreDataValue::UtdHookManagerData(data.clone()),
+        )
+        .await
+        .expect("Could not save data");
+
+        // ... and check it comes back.
+        let read_data = self
+            .get_kv_data(StateStoreDataKey::UtdHookManagerData)
+            .await
+            .expect("Could not read data")
+            .expect("no data found")
+            .into_utd_hook_manager_data()
+            .expect("not UtdHookManagerData");
+
+        assert_eq!(read_data, data);
     }
 
     async fn test_stripped_member_saving(&self) {
@@ -1314,9 +1374,21 @@ macro_rules! statestore_integration_tests {
         }
 
         #[async_test]
+        async fn test_user_avatar_url_saving() {
+            let store = get_store().await.unwrap().into_state_store();
+            store.test_user_avatar_url_saving().await
+        }
+
+        #[async_test]
         async fn test_sync_token_saving() {
             let store = get_store().await.unwrap().into_state_store();
             store.test_sync_token_saving().await
+        }
+
+        #[async_test]
+        async fn test_utd_hook_manager_data_saving() {
+             let store = get_store().await.expect("creating store failed").into_state_store();
+             store.test_utd_hook_manager_data_saving().await;
         }
 
         #[async_test]

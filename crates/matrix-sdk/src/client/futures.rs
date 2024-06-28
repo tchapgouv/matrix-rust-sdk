@@ -16,7 +16,6 @@
 
 use std::{fmt::Debug, future::IntoFuture};
 
-use cfg_vis::cfg_vis;
 use eyeball::SharedObservable;
 #[cfg(not(target_arch = "wasm32"))]
 use eyeball::Subscriber;
@@ -60,7 +59,6 @@ impl<R> SendRequest<R> {
     /// Note that any subscribers obtained from
     /// [`subscribe_to_send_progress`][Self::subscribe_to_send_progress]
     /// will be invalidated by this.
-    #[cfg_vis(target_arch = "wasm32", pub(crate))]
     pub fn with_send_progress_observable(
         mut self,
         send_progress: SharedObservable<TransmissionProgress>,
@@ -155,7 +153,7 @@ where
                                     // need to sign out.
                                 }
                             };
-                            return Err(refresh_error.into());
+                            return Err(HttpError::RefreshToken(refresh_error));
                         }
 
                         _ => {
@@ -163,7 +161,7 @@ where
                             // This isn't necessarily correct, but matches the behaviour when
                             // implementing OIDC.
                             client.broadcast_unknown_token(soft_logout);
-                            return Err(refresh_error.into());
+                            return Err(HttpError::RefreshToken(refresh_error));
                         }
                     }
                 } else {

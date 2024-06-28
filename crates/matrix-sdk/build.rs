@@ -19,6 +19,9 @@ fn ensure(cond: bool, err: &str) {
 }
 
 fn main() {
+    // Prevent unnecessary rerunning of this build script
+    println!("cargo:rerun-if-changed=build.rs");
+
     let native_tls_set = env_is_set("CARGO_FEATURE_NATIVE_TLS");
     let rustls_tls_set = env_is_set("CARGO_FEATURE_RUSTLS_TLS");
     ensure(

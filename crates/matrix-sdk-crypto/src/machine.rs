@@ -62,9 +62,8 @@ use crate::{
     gossiping::GossipMachine,
     identities::{user::UserIdentities, Device, IdentityManager, UserDevices},
     olm::{
-        Account, CrossSigningStatus, EncryptionSettings, ExportedRoomKey, IdentityKeys,
-        InboundGroupSession, OlmDecryptionInfo, PrivateCrossSigningIdentity, SessionType,
-        StaticAccountData,
+        Account, CrossSigningStatus, EncryptionSettings, IdentityKeys, InboundGroupSession,
+        OlmDecryptionInfo, PrivateCrossSigningIdentity, SessionType, StaticAccountData,
     },
     requests::{IncomingResponse, OutgoingRequest, UploadSigningKeysRequest},
     session_manager::{GroupSessionManager, SessionManager},
@@ -91,7 +90,7 @@ use crate::{
     utilities::timestamp_to_iso8601,
     verification::{Verification, VerificationMachine, VerificationRequest},
     CrossSigningKeyExport, CryptoStoreError, KeysQueryRequest, LocalTrust, ReadOnlyDevice,
-    RoomKeyImportResult, SignatureError, ToDeviceRequest,
+    SignatureError, ToDeviceRequest,
 };
 
 /// State machine implementation of the Olm/Megolm encryption protocol used for
@@ -156,7 +155,7 @@ impl OlmMachine {
     ///
     /// * `device_id` - The unique id of the device that owns this machine.
     pub async fn new(user_id: &UserId, device_id: &DeviceId) -> Self {
-        OlmMachine::with_store(user_id, device_id, MemoryStore::new())
+        OlmMachine::with_store(user_id, device_id, MemoryStore::new(), None)
             .await
             .expect("Reading and writing to the memory store always succeeds")
     }
@@ -167,8 +166,7 @@ impl OlmMachine {
         device_id: &DeviceId,
         device_data: Raw<DehydratedDeviceData>,
     ) -> Result<OlmMachine, DehydrationError> {
-        let account =
-            Account::rehydrate(pickle_key, self.user_id(), device_id, device_data).await?;
+        let account = Account::rehydrate(pickle_key, self.user_id(), device_id, device_data)?;
         let static_account = account.static_data().clone();
 
         let store = Arc::new(CryptoStoreWrapper::new(self.user_id(), MemoryStore::new()));
@@ -245,18 +243,30 @@ impl OlmMachine {
     /// * `store` - A `CryptoStore` implementation that will be used to store
     /// the encryption keys.
     ///
+    /// * `custom_account` - A custom [`vodozemac::olm::Account`] to be used for
+    ///   the identity and one-time keys of this [`OlmMachine`]. If no account
+    ///   is provided, a new default one or one from the store will be used. If
+    ///   an account is provided and one already exists in the store for this
+    ///   [`UserId`]/[`DeviceId`] combination, an error will be raised. This is
+    ///   useful if one wishes to create identity keys before knowing the
+    ///   user/device IDs, e.g., to use the identity key as the device ID.
+    ///
     /// [`CryptoStore`]: crate::store::CryptoStore
-    #[instrument(skip(store), fields(ed25519_key, curve25519_key))]
+    #[instrument(skip(store, custom_account), fields(ed25519_key, curve25519_key))]
     pub async fn with_store(
         user_id: &UserId,
         device_id: &DeviceId,
         store: impl IntoCryptoStore,
+        custom_account: Option<vodozemac::olm::Account>,
     ) -> StoreResult<Self> {
         let store = store.into_crypto_store();
 
         let static_account = match store.load_account().await? {
             Some(account) => {
-                if user_id != account.user_id() || device_id != account.device_id() {
+                if user_id != account.user_id()
+                    || device_id != account.device_id()
+                    || custom_account.is_some()
+                {
                     return Err(CryptoStoreError::MismatchedAccount {
                         expected: (account.user_id().to_owned(), account.device_id().to_owned()),
                         got: (user_id.to_owned(), device_id.to_owned()),
@@ -272,7 +282,12 @@ impl OlmMachine {
             }
 
             None => {
-                let account = Account::with_device_id(user_id, device_id);
+                let account = if let Some(account) = custom_account {
+                    Account::new_helper(account, user_id, device_id)
+                } else {
+                    Account::with_device_id(user_id, device_id)
+                };
+
                 let static_account = account.static_data().clone();
 
                 Span::current()
@@ -314,13 +329,16 @@ impl OlmMachine {
             }
         };
 
+        // FIXME: This is a workaround for `regenerate_olm` clearing the backup
+        // state. Ideally, backups should not get automatically enabled since
+        // the `OlmMachine` doesn't get enough info from the homeserver for this
+        // to work reliably.
         let saved_keys = store.load_backup_keys().await?;
         let maybe_backup_key = saved_keys.decryption_key.and_then(|k| {
             if let Some(version) = saved_keys.backup_version {
-                MegolmV1BackupKey::from_base64(&k.to_base64()).ok().map(|k| {
-                    k.set_version(version);
-                    k
-                })
+                let megolm_v1_backup_key = k.megolm_v1_public_key();
+                megolm_v1_backup_key.set_version(version);
+                Some(megolm_v1_backup_key)
             } else {
                 None
             }
@@ -601,24 +619,42 @@ impl OlmMachine {
             (upload_signing_keys_req, upload_signatures_req)
         };
 
+        // `upload_device_keys()` will attempt to sign the device keys using this
+        // `identity`, it will attempt to acquire the lock, so we need to drop
+        // here to avoid a deadlock.
+        drop(identity);
+
         // If there are any *device* keys to upload (i.e. the account isn't shared),
         // upload them before we upload the signatures, since the signatures may
         // reference keys to be uploaded.
-        let upload_keys_req = {
-            let cache = self.store().cache().await?;
-            let account = cache.account().await?;
-            if account.shared() {
-                None
-            } else {
-                self.keys_for_upload(&account).await.map(OutgoingRequest::from)
-            }
-        };
+        let upload_keys_req =
+            self.upload_device_keys().await?.map(|(_, request)| OutgoingRequest::from(request));
 
         Ok(CrossSigningBootstrapRequests {
             upload_signing_keys_req,
             upload_keys_req,
             upload_signatures_req,
         })
+    }
+
+    /// Upload the device keys for this [`OlmMachine`].
+    ///
+    /// **Warning**: Do not use this method if
+    /// [`OlmMachine::outgoing_requests()`] is already in use. This method
+    /// is intended for explicitly uploading the device keys before starting
+    /// a sync and before using [`OlmMachine::outgoing_requests()`].
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing a transaction ID and a request if the device keys
+    /// need to be uploaded. Otherwise, returns `None`.
+    pub async fn upload_device_keys(
+        &self,
+    ) -> StoreResult<Option<(OwnedTransactionId, UploadKeysRequest)>> {
+        let cache = self.store().cache().await?;
+        let account = cache.account().await?;
+
+        Ok(self.keys_for_upload(&account).await.map(|request| (TransactionId::new(), request)))
     }
 
     /// Receive a successful `/keys/upload` response.
@@ -699,7 +735,28 @@ impl OlmMachine {
     ///
     /// [`receive_keys_upload_response`]: #method.receive_keys_upload_response
     async fn keys_for_upload(&self, account: &Account) -> Option<UploadKeysRequest> {
-        let (device_keys, one_time_keys, fallback_keys) = account.keys_for_upload();
+        let (mut device_keys, one_time_keys, fallback_keys) = account.keys_for_upload();
+
+        // When uploading the device keys, if all private cross-signing keys are
+        // available locally, sign the device using these cross-signing keys.
+        // This will mark the device as verified if the user identity (i.e., the
+        // cross-signing keys) is also marked as verified.
+        //
+        // This approach eliminates the need to upload signatures in a separate request,
+        // ensuring that other users/devices will never encounter this device
+        // without a signature from their user identity. Consequently, they will
+        // never see the device as unverified.
+        if let Some(device_keys) = &mut device_keys {
+            let private_identity = self.store().private_identity();
+            let guard = private_identity.lock().await;
+
+            if guard.status().await.is_complete() {
+                guard.sign_device_keys(device_keys).await.expect(
+                    "We should be able to sign our device keys since we confirmed that we \
+                     have a complete set of private cross-signing keys",
+                );
+            }
+        }
 
         if device_keys.is_none() && one_time_keys.is_empty() && fallback_keys.is_empty() {
             None
@@ -806,7 +863,7 @@ impl OlmMachine {
         }
     }
 
-    async fn add_withheld_info(&self, changes: &mut Changes, event: &RoomKeyWithheldEvent) {
+    fn add_withheld_info(&self, changes: &mut Changes, event: &RoomKeyWithheldEvent) {
         if let RoomKeyWithheldContent::MegolmV1AesSha2(
             MegolmV1AesSha2WithheldContent::BlackListed(c)
             | MegolmV1AesSha2WithheldContent::Unverified(c),
@@ -1070,7 +1127,7 @@ impl OlmMachine {
         match event {
             RoomKeyRequest(e) => self.inner.key_request_machine.receive_incoming_key_request(e),
             SecretRequest(e) => self.inner.key_request_machine.receive_incoming_secret_request(e),
-            RoomKeyWithheld(e) => self.add_withheld_info(changes, e).await,
+            RoomKeyWithheld(e) => self.add_withheld_info(changes, e),
             KeyVerificationAccept(..)
             | KeyVerificationCancel(..)
             | KeyVerificationKey(..)
@@ -1780,49 +1837,6 @@ impl OlmMachine {
         self.store().get_user_devices(user_id).await
     }
 
-    /// Import the given room keys into our store.
-    ///
-    /// # Arguments
-    ///
-    /// * `exported_keys` - A list of previously exported keys that should be
-    /// imported into our store. If we already have a better version of a key
-    /// the key will *not* be imported.
-    ///
-    /// * `from_backup` - Were the room keys imported from the backup, if true
-    /// will mark the room keys as already backed up. This will prevent backing
-    /// up keys that are already backed up.
-    ///
-    /// Returns a tuple of numbers that represent the number of sessions that
-    /// were imported and the total number of sessions that were found in the
-    /// key export.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use std::io::Cursor;
-    /// # use matrix_sdk_crypto::{OlmMachine, decrypt_room_key_export};
-    /// # use ruma::{device_id, user_id};
-    /// # let alice = user_id!("@alice:example.org");
-    /// # async {
-    /// # let machine = OlmMachine::new(&alice, device_id!("DEVICEID")).await;
-    /// # let export = Cursor::new("".to_owned());
-    /// let exported_keys = decrypt_room_key_export(export, "1234").unwrap();
-    /// machine.import_room_keys(exported_keys, false, |_, _| {}).await.unwrap();
-    /// # };
-    /// ```
-    #[deprecated(
-        since = "0.7.0",
-        note = "Use the OlmMachine::store::import_exported_room_keys method instead"
-    )]
-    pub async fn import_room_keys(
-        &self,
-        exported_keys: Vec<ExportedRoomKey>,
-        from_backup: bool,
-        progress_listener: impl Fn(usize, usize),
-    ) -> StoreResult<RoomKeyImportResult> {
-        self.store().import_room_keys(exported_keys, from_backup, progress_listener).await
-    }
-
     /// Get the status of the private cross signing keys.
     ///
     /// This can be used to check which private cross signing keys we have
@@ -2135,6 +2149,13 @@ impl OlmMachine {
         let account = cache.account().await?;
         Ok(account.uploaded_key_count())
     }
+
+    /// Clear any in-memory caches because they may be out of sync with the
+    /// underlying data store.
+    pub async fn clear_crypto_cache(&self) {
+        let crypto_store = self.store().crypto_store();
+        crypto_store.as_ref().clear_caches().await;
+    }
 }
 
 /// A set of requests to be executed when bootstrapping cross-signing using
@@ -2241,8 +2262,10 @@ pub(crate) mod tests {
     use crate::{
         error::{EventError, SetRoomSettingsError},
         machine::{EncryptionSyncChanges, OlmMachine},
-        olm::{InboundGroupSession, OutboundGroupSession, VerifyJson},
-        store::{Changes, RoomSettings},
+        olm::{
+            BackedUpRoomKey, ExportedRoomKey, InboundGroupSession, OutboundGroupSession, VerifyJson,
+        },
+        store::{BackupDecryptionKey, Changes, CryptoStore, MemoryStore, RoomSettings},
         types::{
             events::{
                 room::encrypted::{EncryptedToDeviceEvent, ToDeviceEncryptedEventContent},
@@ -3733,7 +3756,7 @@ pub(crate) mod tests {
 
         // Alice sends a verification request with her desired methods to Bob
         let (alice_ver_req, request) =
-            bob_device.request_verification_with_methods(vec![VerificationMethod::SasV1]).await;
+            bob_device.request_verification_with_methods(vec![VerificationMethod::SasV1]);
 
         // ----------------------------------------------------------------------------
         // On Bobs's device:
@@ -4335,5 +4358,85 @@ pub(crate) mod tests {
             .await;
 
         assert_matches!(encryption_result, Err(OlmError::MissingSession));
+    }
+
+    #[async_test]
+    async fn test_fix_incorrect_usage_of_backup_key_causing_decryption_errors() {
+        let store = MemoryStore::new();
+
+        let backup_decryption_key = BackupDecryptionKey::new().unwrap();
+
+        store
+            .save_changes(Changes {
+                backup_decryption_key: Some(backup_decryption_key.clone()),
+                backup_version: Some("1".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Some valid key data
+        let data = json!({
+           "algorithm": "m.megolm.v1.aes-sha2",
+           "room_id": "!room:id",
+           "sender_key": "FOvlmz18LLI3k/llCpqRoKT90+gFF8YhuL+v1YBXHlw",
+           "session_id": "/2K+V777vipCxPZ0gpY9qcpz1DYaXwuMRIu0UEP0Wa0",
+           "session_key": "AQAAAAAclzWVMeWBKH+B/WMowa3rb4ma3jEl6n5W4GCs9ue65CruzD3ihX+85pZ9hsV9Bf6fvhjp76WNRajoJYX0UIt7aosjmu0i+H+07hEQ0zqTKpVoSH0ykJ6stAMhdr6Q4uW5crBmdTTBIsqmoWsNJZKKoE2+ldYrZ1lrFeaJbjBIY/9ivle++74qQsT2dIKWPanKc9Q2Gl8LjESLtFBD9Fmt",
+           "sender_claimed_keys": {
+               "ed25519": "F4P7f1Z0RjbiZMgHk1xBCG3KC4/Ng9PmxLJ4hQ13sHA"
+           },
+           "forwarding_curve25519_key_chain": ["DBPC2zr6c9qimo9YRFK3RVr0Two/I6ODb9mbsToZN3Q", "bBc/qzZFOOKshMMT+i4gjS/gWPDoKfGmETs9yfw9430"]
+        });
+
+        let backed_up_room_key: BackedUpRoomKey = serde_json::from_value(data).unwrap();
+
+        // Create the machine using `with_store` and without a call to enable_backup_v1,
+        // like regenerate_olm would do
+        let alice =
+            OlmMachine::with_store(user_id(), alice_device_id(), store, None).await.unwrap();
+
+        let exported_key = ExportedRoomKey::from_backed_up_room_key(
+            room_id!("!room:id").to_owned(),
+            "/2K+V777vipCxPZ0gpY9qcpz1DYaXwuMRIu0UEP0Wa0".into(),
+            backed_up_room_key,
+        );
+
+        alice.store().import_exported_room_keys(vec![exported_key], |_, _| {}).await.unwrap();
+
+        let (_, request) = alice.backup_machine().backup().await.unwrap().unwrap();
+
+        let key_backup_data = request.rooms[&room_id!("!room:id").to_owned()]
+            .sessions
+            .get("/2K+V777vipCxPZ0gpY9qcpz1DYaXwuMRIu0UEP0Wa0")
+            .unwrap()
+            .deserialize()
+            .unwrap();
+
+        let ephemeral = key_backup_data.session_data.ephemeral.encode();
+        let ciphertext = key_backup_data.session_data.ciphertext.encode();
+        let mac = key_backup_data.session_data.mac.encode();
+
+        // Prior to the fix for GHSA-9ggc-845v-gcgv, this would produce a
+        // `Mac(MacError)`
+        backup_decryption_key
+            .decrypt_v1(&ephemeral, &mac, &ciphertext)
+            .expect("The backed up key should be decrypted successfully");
+    }
+
+    #[async_test]
+    async fn test_olm_machine_with_custom_account() {
+        let store = MemoryStore::new();
+        let account = vodozemac::olm::Account::new();
+        let curve_key = account.identity_keys().curve25519;
+
+        let alice = OlmMachine::with_store(user_id(), alice_device_id(), store, Some(account))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            alice.identity_keys().curve25519,
+            curve_key,
+            "The Olm machine should have used the Account we provided"
+        );
     }
 }
