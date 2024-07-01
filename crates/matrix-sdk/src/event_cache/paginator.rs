@@ -24,12 +24,13 @@ use matrix_sdk_base::{deserialized_responses::TimelineEvent, SendOutsideWasm, Sy
 use ruma::{api::Direction, EventId, OwnedEventId, UInt};
 
 use crate::{
-    room::{EventWithContextResponse, Messages, MessagesOptions},
+    room::{EventWithContextResponse, Messages, MessagesOptions, WeakRoom},
     Room,
 };
 
 /// Current state of a [`Paginator`].
 #[derive(Debug, PartialEq, Copy, Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 pub enum PaginatorState {
     /// The initial state of the paginator.
     Initial,
@@ -66,6 +67,29 @@ pub enum PaginatorError {
     SdkError(#[source] crate::Error),
 }
 
+/// Pagination token data, indicating in which state is the current pagination.
+#[derive(Clone, Debug)]
+enum PaginationToken {
+    /// We never had a pagination token, so we'll start back-paginating from the
+    /// end, or forward-paginating from the start.
+    None,
+    /// We paginated once before, and we received a prev/next batch token that
+    /// we may reuse for the next query.
+    HasMore(String),
+    /// We've hit one end of the timeline (either the start or the actual end),
+    /// so there's no need to continue paginating.
+    HitEnd,
+}
+
+impl From<Option<String>> for PaginationToken {
+    fn from(token: Option<String>) -> Self {
+        match token {
+            Some(val) => Self::HasMore(val),
+            None => Self::None,
+        }
+    }
+}
+
 /// A stateful object to reach to an event, and then paginate backward and
 /// forward from it.
 ///
@@ -80,12 +104,12 @@ pub struct Paginator {
     /// The token to run the next backward pagination.
     ///
     /// This mutex is only taken for short periods of time, so it's sync.
-    prev_batch_token: Mutex<Option<String>>,
+    prev_batch_token: Mutex<PaginationToken>,
 
     /// The token to run the next forward pagination.
     ///
     /// This mutex is only taken for short periods of time, so it's sync.
-    next_batch_token: Mutex<Option<String>>,
+    next_batch_token: Mutex<PaginationToken>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -113,7 +137,7 @@ pub struct PaginationResult {
     /// topological order.
     pub events: Vec<TimelineEvent>,
 
-    /// Did we hit an end of the timeline?
+    /// Did we hit *an* end of the timeline?
     ///
     /// If this is the result of a backward pagination, this means we hit the
     /// *start* of the timeline.
@@ -168,8 +192,8 @@ impl Paginator {
         Self {
             room,
             state: SharedObservable::new(PaginatorState::Initial),
-            prev_batch_token: Mutex::new(None),
-            next_batch_token: Mutex::new(None),
+            prev_batch_token: Mutex::new(None.into()),
+            next_batch_token: Mutex::new(None.into()),
         }
     }
 
@@ -186,6 +210,45 @@ impl Paginator {
     /// Returns a subscriber to the internal [`PaginatorState`] machine.
     pub fn state(&self) -> Subscriber<PaginatorState> {
         self.state.subscribe()
+    }
+
+    /// Prepares the paginator to be in the idle state, ready for backwards- and
+    /// forwards- pagination.
+    ///
+    /// Will return an `InvalidPreviousState` error if the paginator is busy
+    /// (running /context or /messages).
+    pub(super) fn set_idle_state(
+        &self,
+        prev_batch_token: Option<String>,
+        next_batch_token: Option<String>,
+    ) -> Result<(), PaginatorError> {
+        let prev_state = self.state.get();
+
+        match prev_state {
+            PaginatorState::Initial | PaginatorState::Idle => {}
+            PaginatorState::FetchingTargetEvent | PaginatorState::Paginating => {
+                // The paginator was busy. Don't interrupt it.
+                return Err(PaginatorError::InvalidPreviousState {
+                    // Technically it's initial OR idle, but we don't really care here.
+                    expected: PaginatorState::Idle,
+                    actual: prev_state,
+                });
+            }
+        }
+
+        self.state.set_if_not_eq(PaginatorState::Idle);
+        *self.prev_batch_token.lock().unwrap() = prev_batch_token.into();
+        *self.next_batch_token.lock().unwrap() = next_batch_token.into();
+
+        Ok(())
+    }
+
+    /// Returns the current previous batch token, as stored in this paginator.
+    pub(super) fn prev_batch_token(&self) -> Option<String> {
+        match &*self.prev_batch_token.lock().unwrap() {
+            PaginationToken::HitEnd | PaginationToken::None => None,
+            PaginationToken::HasMore(token) => Some(token.clone()),
+        }
     }
 
     /// Starts the pagination from the initial event, requesting `num_events`
@@ -224,8 +287,15 @@ impl Paginator {
 
         let has_prev = response.prev_batch_token.is_some();
         let has_next = response.next_batch_token.is_some();
-        *self.prev_batch_token.lock().unwrap() = response.prev_batch_token;
-        *self.next_batch_token.lock().unwrap() = response.next_batch_token;
+
+        *self.prev_batch_token.lock().unwrap() = match response.prev_batch_token {
+            Some(token) => PaginationToken::HasMore(token),
+            None => PaginationToken::HitEnd,
+        };
+        *self.next_batch_token.lock().unwrap() = match response.next_batch_token {
+            Some(token) => PaginationToken::HasMore(token),
+            None => PaginationToken::HitEnd,
+        };
 
         // Forget the reset state guard, so its Drop method is not called.
         reset_state_guard.disarm();
@@ -264,6 +334,22 @@ impl Paginator {
         self.paginate(Direction::Backward, num_events, &self.prev_batch_token).await
     }
 
+    /// Returns whether we've hit the start of the timeline.
+    ///
+    /// This is true if, and only if, we didn't have a previous-batch token and
+    /// running backwards pagination would be useless.
+    pub fn hit_timeline_start(&self) -> bool {
+        matches!(*self.prev_batch_token.lock().unwrap(), PaginationToken::HitEnd)
+    }
+
+    /// Returns whether we've hit the end of the timeline.
+    ///
+    /// This is true if, and only if, we didn't have a next-batch token and
+    /// running forwards pagination would be useless.
+    pub fn hit_timeline_end(&self) -> bool {
+        matches!(*self.next_batch_token.lock().unwrap(), PaginationToken::HitEnd)
+    }
+
     /// Runs a forward pagination (requesting `num_events` to the server), from
     /// the current state of the object.
     ///
@@ -285,16 +371,19 @@ impl Paginator {
         &self,
         dir: Direction,
         num_events: UInt,
-        token_lock: &Mutex<Option<String>>,
+        token_lock: &Mutex<PaginationToken>,
     ) -> Result<PaginationResult, PaginatorError> {
         self.check_state(PaginatorState::Idle)?;
 
         let token = {
             let token = token_lock.lock().unwrap();
-            if token.is_none() {
-                return Ok(PaginationResult { events: Vec::new(), hit_end_of_timeline: true });
-            };
-            token.clone()
+            match &*token {
+                PaginationToken::None => None,
+                PaginationToken::HasMore(val) => Some(val.clone()),
+                PaginationToken::HitEnd => {
+                    return Ok(PaginationResult { events: Vec::new(), hit_end_of_timeline: true });
+                }
+            }
         };
 
         // Note: it's possible two callers have checked the state and both figured it's
@@ -321,7 +410,11 @@ impl Paginator {
         // may be incorrect.
 
         let hit_end_of_timeline = response.end.is_none();
-        *token_lock.lock().unwrap() = response.end;
+
+        *token_lock.lock().unwrap() = match response.end {
+            Some(val) => PaginationToken::HasMore(val),
+            None => PaginationToken::HitEnd,
+        };
 
         // TODO: what to do with state events?
 
@@ -400,6 +493,34 @@ impl PaginableRoom for Room {
 
     async fn messages(&self, opts: MessagesOptions) -> Result<Messages, PaginatorError> {
         self.messages(opts).await.map_err(PaginatorError::SdkError)
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl PaginableRoom for WeakRoom {
+    async fn event_with_context(
+        &self,
+        event_id: &EventId,
+        lazy_load_members: bool,
+        num_events: UInt,
+    ) -> Result<EventWithContextResponse, PaginatorError> {
+        let Some(room) = self.get() else {
+            // Client is shutting down, return a default response.
+            return Ok(EventWithContextResponse::default());
+        };
+
+        PaginableRoom::event_with_context(&room, event_id, lazy_load_members, num_events).await
+    }
+
+    /// Runs a /messages query for the given room.
+    async fn messages(&self, opts: MessagesOptions) -> Result<Messages, PaginatorError> {
+        let Some(room) = self.get() else {
+            // Client is shutting down, return a default response.
+            return Ok(Messages::default());
+        };
+
+        PaginableRoom::messages(&room, opts).await
     }
 }
 
@@ -669,6 +790,13 @@ mod tests {
 
         // When I call `Paginator::start_from`, it works,
         let paginator = Arc::new(Paginator::new(room.clone()));
+
+        assert!(!paginator.hit_timeline_start(), "we must have a prev-batch token");
+        assert!(
+            !paginator.hit_timeline_end(),
+            "we don't know about the status of the next-batch token"
+        );
+
         let context =
             paginator.start_from(event_id, uint!(100)).await.expect("start_from should work");
 
@@ -677,9 +805,12 @@ mod tests {
         assert_event_matches_msg(&context.events[0], "initial");
         assert_eq!(context.events[0].event.deserialize().unwrap().event_id(), event_id);
 
-        // There's a previous batch.
+        // There's a previous batch, but no next batch.
         assert!(context.has_prev);
         assert!(!context.has_next);
+
+        assert!(!paginator.hit_timeline_start());
+        assert!(paginator.hit_timeline_end());
 
         // Preparing data for the next back-pagination.
         *room.prev_events.lock().await = vec![event_factory.text_msg("previous").into_timeline()];
@@ -689,6 +820,7 @@ mod tests {
         let prev =
             paginator.paginate_backward(uint!(100)).await.expect("paginate backward should work");
         assert!(!prev.hit_end_of_timeline);
+        assert!(!paginator.hit_timeline_start());
         assert_eq!(prev.events.len(), 1);
         assert_event_matches_msg(&prev.events[0], "previous");
 
@@ -702,6 +834,7 @@ mod tests {
             .await
             .expect("paginate backward the second time should work");
         assert!(prev.hit_end_of_timeline);
+        assert!(paginator.hit_timeline_start());
         assert_eq!(prev.events.len(), 1);
         assert_event_matches_msg(&prev.events[0], "oldest");
 
@@ -712,6 +845,7 @@ mod tests {
             .await
             .expect("paginate backward the third time should work");
         assert!(prev.hit_end_of_timeline);
+        assert!(paginator.hit_timeline_start());
         assert!(prev.events.is_empty());
     }
 
@@ -772,6 +906,12 @@ mod tests {
 
         // When I call `Paginator::start_from`, it works,
         let paginator = Arc::new(Paginator::new(room.clone()));
+        assert!(!paginator.hit_timeline_end(), "we must have a next-batch token");
+        assert!(
+            !paginator.hit_timeline_start(),
+            "we don't know about the status of the prev-batch token"
+        );
+
         let context =
             paginator.start_from(event_id, uint!(100)).await.expect("start_from should work");
 
@@ -780,9 +920,13 @@ mod tests {
         assert_event_matches_msg(&context.events[0], "initial");
         assert_eq!(context.events[0].event.deserialize().unwrap().event_id(), event_id);
 
-        // There's a next batch.
+        // There's a next batch, but no previous batch (i.e. we've hit the start of the
+        // timeline).
         assert!(!context.has_prev);
         assert!(context.has_next);
+
+        assert!(paginator.hit_timeline_start());
+        assert!(!paginator.hit_timeline_end());
 
         // Preparing data for the next forward-pagination.
         *room.next_events.lock().await = vec![event_factory.text_msg("next").into_timeline()];
@@ -794,6 +938,7 @@ mod tests {
         assert!(!next.hit_end_of_timeline);
         assert_eq!(next.events.len(), 1);
         assert_event_matches_msg(&next.events[0], "next");
+        assert!(!paginator.hit_timeline_end());
 
         // And I can forward-paginate again, because there's a prev batch token
         // still.
@@ -807,6 +952,7 @@ mod tests {
         assert!(next.hit_end_of_timeline);
         assert_eq!(next.events.len(), 1);
         assert_event_matches_msg(&next.events[0], "latest");
+        assert!(paginator.hit_timeline_end());
 
         // I've hit the start of the timeline, but back-paginating again will
         // return immediately.
@@ -816,6 +962,7 @@ mod tests {
             .expect("paginate forward the third time should work");
         assert!(next.hit_end_of_timeline);
         assert!(next.events.is_empty());
+        assert!(paginator.hit_timeline_end());
     }
 
     #[async_test]
@@ -997,9 +1144,7 @@ mod tests {
 
             // Assuming a paginator ready to back- or forward- paginate,
             let paginator = Paginator::new(room.clone());
-            paginator.state.set(PaginatorState::Idle);
-            *paginator.prev_batch_token.lock().unwrap() = Some("prev".to_owned());
-            *paginator.next_batch_token.lock().unwrap() = Some("next".to_owned());
+            paginator.set_idle_state(Some("prev".to_owned()), Some("next".to_owned())).unwrap();
 
             let paginator = Arc::new(paginator);
 

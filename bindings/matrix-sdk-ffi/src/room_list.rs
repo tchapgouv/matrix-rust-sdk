@@ -16,9 +16,9 @@ use matrix_sdk_ui::{
     room_list_service::{
         filters::{
             new_filter_all, new_filter_any, new_filter_category, new_filter_favourite,
-            new_filter_fuzzy_match_room_name, new_filter_invite, new_filter_non_left,
-            new_filter_none, new_filter_normalized_match_room_name, new_filter_unread,
-            RoomCategory,
+            new_filter_fuzzy_match_room_name, new_filter_invite, new_filter_joined,
+            new_filter_non_left, new_filter_none, new_filter_normalized_match_room_name,
+            new_filter_unread, RoomCategory,
         },
         BoxedFilterFn,
     },
@@ -125,11 +125,11 @@ impl RoomListService {
         })))
     }
 
-    async fn room(&self, room_id: String) -> Result<Arc<RoomListItem>, RoomListError> {
+    fn room(&self, room_id: String) -> Result<Arc<RoomListItem>, RoomListError> {
         let room_id = <&RoomId>::try_from(room_id.as_str()).map_err(RoomListError::from)?;
 
         Ok(Arc::new(RoomListItem {
-            inner: Arc::new(self.inner.room(room_id).await?),
+            inner: Arc::new(self.inner.room(room_id)?),
             utd_hook: self.utd_hook.clone(),
         }))
     }
@@ -138,13 +138,6 @@ impl RoomListService {
         Ok(Arc::new(RoomList {
             room_list_service: self.clone(),
             inner: Arc::new(self.inner.all_rooms().await.map_err(RoomListError::from)?),
-        }))
-    }
-
-    async fn invites(self: Arc<Self>) -> Result<Arc<RoomList>, RoomListError> {
-        Ok(Arc::new(RoomList {
-            room_list_service: self.clone(),
-            inner: Arc::new(self.inner.invites().await.map_err(RoomListError::from)?),
         }))
     }
 
@@ -179,7 +172,7 @@ pub struct RoomList {
     inner: Arc<matrix_sdk_ui::room_list_service::RoomList>,
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[uniffi::export]
 impl RoomList {
     fn loading_state(
         &self,
@@ -240,8 +233,8 @@ impl RoomList {
         }
     }
 
-    async fn room(&self, room_id: String) -> Result<Arc<RoomListItem>, RoomListError> {
-        self.room_list_service.room(room_id).await
+    fn room(&self, room_id: String) -> Result<Arc<RoomListItem>, RoomListError> {
+        self.room_list_service.room(room_id)
     }
 }
 
@@ -423,6 +416,7 @@ pub enum RoomListEntriesDynamicFilterKind {
     All { filters: Vec<RoomListEntriesDynamicFilterKind> },
     Any { filters: Vec<RoomListEntriesDynamicFilterKind> },
     NonLeft,
+    Joined,
     Unread,
     Favourite,
     Invite,
@@ -463,6 +457,7 @@ impl FilterWrapper {
                 filters.into_iter().map(|filter| FilterWrapper::from(client, filter).0).collect(),
             ))),
             Kind::NonLeft => Self(Box::new(new_filter_non_left(client))),
+            Kind::Joined => Self(Box::new(new_filter_joined(client))),
             Kind::Unread => Self(Box::new(new_filter_unread(client))),
             Kind::Favourite => Self(Box::new(new_filter_favourite(client))),
             Kind::Invite => Self(Box::new(new_filter_invite(client))),
@@ -494,7 +489,7 @@ impl RoomListItem {
     /// compute a room name based on the room's nature (DM or not) and number of
     /// members.
     fn display_name(&self) -> Option<String> {
-        RUNTIME.block_on(self.inner.computed_display_name())
+        self.inner.cached_display_name()
     }
 
     fn avatar_url(&self) -> Option<String> {
@@ -510,14 +505,13 @@ impl RoomListItem {
     }
 
     pub async fn room_info(&self) -> Result<RoomInfo, ClientError> {
-        let latest_event = self.inner.latest_event().await.map(EventTimelineItem).map(Arc::new);
-
-        Ok(RoomInfo::new(self.inner.inner_room(), latest_event).await?)
+        Ok(RoomInfo::new(self.inner.inner_room()).await?)
     }
 
-    /// Building a `Room`. If its internal timeline hasn't been initialized
-    /// it'll fail.
-    async fn full_room(&self) -> Result<Arc<Room>, RoomListError> {
+    /// Build a full `Room` FFI object, filling its associated timeline.
+    ///
+    /// If its internal timeline hasn't been initialized, it'll fail.
+    fn full_room(&self) -> Result<Arc<Room>, RoomListError> {
         if let Some(timeline) = self.inner.timeline() {
             Ok(Arc::new(Room::with_timeline(
                 self.inner.inner_room().clone(),
@@ -620,6 +614,7 @@ pub struct RequiredState {
 pub struct RoomSubscription {
     pub required_state: Option<Vec<RequiredState>>,
     pub timeline_limit: Option<u32>,
+    pub include_heroes: Option<bool>,
 }
 
 impl From<RoomSubscription> for RumaRoomSubscription {
@@ -628,7 +623,8 @@ impl From<RoomSubscription> for RumaRoomSubscription {
             required_state: val.required_state.map(|r|
                 r.into_iter().map(|s| (s.key.into(), s.value)).collect()
             ).unwrap_or_default(),
-            timeline_limit: val.timeline_limit.map(|u| u.into())
+            timeline_limit: val.timeline_limit.map(|u| u.into()),
+            include_heroes: val.include_heroes,
         })
     }
 }

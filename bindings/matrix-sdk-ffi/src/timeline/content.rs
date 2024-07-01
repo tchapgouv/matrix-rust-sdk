@@ -16,6 +16,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use matrix_sdk::{crypto::types::events::UtdCause, room::power_levels::power_level_user_changes};
 use matrix_sdk_ui::timeline::{PollResult, TimelineDetails};
+use ruma::events::{
+    room::{message::RoomMessageEventContentWithoutRelation, MediaSource},
+    FullStateEventContent,
+};
 use tracing::warn;
 
 use super::ProfileDetails;
@@ -37,16 +41,24 @@ impl TimelineItemContent {
                 TimelineItemContentKind::Sticker {
                     body: content.body.clone(),
                     info: (&content.info).into(),
-                    url: content.url.to_string(),
+                    source: Arc::new(MediaSource::from(content.source.clone())),
                 }
             }
             Content::Poll(poll_state) => TimelineItemContentKind::from(poll_state.results()),
             Content::CallInvite => TimelineItemContentKind::CallInvite,
+            Content::CallNotify => TimelineItemContentKind::CallNotify,
             Content::UnableToDecrypt(msg) => {
                 TimelineItemContentKind::UnableToDecrypt { msg: EncryptedMessage::new(msg) }
             }
             Content::MembershipChange(membership) => TimelineItemContentKind::RoomMembership {
                 user_id: membership.user_id().to_string(),
+                user_display_name: if let FullStateEventContent::Original { content, .. } =
+                    membership.content()
+                {
+                    content.displayname.clone()
+                } else {
+                    None
+                },
                 change: membership.change().map(Into::into),
             },
             Content::ProfileChange(profile) => {
@@ -103,7 +115,7 @@ pub enum TimelineItemContentKind {
     Sticker {
         body: String,
         info: ImageInfo,
-        url: String,
+        source: Arc<MediaSource>,
     },
     Poll {
         question: String,
@@ -115,11 +127,13 @@ pub enum TimelineItemContentKind {
         has_been_edited: bool,
     },
     CallInvite,
+    CallNotify,
     UnableToDecrypt {
         msg: EncryptedMessage,
     },
     RoomMembership {
         user_id: String,
+        user_display_name: Option<String>,
         change: Option<MembershipChange>,
     },
     ProfileChange {
@@ -167,12 +181,22 @@ impl Message {
     pub fn is_edited(&self) -> bool {
         self.0.is_edited()
     }
+
+    pub fn content(&self) -> Arc<RoomMessageEventContentWithoutRelation> {
+        Arc::new(RoomMessageEventContentWithoutRelation::new(self.0.msgtype().clone()))
+    }
 }
 
 #[derive(uniffi::Record)]
 pub struct InReplyToDetails {
     event_id: String,
     event: RepliedToEventDetails,
+}
+
+impl InReplyToDetails {
+    pub(crate) fn new(event_id: String, event: RepliedToEventDetails) -> Self {
+        Self { event_id, event }
+    }
 }
 
 impl From<&matrix_sdk_ui::timeline::InReplyToDetails> for InReplyToDetails {

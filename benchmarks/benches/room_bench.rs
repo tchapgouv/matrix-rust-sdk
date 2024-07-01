@@ -63,12 +63,17 @@ pub fn receive_all_members_benchmark(c: &mut Criterion) {
         .expect("initial filling of sqlite failed");
 
     let base_client = BaseClient::with_store_config(StoreConfig::new().state_store(sqlite_store));
+
     runtime
-        .block_on(base_client.set_session_meta(SessionMeta {
-            user_id: user_id!("@somebody:example.com").to_owned(),
-            device_id: device_id!("DEVICE_ID").to_owned(),
-        }))
+        .block_on(base_client.set_session_meta(
+            SessionMeta {
+                user_id: user_id!("@somebody:example.com").to_owned(),
+                device_id: device_id!("DEVICE_ID").to_owned(),
+            },
+            None,
+        ))
         .expect("Could not set session meta");
+
     base_client.get_or_create_room(&room_id, RoomState::Joined);
 
     let request = get_member_events::v3::Request::new(room_id.clone());

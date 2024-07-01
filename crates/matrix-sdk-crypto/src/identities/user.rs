@@ -148,7 +148,7 @@ impl OwnUserIdentity {
 
         let cache = self.store.cache().await?;
         let account = cache.account().await?;
-        account.sign_master_key(self.master_key.clone())
+        account.sign_master_key(&self.master_key)
     }
 
     /// Send a verification request to our other devices.
@@ -193,10 +193,11 @@ impl OwnUserIdentity {
             .inner
             .filter_devices_to_request(all_devices, self.verification_machine.own_device_id());
 
-        Ok(self
-            .verification_machine
-            .request_to_device_verification(self.user_id(), devices, methods)
-            .await)
+        Ok(self.verification_machine.request_to_device_verification(
+            self.user_id(),
+            devices,
+            methods,
+        ))
     }
 }
 
@@ -256,15 +257,18 @@ impl UserIdentity {
 
     /// Create a `VerificationRequest` object after the verification request
     /// content has been sent out.
-    pub async fn request_verification(
+    pub fn request_verification(
         &self,
         room_id: &RoomId,
         request_event_id: &EventId,
         methods: Option<Vec<VerificationMethod>>,
     ) -> VerificationRequest {
-        self.verification_machine
-            .request_verification(&self.inner, room_id, request_event_id, methods)
-            .await
+        self.verification_machine.request_verification(
+            &self.inner,
+            room_id,
+            request_event_id,
+            methods,
+        )
     }
 
     /// Send a verification request to the given user.
@@ -276,7 +280,7 @@ impl UserIdentity {
     /// started with the [`request_verification()`] method.
     ///
     /// [`request_verification()`]: #method.request_verification
-    pub async fn verification_request_content(
+    pub fn verification_request_content(
         &self,
         methods: Option<Vec<VerificationMethod>>,
     ) -> KeyVerificationRequestEventContent {
@@ -369,8 +373,8 @@ impl ReadOnlyUserIdentities {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReadOnlyUserIdentity {
     user_id: OwnedUserId,
-    pub(crate) master_key: MasterPubkey,
-    self_signing_key: SelfSigningPubkey,
+    pub(crate) master_key: Arc<MasterPubkey>,
+    self_signing_key: Arc<SelfSigningPubkey>,
 }
 
 impl PartialEq for ReadOnlyUserIdentity {
@@ -411,14 +415,19 @@ impl ReadOnlyUserIdentity {
     ) -> Result<Self, SignatureError> {
         master_key.verify_subkey(&self_signing_key)?;
 
-        Ok(Self { user_id: master_key.user_id().into(), master_key, self_signing_key })
+        Ok(Self {
+            user_id: master_key.user_id().into(),
+            master_key: master_key.into(),
+            self_signing_key: self_signing_key.into(),
+        })
     }
 
     #[cfg(test)]
     pub(crate) async fn from_private(identity: &crate::olm::PrivateCrossSigningIdentity) -> Self {
-        let master_key = identity.master_key.lock().await.as_ref().unwrap().public_key.clone();
+        let master_key =
+            identity.master_key.lock().await.as_ref().unwrap().public_key().clone().into();
         let self_signing_key =
-            identity.self_signing_key.lock().await.as_ref().unwrap().public_key.clone();
+            identity.self_signing_key.lock().await.as_ref().unwrap().public_key().clone().into();
 
         Self { user_id: identity.user_id().into(), master_key, self_signing_key }
     }
@@ -494,9 +503,9 @@ impl ReadOnlyUserIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadOnlyOwnUserIdentity {
     user_id: OwnedUserId,
-    master_key: MasterPubkey,
-    self_signing_key: SelfSigningPubkey,
-    user_signing_key: UserSigningPubkey,
+    master_key: Arc<MasterPubkey>,
+    self_signing_key: Arc<SelfSigningPubkey>,
+    user_signing_key: Arc<UserSigningPubkey>,
     #[serde(
         serialize_with = "atomic_bool_serializer",
         deserialize_with = "atomic_bool_deserializer"
@@ -551,26 +560,26 @@ impl ReadOnlyOwnUserIdentity {
 
         Ok(Self {
             user_id: master_key.user_id().into(),
-            master_key,
-            self_signing_key,
-            user_signing_key,
+            master_key: master_key.into(),
+            self_signing_key: self_signing_key.into(),
+            user_signing_key: user_signing_key.into(),
             verified: Arc::new(AtomicBool::new(false)),
         })
     }
 
     #[cfg(test)]
     pub(crate) async fn from_private(identity: &crate::olm::PrivateCrossSigningIdentity) -> Self {
-        let master_key = identity.master_key.lock().await.as_ref().unwrap().public_key.clone();
+        let master_key = identity.master_key.lock().await.as_ref().unwrap().public_key().clone();
         let self_signing_key =
-            identity.self_signing_key.lock().await.as_ref().unwrap().public_key.clone();
+            identity.self_signing_key.lock().await.as_ref().unwrap().public_key().clone();
         let user_signing_key =
-            identity.user_signing_key.lock().await.as_ref().unwrap().public_key.clone();
+            identity.user_signing_key.lock().await.as_ref().unwrap().public_key().clone();
 
         Self {
             user_id: identity.user_id().into(),
-            master_key,
-            self_signing_key,
-            user_signing_key,
+            master_key: master_key.into(),
+            self_signing_key: self_signing_key.into(),
+            user_signing_key: user_signing_key.into(),
             verified: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -672,14 +681,14 @@ impl ReadOnlyOwnUserIdentity {
 
         let old = self.clone();
 
-        self.self_signing_key = self_signing_key;
-        self.user_signing_key = user_signing_key;
+        self.self_signing_key = self_signing_key.into();
+        self.user_signing_key = user_signing_key.into();
 
-        if self.master_key != master_key {
+        if self.master_key.as_ref() != &master_key {
             self.verified.store(false, Ordering::SeqCst);
         }
 
-        self.master_key = master_key;
+        self.master_key = master_key.into();
 
         Ok(old != *self)
     }
