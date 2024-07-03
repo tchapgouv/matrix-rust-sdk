@@ -35,12 +35,8 @@
 //!
 //! # Homeserver support
 //!
-//! It is recommended to build the Client with [`Client::builder()`] and then to
-//! enable auto-discovery by calling [`ClientBuilder::server_name()`]. That will
-//! allow to discover the OpenID Connect Provider that is advertised by the
-//! homeserver. After building the client, you can check that the homeserver
-//! supports logging in via OIDC when [`Oidc::authentication_server_info()`]
-//! is set.
+//! After building the client, you can check that the homeserver supports
+//! logging in via OIDC when [`Oidc::fetch_authentication_issuer()`] succeeds.
 //!
 //! If the homeserver doesn't advertise its support for OIDC, but the issuer URL
 //! is known by some other method, it can be provided manually during
@@ -75,6 +71,8 @@
 //! authenticating with the OIDC provider, the user will be redirected to the
 //! provided redirect URI, with a code in the query that will allow to finish
 //! the authorization process by calling [`Oidc::finish_authorization()`].
+//!
+//! When the login is successful, you must then call [`Oidc::finish_login()`].
 //!
 //! # Persisting/restoring a session
 //!
@@ -143,18 +141,20 @@
 //!
 //! # Account management.
 //!
-//! The homeserver might advertise a URL that allows the user to manage their
-//! account, alongside the issuer in the [`Oidc::authentication_server_info()`]
-//! obtained during registration.
+//! The homeserver or provider might advertise a URL that allows the user to
+//! manage their account, it can be obtained with
+//! [`Oidc::account_management_url()`].
 //!
 //! # Logout
 //!
-//! To log the [`Client`] out of the session, simply call [`Oidc::logout()`].
+//! To log the [`Client`] out of the session, simply call [`Oidc::logout()`]. If
+//! the provider supports it, it will return a URL to present to the user if
+//! they also want to log out from their account on the provider's website.
 //!
 //! # Examples
 //!
 //! Most methods have examples, there is also an example CLI application that
-//! supports all the actions described here, in [`examples/oidc-cli`].
+//! supports all the actions described here, in [`examples/oidc_cli`].
 //!
 //! [MSC3861]: https://github.com/matrix-org/matrix-spec-proposals/pull/3861
 //! [areweoidcyet.com]: https://areweoidcyet.com/
@@ -163,29 +163,34 @@
 //! [`Error`]: ruma::api::client::error::Error
 //! [`ErrorKind::UnknownToken`]: ruma::api::client::error::ErrorKind::UnknownToken
 //! [`AuthenticateError::InsufficientScope`]: ruma::api::client::error::AuthenticateError
-//! [`examples/oidc-cli`]: https://github.com/matrix-org/matrix-rust-sdk/tree/main/examples/oidc-cli
+//! [`examples/oidc_cli`]: https://github.com/matrix-org/matrix-rust-sdk/tree/main/examples/oidc_cli
 
 use std::{collections::HashMap, fmt, sync::Arc};
 
 use as_variant::as_variant;
 use eyeball::SharedObservable;
 use futures_core::Stream;
-pub use mas_oidc_client::{error, types};
+pub use mas_oidc_client::{error, requests, types};
 use mas_oidc_client::{
-    requests::authorization_code::AuthorizationValidationData,
+    requests::{
+        account_management::{build_account_management_url, AccountManagementActionFull},
+        authorization_code::AuthorizationValidationData,
+    },
     types::{
         client_credentials::ClientCredentials,
         errors::ClientError,
         iana::oauth::OAuthTokenTypeHint,
-        oidc::VerifiedProviderMetadata,
+        oidc::{AccountManagementAction, VerifiedProviderMetadata},
         registration::{ClientRegistrationResponse, VerifiedClientMetadata},
         scope::{MatrixApiScopeToken, Scope, ScopeToken},
         IdToken,
     },
 };
-use matrix_sdk_base::{once_cell::sync::OnceCell, SessionMeta};
+use matrix_sdk_base::{
+    crypto::types::qr_login::QrCodeData, once_cell::sync::OnceCell, SessionMeta,
+};
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use ruma::{api::client::discovery::discover_homeserver::AuthenticationServerInfo, OwnedDeviceId};
+use ruma::api::client::discovery::get_authentication_issuer;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use thiserror::Error;
@@ -204,20 +209,20 @@ mod tests;
 
 pub use self::{
     auth_code_builder::{OidcAuthCodeUrlBuilder, OidcAuthorizationData},
+    cross_process::CrossProcessRefreshLockError,
     end_session_builder::{OidcEndSessionData, OidcEndSessionUrlBuilder},
 };
 use self::{
     backend::{server::OidcServer, OidcBackend},
-    cross_process::{
-        CrossProcessRefreshLockError, CrossProcessRefreshLockGuard, CrossProcessRefreshManager,
-    },
+    cross_process::{CrossProcessRefreshLockGuard, CrossProcessRefreshManager},
 };
-use crate::{authentication::AuthData, client::SessionChange, Client, RefreshTokenError, Result};
+use crate::{
+    authentication::{qrcode::LoginWithQrCode, AuthData},
+    client::SessionChange,
+    Client, HttpError, RefreshTokenError, Result,
+};
 
 pub(crate) struct OidcCtx {
-    /// The authentication server info discovered from the homeserver.
-    authentication_server_info: Option<AuthenticationServerInfo>,
-
     /// Lock and state when multiple processes may refresh an OIDC session.
     cross_process_token_refresh_manager: OnceCell<CrossProcessRefreshManager>,
 
@@ -232,12 +237,8 @@ pub(crate) struct OidcCtx {
 }
 
 impl OidcCtx {
-    pub(crate) fn new(
-        authentication_server_info: Option<AuthenticationServerInfo>,
-        insecure_discover: bool,
-    ) -> Self {
+    pub(crate) fn new(insecure_discover: bool) -> Self {
         Self {
-            authentication_server_info,
             insecure_discover,
             cross_process_token_refresh_manager: Default::default(),
             deferred_cross_process_lock_init: Default::default(),
@@ -246,7 +247,7 @@ impl OidcCtx {
 }
 
 pub(crate) struct OidcAuthData {
-    pub(crate) issuer_info: AuthenticationServerInfo,
+    pub(crate) issuer: String,
     pub(crate) credentials: ClientCredentials,
     pub(crate) metadata: VerifiedClientMetadata,
     pub(crate) tokens: OnceCell<SharedObservable<OidcSessionTokens>>,
@@ -257,9 +258,7 @@ pub(crate) struct OidcAuthData {
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for OidcAuthData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OidcAuthData")
-            .field("issuer_info", &self.issuer_info)
-            .finish_non_exhaustive()
+        f.debug_struct("OidcAuthData").field("issuer", &self.issuer).finish_non_exhaustive()
     }
 }
 
@@ -304,17 +303,17 @@ impl Oidc {
     /// olm machine has been initialized.
     ///
     /// Must be called after `set_session_meta`.
-    async fn deferred_enable_cross_process_refresh_lock(&self) -> Result<()> {
+    async fn deferred_enable_cross_process_refresh_lock(&self) {
         let deferred_init_lock = self.ctx().deferred_cross_process_lock_init.lock().await;
 
         // Don't `take()` the value, so that subsequent calls to
         // `enable_cross_process_refresh_lock` will keep on failing if we've enabled the
         // lock at least once.
         let Some(lock_value) = deferred_init_lock.as_ref() else {
-            return Ok(());
+            return;
         };
 
-        // FIXME We shouldn't be using the crypto store for that! see also https://github.com/matrix-org/matrix-rust-sdk/issues/2472
+        // FIXME: We shouldn't be using the crypto store for that! see also https://github.com/matrix-org/matrix-rust-sdk/issues/2472
         let olm_machine_lock = self.client.olm_machine().await;
         let olm_machine =
             olm_machine_lock.as_ref().expect("there has to be an olm machine, hopefully?");
@@ -327,8 +326,6 @@ impl Oidc {
         // This method is guarded with the `deferred_cross_process_lock_init` lock held,
         // so this `set` can't be an error.
         let _ = self.ctx().cross_process_token_refresh_manager.set(manager);
-
-        Ok(())
     }
 
     /// The OpenID Connect authentication data.
@@ -341,17 +338,100 @@ impl Oidc {
         as_variant!(data, AuthData::Oidc)
     }
 
-    /// The authentication server info discovered from the homeserver.
+    /// Get the authentication issuer advertised by the homeserver.
     ///
-    /// This will only be set if the homeserver supports authenticating via
-    /// OpenID Connect ([MSC3861]) and this `Client` was constructed using
-    /// auto-discovery by setting the homeserver with
-    /// [`ClientBuilder::server_name()`].
+    /// Returns an error if the request fails. An error with a
+    /// `StatusCode::NOT_FOUND` should mean that the homeserver does not support
+    /// authenticating via OpenID Connect ([MSC3861]).
     ///
     /// [MSC3861]: https://github.com/matrix-org/matrix-spec-proposals/pull/3861
-    /// [`ClientBuilder::server_name()`]: crate::ClientBuilder::server_name()
-    pub fn authentication_server_info(&self) -> Option<&AuthenticationServerInfo> {
-        self.client.inner.auth_ctx.oidc.authentication_server_info.as_ref()
+    pub async fn fetch_authentication_issuer(&self) -> Result<String, HttpError> {
+        let response =
+            self.client.send(get_authentication_issuer::msc2965::Request::new(), None).await?;
+
+        Ok(response.issuer)
+    }
+
+    /// Log in using a QR code.
+    ///
+    /// This method allows you to log in with a QR code, the existing device
+    /// needs to display the QR code which this device can scan and call
+    /// this method to log in.
+    ///
+    /// A successful login using this method will automatically mark the device
+    /// as verified and transfer all end-to-end encryption related secrets, like
+    /// the private cross-signing keys and the backup key from the existing
+    /// device to the new device.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use anyhow::bail;
+    /// use futures_util::StreamExt;
+    /// use matrix_sdk::{
+    ///     authentication::qrcode::{LoginProgress, QrCodeData, QrCodeModeData},
+    ///     Client,
+    ///     oidc::types::registration::VerifiedClientMetadata,
+    /// };
+    /// # fn client_metadata() -> VerifiedClientMetadata { unimplemented!() }
+    /// # _ = async {
+    /// # let bytes = unimplemented!();
+    /// // You'll need to use a different library to scan and extract the raw bytes from the QR
+    /// // code.
+    /// let qr_code_data = QrCodeData::from_bytes(bytes)?;
+    ///
+    /// // Fetch the homeserver out of the parsed QR code data.
+    /// let QrCodeModeData::Reciprocate{ homeserver_url } = qr_code_data.mode_data else {
+    ///     bail!("The QR code is invalid, we did not receive a homeserver in the QR code.");
+    /// };
+    ///
+    /// // Build the client as usual.
+    /// let client = Client::builder()
+    ///     .homeserver_url(homeserver_url)
+    ///     .handle_refresh_tokens()
+    ///     .build()
+    ///     .await?;
+    ///
+    /// let oidc = client.oidc();
+    /// let metadata: VerifiedClientMetadata = client_metadata();
+    ///
+    /// // Subscribing to the progress is necessary since we need to input the check
+    /// // code on the existing device.
+    /// let login = oidc.login_with_qr_code(&qr_code_data, metadata);
+    /// let mut progress = login.subscribe_to_progress();
+    ///
+    /// // Create a task which will show us the progress and tell us the check
+    /// // code to input in the existing device.
+    /// let task = tokio::spawn(async move {
+    ///     while let Some(state) = progress.next().await {
+    ///         match state {
+    ///             LoginProgress::Starting => (),
+    ///             LoginProgress::EstablishingSecureChannel { check_code } => {
+    ///                 let code = check_code.to_digit();
+    ///                 println!("Please enter the following code into the other device {code:02}");
+    ///             },
+    ///             LoginProgress::WaitingForToken { user_code } => {
+    ///                 println!("Please use your other device to confirm the log in {user_code}")
+    ///             },
+    ///             LoginProgress::Done => break,
+    ///         }
+    ///     }
+    /// });
+    ///
+    /// // Now run the future to complete the login.
+    /// login.await?;
+    /// task.abort();
+    ///
+    /// println!("Successfully logged in: {:?} {:?}", client.user_id(), client.device_id());
+    /// # anyhow::Ok(()) };
+    /// ```
+    #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+    pub fn login_with_qr_code<'a>(
+        &'a self,
+        data: &'a QrCodeData,
+        client_metadata: VerifiedClientMetadata,
+    ) -> LoginWithQrCode<'a> {
+        LoginWithQrCode::new(&self.client, client_metadata, data)
     }
 
     /// The OpenID Connect Provider used for authorization.
@@ -360,50 +440,48 @@ impl Oidc {
     /// [`Oidc::restore_registered_client()`] or
     /// [`Oidc::restore_session()`].
     pub fn issuer(&self) -> Option<&str> {
-        self.data().map(|data| data.issuer_info.issuer.as_str())
+        self.data().map(|data| data.issuer.as_str())
     }
 
-    /// The URL where the user can manage their account.
+    /// The account management actions supported by the provider's account
+    /// management URL.
     ///
-    /// Returns `Ok(None)` if the client registration was not restored with
-    /// [`Oidc::restore_registered_client()`] or
-    /// [`Oidc::restore_session()`], or if the homeserver doesn't advertise this
-    /// URL. Returns an error if the URL could not be parsed
-    pub fn account_management_url(
+    /// Returns `Ok(None)` if the data was not found. Returns an error if the
+    /// request to get the provider metadata fails.
+    pub async fn account_management_actions_supported(
         &self,
-        action: Option<OidcAccountManagementAction>,
-    ) -> Result<Option<Url>, url::ParseError> {
-        let Some(data) = self.data() else {
+    ) -> Result<Option<Vec<AccountManagementAction>>, OidcError> {
+        let provider_metadata = self.provider_metadata().await?;
+
+        Ok(provider_metadata.account_management_actions_supported.clone())
+    }
+
+    /// Build the URL where the user can manage their account.
+    ///
+    /// # Arguments
+    ///
+    /// * `action` - An optional action that wants to be performed by the user
+    ///   when they open the URL. The list of supported actions by the account
+    ///   management URL can be found in the [`VerifiedProviderMetadata`], or
+    ///   directly with [`Oidc::account_management_actions_supported()`].
+    ///
+    /// Returns `Ok(None)` if the URL was not found. Returns an error if the
+    /// request to get the provider metadata fails or the URL could not be
+    /// parsed.
+    pub async fn account_management_url(
+        &self,
+        action: Option<AccountManagementActionFull>,
+    ) -> Result<Option<Url>, OidcError> {
+        let provider_metadata = self.provider_metadata().await?;
+
+        let Some(base_url) = provider_metadata.account_management_uri.clone() else {
             return Ok(None);
         };
-        let Some(account) = data.issuer_info.account.as_deref() else {
-            return Ok(None);
-        };
 
-        let mut url = Url::parse(account)?;
+        let id_token_hint =
+            self.session_tokens().and_then(|t| t.latest_id_token).map(|t| t.to_string());
 
-        if let Some(id_token) = self.session_tokens().and_then(|t| t.latest_id_token) {
-            url.query_pairs_mut().append_pair("id_token_hint", id_token.as_str());
-        }
-
-        if let Some(action) = action {
-            match action {
-                OidcAccountManagementAction::Profile => {
-                    url.query_pairs_mut().append_pair("action", "profile");
-                }
-                OidcAccountManagementAction::SessionsList => {
-                    url.query_pairs_mut().append_pair("action", "sessions_list");
-                }
-                OidcAccountManagementAction::SessionView { device_id } => {
-                    url.query_pairs_mut().append_pair("action", "session_view");
-                    url.query_pairs_mut().append_pair("device_id", device_id.as_str());
-                }
-                OidcAccountManagementAction::SessionEnd { device_id } => {
-                    url.query_pairs_mut().append_pair("action", "session_end");
-                    url.query_pairs_mut().append_pair("device_id", device_id.as_str());
-                }
-            }
-        }
+        let url = build_account_management_url(base_url, action, id_token_hint)?;
 
         Ok(Some(url))
     }
@@ -452,7 +530,7 @@ impl Oidc {
     /// # Panics
     ///
     /// Will panic if no OIDC client has been configured yet.
-    fn set_session_tokens(&self, session_tokens: OidcSessionTokens) {
+    pub(crate) fn set_session_tokens(&self, session_tokens: OidcSessionTokens) {
         let data =
             self.data().expect("Cannot call OpenID Connect API after logging in with another API");
         if let Some(tokens) = data.tokens.get() {
@@ -546,8 +624,8 @@ impl Oidc {
     pub fn user_session(&self) -> Option<UserSession> {
         let meta = self.client.session_meta()?.to_owned();
         let tokens = self.session_tokens()?;
-        let issuer_info = self.data()?.issuer_info.clone();
-        Some(UserSession { meta, tokens, issuer_info })
+        let issuer = self.data()?.issuer.clone();
+        Some(UserSession { meta, tokens, issuer })
     }
 
     /// The full OpenID Connect session of this client.
@@ -578,7 +656,7 @@ impl Oidc {
     /// # Arguments
     ///
     /// * `issuer` - The OpenID Connect Provider to register with. Can be
-    ///   obtained with [`Oidc::authentication_server_info()`].
+    ///   obtained with [`Oidc::fetch_authentication_issuer()`].
     ///
     /// * `client_metadata` - The [`VerifiedClientMetadata`] to register.
     ///
@@ -607,9 +685,9 @@ impl Oidc {
     /// let client = Client::builder().server_name(&server_name).build().await?;
     /// let oidc = client.oidc();
     ///
-    /// if let Some(info) = oidc.authentication_server_info() {
+    /// if let Ok(issuer) = oidc.fetch_authentication_issuer().await {
     ///     let response = oidc
-    ///         .register_client(&info.issuer, client_metadata.clone(), None)
+    ///         .register_client(&issuer, client_metadata.clone(), None)
     ///         .await?;
     ///
     ///     println!(
@@ -622,7 +700,7 @@ impl Oidc {
     ///         client_id: response.client_id,
     ///     };
     ///
-    ///     persist_client_registration(&info.issuer, &client_metadata, &credentials);
+    ///     persist_client_registration(&issuer, &client_metadata, &credentials);
     /// }
     /// # anyhow::Ok(()) };
     /// ```
@@ -654,8 +732,7 @@ impl Oidc {
     ///
     /// # Arguments
     ///
-    /// * `issuer_info` - The [`AuthenticationServerInfo`] for the OpenID
-    ///   Connect Provider we're interacting with.
+    /// * `issuer` - The OpenID Connect Provider we're interacting with.
     ///
     /// * `client_metadata` - The [`VerifiedClientMetadata`] that was
     ///   registered.
@@ -668,12 +745,12 @@ impl Oidc {
     /// Panics if authentication data was already set.
     pub fn restore_registered_client(
         &self,
-        issuer_info: AuthenticationServerInfo,
+        issuer: String,
         client_metadata: VerifiedClientMetadata,
         client_credentials: ClientCredentials,
     ) {
         let data = OidcAuthData {
-            issuer_info,
+            issuer,
             credentials: client_credentials,
             metadata: client_metadata,
             tokens: Default::default(),
@@ -702,19 +779,25 @@ impl Oidc {
     ///
     /// Panics if authentication data was already set.
     pub async fn restore_session(&self, session: OidcSession) -> Result<()> {
-        let OidcSession { credentials, metadata, user: UserSession { meta, tokens, issuer_info } } =
+        let OidcSession { credentials, metadata, user: UserSession { meta, tokens, issuer } } =
             session;
 
         let data = OidcAuthData {
-            issuer_info,
+            issuer,
             credentials,
             metadata,
             tokens: SharedObservable::new(tokens.clone()).into(),
             authorization_data: Default::default(),
         };
 
-        self.client.set_session_meta(meta).await?;
-        self.deferred_enable_cross_process_refresh_lock().await?;
+        self.client
+            .set_session_meta(
+                meta,
+                #[cfg(feature = "e2e-encryption")]
+                None,
+            )
+            .await?;
+        self.deferred_enable_cross_process_refresh_lock().await;
 
         self.client
             .inner
@@ -757,7 +840,7 @@ impl Oidc {
         }
 
         #[cfg(feature = "e2e-encryption")]
-        self.client.encryption().run_initialization_tasks(None).await?;
+        self.client.encryption().spawn_initialization_task(None);
 
         Ok(())
     }
@@ -915,18 +998,34 @@ impl Oidc {
             device_id: whoami_res.device_id.ok_or(OidcError::MissingDeviceId)?,
         };
 
-        self.client.set_session_meta(session).await.map_err(crate::Error::from)?;
+        self.client
+            .set_session_meta(
+                session,
+                #[cfg(feature = "e2e-encryption")]
+                None,
+            )
+            .await
+            .map_err(crate::Error::from)?;
         // At this point the Olm machine has been set up.
 
         // Enable the cross-process lock for refreshes, if needs be.
-        self.deferred_enable_cross_process_refresh_lock().await?;
+        self.enable_cross_process_lock().await.map_err(OidcError::from)?;
+
+        #[cfg(feature = "e2e-encryption")]
+        self.client.encryption().spawn_initialization_task(None);
+
+        Ok(())
+    }
+
+    pub(crate) async fn enable_cross_process_lock(
+        &self,
+    ) -> Result<(), CrossProcessRefreshLockError> {
+        // Enable the cross-process lock for refreshes, if needs be.
+        self.deferred_enable_cross_process_refresh_lock().await;
 
         if let Some(cross_process_manager) = self.ctx().cross_process_token_refresh_manager.get() {
             if let Some(tokens) = self.session_tokens() {
-                let mut cross_process_guard = cross_process_manager
-                    .spin_lock()
-                    .await
-                    .map_err(|err| crate::Error::Oidc(err.into()))?;
+                let mut cross_process_guard = cross_process_manager.spin_lock().await?;
 
                 if cross_process_guard.hash_mismatch {
                     // At this point, we're finishing a login while another process had written
@@ -938,15 +1037,9 @@ impl Oidc {
                     );
                 }
 
-                cross_process_guard
-                    .save_in_memory_and_db(&tokens)
-                    .await
-                    .map_err(|err| crate::Error::Oidc(err.into()))?;
+                cross_process_guard.save_in_memory_and_db(&tokens).await?;
             }
         }
-
-        #[cfg(feature = "e2e-encryption")]
-        self.client.encryption().run_initialization_tasks(None).await?;
 
         Ok(())
     }
@@ -1100,7 +1193,7 @@ impl Oidc {
                     {
                         // Satisfies the save_session_callback invariant: set_session_tokens has
                         // been called just above.
-                        if let Err(err) = save_session_callback(this.client.clone()).await {
+                        if let Err(err) = save_session_callback(this.client.clone()) {
                             error!("when saving session after refresh: {err}");
                         }
                     }
@@ -1283,7 +1376,7 @@ pub struct OidcSession {
 }
 
 /// A user session for the OpenID Connect API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UserSession {
     /// The Matrix user session info.
     #[serde(flatten)]
@@ -1293,8 +1386,8 @@ pub struct UserSession {
     #[serde(flatten)]
     pub tokens: OidcSessionTokens,
 
-    /// Information about the OpenID Connect provider used for this session.
-    pub issuer_info: AuthenticationServerInfo,
+    /// The OpenID Connect provider used for this session.
+    pub issuer: String,
 }
 
 /// The tokens for a user session obtained with the OpenID Connect API.
@@ -1389,32 +1482,12 @@ pub enum RedirectUriQueryParseError {
     UnknownFormat,
 }
 
-/// Indicates the action that the user wishes to take when showing the account
-/// URL page.
-#[derive(Debug)]
-pub enum OidcAccountManagementAction {
-    /// The user wishes to view their profile (name, avatar, contact details).
-    Profile,
-    /// The user wishes to view a list of their sessions.
-    SessionsList,
-    /// The user wishes to view the details of a session.
-    SessionView {
-        /// The Matrix device ID to be shown.
-        device_id: OwnedDeviceId,
-    },
-    /// The user wishes to end/logout a session.
-    SessionEnd {
-        /// The Matrix device ID to be ended.
-        device_id: OwnedDeviceId,
-    },
-}
-
 /// All errors that can occur when using the OpenID Connect API.
 #[derive(Debug, Error)]
 pub enum OidcError {
     /// An error occurred when interacting with the provider.
     #[error(transparent)]
-    Oidc(mas_oidc_client::error::Error),
+    Oidc(error::Error),
 
     /// No authentication issuer was provided by the homeserver or by the user.
     #[error("client missing authentication issuer")]
@@ -1452,6 +1525,10 @@ pub enum OidcError {
     #[error(transparent)]
     Rand(rand::Error),
 
+    /// An error occurred parsing a URL.
+    #[error(transparent)]
+    Url(url::ParseError),
+
     /// An error occurred caused by the cross-process locks.
     #[error(transparent)]
     LockError(#[from] CrossProcessRefreshLockError),
@@ -1463,7 +1540,7 @@ pub enum OidcError {
 
 impl<E> From<E> for OidcError
 where
-    E: Into<mas_oidc_client::error::Error>,
+    E: Into<error::Error>,
 {
     fn from(value: E) -> Self {
         Self::Oidc(value.into())
@@ -1474,6 +1551,6 @@ fn rng() -> Result<StdRng, OidcError> {
     StdRng::from_rng(rand::thread_rng()).map_err(OidcError::Rand)
 }
 
-fn hash_str(x: &str) -> impl std::fmt::LowerHex {
+fn hash_str(x: &str) -> impl fmt::LowerHex {
     sha2::Sha256::new().chain_update(x).finalize()
 }

@@ -4,7 +4,6 @@ use std::{
 };
 
 use anyhow::Result;
-use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, FutureExt, StreamExt as _};
 use matrix_sdk::{
@@ -355,9 +354,12 @@ impl UpdateObserver {
     ///
     /// Returns `None` when the diff was empty, aka it was a spurious update.
     async fn next(&mut self) -> Option<RoomInfo> {
-        assert_let!(
-            Ok(Some(update)) = timeout(Duration::from_secs(3), self.subscriber.next()).await
-        );
+        // Wait for the room info updates to stabilize.
+        let mut update = None;
+        while let Ok(Some(up)) = timeout(Duration::from_secs(2), self.subscriber.next()).await {
+            update = Some(up);
+        }
+        let update = update.expect("there should have been an update");
 
         let update_json = serde_json::to_value(&update).unwrap();
         let update_diff = json_structural_diff::JsonDiff::diff_string(
@@ -531,7 +533,7 @@ async fn test_room_notification_count() -> Result<()> {
     bob_room
         .send(
             RoomMessageEventContent::text_plain("Hello my dear friend Alice!")
-                .set_mentions(Mentions::with_user_ids([alice.user_id().unwrap().to_owned()])),
+                .add_mentions(Mentions::with_user_ids([alice.user_id().unwrap().to_owned()])),
         )
         .await?;
 
@@ -570,12 +572,7 @@ async fn test_room_notification_count() -> Result<()> {
 
     {
         debug!("Remote echo of marking the room as read");
-        let update = update_observer.next().await;
-
-        if update.is_none() {
-            debug!("Previous update was spurious, actual update now");
-            update_observer.next().await.expect("there should be a non-empty update at some point");
-        }
+        update_observer.next().await;
 
         assert!(!alice_room.are_members_synced());
 
@@ -600,21 +597,10 @@ async fn test_room_notification_count() -> Result<()> {
     alice_room.send(RoomMessageEventContent::text_plain("hello bob")).await?;
 
     {
-        debug!("Room members got synced.");
+        debug!("Room members got synced + remote echo for hello bob.");
         update_observer.next().await.expect("syncing room members should update room info");
 
         assert!(alice_room.are_members_synced());
-
-        assert_eq!(alice_room.num_unread_messages(), 0);
-        assert_eq!(alice_room.num_unread_notifications(), 0);
-        assert_eq!(alice_room.num_unread_mentions(), 0);
-
-        update_observer.assert_is_pending();
-    }
-
-    {
-        debug!("Remote echo for hello bob");
-        update_observer.next().await.expect("we should receive a remote echo for our own message");
 
         assert_eq!(alice_room.num_unread_messages(), 0);
         assert_eq!(alice_room.num_unread_notifications(), 0);
@@ -658,7 +644,7 @@ async fn test_room_notification_count() -> Result<()> {
     bob_room
         .send(
             RoomMessageEventContent::text_plain("Why, hello there Alice!")
-                .set_mentions(Mentions::with_user_ids([alice.user_id().unwrap().to_owned()])),
+                .add_mentions(Mentions::with_user_ids([alice.user_id().unwrap().to_owned()])),
         )
         .await?;
 
@@ -713,16 +699,11 @@ impl CustomResponder {
 impl wiremock::Respond for &CustomResponder {
     fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
         // Convert the mocked request to an actual server request.
-        let mut req = self.client.request(
-            request.method.to_string().parse().expect("All methods exist"),
-            request.url.clone(),
-        );
-        for header in &request.headers {
-            for value in header.1 {
-                req = req.header(header.0.to_string(), value.to_string());
-            }
-        }
-        req = req.body(request.body.clone());
+        let req = self
+            .client
+            .request(request.method.clone(), request.url.clone())
+            .headers(request.headers.clone())
+            .body(request.body.clone());
 
         // Run await inside of non-async fn by spawning a new thread and creating a new
         // runtime. We need to do this because the current runtime can't run blocking
@@ -1061,11 +1042,21 @@ async fn test_room_preview() -> Result<()> {
     let sliding_alice = alice
         .sliding_sync("main")?
         .with_all_extensions()
-        .poll_timeout(Duration::from_secs(5))
-        .network_timeout(Duration::from_secs(5))
+        .poll_timeout(Duration::from_secs(30))
+        .network_timeout(Duration::from_secs(30))
         .add_list(
             SlidingSyncList::builder("all")
-                .sync_mode(SlidingSyncMode::new_selective().add_range(0..=20)),
+                .sync_mode(SlidingSyncMode::new_selective().add_range(0..=20))
+                .required_state(vec![
+                    // Explicitly request all the state events we need to get a preview for a known
+                    // room.
+                    (StateEventType::RoomName, "".to_owned()),
+                    (StateEventType::RoomCanonicalAlias, "".to_owned()),
+                    (StateEventType::RoomTopic, "".to_owned()),
+                    (StateEventType::RoomCreate, "".to_owned()),
+                    (StateEventType::RoomJoinRules, "".to_owned()),
+                    (StateEventType::RoomHistoryVisibility, "".to_owned()),
+                ]),
         )
         .build()
         .await?;
@@ -1108,8 +1099,11 @@ async fn test_room_preview() -> Result<()> {
     // successful updates for more than 2 seconds).
     let stream = sliding_alice.sync();
     pin_mut!(stream);
+
+    // Wait for updates coming in under than 15 seconds. After that, we consider the
+    // sync as stable.
     loop {
-        match timeout(Duration::from_secs(2), stream.next()).await {
+        match timeout(Duration::from_secs(15), stream.next()).await {
             Ok(None) | Err(_) => break,
             Ok(Some(up)) => {
                 warn!("alice got an update: {up:?}");
@@ -1123,7 +1117,8 @@ async fn test_room_preview() -> Result<()> {
     {
         // Dummy test for `Client::get_room_preview` which may call one or the other
         // methods.
-        let preview = alice.get_room_preview(room_id).await.unwrap();
+        info!("Alice gets a preview of the public room using any method");
+        let preview = alice.get_room_preview(room_id.into(), Vec::new()).await.unwrap();
         assert_room_preview(&preview, &room_alias);
         assert_eq!(preview.state, Some(RoomState::Joined));
     }
@@ -1150,18 +1145,21 @@ async fn get_room_preview_with_room_state(
     public_no_history_room_id: &RoomId,
 ) {
     // Alice has joined the room, so they get the full details.
+    info!("Alice gets a preview of the public room from state events");
     let preview = RoomPreview::from_state_events(alice, room_id).await.unwrap();
     assert_room_preview(&preview, room_alias);
     assert_eq!(preview.state, Some(RoomState::Joined));
 
     // Bob definitely doesn't know about the room, but they can get a preview of the
     // room too.
+    info!("Bob gets a preview of the public room from state events");
     let preview = RoomPreview::from_state_events(bob, room_id).await.unwrap();
     assert_room_preview(&preview, room_alias);
     assert!(preview.state.is_none());
 
     // Bob can't preview the second room, because its history visibility is neither
     // world-readable, nor have they joined the room before.
+    info!("Bob gets a preview of the private room from state events");
     let preview_result = RoomPreview::from_state_events(bob, public_no_history_room_id).await;
     assert_eq!(preview_result.unwrap_err().as_client_api_error().unwrap().status_code, 403);
 }
@@ -1174,31 +1172,51 @@ async fn get_room_preview_with_room_summary(
     public_no_history_room_id: &RoomId,
 ) {
     // Alice has joined the room, so they get the full details.
-    let preview = match RoomPreview::from_room_summary(alice, room_id).await {
-        Ok(r) => r,
-        Err(err) => {
-            if let Some(client_api_error) = err.as_client_api_error() {
-                if client_api_error.status_code == 404 {
-                    warn!("Skipping the room summary test, because the server may not support it.");
-                    return;
-                }
-            }
-            panic!("{err}");
-        }
-    };
+    info!("Alice gets a preview of the public room from msc3266 using the room id");
+    let preview =
+        RoomPreview::from_room_summary(alice, room_id.to_owned(), room_id.into(), Vec::new())
+            .await
+            .unwrap();
+
+    assert_room_preview(&preview, room_alias);
+    assert_eq!(preview.state, Some(RoomState::Joined));
+
+    // The preview also works when using the room alias parameter.
+    info!("Alice gets a preview of the public room from msc3266 using the room alias");
+    let full_alias = format!("#{room_alias}:{}", alice.user_id().unwrap().server_name());
+    let preview = RoomPreview::from_room_summary(
+        alice,
+        room_id.to_owned(),
+        <_>::try_from(full_alias.as_str()).unwrap(),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
 
     assert_room_preview(&preview, room_alias);
     assert_eq!(preview.state, Some(RoomState::Joined));
 
     // Bob definitely doesn't know about the room, but they can get a preview of the
     // room too.
-    let preview = RoomPreview::from_room_summary(bob, room_id).await.unwrap();
+    info!("Bob gets a preview of the public room from msc3266 using the room id");
+    let preview =
+        RoomPreview::from_room_summary(bob, room_id.to_owned(), room_id.into(), Vec::new())
+            .await
+            .unwrap();
     assert_room_preview(&preview, room_alias);
     assert!(preview.state.is_none());
 
     // Bob can preview the second room with the room summary (because its join rule
     // is set to public, or because Alice is a member of that room).
-    let preview = RoomPreview::from_room_summary(bob, public_no_history_room_id).await.unwrap();
+    info!("Bob gets a preview of the private room from msc3266 using the room id");
+    let preview = RoomPreview::from_room_summary(
+        bob,
+        public_no_history_room_id.to_owned(),
+        public_no_history_room_id.into(),
+        Vec::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(preview.name.unwrap(), "Alice's Room 2");
     assert!(preview.state.is_none());
 }

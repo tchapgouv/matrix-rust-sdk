@@ -33,14 +33,14 @@ use ruma::{
         relation::InReplyTo,
         room::message::{
             MessageType, Relation, ReplacementMetadata, RoomMessageEventContent,
-            TextMessageEventContent,
+            RoomMessageEventContentWithoutRelation, TextMessageEventContent,
         },
     },
     room_id, user_id,
 };
 use serde_json::json;
 use stream_assert::assert_next_matches;
-use tokio::time::sleep;
+use tokio::{task::yield_now, time::sleep};
 use wiremock::{
     matchers::{method, path_regex},
     Mock, ResponseTemplate,
@@ -55,10 +55,10 @@ async fn test_edit() {
     let event_builder = EventBuilder::new();
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
-    let mut ev_builder = SyncResponseBuilder::new();
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -67,7 +67,7 @@ async fn test_edit() {
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
     let event_id = event_id!("$msda7m:localhost");
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
         event_builder.make_sync_message_event_with_id(
             &ALICE,
             event_id,
@@ -75,7 +75,7 @@ async fn test_edit() {
         ),
     ));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -90,7 +90,7 @@ async fn test_edit() {
     assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
     assert!(day_divider.is_day_divider());
 
-    ev_builder.add_joined_room(
+    sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
             .add_timeline_event(event_builder.make_sync_message_event(
                 &BOB,
@@ -107,7 +107,7 @@ async fn test_edit() {
             ),
     );
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -189,7 +189,7 @@ async fn test_send_edit() {
         assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
     let hello_world_message = hello_world_item.content().as_message().unwrap();
     assert!(!hello_world_message.is_edited());
-    assert!(hello_world_item.can_be_edited());
+    assert!(hello_world_item.is_editable());
 
     mock_encryption_state(&server, false).await;
     Mock::given(method("PUT"))
@@ -202,9 +202,12 @@ async fn test_send_edit() {
         .await;
 
     timeline
-        .edit(RoomMessageEventContent::text_plain("Hello, Room!"), &hello_world_item)
+        .edit(RoomMessageEventContentWithoutRelation::text_plain("Hello, Room!"), &hello_world_item)
         .await
         .unwrap();
+
+    // Let the send queue handle the event.
+    yield_now().await;
 
     let edit_item =
         assert_next_matches!(timeline_stream, VectorDiff::Set { index: 0, value } => value);
@@ -266,14 +269,14 @@ async fn test_send_reply_edit() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
-    // 'Hello, World!' message
+    // 'Hello, World!' message.
     assert_next_matches!(timeline_stream, VectorDiff::PushBack { .. });
 
-    // Reply message
+    // Reply message.
     let reply_item = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
     let reply_message = reply_item.content().as_message().unwrap();
     assert!(!reply_message.is_edited());
-    assert!(reply_item.can_be_edited());
+    assert!(reply_item.is_editable());
     let in_reply_to = reply_message.in_reply_to().unwrap();
     assert_eq!(in_reply_to.event_id, fst_event_id);
     assert_matches!(in_reply_to.event, TimelineDetails::Ready(_));
@@ -288,7 +291,13 @@ async fn test_send_reply_edit() {
         .mount(&server)
         .await;
 
-    timeline.edit(RoomMessageEventContent::text_plain("Hello, Room!"), &reply_item).await.unwrap();
+    timeline
+        .edit(RoomMessageEventContentWithoutRelation::text_plain("Hello, Room!"), &reply_item)
+        .await
+        .unwrap();
+
+    // Let the send queue handle the event.
+    yield_now().await;
 
     let edit_item =
         assert_next_matches!(timeline_stream, VectorDiff::Set { index: 1, value } => value);
@@ -377,6 +386,9 @@ async fn test_send_edit_poll() {
     let edited_poll =
         UnstablePollStartContentBlock::new("Edited Test".to_owned(), edited_poll_answers);
     timeline.edit_poll("poll_fallback_text", edited_poll, &poll_event).await.unwrap();
+
+    // Let the send queue handle the event.
+    yield_now().await;
 
     let edit_item =
         assert_next_matches!(timeline_stream, VectorDiff::Set { index: 0, value } => value);

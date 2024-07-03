@@ -32,6 +32,8 @@ use ruma::events::{
     room::{history_visibility::HistoryVisibility, message::MessageType},
     SyncMessageLikeEvent,
 };
+#[cfg(doc)]
+use ruma::DeviceId;
 use ruma::{
     api::client as api,
     events::{
@@ -124,8 +126,7 @@ impl BaseClient {
     /// * `config` - An optional session if the user already has one from a
     /// previous login call.
     pub fn with_store_config(config: StoreConfig) -> Self {
-        let (roominfo_update_sender, _roominfo_update_receiver) =
-            tokio::sync::broadcast::channel(100);
+        let (roominfo_update_sender, _roominfo_update_receiver) = broadcast::channel(100);
 
         BaseClient {
             store: Store::new(config.state_store),
@@ -159,25 +160,19 @@ impl BaseClient {
     }
 
     /// Get all the rooms this client knows about.
-    pub fn get_rooms(&self) -> Vec<Room> {
-        self.store.get_rooms()
+    pub fn rooms(&self) -> Vec<Room> {
+        self.store.rooms()
     }
 
     /// Get all the rooms this client knows about, filtered by room state.
-    pub fn get_rooms_filtered(&self, filter: RoomStateFilter) -> Vec<Room> {
-        self.store.get_rooms_filtered(filter)
+    pub fn rooms_filtered(&self, filter: RoomStateFilter) -> Vec<Room> {
+        self.store.rooms_filtered(filter)
     }
 
     /// Lookup the Room for the given RoomId, or create one, if it didn't exist
     /// yet in the store
     pub fn get_or_create_room(&self, room_id: &RoomId, room_state: RoomState) -> Room {
         self.store.get_or_create_room(room_id, room_state, self.roominfo_update_sender.clone())
-    }
-
-    /// Get all the rooms this client knows about.
-    #[deprecated = "Use get_rooms_filtered with RoomStateFilter::INVITED instead."]
-    pub fn get_stripped_rooms(&self) -> Vec<Room> {
-        self.get_rooms_filtered(RoomStateFilter::INVITED)
     }
 
     /// Get a reference to the store.
@@ -201,13 +196,28 @@ impl BaseClient {
     /// * `session_meta` - The meta of a session that the user already has from
     ///   a previous login call.
     ///
+    /// * `custom_account` - A custom
+    ///   [`matrix_sdk_crypto::vodozemac::olm::Account`] to be used for the
+    ///   identity and one-time keys of this [`BaseClient`]. If no account is
+    ///   provided, a new default one or one from the store will be used. If an
+    ///   account is provided and one already exists in the store for this
+    ///   [`UserId`]/[`DeviceId`] combination, an error will be raised. This is
+    ///   useful if one wishes to create identity keys before knowing the
+    ///   user/device IDs, e.g., to use the identity key as the device ID.
+    ///
     /// This method panics if it is called twice.
-    pub async fn set_session_meta(&self, session_meta: SessionMeta) -> Result<()> {
+    pub async fn set_session_meta(
+        &self,
+        session_meta: SessionMeta,
+        #[cfg(feature = "e2e-encryption")] custom_account: Option<
+            crate::crypto::vodozemac::olm::Account,
+        >,
+    ) -> Result<()> {
         debug!(user_id = ?session_meta.user_id, device_id = ?session_meta.device_id, "Restoring login");
         self.store.set_session_meta(session_meta.clone(), &self.roominfo_update_sender).await?;
 
         #[cfg(feature = "e2e-encryption")]
-        self.regenerate_olm().await?;
+        self.regenerate_olm(custom_account).await?;
 
         Ok(())
     }
@@ -216,7 +226,10 @@ impl BaseClient {
     ///
     /// In particular, this will clear all its caches.
     #[cfg(feature = "e2e-encryption")]
-    pub async fn regenerate_olm(&self) -> Result<()> {
+    pub async fn regenerate_olm(
+        &self,
+        custom_account: Option<crate::crypto::vodozemac::olm::Account>,
+    ) -> Result<()> {
         tracing::debug!("regenerating OlmMachine");
         let session_meta = self.session_meta().ok_or(Error::OlmError(OlmError::MissingSession))?;
 
@@ -227,6 +240,7 @@ impl BaseClient {
             &session_meta.user_id,
             &session_meta.device_id,
             self.crypto_store.clone(),
+            custom_account,
         )
         .await
         .map_err(OlmError::from)?;
@@ -398,7 +412,6 @@ impl BaseClient {
                             room_info,
                             changes,
                         )
-                        .await;
                     } else {
                         push_context = self.get_push_room_context(room, room_info, changes).await?;
                     }
@@ -553,7 +566,7 @@ impl BaseClient {
                 on_room_info(room_info);
             }
             // The `BaseClient` has the `Room`, which has the `RoomInfo`.
-            else if let Some(room) = client.store.get_room(room_id) {
+            else if let Some(room) = client.store.room(room_id) {
                 // Clone the `RoomInfo`.
                 let mut room_info = room.clone_info();
 
@@ -618,7 +631,7 @@ impl BaseClient {
 
                         if let Some(room) = changes.room_infos.get_mut(room_id) {
                             room.base_info.dm_targets.insert(user_id.clone());
-                        } else if let Some(room) = self.store.get_room(room_id) {
+                        } else if let Some(room) = self.store.room(room_id) {
                             let mut info = room.clone_info();
                             if info.base_info.dm_targets.insert(user_id.clone()) {
                                 changes.add_room(info);
@@ -710,7 +723,8 @@ impl BaseClient {
                     match is_suitable_for_latest_event(&any_sync_event) {
                         PossibleLatestEvent::YesRoomMessage(_)
                         | PossibleLatestEvent::YesPoll(_)
-                        | PossibleLatestEvent::YesCallInvite(_) => {
+                        | PossibleLatestEvent::YesCallInvite(_)
+                        | PossibleLatestEvent::YesCallNotify(_) => {
                             // The event is the right type for us to use as latest_event
                             return Some((Box::new(LatestEvent::new(decrypted)), i));
                         }
@@ -731,6 +745,7 @@ impl BaseClient {
             RoomState::Joined,
             self.roominfo_update_sender.clone(),
         );
+
         if room.state() != RoomState::Joined {
             let _sync_lock = self.sync_lock().lock().await;
 
@@ -757,6 +772,7 @@ impl BaseClient {
             RoomState::Left,
             self.roominfo_update_sender.clone(),
         );
+
         if room.state() != RoomState::Left {
             let _sync_lock = self.sync_lock().lock().await;
 
@@ -832,10 +848,11 @@ impl BaseClient {
                 RoomState::Joined,
                 self.roominfo_update_sender.clone(),
             );
+
             let mut room_info = room.clone_info();
 
             room_info.mark_as_joined();
-            room_info.update_summary(&new_info.summary);
+            room_info.update_from_ruma_summary(&new_info.summary);
             room_info.set_prev_batch(new_info.timeline.prev_batch.as_deref());
             room_info.mark_state_fully_synced();
 
@@ -944,6 +961,7 @@ impl BaseClient {
                 RoomState::Left,
                 self.roominfo_update_sender.clone(),
             );
+
             let mut room_info = room.clone_info();
             room_info.mark_as_left();
             room_info.mark_state_partially_synced();
@@ -1002,6 +1020,7 @@ impl BaseClient {
                 RoomState::Invited,
                 self.roominfo_update_sender.clone(),
             );
+
             let mut room_info = room.clone_info();
             room_info.mark_as_invited();
             room_info.mark_state_fully_synced();
@@ -1046,6 +1065,13 @@ impl BaseClient {
             self.apply_changes(&changes, false);
         }
 
+        // Now that all the rooms information have been saved, update the display name
+        // cache (which relies on information stored in the database). This will
+        // live in memory, until the next sync which will saves the room info to
+        // disk; we do this to avoid saving that would be redundant with the
+        // above. Oh well.
+        new_rooms.update_in_memory_caches(&self.store).await;
+
         info!("Processed a sync response in {:?}", now.elapsed());
 
         let response = SyncResponse {
@@ -1079,8 +1105,8 @@ impl BaseClient {
         }
 
         for (room_id, room_info) in &changes.room_infos {
-            if let Some(room) = self.store.get_room(room_id) {
-                room.set_room_info(room_info.clone(), trigger_room_list_update);
+            if let Some(room) = self.store.room(room_id) {
+                room.set_room_info(room_info.clone(), trigger_room_list_update)
             }
         }
     }
@@ -1111,13 +1137,12 @@ impl BaseClient {
             return Err(Error::InvalidReceiveMembersParameters);
         }
 
-        let mut chunk = Vec::with_capacity(response.chunk.len());
-
-        let Some(room) = self.store.get_room(room_id) else {
+        let Some(room) = self.store.room(room_id) else {
             // The room is unknown to us: leave early.
             return Ok(());
         };
 
+        let mut chunk = Vec::with_capacity(response.chunk.len());
         let mut changes = StateChanges::default();
 
         #[cfg(feature = "e2e-encryption")]
@@ -1277,7 +1302,7 @@ impl BaseClient {
     ///
     /// * `room_id` - The id of the room that should be fetched.
     pub fn get_room(&self, room_id: &RoomId) -> Option<Room> {
-        self.store.get_room(room_id)
+        self.store.room(room_id)
     }
 
     /// Get the olm machine.
@@ -1388,7 +1413,7 @@ impl BaseClient {
     /// Update the push context for the given room.
     ///
     /// Updates the context data from `changes` or `room_info`.
-    pub async fn update_push_room_context(
+    pub fn update_push_room_context(
         &self,
         push_rules: &mut PushConditionRoomCtx,
         user_id: &UserId,
@@ -1515,9 +1540,9 @@ mod tests {
 
         let client = logged_in_base_client(Some(user_id)).await;
 
-        let mut ev_builder = SyncResponseBuilder::new();
+        let mut sync_builder = SyncResponseBuilder::new();
 
-        let response = ev_builder
+        let response = sync_builder
             .add_left_room(LeftRoomBuilder::new(room_id).add_timeline_event(sync_timeline_event!({
                 "content": {
                     "displayname": "Alice",
@@ -1533,7 +1558,7 @@ mod tests {
         client.receive_sync_response(response).await.unwrap();
         assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Left);
 
-        let response = ev_builder
+        let response = sync_builder
             .add_invited_room(InvitedRoomBuilder::new(room_id).add_state_event(
                 StrippedStateTestEvent::Custom(json!({
                     "content": {
@@ -1635,7 +1660,7 @@ mod tests {
         let room = client.get_room(room_id).expect("Room not found");
         assert_eq!(room.state(), RoomState::Invited);
         assert_eq!(
-            room.display_name().await.expect("fetching display name failed"),
+            room.compute_display_name().await.expect("fetching display name failed"),
             DisplayName::Calculated("Kyra".to_owned())
         );
     }
@@ -1675,8 +1700,8 @@ mod tests {
         event_id: &str,
         user_id: &UserId,
     ) -> crate::Room {
-        let mut ev_builder = SyncResponseBuilder::new();
-        let response = ev_builder
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
             .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_timeline_event(
                 sync_timeline_event!({
                     "content": {
@@ -1697,36 +1722,6 @@ mod tests {
         client.get_room(room_id).expect("Just-created room not found!")
     }
 
-    #[cfg(feature = "e2e-encryption")]
-    #[async_test]
-    async fn test_regerating_olm_clears_store_caches() {
-        // See https://github.com/matrix-org/matrix-rust-sdk/issues/3110
-        // We must clear the store cache when we regenerate the OlmMachine
-        // to ensure we really get the new state.
-
-        use ruma::{owned_device_id, owned_user_id};
-
-        use crate::store::StoreConfig;
-
-        // Given a client using a fake store
-        let user_id = owned_user_id!("@u:m.o");
-        let device_id = owned_device_id!("DEVICE");
-        let fake_store = fake_crypto_store::FakeCryptoStore::default();
-        let store_config = StoreConfig::new().crypto_store(fake_store.clone());
-        let client = BaseClient::with_store_config(store_config);
-        client.set_session_meta(SessionMeta { user_id, device_id }).await.unwrap();
-        fake_store.clear_method_calls();
-
-        // When we regenerate the OlmMachine
-        client.regenerate_olm().await.expect("Failed to regenerate olm");
-
-        // Then we cleared the store cache
-        assert!(
-            fake_store.method_calls().contains(&"clear_caches".to_owned()),
-            "No clear_caches call!"
-        );
-    }
-
     #[async_test]
     async fn test_deserialization_failure() {
         let user_id = user_id!("@alice:example.org");
@@ -1734,10 +1729,11 @@ mod tests {
 
         let client = BaseClient::new();
         client
-            .set_session_meta(SessionMeta {
-                user_id: user_id.to_owned(),
-                device_id: "FOOBAR".into(),
-            })
+            .set_session_meta(
+                SessionMeta { user_id: user_id.to_owned(), device_id: "FOOBAR".into() },
+                #[cfg(feature = "e2e-encryption")]
+                None,
+            )
             .await
             .unwrap();
 
@@ -1794,16 +1790,17 @@ mod tests {
 
         let client = BaseClient::new();
         client
-            .set_session_meta(SessionMeta {
-                user_id: user_id.to_owned(),
-                device_id: "FOOBAR".into(),
-            })
+            .set_session_meta(
+                SessionMeta { user_id: user_id.to_owned(), device_id: "FOOBAR".into() },
+                #[cfg(feature = "e2e-encryption")]
+                None,
+            )
             .await
             .unwrap();
 
         // Preamble: let the SDK know about the room.
-        let mut ev_builder = SyncResponseBuilder::new();
-        let response = ev_builder
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
             .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id))
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
@@ -1853,16 +1850,17 @@ mod tests {
 
         let client = BaseClient::new();
         client
-            .set_session_meta(SessionMeta {
-                user_id: user_id.to_owned(),
-                device_id: "FOOBAR".into(),
-            })
+            .set_session_meta(
+                SessionMeta { user_id: user_id.to_owned(), device_id: "FOOBAR".into() },
+                #[cfg(feature = "e2e-encryption")]
+                None,
+            )
             .await
             .unwrap();
 
         // Preamble: let the SDK know about the room, and that the invited user left it.
-        let mut ev_builder = SyncResponseBuilder::new();
-        let response = ev_builder
+        let mut sync_builder = SyncResponseBuilder::new();
+        let response = sync_builder
             .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_state_event(
                 StateTestEvent::Custom(json!({
                     "content": {
@@ -1915,293 +1913,5 @@ mod tests {
         assert_eq!(member.user_id(), user_id);
         assert_eq!(member.display_name().unwrap(), "Invited Alice");
         assert_eq!(member.avatar_url().unwrap().to_string(), "mxc://localhost/fewjilfewjil42");
-    }
-
-    #[cfg(feature = "e2e-encryption")]
-    mod fake_crypto_store {
-        use std::{
-            collections::HashMap,
-            convert::Infallible,
-            sync::{Arc, Mutex},
-        };
-
-        use async_trait::async_trait;
-        use matrix_sdk_crypto::{
-            olm::{InboundGroupSession, OutboundGroupSession, PrivateCrossSigningIdentity},
-            store::{
-                BackupKeys, Changes, CryptoStore, PendingChanges, RoomKeyCounts, RoomSettings,
-            },
-            types::events::room_key_withheld::RoomKeyWithheldEvent,
-            Account, GossipRequest, GossippedSecret, ReadOnlyDevice, ReadOnlyUserIdentities,
-            SecretInfo, Session, TrackedUser,
-        };
-        use ruma::{
-            events::secret::request::SecretName, DeviceId, OwnedDeviceId, RoomId, TransactionId,
-            UserId,
-        };
-
-        #[derive(Clone, Debug, Default)]
-        pub(crate) struct FakeCryptoStore {
-            pub method_calls: Arc<Mutex<Vec<String>>>,
-        }
-
-        impl FakeCryptoStore {
-            pub fn method_calls(&self) -> Vec<String> {
-                self.method_calls.lock().unwrap().clone()
-            }
-
-            pub fn clear_method_calls(&self) {
-                self.method_calls.lock().unwrap().clear();
-            }
-
-            fn call(&self, method_name: &str) {
-                self.method_calls.lock().unwrap().push(method_name.to_owned());
-            }
-        }
-
-        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-        impl CryptoStore for FakeCryptoStore {
-            type Error = Infallible;
-
-            async fn clear_caches(&self) {
-                self.call("clear_caches");
-            }
-
-            async fn load_account(&self) -> Result<Option<Account>, Self::Error> {
-                self.call("load_account");
-                Ok(None)
-            }
-
-            async fn load_identity(
-                &self,
-            ) -> Result<Option<PrivateCrossSigningIdentity>, Self::Error> {
-                self.call("load_identity");
-                Ok(None)
-            }
-
-            async fn next_batch_token(&self) -> Result<Option<String>, Self::Error> {
-                self.call("next_batch_token");
-                Ok(None)
-            }
-
-            async fn save_pending_changes(
-                &self,
-                _changes: PendingChanges,
-            ) -> Result<(), Self::Error> {
-                self.call("save_pending_changes");
-                Ok(())
-            }
-
-            async fn save_changes(&self, _changes: Changes) -> Result<(), Self::Error> {
-                self.call("save_changes");
-                Ok(())
-            }
-
-            async fn get_sessions(
-                &self,
-                _sender_key: &str,
-            ) -> Result<Option<Arc<tokio::sync::Mutex<Vec<Session>>>>, Self::Error> {
-                self.call("get_sessions");
-                Ok(None)
-            }
-
-            async fn get_inbound_group_session(
-                &self,
-                _room_id: &RoomId,
-                _session_id: &str,
-            ) -> Result<Option<InboundGroupSession>, Self::Error> {
-                self.call("get_inbound_group_session");
-                Ok(None)
-            }
-
-            async fn get_withheld_info(
-                &self,
-                _room_id: &RoomId,
-                _session_id: &str,
-            ) -> Result<Option<RoomKeyWithheldEvent>, Self::Error> {
-                self.call("get_withheld_info");
-                Ok(None)
-            }
-
-            async fn get_inbound_group_sessions(
-                &self,
-            ) -> Result<Vec<InboundGroupSession>, Self::Error> {
-                self.call("get_inbound_group_sessions");
-                Ok(vec![])
-            }
-
-            async fn inbound_group_session_counts(
-                &self,
-                _backup_version: Option<&str>,
-            ) -> Result<RoomKeyCounts, Self::Error> {
-                self.call("inbound_group_session_counts");
-                Ok(RoomKeyCounts { total: 0, backed_up: 0 })
-            }
-
-            async fn inbound_group_sessions_for_backup(
-                &self,
-                _backup_version: &str,
-                _limit: usize,
-            ) -> Result<Vec<InboundGroupSession>, Self::Error> {
-                self.call("inbound_group_sessions_for_backup");
-                Ok(vec![])
-            }
-
-            async fn mark_inbound_group_sessions_as_backed_up(
-                &self,
-                _backup_version: &str,
-                _room_and_session_ids: &[(&RoomId, &str)],
-            ) -> Result<(), Self::Error> {
-                self.call("mark_inbound_group_sessions_as_backed_up");
-                Ok(())
-            }
-
-            async fn reset_backup_state(&self) -> Result<(), Self::Error> {
-                self.call("reset_backup_state");
-                Ok(())
-            }
-
-            async fn load_backup_keys(&self) -> Result<BackupKeys, Self::Error> {
-                self.call("load_backup_keys");
-                Ok(BackupKeys::default())
-            }
-
-            async fn get_outbound_group_session(
-                &self,
-                _room_id: &RoomId,
-            ) -> Result<Option<OutboundGroupSession>, Self::Error> {
-                self.call("get_outbound_group_session");
-                Ok(None)
-            }
-
-            async fn load_tracked_users(&self) -> Result<Vec<TrackedUser>, Self::Error> {
-                self.call("load_tracked_users");
-                Ok(vec![])
-            }
-
-            async fn save_tracked_users(
-                &self,
-                _tracked_users: &[(&UserId, bool)],
-            ) -> Result<(), Self::Error> {
-                self.call("save_tracked_users");
-                Ok(())
-            }
-
-            async fn get_device(
-                &self,
-                _user_id: &UserId,
-                _device_id: &DeviceId,
-            ) -> Result<Option<ReadOnlyDevice>, Self::Error> {
-                self.call("get_device");
-                Ok(None)
-            }
-
-            async fn get_user_devices(
-                &self,
-                _user_id: &UserId,
-            ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>, Self::Error> {
-                self.call("get_user_devices");
-                Ok(HashMap::default())
-            }
-
-            async fn get_user_identity(
-                &self,
-                _user_id: &UserId,
-            ) -> Result<Option<ReadOnlyUserIdentities>, Self::Error> {
-                self.call("get_user_identity");
-                Ok(None)
-            }
-
-            async fn is_message_known(
-                &self,
-                _message_hash: &matrix_sdk_crypto::olm::OlmMessageHash,
-            ) -> Result<bool, Self::Error> {
-                self.call("is_message_known");
-                Ok(false)
-            }
-
-            async fn get_outgoing_secret_requests(
-                &self,
-                _request_id: &TransactionId,
-            ) -> Result<Option<GossipRequest>, Self::Error> {
-                self.call("get_outgoing_secret_requests");
-                Ok(None)
-            }
-
-            async fn get_secret_request_by_info(
-                &self,
-                _key_info: &SecretInfo,
-            ) -> Result<Option<GossipRequest>, Self::Error> {
-                self.call("get_secret_request_by_info");
-                Ok(None)
-            }
-
-            async fn get_unsent_secret_requests(&self) -> Result<Vec<GossipRequest>, Self::Error> {
-                self.call("get_unsent_secret_requests");
-                Ok(vec![])
-            }
-
-            async fn delete_outgoing_secret_requests(
-                &self,
-                _request_id: &TransactionId,
-            ) -> Result<(), Self::Error> {
-                self.call("delete_outgoing_secret_requests");
-                Ok(())
-            }
-
-            async fn get_secrets_from_inbox(
-                &self,
-                _secret_name: &SecretName,
-            ) -> Result<Vec<GossippedSecret>, Self::Error> {
-                self.call("get_secrets_from_inbox");
-                Ok(vec![])
-            }
-
-            async fn delete_secrets_from_inbox(
-                &self,
-                _secret_name: &SecretName,
-            ) -> Result<(), Self::Error> {
-                self.call("delete_secrets_from_inbox");
-                Ok(())
-            }
-
-            async fn get_room_settings(
-                &self,
-                _room_id: &RoomId,
-            ) -> Result<Option<RoomSettings>, Self::Error> {
-                self.call("get_room_settings");
-                Ok(None)
-            }
-
-            async fn get_custom_value(&self, _key: &str) -> Result<Option<Vec<u8>>, Self::Error> {
-                self.call("get_custom_value");
-                Ok(None)
-            }
-
-            async fn set_custom_value(
-                &self,
-                _key: &str,
-                _value: Vec<u8>,
-            ) -> Result<(), Self::Error> {
-                self.call("set_custom_value");
-                Ok(())
-            }
-
-            async fn remove_custom_value(&self, _key: &str) -> Result<(), Self::Error> {
-                self.call("remove_custom_value");
-                Ok(())
-            }
-
-            async fn try_take_leased_lock(
-                &self,
-                _lease_duration_ms: u32,
-                _key: &str,
-                _holder: &str,
-            ) -> Result<bool, Self::Error> {
-                self.call("try_take_leased_lock");
-                Ok(true)
-            }
-        }
     }
 }

@@ -21,17 +21,16 @@ use matrix_sdk::{
     encryption::{BackupDownloadStrategy, EncryptionSettings},
     matrix_auth::MatrixSession,
     ruma::{
-        api::client::receipt::create_receipt::v3::ReceiptType, events::room::message::MessageType,
-        OwnedRoomId, RoomId,
+        api::client::receipt::create_receipt::v3::ReceiptType,
+        events::room::message::{MessageType, RoomMessageEventContent},
+        MilliSecondsSinceUnixEpoch, OwnedRoomId, RoomId,
     },
     AuthSession, Client, RoomListEntry, ServerName, SqliteCryptoStore, SqliteStateStore,
 };
 use matrix_sdk_ui::{
     room_list_service,
     sync_service::{self, SyncService},
-    timeline::{
-        PaginationOptions, TimelineItem, TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
-    },
+    timeline::{TimelineItem, TimelineItemContent, TimelineItemKind, VirtualTimelineItem},
     Timeline as SdkTimeline,
 };
 use ratatui::{prelude::*, style::palette::tailwind, widgets::*};
@@ -52,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(tracing_appender::rolling::hourly("/tmp/", "logs-"));
 
     tracing_subscriber::registry()
-        .with(EnvFilter::new(std::env::var("RUST_LOG").unwrap_or("".into())))
+        .with(EnvFilter::new(env::var("RUST_LOG").unwrap_or("".into())))
         .with(file_layer)
         .init();
 
@@ -122,6 +121,16 @@ struct Timeline {
     task: JoinHandle<()>,
 }
 
+/// Extra room information, like its display name, etc.
+#[derive(Clone)]
+struct ExtraRoomInfo {
+    /// Content of the raw m.room.name event, if available.
+    raw_name: Option<String>,
+
+    /// Calculated display name for the room.
+    display_name: Option<String>,
+}
+
 struct App {
     /// Reference to the main SDK client.
     client: Client,
@@ -137,6 +146,9 @@ struct App {
 
     /// Ratatui's list of room list entries.
     room_list_entries: StatefulList<RoomListEntry>,
+
+    /// Extra information about rooms.
+    room_info: Arc<Mutex<HashMap<OwnedRoomId, ExtraRoomInfo>>>,
 
     /// Task listening to room list service changes, and spawning timelines.
     listen_task: JoinHandle<()>,
@@ -166,11 +178,14 @@ impl App {
         let (rooms, stream) = all_rooms.entries();
 
         let rooms = Arc::new(Mutex::new(rooms));
+        let room_infos: Arc<Mutex<HashMap<OwnedRoomId, ExtraRoomInfo>>> =
+            Arc::new(Mutex::new(Default::default()));
         let ui_rooms: Arc<Mutex<HashMap<OwnedRoomId, room_list_service::Room>>> =
             Default::default();
         let timelines = Arc::new(Mutex::new(HashMap::new()));
 
         let r = rooms.clone();
+        let ri = room_infos.clone();
         let ur = ui_rooms.clone();
         let s = sync_service.clone();
         let t = timelines.clone();
@@ -178,6 +193,7 @@ impl App {
         let listen_task = spawn(async move {
             pin_mut!(stream);
             let rooms = r;
+            let room_infos = ri;
             let ui_rooms = ur;
             let sync_service = s;
             let timelines = t;
@@ -211,7 +227,7 @@ impl App {
                     all_rooms.into_iter().filter(|room_id| !previous_ui_rooms.contains_key(room_id))
                 {
                     // Retrieve the room list service's Room.
-                    let Ok(ui_room) = sync_service.room_list_service().room(&room_id).await else {
+                    let Ok(ui_room) = sync_service.room_list_service().room(&room_id) else {
                         error!("error when retrieving room after an update");
                         continue;
                     };
@@ -254,6 +270,15 @@ impl App {
                     new_ui_rooms.insert(room_id, ui_room);
                 }
 
+                for (room_id, room) in &new_ui_rooms {
+                    let raw_name = room.name();
+                    let display_name = room.cached_display_name();
+                    room_infos
+                        .lock()
+                        .unwrap()
+                        .insert(room_id.clone(), ExtraRoomInfo { raw_name, display_name });
+                }
+
                 ui_rooms.lock().unwrap().extend(new_ui_rooms);
                 timelines.lock().unwrap().extend(new_timelines);
             }
@@ -266,6 +291,7 @@ impl App {
         Ok(Self {
             sync_service,
             room_list_entries: StatefulList { state: Default::default(), items: rooms },
+            room_info: room_infos,
             client,
             listen_task,
             last_status_message: Default::default(),
@@ -325,7 +351,7 @@ impl App {
 
     /// Run a small back-pagination (expect a batch of 20 events, continue until
     /// we get 10 timeline items or hit the timeline start).
-    async fn back_paginate(&mut self) {
+    fn back_paginate(&mut self) {
         let Some(sdk_timeline) = self.get_selected_room_id(None).and_then(|room_id| {
             self.timelines.lock().unwrap().get(&room_id).map(|timeline| timeline.timeline.clone())
         }) else {
@@ -343,10 +369,7 @@ impl App {
         // Start a new one, request batches of 20 events, stop after 10 timeline items
         // have been added.
         *pagination = Some(spawn(async move {
-            if let Err(err) = sdk_timeline
-                .live_paginate_backwards(PaginationOptions::until_num_items(20, 10))
-                .await
-            {
+            if let Err(err) = sdk_timeline.live_paginate_backwards(20).await {
                 // TODO: would be nice to be able to set the status
                 // message remotely?
                 //self.set_status_message(format!(
@@ -390,7 +413,7 @@ impl App {
         loop {
             terminal.draw(|f| f.render_widget(&mut *self, f.size()))?;
 
-            if crossterm::event::poll(Duration::from_millis(16))? {
+            if event::poll(Duration::from_millis(16))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         use KeyCode::*;
@@ -411,11 +434,52 @@ impl App {
 
                             Char('s') => self.sync_service.start().await,
                             Char('S') => self.sync_service.stop().await?,
+
+                            Char('Q') => {
+                                let q = self.client.send_queue();
+                                let enabled = q.is_enabled();
+                                q.set_enabled(!enabled);
+                            }
+
+                            Char('M') => {
+                                if let Some(sdk_timeline) =
+                                    self.get_selected_room_id(None).and_then(|room_id| {
+                                        self.timelines
+                                            .lock()
+                                            .unwrap()
+                                            .get(&room_id)
+                                            .map(|timeline| timeline.timeline.clone())
+                                    })
+                                {
+                                    match sdk_timeline
+                                        .send(
+                                            RoomMessageEventContent::text_plain(format!(
+                                                "hey {}",
+                                                MilliSecondsSinceUnixEpoch::now().get()
+                                            ))
+                                            .into(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            self.set_status_message("message sent!".to_owned());
+                                        }
+                                        Err(err) => {
+                                            self.set_status_message(format!(
+                                                "error when sending event: {err}"
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    self.set_status_message("missing timeline for room".to_owned());
+                                };
+                            }
+
                             Char('r') => self.details_mode = DetailsMode::ReadReceipts,
                             Char('t') => self.details_mode = DetailsMode::TimelineItems,
 
                             Char('b') if self.details_mode == DetailsMode::TimelineItems => {
-                                self.back_paginate().await;
+                                self.back_paginate();
                             }
 
                             Char('m') if self.details_mode == DetailsMode::ReadReceipts => {
@@ -507,6 +571,10 @@ impl App {
         // We can render the header in outer_area.
         outer_block.render(outer_area, buf);
 
+        // Don't keep this lock too long by cloning the content. RAM's free these days,
+        // right?
+        let mut room_info = self.room_info.lock().unwrap().clone();
+
         // Iterate through all elements in the `items` and stylize them.
         let items: Vec<ListItem<'_>> = self
             .room_list_entries
@@ -524,7 +592,24 @@ impl App {
                 let line = if let Some(room) =
                     item.as_room_id().and_then(|room_id| self.client.get_room(room_id))
                 {
-                    format!("#{i} {}", room.room_id())
+                    let room_id = room.room_id();
+                    let room_info = room_info.remove(room_id);
+
+                    let (raw, display) = if let Some(info) = room_info {
+                        (info.raw_name, info.display_name)
+                    } else {
+                        (None, None)
+                    };
+
+                    let room_name = if let Some(n) = display {
+                        format!("{n} ({room_id})")
+                    } else if let Some(n) = raw {
+                        format!("m.room.name:{n} ({room_id})")
+                    } else {
+                        room_id.to_string()
+                    };
+
+                    format!("#{i} {}", room_name)
                 } else {
                     "non-filled room".to_owned()
                 };
@@ -670,7 +755,8 @@ impl App {
                         | TimelineItemContent::FailedToParseMessageLike { .. }
                         | TimelineItemContent::FailedToParseState { .. }
                         | TimelineItemContent::Poll(_)
-                        | TimelineItemContent::CallInvite => {
+                        | TimelineItemContent::CallInvite
+                        | TimelineItemContent::CallNotify => {
                             continue;
                         }
                     }
@@ -725,10 +811,10 @@ impl App {
         } else {
             match self.details_mode {
                 DetailsMode::ReadReceipts => {
-                    "\nUse ↓↑ to move, s/S to start/stop the sync service, m to mark as read, t to show the timeline.".to_owned()
+                    "\nUse j/k to move, s/S to start/stop the sync service, m to mark as read, t to show the timeline.".to_owned()
                 }
                 DetailsMode::TimelineItems => {
-                    "\nUse ↓↑ to move, s/S to start/stop the sync service, r to show read receipts.".to_owned()
+                    "\nUse j/k to move, s/S to start/stop the sync service, r to show read receipts, Q to enable/disable the send queue, M to send a message.".to_owned()
                 }
             }
         };
@@ -808,7 +894,7 @@ async fn configure_client(server_name: String, config_path: String) -> anyhow::R
             auto_enable_backups: true,
         });
 
-    if let Ok(proxy_url) = std::env::var("PROXY") {
+    if let Ok(proxy_url) = env::var("PROXY") {
         client_builder = client_builder.proxy(proxy_url).disable_ssl_verification();
     }
 

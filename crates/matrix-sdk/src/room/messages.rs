@@ -125,7 +125,7 @@ impl fmt::Debug for MessagesOptions {
 ///
 /// In short, this is a possibly decrypted version of the response of a
 /// `room/messages` api call.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Messages {
     /// The token the pagination starts from.
     pub start: String,
@@ -145,7 +145,7 @@ pub struct Messages {
 /// This is a wrapper around
 /// [`ruma::api::client::context::get_context::v3::Response`], with events
 /// decrypted if needs be.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct EventWithContextResponse {
     /// The event targeted by the /context query.
     pub event: Option<TimelineEvent>,

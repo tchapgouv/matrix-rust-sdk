@@ -1,17 +1,21 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use matrix_sdk::RoomState;
-use ruma::OwnedMxcUri;
 
 use crate::{
-    notification_settings::RoomNotificationMode, room::Membership, room_member::RoomMember,
-    timeline::EventTimelineItem,
+    notification_settings::RoomNotificationMode,
+    room::{Membership, RoomHero},
+    room_member::RoomMember,
 };
 
 #[derive(uniffi::Record)]
 pub struct RoomInfo {
     id: String,
-    name: Option<String>,
+    /// The room's name from the room state event if received from sync, or one
+    /// that's been computed otherwise.
+    display_name: Option<String>,
+    /// Room name as defined by the room state event only.
+    raw_name: Option<String>,
     topic: Option<String>,
     avatar_url: Option<String>,
     is_direct: bool,
@@ -22,13 +26,13 @@ pub struct RoomInfo {
     canonical_alias: Option<String>,
     alternative_aliases: Vec<String>,
     membership: Membership,
-    latest_event: Option<Arc<EventTimelineItem>>,
     /// Member who invited the current user to a room that's in the invited
     /// state.
     ///
     /// Can be missing if the room membership invite event is missing from the
     /// store.
     inviter: Option<RoomMember>,
+    heroes: Vec<RoomHero>,
     active_members_count: u64,
     invited_members_count: u64,
     joined_members_count: u64,
@@ -52,11 +56,7 @@ pub struct RoomInfo {
 }
 
 impl RoomInfo {
-    pub(crate) async fn new(
-        room: &matrix_sdk::Room,
-        avatar_url: Option<OwnedMxcUri>,
-        latest_event: Option<Arc<EventTimelineItem>>,
-    ) -> matrix_sdk::Result<Self> {
+    pub(crate) async fn new(room: &matrix_sdk::Room) -> matrix_sdk::Result<Self> {
         let unread_notification_counts = room.unread_notification_counts();
 
         let power_levels_map = room.users_with_power_levels().await;
@@ -67,9 +67,10 @@ impl RoomInfo {
 
         Ok(Self {
             id: room.room_id().to_string(),
-            name: room.name(),
+            display_name: room.cached_display_name().map(|name| name.to_string()),
+            raw_name: room.name(),
             topic: room.topic(),
-            avatar_url: avatar_url.map(Into::into),
+            avatar_url: room.avatar_url().map(Into::into),
             is_direct: room.is_direct().await?,
             is_public: room.is_public(),
             is_space: room.is_space(),
@@ -78,7 +79,6 @@ impl RoomInfo {
             canonical_alias: room.canonical_alias().map(Into::into),
             alternative_aliases: room.alt_aliases().into_iter().map(Into::into).collect(),
             membership: room.state().into(),
-            latest_event,
             inviter: match room.state() {
                 RoomState::Invited => room
                     .invite_details()
@@ -88,6 +88,7 @@ impl RoomInfo {
                     .map(Into::into),
                 _ => None,
             },
+            heroes: room.heroes().into_iter().map(Into::into).collect(),
             active_members_count: room.active_members_count(),
             invited_members_count: room.invited_members_count(),
             joined_members_count: room.joined_members_count(),

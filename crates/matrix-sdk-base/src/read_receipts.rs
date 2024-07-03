@@ -544,7 +544,7 @@ fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool 
     }
 
     match event {
-        ruma::events::AnySyncTimelineEvent::MessageLike(event) => {
+        AnySyncTimelineEvent::MessageLike(event) => {
             // Filter out redactions.
             let Some(content) = event.original_content() else {
                 tracing::trace!("not interesting because redacted");
@@ -563,6 +563,7 @@ fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool 
             match event {
                 AnySyncMessageLikeEvent::CallAnswer(_)
                 | AnySyncMessageLikeEvent::CallInvite(_)
+                | AnySyncMessageLikeEvent::CallNotify(_)
                 | AnySyncMessageLikeEvent::CallHangup(_)
                 | AnySyncMessageLikeEvent::CallCandidates(_)
                 | AnySyncMessageLikeEvent::CallNegotiate(_)
@@ -612,7 +613,7 @@ fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool 
             }
         }
 
-        ruma::events::AnySyncTimelineEvent::State(_) => false,
+        AnySyncTimelineEvent::State(_) => false,
     }
 }
 

@@ -85,7 +85,7 @@ async fn test_notification() -> Result<()> {
 
         // Try with sliding sync first.
         let notification_client =
-            NotificationClient::builder(bob.clone(), process_setup.clone()).await.unwrap().build();
+            NotificationClient::new(bob.clone(), process_setup.clone()).await.unwrap();
         assert_let!(
             NotificationStatus::Event(notification) =
                 notification_client.get_notification_with_sliding_sync(&room_id, &event_id).await?
@@ -107,12 +107,12 @@ async fn test_notification() -> Result<()> {
         // In theory, the room name ought to be ROOM_NAME here, but the sliding sync
         // proxy returns the other person's name as the room's name (as of
         // 2023-08-04).
-        assert!(notification.room_display_name != ROOM_NAME);
-        assert_eq!(notification.room_display_name, ALICE_NAME);
+        assert!(notification.room_computed_display_name != ROOM_NAME);
+        assert_eq!(notification.room_computed_display_name, ALICE_NAME);
 
         // Then with /context.
         let notification_client =
-            NotificationClient::builder(bob.clone(), process_setup.clone()).await.unwrap().build();
+            NotificationClient::new(bob.clone(), process_setup.clone()).await.unwrap();
         let notification =
             notification_client.get_notification_with_context(&room_id, &event_id).await;
         // We aren't authorized to inspect events from rooms we were not invited to.
@@ -194,19 +194,18 @@ async fn test_notification() -> Result<()> {
         );
 
         assert_eq!(notification.sender_display_name.as_deref(), Some(ALICE_NAME));
-        assert_eq!(notification.room_display_name, ROOM_NAME);
+        assert_eq!(notification.room_computed_display_name, ROOM_NAME);
     };
 
     let notification_client =
-        NotificationClient::builder(bob.clone(), process_setup.clone()).await.unwrap().build();
+        NotificationClient::new(bob.clone(), process_setup.clone()).await.unwrap();
     assert_let!(
         NotificationStatus::Event(notification) =
             notification_client.get_notification_with_sliding_sync(&room_id, &event_id).await?
     );
     check_notification(true, notification);
 
-    let notification_client =
-        NotificationClient::builder(bob.clone(), process_setup).await.unwrap().build();
+    let notification_client = NotificationClient::new(bob.clone(), process_setup).await.unwrap();
     let notification = notification_client
         .get_notification_with_context(&room_id, &event_id)
         .await?

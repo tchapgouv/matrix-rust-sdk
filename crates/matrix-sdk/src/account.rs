@@ -49,7 +49,7 @@ use ruma::{
 use serde::Deserialize;
 use tracing::error;
 
-use crate::{config::RequestConfig, Client, Error, HttpError, Result};
+use crate::{config::RequestConfig, Client, Error, Result};
 
 /// A high-level API to manage the client owner's account.
 ///
@@ -120,6 +120,10 @@ impl Account {
     }
 
     /// Get the MXC URI of the account's avatar, if set.
+    ///
+    /// This always sends a request to the server to retrieve this information.
+    /// If successful, this fills the cache, and makes it so that
+    /// [`Self::get_cached_avatar_url`] will always return something.
     ///
     /// # Examples
     ///
@@ -737,8 +741,7 @@ impl Account {
         &self,
         event_type: GlobalAccountDataEventType,
     ) -> Result<Option<Raw<AnyGlobalAccountDataEventContent>>> {
-        let own_user =
-            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
         let request = get_global_account_data::v3::Request::new(own_user.to_owned(), event_type);
 
@@ -791,8 +794,7 @@ impl Account {
     where
         T: GlobalAccountDataEventContent,
     {
-        let own_user =
-            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
         let request = set_global_account_data::v3::Request::new(own_user.to_owned(), &content)?;
 
@@ -805,8 +807,7 @@ impl Account {
         event_type: GlobalAccountDataEventType,
         content: Raw<AnyGlobalAccountDataEventContent>,
     ) -> Result<set_global_account_data::v3::Response> {
-        let own_user =
-            self.client.user_id().ok_or_else(|| Error::from(HttpError::AuthenticationRequired))?;
+        let own_user = self.client.user_id().ok_or(Error::AuthenticationRequired)?;
 
         let request =
             set_global_account_data::v3::Request::new_raw(own_user.to_owned(), event_type, content);
@@ -902,7 +903,7 @@ impl Account {
         Ok(ignored_user_list)
     }
 
-    /// Get the current push rules.
+    /// Get the current push rules from storage.
     ///
     /// If no push rules event was found, or it fails to deserialize, a ruleset
     /// with the server-default push rules is returned.

@@ -41,10 +41,11 @@ jobs:
           - markdown
           - socks
           - sso-login
+          - image-proc
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -64,7 +65,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Get xtask
-        uses: actions/cache/restore@v3
+        uses: actions/cache/restore@v4
         with:
           path: target/debug/xtask
           key: "${{ needs.xtask.outputs.cachekey-linux }}"
@@ -82,7 +83,7 @@ jobs:
 
     steps:
       - name: Checkout the repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -96,7 +97,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Get xtask
-        uses: actions/cache/restore@v3
+        uses: actions/cache/restore@v4
         with:
           path: target/debug/xtask
           key: "${{ needs.xtask.outputs.cachekey-linux }}"
@@ -114,7 +115,7 @@ jobs:
 
     steps:
       - name: Checkout the repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -128,7 +129,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Get xtask
-        uses: actions/cache/restore@v3
+        uses: actions/cache/restore@v4
         with:
           path: target/debug/xtask
           key: "${{ needs.xtask.outputs.cachekey-linux }}"
@@ -161,7 +162,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install protoc
         uses: taiki-e/install-action@v2
@@ -224,7 +225,7 @@ jobs:
 
     steps:
       - name: Checkout the repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -233,7 +234,7 @@ jobs:
           components: clippy
 
       - name: Install wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
+        uses: qmaru/wasm-pack-action@v0.5.0
         with:
           version: v0.10.3
 
@@ -252,7 +253,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Get xtask
-        uses: actions/cache/restore@v3
+        uses: actions/cache/restore@v4
         with:
           path: target/debug/xtask
           key: "${{ needs.xtask.outputs.cachekey-linux }}"
@@ -273,12 +274,12 @@ jobs:
 
     steps:
       - name: Checkout the repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2024-02-06
+          toolchain: nightly-2024-05-19
           components: rustfmt
 
       - name: Cargo fmt
@@ -292,10 +293,10 @@ jobs:
 
     steps:
       - name: Checkout Actions Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Check the spelling of the files in our repo
-        uses: crate-ci/typos@v1.17.0
+        uses: crate-ci/typos@v1.20.10
 
   clippy:
     name: Run clippy
@@ -305,7 +306,7 @@ jobs:
 
     steps:
       - name: Checkout the repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install protoc
         uses: taiki-e/install-action@v2
@@ -315,7 +316,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2024-02-06
+          toolchain: nightly-2024-05-19
           components: clippy
 
       - name: Load cache
@@ -324,7 +325,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Get xtask
-        uses: actions/cache/restore@v3
+        uses: actions/cache/restore@v4
         with:
           path: target/debug/xtask
           key: "${{ needs.xtask.outputs.cachekey-linux }}"
@@ -375,7 +376,7 @@ jobs:
       # tests need a synapse: this is a service and not michaelkaye/setup-matrix-synapse@main as the
       # latter does not provide networking for services to communicate with it.
       synapse:
-        image: ghcr.io/matrix-org/synapse-service:v1.94.0 # keep in sync with ./coverage.yml
+        image: ghcr.io/matrix-org/synapse-service:5b6a75935e560945f69af72e9768bbaac10c9b4f # keep in sync with ./coverage.yml
         env:
             SYNAPSE_COMPLEMENT_DATABASE: sqlite
             SERVER_NAME: synapse
@@ -384,7 +385,7 @@ jobs:
 
     steps:
       - name: Checkout the repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -399,7 +400,7 @@ jobs:
 
       - name: Test
         env:
-          RUST_LOG: "hyper=trace"
+          RUST_LOG: "info,matrix_sdk=trace"
           HOMESERVER_URL: "http://localhost:8008"
           HOMESERVER_DOMAIN: "synapse"
           SLIDING_SYNC_PROXY_URL: "http://localhost:8118"

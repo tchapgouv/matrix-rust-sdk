@@ -18,13 +18,24 @@ use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
-use matrix_sdk::{config::SyncSettings, test_utils::logged_in_client_with_server};
+use matrix_sdk::{
+    config::SyncSettings,
+    test_utils::{events::EventFactory, logged_in_client_with_server},
+};
 use matrix_sdk_test::{
     async_test, sync_timeline_event, JoinedRoomBuilder, RoomAccountDataTestEvent, StateTestEvent,
     SyncResponseBuilder,
 };
-use matrix_sdk_ui::timeline::{RoomExt, TimelineItemContent, VirtualTimelineItem};
-use ruma::{room_id, user_id};
+use matrix_sdk_ui::timeline::{EventSendState, RoomExt, TimelineItemContent, VirtualTimelineItem};
+use ruma::{
+    event_id, events::room::message::RoomMessageEventContent, room_id, user_id,
+    MilliSecondsSinceUnixEpoch,
+};
+use serde_json::json;
+use wiremock::{
+    matchers::{header, method, path_regex},
+    Mock, ResponseTemplate,
+};
 
 use crate::mock_sync;
 
@@ -46,10 +57,10 @@ async fn test_reaction() {
     let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
-    let mut ev_builder = SyncResponseBuilder::new();
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -57,7 +68,7 @@ async fn test_reaction() {
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
-    ev_builder.add_joined_room(
+    sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
             .add_timeline_event(sync_timeline_event!({
                 "content": {
@@ -84,7 +95,7 @@ async fn test_reaction() {
             })),
     );
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -123,9 +134,7 @@ async fn test_reaction() {
     assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
     assert!(day_divider.is_day_divider());
 
-    // TODO: After adding raw timeline items, check for one here
-
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
         sync_timeline_event!({
             "content": {},
             "redacts": "$031IXQRi27504",
@@ -136,7 +145,7 @@ async fn test_reaction() {
         }),
     ));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -155,10 +164,10 @@ async fn test_redacted_message() {
     let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
-    let mut ev_builder = SyncResponseBuilder::new();
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -166,7 +175,7 @@ async fn test_redacted_message() {
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
-    ev_builder.add_joined_room(
+    sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
             .add_timeline_event(sync_timeline_event!({
                 "content": {},
@@ -195,7 +204,7 @@ async fn test_redacted_message() {
             })),
     );
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -204,8 +213,87 @@ async fn test_redacted_message() {
 
     assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
     assert!(day_divider.is_day_divider());
+}
 
-    // TODO: After adding raw timeline items, check for one here
+#[async_test]
+async fn test_redact_message() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let (client, server) = logged_in_client_with_server().await;
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    let room = client.get_room(room_id).unwrap();
+    let timeline = room.timeline().await.unwrap();
+    let (_, mut timeline_stream) = timeline.subscribe().await;
+
+    let factory = EventFactory::new();
+    factory.set_next_ts(MilliSecondsSinceUnixEpoch::now().get().into());
+
+    sync_builder.add_joined_room(
+        JoinedRoomBuilder::new(room_id).add_timeline_event(
+            factory.sender(user_id!("@a:b.com")).text_msg("buy my bitcoins bro"),
+        ),
+    );
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    assert_let!(Some(VectorDiff::PushBack { value: first }) = timeline_stream.next().await);
+    assert_eq!(
+        first.as_event().unwrap().content().as_message().unwrap().body(),
+        "buy my bitcoins bro"
+    );
+
+    assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
+    assert!(day_divider.is_day_divider());
+
+    // Redacting a remote event works.
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/redact/.*?/.*?"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "event_id": "$42"
+        })))
+        .mount(&server)
+        .await;
+
+    let event_id = first.as_event().unwrap();
+
+    let did_redact = timeline.redact(event_id, Some("inapprops")).await.unwrap();
+    assert!(did_redact);
+
+    // Redacting a local event works.
+    timeline
+        .send(RoomMessageEventContent::text_plain("i will disappear soon").into())
+        .await
+        .unwrap();
+
+    assert_let!(Some(VectorDiff::PushBack { value: second }) = timeline_stream.next().await);
+
+    let second = second.as_event().unwrap();
+    assert_matches!(second.send_state(), Some(EventSendState::NotSentYet));
+
+    // We haven't set a route for sending events, so this will fail.
+    assert_let!(Some(VectorDiff::Set { index, value: second }) = timeline_stream.next().await);
+    assert_eq!(index, 2);
+
+    let second = second.as_event().unwrap();
+    assert!(second.is_local_echo());
+    assert_matches!(second.send_state(), Some(EventSendState::SendingFailed { .. }));
+
+    // Let's redact the local echo.
+    let did_redact = timeline.redact(second, None).await.unwrap();
+    assert!(did_redact);
+
+    // Observe local echo being removed.
+    assert_matches!(timeline_stream.next().await, Some(VectorDiff::Remove { index: 2 }));
 }
 
 #[async_test]
@@ -214,10 +302,10 @@ async fn test_read_marker() {
     let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
-    let mut ev_builder = SyncResponseBuilder::new();
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -225,7 +313,7 @@ async fn test_read_marker() {
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
         sync_timeline_event!({
             "content": {
                 "body": "hello",
@@ -238,7 +326,7 @@ async fn test_read_marker() {
         }),
     ));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -248,17 +336,17 @@ async fn test_read_marker() {
     assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
     assert!(day_divider.is_day_divider());
 
-    ev_builder.add_joined_room(
+    sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id).add_account_data(RoomAccountDataTestEvent::FullyRead),
     );
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
     // Nothing should happen, the marker cannot be added at the end.
 
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
         sync_timeline_event!({
             "content": {
                 "body": "hello to you!",
@@ -271,7 +359,7 @@ async fn test_read_marker() {
         }),
     ));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -290,8 +378,8 @@ async fn test_sync_highlighted() {
     let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
-    let mut ev_builder = SyncResponseBuilder::new();
-    ev_builder
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder
         // We need the member event and power levels locally so the push rules processor works.
         .add_joined_room(
             JoinedRoomBuilder::new(room_id)
@@ -299,7 +387,7 @@ async fn test_sync_highlighted() {
                 .add_state_event(StateTestEvent::PowerLevels),
         );
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -307,7 +395,7 @@ async fn test_sync_highlighted() {
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
         sync_timeline_event!({
             "content": {
                 "body": "hello",
@@ -320,7 +408,7 @@ async fn test_sync_highlighted() {
         }),
     ));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -332,7 +420,7 @@ async fn test_sync_highlighted() {
     assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
     assert!(day_divider.is_day_divider());
 
-    ev_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
         sync_timeline_event!({
             "content": {
                 "body": "This room has been replaced",
@@ -346,7 +434,7 @@ async fn test_sync_highlighted() {
         }),
     ));
 
-    mock_sync(&server, ev_builder.build_json_sync_response(), None).await;
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
@@ -354,4 +442,68 @@ async fn test_sync_highlighted() {
     let remote_event = second.as_event().unwrap();
     // `m.room.tombstone` should be highlighted by default.
     assert!(remote_event.is_highlighted());
+}
+
+#[async_test]
+async fn test_duplicate_maintains_correct_order() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let (client, server) = logged_in_client_with_server().await;
+    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    let room = client.get_room(room_id).unwrap();
+    let timeline = room.timeline().await.unwrap();
+
+    // At the beginning, the timeline is empty.
+    assert!(timeline.items().await.is_empty());
+
+    let f = EventFactory::new().sender(user_id!("@a:b.c"));
+
+    // We receive an event F, from a sliding sync with timeline limit=1.
+    sync_builder.add_joined_room(
+        JoinedRoomBuilder::new(room_id)
+            .add_timeline_event(f.text_msg("C").event_id(event_id!("$c")).into_raw_sync()),
+    );
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    // The timeline item represents the message we just received.
+    let items = timeline.items().await;
+    assert_eq!(items.len(), 2);
+
+    assert!(items[0].is_day_divider());
+    let content = items[1].as_event().unwrap().content().as_message().unwrap().body();
+    assert_eq!(content, "C");
+
+    // We receive multiple events, and C is now the last one (because we supposedly
+    // increased the timeline limit).
+    sync_builder.add_joined_room(
+        JoinedRoomBuilder::new(room_id)
+            .add_timeline_event(f.text_msg("A").event_id(event_id!("$a")).into_raw_sync())
+            .add_timeline_event(f.text_msg("B").event_id(event_id!("$b")).into_raw_sync())
+            .add_timeline_event(f.text_msg("C").event_id(event_id!("$c")).into_raw_sync()),
+    );
+
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
+    server.reset().await;
+
+    let items = timeline.items().await;
+    assert_eq!(items.len(), 4, "{items:?}");
+
+    assert!(items[0].is_day_divider());
+    let content = items[1].as_event().unwrap().content().as_message().unwrap().body();
+    assert_eq!(content, "A");
+    let content = items[2].as_event().unwrap().content().as_message().unwrap().body();
+    assert_eq!(content, "B");
+    let content = items[3].as_event().unwrap().content().as_message().unwrap().body();
+    assert_eq!(content, "C");
 }
