@@ -1067,6 +1067,8 @@ pub struct CreateRoomParameters {
     pub visibility: RoomVisibility,
     pub preset: RoomPreset,
     #[uniffi(default = None)]
+    pub room_alias_name: Option<String>,
+    #[uniffi(default = None)]
     pub invite: Option<Vec<String>>,
     #[uniffi(default = None)]
     pub avatar: Option<String>,
@@ -1082,6 +1084,7 @@ impl From<CreateRoomParameters> for create_room::v3::Request {
         request.is_direct = value.is_direct;
         request.visibility = value.visibility.into();
         request.preset = Some(value.preset.into());
+        request.room_alias_name = value.room_alias_name;
         request.invite = match value.invite {
             Some(invite) => invite
                 .iter()
