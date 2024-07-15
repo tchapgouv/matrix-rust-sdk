@@ -3273,6 +3273,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "matrix-sdk-bwi"
+version = "0.1.0"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "matrix-sdk-common"
 version = "0.7.0"
 dependencies = [
@@ -3392,6 +3399,7 @@ dependencies = [
  "language-tags",
  "log-panics",
  "matrix-sdk",
+ "matrix-sdk-bwi",
  "matrix-sdk-ui",
  "mime",
  "once_cell",
@@ -3890,7 +3898,7 @@ name = "oauth2"
 version = "5.0.0-alpha.4"
 source = "git+https://github.com/poljar/oauth2-rs?rev=f8e28ce5a7f3278ac85b8593ecdd86f2cf51fa2e#f8e28ce5a7f3278ac85b8593ecdd86f2cf51fa2e"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom",
  "http 1.1.0",
@@ -4826,9 +4834,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.10.4"
+version = "1.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c117dbdfde9c8308975b6a18d71f3f385c89461f7b3fb054288ecf2a2058ba4c"
+checksum = "b91213439dad192326a0d7c6ee3955910425f441d7038e0d6933b0aec5c4517f"
 dependencies = [
  "aho-corasick",
  "memchr",

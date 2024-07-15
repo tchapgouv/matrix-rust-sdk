@@ -75,6 +75,7 @@ zeroize = "1.6.0"
 
 matrix-sdk = { path = "crates/matrix-sdk", version = "0.7.0", default-features = false }
 matrix-sdk-base = { path = "crates/matrix-sdk-base", version = "0.7.0" }
+matrix-sdk-bwi = { path = "crates/matrix-sdk-bwi", version = "0.1.0", default-features = false }
 matrix-sdk-common = { path = "crates/matrix-sdk-common", version = "0.7.0" }
 matrix-sdk-crypto = { path = "crates/matrix-sdk-crypto", version = "0.7.0" }
 matrix-sdk-indexeddb = { path = "crates/matrix-sdk-indexeddb", version = "0.7.0", default-features = false }

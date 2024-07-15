@@ -96,5 +96,6 @@ uniffi::setup_scaffolding!();
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
 
+
 #[cfg(test)]
 matrix_sdk_test::init_tracing_for_tests!();
