@@ -36,6 +36,11 @@ use matrix_sdk::{
     },
     AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
 };
+use matrix_sdk_bwi::{
+    room_alias::{
+        BWIRoomAlias
+    },
+};
 use matrix_sdk_ui::notification_client::{
     NotificationClient as MatrixNotificationClient,
     NotificationProcessSetup as MatrixNotificationProcessSetup,
@@ -1067,8 +1072,6 @@ pub struct CreateRoomParameters {
     pub visibility: RoomVisibility,
     pub preset: RoomPreset,
     #[uniffi(default = None)]
-    pub room_alias_name: Option<String>,
-    #[uniffi(default = None)]
     pub invite: Option<Vec<String>>,
     #[uniffi(default = None)]
     pub avatar: Option<String>,
@@ -1084,7 +1087,12 @@ impl From<CreateRoomParameters> for create_room::v3::Request {
         request.is_direct = value.is_direct;
         request.visibility = value.visibility.into();
         request.preset = Some(value.preset.into());
-        request.room_alias_name = value.room_alias_name;
+        // BWI specific: create room alias
+        if !value.is_direct {
+            if let Some(room_name) = &request.name {
+                request.room_alias_name = Some(BWIRoomAlias::alias_for_room_name(room_name));
+            }
+        }
         request.invite = match value.invite {
             Some(invite) => invite
                 .iter()
