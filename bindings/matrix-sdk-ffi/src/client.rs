@@ -36,11 +36,7 @@ use matrix_sdk::{
     },
     AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
 };
-use matrix_sdk_bwi::{
-    room_alias::{
-        BWIRoomAlias
-    },
-};
+use matrix_sdk_bwi::room_alias::BWIRoomAlias;
 use matrix_sdk_ui::notification_client::{
     NotificationClient as MatrixNotificationClient,
     NotificationProcessSetup as MatrixNotificationProcessSetup,
