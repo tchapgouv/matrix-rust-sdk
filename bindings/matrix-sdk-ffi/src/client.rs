@@ -58,6 +58,7 @@ use tracing::{debug, error};
 use url::Url;
 
 use super::{room::Room, session_verification::SessionVerificationController, RUNTIME};
+use crate::client::ScanState::Infected;
 use crate::{
     client,
     encryption::Encryption,
@@ -93,6 +94,15 @@ pub struct HttpPusherData {
 pub enum PusherKind {
     Http { data: HttpPusherData },
     Email,
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum ScanState {
+    Trusted,
+    Infected,
+    Error,
+    InProgress,
+    NotFound,
 }
 
 impl TryFrom<PusherKind> for RumaPusherKind {
@@ -557,6 +567,22 @@ impl Client {
                 true,
             )
             .await?)
+    }
+
+    pub fn set_content_scanner_url(&self, url: String) {}
+
+    pub async fn get_content_scanner_result_for_attachment(
+        &self,
+        media_source: Arc<MediaSource>,
+    ) -> Result<ScanState, ClientError> {
+        Ok(Infected)
+    }
+
+    pub async fn download_attachment_from_content_scanner(
+        &self,
+        media_source: Arc<MediaSource>,
+    ) -> Result<Vec<u8>, ClientError> {
+        Err(anyhow!("This method is not implemented, but your file is infected anyway!").into())
     }
 
     pub async fn get_session_verification_controller(
