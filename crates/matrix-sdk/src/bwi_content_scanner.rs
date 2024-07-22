@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 use std::sync::Arc;
-use anyhow::anyhow;
-use mas_oidc_client::types::errors::ClientError;
+
 use ruma::events::room::MediaSource;
-use crate::bwi_content_scanner::ScanState::Infected;
+
 use crate::{Client, Result};
+use crate::bwi_content_scanner::ScanState::Infected;
 use crate::Error::InconsistentState;
 use crate::media::MediaFileHandle;
 
@@ -37,25 +37,25 @@ pub struct BWIContentScanner {
 }
 
 impl BWIContentScanner {
-
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
     }
-    pub fn set_content_scanner_url(&self, url: String) {
-    }
-    pub async fn get_content_scanner_result_for_attachment(&self,
-                                                           media_source: Arc<MediaSource>)
-        -> Result<ScanState> {
+    pub fn set_content_scanner_url(&self, url: String) {}
+    pub async fn get_content_scanner_result_for_attachment(
+        &self,
+        media_source: Arc<MediaSource>,
+    ) -> Result<ScanState> {
         Ok(Infected)
     }
 
-    pub async fn download_attachment_from_content_scanner(&self,
-                                                    media_source: Arc<MediaSource>,
-                                                    body: Option<String>,
-                                                    mime_type: String,
-                                                    use_cache: bool,
-                                                    temp_dir: Option<String>)
-        -> Result<MediaFileHandle> {
+    pub async fn download_attachment_from_content_scanner(
+        &self,
+        media_source: Arc<MediaSource>,
+        body: Option<String>,
+        mime_type: String,
+        use_cache: bool,
+        temp_dir: Option<String>,
+    ) -> Result<MediaFileHandle> {
         Err(InconsistentState)
     }
 }

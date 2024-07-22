@@ -68,6 +68,7 @@ use tracing::{debug, error, instrument, trace, Instrument, Span};
 use url::Url;
 
 use self::futures::SendRequest;
+use crate::bwi_content_scanner::BWIContentScanner;
 #[cfg(feature = "experimental-oidc")]
 use crate::oidc::Oidc;
 use crate::{
@@ -93,7 +94,6 @@ use crate::{
     encryption::{Encryption, EncryptionData, EncryptionSettings, VerificationState},
     store_locks::CrossProcessStoreLock,
 };
-use crate::bwi_content_scanner::BWIContentScanner;
 
 mod builder;
 pub(crate) mod futures;

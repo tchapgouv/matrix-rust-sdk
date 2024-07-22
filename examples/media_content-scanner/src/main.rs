@@ -26,7 +26,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn download_media(homeserver_url: String, mediasource_url: String) -> matrix_sdk::Result<Vec<u8>> {
+async fn download_media(
+    homeserver_url: String,
+    mediasource_url: String,
+) -> matrix_sdk::Result<Vec<u8>> {
     let homeserver_url = Url::parse(&homeserver_url)?;
     let client = Client::new(homeserver_url).await?;
 

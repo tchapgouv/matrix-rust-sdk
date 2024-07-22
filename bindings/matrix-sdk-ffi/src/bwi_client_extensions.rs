@@ -13,12 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use std::sync::Arc;
-use anyhow::anyhow;
-use ruma::events::room::MediaSource;
 use crate::bwi_client_extensions::BWIScanState::Infected;
 use crate::client::{Client, MediaFileHandle};
 use crate::error::ClientError;
+use anyhow::anyhow;
+use ruma::events::room::MediaSource;
+use std::sync::Arc;
 
 #[derive(Clone, uniffi::Enum)]
 pub enum BWIScanState {
@@ -31,18 +31,17 @@ pub enum BWIScanState {
 #[uniffi::export(async_runtime = "tokio")]
 impl Client {
     pub fn bwi_set_content_scanner_url(&self, url: String) {
-        self.inner.bwi_content_scanner()
-            .set_content_scanner_url(url)
+        self.inner.bwi_content_scanner().set_content_scanner_url(url)
     }
 
     pub async fn bwi_get_content_scanner_result_for_attachment(
         &self,
         media_source: Arc<MediaSource>,
     ) -> Result<BWIScanState, ClientError> {
-        let res = self.inner.bwi_content_scanner()
-            .get_content_scanner_result_for_attachment(
-                media_source,
-            )
+        let res = self
+            .inner
+            .bwi_content_scanner()
+            .get_content_scanner_result_for_attachment(media_source)
             .await?;
         Ok(Infected)
     }
@@ -54,7 +53,7 @@ impl Client {
         mime_type: String,
         use_cache: bool,
         temp_dir: Option<String>,
-    ) -> Result<Arc<MediaFileHandle>, ClientError>  {
+    ) -> Result<Arc<MediaFileHandle>, ClientError> {
         let handle = self
             .inner
             .bwi_content_scanner()
@@ -63,7 +62,7 @@ impl Client {
                 body,
                 mime_type,
                 use_cache,
-                temp_dir
+                temp_dir,
             )
             .await?;
 
