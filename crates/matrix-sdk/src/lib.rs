@@ -33,6 +33,8 @@ pub use reqwest;
 mod account;
 pub mod attachment;
 pub mod authentication;
+
+pub mod bwi_content_scanner;
 mod client;
 pub mod config;
 mod deduplicating_handler;
