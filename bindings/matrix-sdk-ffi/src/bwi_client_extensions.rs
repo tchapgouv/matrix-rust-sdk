@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use ruma::events::room::MediaSource;
 use crate::bwi_client_extensions::BWIScanState::Infected;
-use crate::client::Client;
+use crate::client::{Client, MediaFileHandle};
 use crate::error::ClientError;
 
 #[derive(Clone, uniffi::Enum)]
@@ -31,20 +31,42 @@ pub enum BWIScanState {
 #[uniffi::export(async_runtime = "tokio")]
 impl Client {
     pub fn bwi_set_content_scanner_url(&self, url: String) {
-        //self.inner.
+        self.inner.bwi_content_scanner()
+            .set_content_scanner_url(url)
     }
 
     pub async fn bwi_get_content_scanner_result_for_attachment(
         &self,
         media_source: Arc<MediaSource>,
     ) -> Result<BWIScanState, ClientError> {
+        let res = self.inner.bwi_content_scanner()
+            .get_content_scanner_result_for_attachment(
+                media_source,
+            )
+            .await?;
         Ok(Infected)
     }
 
     pub async fn bwi_download_attachment_from_content_scanner(
         &self,
         media_source: Arc<MediaSource>,
-    ) -> Result<Vec<u8>, ClientError> {
-        Err(anyhow!("This method is not implemented, but your file is infected anyway!").into())
+        body: Option<String>,
+        mime_type: String,
+        use_cache: bool,
+        temp_dir: Option<String>,
+    ) -> Result<Arc<MediaFileHandle>, ClientError>  {
+        let handle = self
+            .inner
+            .bwi_content_scanner()
+            .download_attachment_from_content_scanner(
+                media_source,
+                body,
+                mime_type,
+                use_cache,
+                temp_dir
+            )
+            .await?;
+
+        Ok(Arc::new(MediaFileHandle::new(handle)))
     }
 }

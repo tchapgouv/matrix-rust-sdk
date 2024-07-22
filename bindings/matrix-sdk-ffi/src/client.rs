@@ -1454,7 +1454,7 @@ pub struct MediaFileHandle {
 }
 
 impl MediaFileHandle {
-    fn new(handle: SdkMediaFileHandle) -> Self {
+    pub(crate) fn new(handle: SdkMediaFileHandle) -> Self {
         Self { inner: RwLock::new(Some(handle)) }
     }
 }

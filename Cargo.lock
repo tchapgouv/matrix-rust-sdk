@@ -3202,6 +3202,7 @@ dependencies = [
  "language-tags",
  "mas-oidc-client",
  "matrix-sdk-base",
+ "matrix-sdk-bwi",
  "matrix-sdk-common",
  "matrix-sdk-indexeddb",
  "matrix-sdk-sqlite",

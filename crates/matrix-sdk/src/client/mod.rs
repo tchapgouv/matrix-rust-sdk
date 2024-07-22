@@ -93,6 +93,7 @@ use crate::{
     encryption::{Encryption, EncryptionData, EncryptionSettings, VerificationState},
     store_locks::CrossProcessStoreLock,
 };
+use crate::bwi_content_scanner::BWIContentScanner;
 
 mod builder;
 pub(crate) mod futures;
@@ -570,6 +571,10 @@ impl Client {
     /// Get the media manager of the client.
     pub fn media(&self) -> Media {
         Media::new(self.clone())
+    }
+
+    pub fn bwi_content_scanner(&self) -> BWIContentScanner {
+        BWIContentScanner::new(self.clone())
     }
 
     /// Get the pusher manager of the client.
