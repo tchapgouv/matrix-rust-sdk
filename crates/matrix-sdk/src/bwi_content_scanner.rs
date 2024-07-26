@@ -17,10 +17,10 @@ use std::sync::Arc;
 
 use ruma::events::room::MediaSource;
 
-use crate::{Client, Result};
 use crate::bwi_content_scanner::ScanState::Infected;
-use crate::Error::InconsistentState;
 use crate::media::MediaFileHandle;
+use crate::Error::InconsistentState;
+use crate::{Client, Result};
 
 pub enum ScanState {
     Trusted,
