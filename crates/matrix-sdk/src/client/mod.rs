@@ -573,6 +573,7 @@ impl Client {
         Media::new(self.clone())
     }
 
+    /// Get the content scanner of the client.
     pub fn bwi_content_scanner(&self) -> BWIContentScanner {
         BWIContentScanner::new(self.clone())
     }

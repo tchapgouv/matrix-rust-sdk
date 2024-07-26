@@ -20,10 +20,10 @@ use regex::Regex;
 pub struct BWIRoomAlias {}
 
 impl BWIRoomAlias {
-    pub fn alias_for_room_name(room_name: &String) -> String {
+    pub fn alias_for_room_name(room_name: &str) -> String {
         let re = Regex::new(r"[^a-z0-9]").unwrap();
         let lowercase_room_name = room_name.to_lowercase();
-        let alias = re.replace_all(&*lowercase_room_name, "");
+        let alias = re.replace_all(&lowercase_room_name, "");
         let milliseconds_timestamp: u128 =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
         alias.into_owned() + &*milliseconds_timestamp.to_string()
