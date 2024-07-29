@@ -17,11 +17,13 @@ use std::sync::Arc;
 
 use ruma::events::room::MediaSource;
 
-use crate::{Client, Result};
 use crate::bwi_content_scanner::ScanState::Infected;
-use crate::Error::InconsistentState;
 use crate::media::MediaFileHandle;
+use crate::Error::InconsistentState;
+use crate::{Client, Result};
 
+#[derive(Debug, Clone)]
+#[allow(unused_variables, dead_code, missing_docs, clippy::all)]
 pub enum ScanState {
     Trusted,
     Infected,
@@ -31,11 +33,13 @@ pub enum ScanState {
 }
 
 #[derive(Debug, Clone)]
+#[allow(unused_variables, dead_code, missing_docs, clippy::all, clippy::unused_async)]
 pub struct BWIContentScanner {
     /// The underlying HTTP client.
     client: Client,
 }
 
+#[allow(unused_variables, missing_docs, clippy::all, clippy::unused_async)]
 impl BWIContentScanner {
     pub(crate) fn new(client: Client) -> Self {
         Self { client }
