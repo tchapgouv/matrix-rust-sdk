@@ -16,6 +16,8 @@ features = ["docsrs"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
+client = []
+server = []
 default = ["e2e-encryption", "automatic-room-key-forwarding", "sqlite", "native-tls"]
 testing = ["matrix-sdk-sqlite?/testing", "matrix-sdk-indexeddb?/testing", "matrix-sdk-base/testing", "wiremock", "matrix-sdk-test", "assert_matches2"]
 
@@ -98,6 +100,8 @@ mime = "0.3.16"
 mime2ext = "0.1.52"
 rand = { workspace = true , optional = true }
 ruma = { workspace = true, features = ["rand", "unstable-msc2448", "unstable-msc2965", "unstable-msc3930", "unstable-msc3245-v1-compat", "unstable-msc2867"] }
+ruma-common = { git = "https://github.com/ruma/ruma", rev = "79289381444e886c454302e1e8f5b5f62f249a57" }
+ruma-client-api = { git = "https://github.com/ruma/ruma", rev = "79289381444e886c454302e1e8f5b5f62f249a57" }
 serde = { workspace = true }
 serde_html_form = { workspace = true }
 serde_json = { workspace = true }
