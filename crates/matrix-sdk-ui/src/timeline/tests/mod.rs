@@ -26,9 +26,11 @@ use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
 use indexmap::IndexMap;
 use matrix_sdk::{
+    config::RequestConfig,
     deserialized_responses::{SyncTimelineEvent, TimelineEvent},
     event_cache::paginator::{PaginableRoom, PaginatorError},
     room::{EventWithContextResponse, Messages, MessagesOptions},
+    send_queue::RoomSendQueueUpdate,
 };
 use matrix_sdk_base::latest_event::LatestEvent;
 use matrix_sdk_test::{EventBuilder, ALICE, BOB};
@@ -37,28 +39,29 @@ use ruma::{
     events::{
         receipt::{Receipt, ReceiptThread, ReceiptType},
         relation::Annotation,
-        AnyMessageLikeEventContent, AnySyncTimelineEvent, AnyTimelineEvent, EmptyStateKey,
-        MessageLikeEventContent, RedactedMessageLikeEventContent, RedactedStateEventContent,
-        StaticStateEventContent,
+        AnyMessageLikeEventContent, AnyTimelineEvent, EmptyStateKey, MessageLikeEventContent,
+        RedactedMessageLikeEventContent, RedactedStateEventContent, StaticStateEventContent,
     },
     int,
     power_levels::NotificationPowerLevels,
     push::{PushConditionPowerLevelsCtx, PushConditionRoomCtx, Ruleset},
     room_id,
     serde::Raw,
-    server_name, uint, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId,
-    OwnedUserId, RoomId, RoomVersionId, TransactionId, UInt, UserId,
+    uint, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
+    RoomVersionId, TransactionId, UInt, UserId,
 };
 
 use super::{
     event_handler::TimelineEventKind,
     event_item::RemoteEventOrigin,
-    inner::{ReactionAction, TimelineEnd, TimelineInnerSettings},
-    reactions::ReactionToggleResult,
+    inner::{TimelineEnd, TimelineInnerSettings},
+    reactions::{ReactionAction, ReactionToggleResult},
     traits::RoomDataProvider,
     EventTimelineItem, Profile, TimelineFocus, TimelineInner, TimelineItem,
 };
-use crate::unable_to_decrypt_hook::UtdHookManager;
+use crate::{
+    timeline::pinned_events_loader::PinnedEventsRoom, unable_to_decrypt_hook::UtdHookManager,
+};
 
 mod basic;
 mod echo;
@@ -68,10 +71,10 @@ mod encryption;
 mod event_filter;
 mod invalid;
 mod polls;
-mod reaction_group;
 mod reactions;
 mod read_receipts;
 mod redaction;
+mod shields;
 mod virt;
 
 struct TestTimeline {
@@ -91,6 +94,7 @@ impl TestTimeline {
                 TimelineFocus::Live,
                 Some(prefix),
                 None,
+                false,
             ),
             event_builder: EventBuilder::new(),
         }
@@ -98,7 +102,7 @@ impl TestTimeline {
 
     fn with_room_data_provider(room_data_provider: TestRoomDataProvider) -> Self {
         Self {
-            inner: TimelineInner::new(room_data_provider, TimelineFocus::Live, None, None),
+            inner: TimelineInner::new(room_data_provider, TimelineFocus::Live, None, None, false),
             event_builder: EventBuilder::new(),
         }
     }
@@ -110,6 +114,20 @@ impl TestTimeline {
                 TimelineFocus::Live,
                 None,
                 Some(hook),
+                true,
+            ),
+            event_builder: EventBuilder::new(),
+        }
+    }
+
+    fn with_is_room_encrypted(encrypted: bool) -> Self {
+        Self {
+            inner: TimelineInner::new(
+                TestRoomDataProvider::default(),
+                TimelineFocus::Live,
+                None,
+                None,
+                encrypted,
             ),
             event_builder: EventBuilder::new(),
         }
@@ -142,18 +160,6 @@ impl TestTimeline {
         C: MessageLikeEventContent,
     {
         let ev = self.event_builder.make_sync_message_event(sender, content);
-        self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
-    }
-
-    async fn handle_live_message_event_with_id<C>(
-        &self,
-        sender: &UserId,
-        event_id: &EventId,
-        content: C,
-    ) where
-        C: MessageLikeEventContent,
-    {
-        let ev = self.event_builder.make_sync_message_event_with_id(sender, event_id, content);
         self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
     }
 
@@ -212,25 +218,9 @@ impl TestTimeline {
         self.handle_live_event(Raw::new(&ev).unwrap().cast()).await;
     }
 
-    async fn handle_live_custom_event(&self, event: Raw<AnySyncTimelineEvent>) {
-        self.handle_live_event(event).await;
-    }
-
-    async fn handle_live_redaction(&self, sender: &UserId, redacts: &EventId) {
-        let ev = self.event_builder.make_redaction_event(sender, redacts);
-        self.handle_live_event(ev).await;
-    }
-
-    async fn handle_live_reaction(&self, sender: &UserId, annotation: &Annotation) -> OwnedEventId {
-        let event_id = EventId::new(server_name!("dummy.server"));
-        let ev = self.event_builder.make_reaction_event(sender, &event_id, annotation);
-        self.handle_live_event(ev).await;
-        event_id
-    }
-
-    async fn handle_live_event(&self, event: Raw<AnySyncTimelineEvent>) {
-        let event = SyncTimelineEvent { event, encryption_info: None, push_actions: vec![] };
-        self.inner.handle_live_event(event).await
+    async fn handle_live_event(&self, event: impl Into<SyncTimelineEvent>) {
+        let event = event.into();
+        self.inner.add_events_at(vec![event], TimelineEnd::Back, RemoteEventOrigin::Sync).await;
     }
 
     async fn handle_local_event(&self, content: AnyMessageLikeEventContent) -> OwnedTransactionId {
@@ -257,20 +247,7 @@ impl TestTimeline {
         txn_id
     }
 
-    async fn handle_back_paginated_message_event_with_id<C>(
-        &self,
-        sender: &UserId,
-        room_id: &RoomId,
-        event_id: &EventId,
-        content: C,
-    ) where
-        C: MessageLikeEventContent,
-    {
-        let ev = self.event_builder.make_message_event_with_id(sender, room_id, event_id, content);
-        self.handle_back_paginated_custom_event(ev).await;
-    }
-
-    async fn handle_back_paginated_custom_event(&self, event: Raw<AnyTimelineEvent>) {
+    async fn handle_back_paginated_event(&self, event: Raw<AnyTimelineEvent>) {
         let timeline_event = TimelineEvent::new(event.cast());
         self.inner
             .add_events_at(vec![timeline_event], TimelineEnd::Front, RemoteEventOrigin::Pagination)
@@ -298,6 +275,10 @@ impl TestTimeline {
         result: &ReactionToggleResult,
     ) -> Result<ReactionAction, super::Error> {
         self.inner.resolve_reaction_response(annotation, result).await
+    }
+
+    async fn handle_room_send_queue_update(&self, update: RoomSendQueueUpdate) {
+        self.inner.handle_room_send_queue_update(update).await
     }
 }
 
@@ -334,6 +315,26 @@ impl PaginableRoom for TestRoomDataProvider {
     }
 
     async fn messages(&self, _opts: MessagesOptions) -> Result<Messages, PaginatorError> {
+        unimplemented!();
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl PinnedEventsRoom for TestRoomDataProvider {
+    async fn fetch_event(
+        &self,
+        _event_id: &EventId,
+        _config: Option<RequestConfig>,
+    ) -> Result<SyncTimelineEvent, PaginatorError> {
+        unimplemented!();
+    }
+
+    fn pinned_event_ids(&self) -> Vec<OwnedEventId> {
+        unimplemented!();
+    }
+
+    fn is_pinned_event(&self, _event_id: &EventId) -> bool {
         unimplemented!();
     }
 }

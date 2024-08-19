@@ -18,7 +18,6 @@ use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
     event_cache::{EventsOrigin, RoomEventCacheUpdate},
     executor::spawn,
-    send_queue::{LocalEcho, RoomSendQueueUpdate},
     Room,
 };
 use ruma::{events::AnySyncTimelineEvent, RoomVersionId};
@@ -32,10 +31,7 @@ use super::{
     Error, Timeline, TimelineDropHandle, TimelineFocus,
 };
 use crate::{
-    timeline::{
-        event_handler::TimelineEventKind, event_item::RemoteEventOrigin, inner::TimelineEnd,
-        EventSendState,
-    },
+    timeline::{event_item::RemoteEventOrigin, inner::TimelineEnd},
     unable_to_decrypt_hook::UtdHookManager,
 };
 
@@ -154,6 +150,7 @@ impl TimelineBuilder {
 
         let client = room.client();
         let event_cache = client.event_cache();
+        let pinned_event_cache = Arc::new(client.pinned_event_cache().clone());
 
         // Subscribe the event cache to sync responses, in case we hadn't done it yet.
         event_cache.subscribe()?;
@@ -162,14 +159,45 @@ impl TimelineBuilder {
         let (_, mut event_subscriber) = room_event_cache.subscribe().await?;
 
         let is_live = matches!(focus, TimelineFocus::Live);
+        let is_pinned_events = matches!(focus, TimelineFocus::PinnedEvents { .. });
+        let is_room_encrypted =
+            room.is_encrypted().await.map_err(|_| Error::UnknownEncryptionState)?;
 
-        let inner = TimelineInner::new(room, focus, internal_id_prefix, unable_to_decrypt_hook)
-            .with_settings(settings);
+        let inner = TimelineInner::new(
+            room,
+            focus.clone(),
+            internal_id_prefix,
+            unable_to_decrypt_hook,
+            is_room_encrypted,
+        )
+        .with_settings(settings);
 
-        let has_events = inner.init_focus(&room_event_cache).await?;
+        let has_events = inner.init_focus(&room_event_cache, &pinned_event_cache).await?;
 
         let room = inner.room();
         let client = room.client();
+
+        let pinned_events_join_handle = if is_pinned_events {
+            let mut pinned_event_ids_stream = room.pinned_event_ids_stream();
+            Some(spawn({
+                let inner = inner.clone();
+                let cache = pinned_event_cache.clone();
+                async move {
+                    while pinned_event_ids_stream.next().await.is_some() {
+                        if let Ok(events) = inner.reload_pinned_events(&cache).await {
+                            inner
+                                .replace_with_initial_remote_events(
+                                    events,
+                                    RemoteEventOrigin::Pagination,
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
 
         let room_update_join_handle = spawn({
             let room_event_cache = room_event_cache.clone();
@@ -235,13 +263,17 @@ impl TimelineBuilder {
                         RoomEventCacheUpdate::AddTimelineEvents { events, origin } => {
                             trace!("Received new timeline events.");
 
-                            inner.add_events_at(
-                                events,
-                                TimelineEnd::Back,
-                                match origin {
-                                    EventsOrigin::Sync => RemoteEventOrigin::Sync,
-                                }
-                            ).await;
+                            // Note: we deliberately choose to not handle
+                            // updates/reactions/redactions for pinned events.
+                            if !is_pinned_events {
+                                inner.add_events_at(
+                                    events,
+                                    TimelineEnd::Back,
+                                    match origin {
+                                        EventsOrigin::Sync => RemoteEventOrigin::Sync,
+                                    }
+                                ).await;
+                            }
                         }
 
                         RoomEventCacheUpdate::AddEphemeralEvents { events } => {
@@ -267,22 +299,13 @@ impl TimelineBuilder {
         });
 
         let local_echo_listener_handle = if is_live {
-            Some(spawn({
-                let timeline = inner.clone();
-                let (local_echoes, mut listener) = room.send_queue().subscribe().await;
+            let timeline = inner.clone();
+            let (local_echoes, mut listener) = room.send_queue().subscribe().await?;
 
+            Some(spawn({
                 // Handles existing local echoes first.
                 for echo in local_echoes {
-                    timeline
-                        .handle_local_event(
-                            echo.transaction_id,
-                            TimelineEventKind::Message {
-                                content: echo.content,
-                                relations: Default::default(),
-                            },
-                            Some(echo.abort_handle),
-                        )
-                        .await;
+                    timeline.handle_local_echo(echo).await;
                 }
 
                 let span = info_span!(parent: Span::none(), "local_echo_handler", room_id = ?room.room_id());
@@ -294,52 +317,7 @@ impl TimelineBuilder {
 
                     loop {
                         match listener.recv().await {
-                            Ok(update) => match update {
-                                RoomSendQueueUpdate::NewLocalEvent(LocalEcho {
-                                    transaction_id,
-                                    content,
-                                    abort_handle,
-                                }) => {
-                                    timeline
-                                        .handle_local_event(
-                                            transaction_id,
-                                            TimelineEventKind::Message {
-                                                content,
-                                                relations: Default::default(),
-                                            },
-                                            Some(abort_handle),
-                                        )
-                                        .await;
-                                }
-
-                                RoomSendQueueUpdate::CancelledLocalEvent { transaction_id } => {
-                                    if !timeline.discard_local_echo(&transaction_id).await {
-                                        warn!("couldn't find the local echo to discard");
-                                    }
-                                }
-
-                                RoomSendQueueUpdate::SendError {
-                                    transaction_id,
-                                    error,
-                                    is_recoverable,
-                                } => {
-                                    timeline
-                                        .update_event_send_state(
-                                            &transaction_id,
-                                            EventSendState::SendingFailed { error, is_recoverable },
-                                        )
-                                        .await;
-                                }
-
-                                RoomSendQueueUpdate::SentEvent { transaction_id, event_id } => {
-                                    timeline
-                                        .update_event_send_state(
-                                            &transaction_id,
-                                            EventSendState::Sent { event_id },
-                                        )
-                                        .await;
-                                }
-                            },
+                            Ok(update) => timeline.handle_room_send_queue_update(update).await,
 
                             Err(RecvError::Lagged(num_missed)) => {
                                 warn!("missed {num_missed} local echoes, ignoring those missed");
@@ -413,6 +391,7 @@ impl TimelineBuilder {
                 client,
                 event_handler_handles: handles,
                 room_update_join_handle,
+                pinned_events_join_handle,
                 room_key_from_backups_join_handle,
                 local_echo_listener_handle,
                 _event_cache_drop_handle: event_cache_drop,

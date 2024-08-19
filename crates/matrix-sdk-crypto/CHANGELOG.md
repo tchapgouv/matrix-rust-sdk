@@ -2,6 +2,18 @@
 
 Changes:
 
+- Add message IDs to all outgoing to-device messages encrypted by
+  `matrix-sdk-crypto`. The `message-ids` feature of `matrix-sdk-crypto` and
+  `matrix-sdk-base` is now a no-op.
+  ([#3776](https://github.com/matrix-org/matrix-rust-sdk/pull/3776))
+
+- Log the content of received `m.room_key.withheld` to-device events.
+  ([#3591](https://github.com/matrix-org/matrix-rust-sdk/pull/3591))
+
+- Attempt to decrypt bundled events (reactions and the latest thread reply) if
+  they are found in the unsigned part of an event.
+  ([#3468](https://github.com/matrix-org/matrix-rust-sdk/pull/3468))
+
 - Sign the device keys with the user-identity (i.e. cross-signing keys) if
   we're uploading the device keys and if the cross-signing keys are available.
   This approach eliminates the need to upload signatures in a separate request,
@@ -19,6 +31,9 @@ Changes:
   ([#3151](https://github.com/matrix-org/matrix-rust-sdk/pull/3151))
 
 Breaking changes:
+
+- Remove the method `OlmMachine::clear_crypto_cache()`, crypto stores are not
+  supposed to have any caches anymore.
 
 - Add a `custom_account` argument to the `OlmMachine::with_store()` method, this
   allows users to learn their identity keys before they get access to the user
@@ -53,6 +68,11 @@ Deprecations:
 
 Additions:
 
+- Expose new method `OlmMachine::room_keys_withheld_received_stream`, to allow
+  applications to receive notifications about received `m.room_key.withheld`
+  events.
+  ([#3660](https://github.com/matrix-org/matrix-rust-sdk/pull/3660)),
+  ([#3674](https://github.com/matrix-org/matrix-rust-sdk/pull/3674))
 
 - Expose new method `OlmMachine::clear_crypto_cache()`, with FFI bindings
   ([#3462](https://github.com/matrix-org/matrix-rust-sdk/pull/3462))
@@ -104,9 +124,15 @@ Additions:
   ([#3194](https://github.com/matrix-org/matrix-rust-sdk/pull/3194))
 
 
-## 0.7.1 
+# 0.7.2
 
-Security fixes:
+### Security Fixes
+
+- Fix `UserIdentity::is_verified` to take into account our own identity
+  [#d8d9dae](https://github.com/matrix-org/matrix-rust-sdk/commit/d8d9dae9d77bee48a2591b9aad9bd2fa466354cc) (Moderate, [GHSA-4qg4-cvh2-crgg](https://github.com/matrix-org/matrix-rust-sdk/security/advisories/GHSA-4qg4-cvh2-crgg)).
+
+# 0.7.1
+### Security Fixes
 
 - Don't log the private part of the backup key, introduced in [#71136e4](https://github.com/matrix-org/matrix-rust-sdk/commit/71136e44c03c79f80d6d1a2446673bc4d53a2067).
 

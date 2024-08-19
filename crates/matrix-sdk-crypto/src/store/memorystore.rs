@@ -15,7 +15,7 @@
 use std::{
     collections::{hash_map::Entry, BTreeMap, HashMap, HashSet},
     convert::Infallible,
-    sync::{Arc, RwLock as StdRwLock},
+    sync::RwLock as StdRwLock,
     time::{Duration, Instant},
 };
 
@@ -24,17 +24,17 @@ use ruma::{
     events::secret::request::SecretName, DeviceId, OwnedDeviceId, OwnedRoomId, OwnedTransactionId,
     OwnedUserId, RoomId, TransactionId, UserId,
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing::warn;
 
 use super::{
-    caches::{DeviceStore, GroupSessionStore, SessionStore},
+    caches::{DeviceStore, GroupSessionStore},
     Account, BackupKeys, Changes, CryptoStore, InboundGroupSession, PendingChanges, RoomKeyCounts,
     RoomSettings, Session,
 };
 use crate::{
     gossiping::{GossipRequest, GossippedSecret, SecretInfo},
-    identities::{ReadOnlyDevice, ReadOnlyUserIdentities},
+    identities::{DeviceData, UserIdentityData},
     olm::{OutboundGroupSession, PrivateCrossSigningIdentity},
     types::events::room_key_withheld::RoomKeyWithheldEvent,
     TrackedUser,
@@ -69,7 +69,7 @@ impl BackupVersion {
 #[derive(Debug)]
 pub struct MemoryStore {
     account: StdRwLock<Option<Account>>,
-    sessions: SessionStore,
+    sessions: StdRwLock<BTreeMap<String, Vec<Session>>>,
     inbound_group_sessions: GroupSessionStore,
 
     /// Map room id -> session id -> backup order number
@@ -83,7 +83,7 @@ pub struct MemoryStore {
     tracked_users: StdRwLock<HashMap<OwnedUserId, TrackedUser>>,
     olm_hashes: StdRwLock<HashMap<String, HashSet<String>>>,
     devices: DeviceStore,
-    identities: StdRwLock<HashMap<OwnedUserId, ReadOnlyUserIdentities>>,
+    identities: StdRwLock<HashMap<OwnedUserId, String>>,
     outgoing_key_requests: StdRwLock<HashMap<OwnedTransactionId, GossipRequest>>,
     key_requests_by_info: StdRwLock<HashMap<String, OwnedTransactionId>>,
     direct_withheld_info: StdRwLock<HashMap<OwnedRoomId, HashMap<String, RoomKeyWithheldEvent>>>,
@@ -99,7 +99,7 @@ impl Default for MemoryStore {
     fn default() -> Self {
         MemoryStore {
             account: Default::default(),
-            sessions: SessionStore::new(),
+            sessions: Default::default(),
             inbound_group_sessions: GroupSessionStore::new(),
             inbound_group_sessions_backed_up_to: Default::default(),
             outbound_group_sessions: Default::default(),
@@ -127,21 +127,29 @@ impl MemoryStore {
         Self::default()
     }
 
-    pub(crate) fn save_devices(&self, devices: Vec<ReadOnlyDevice>) {
+    pub(crate) fn save_devices(&self, devices: Vec<DeviceData>) {
         for device in devices {
             let _ = self.devices.add(device);
         }
     }
 
-    fn delete_devices(&self, devices: Vec<ReadOnlyDevice>) {
+    fn delete_devices(&self, devices: Vec<DeviceData>) {
         for device in devices {
             let _ = self.devices.remove(device.user_id(), device.device_id());
         }
     }
 
-    async fn save_sessions(&self, sessions: Vec<Session>) {
+    fn save_sessions(&self, sessions: Vec<Session>) {
+        let mut session_store = self.sessions.write().unwrap();
+
         for session in sessions {
-            let _ = self.sessions.add(session.clone()).await;
+            let entry = session_store.entry(session.sender_key().to_base64()).or_default();
+
+            if let Some(old_entry) = entry.iter_mut().find(|entry| &session == *entry) {
+                *old_entry = session;
+            } else {
+                entry.push(session);
+            }
         }
     }
 
@@ -190,14 +198,6 @@ type Result<T> = std::result::Result<T, Infallible>;
 impl CryptoStore for MemoryStore {
     type Error = Infallible;
 
-    async fn clear_caches(&self) {
-        // no-op: it makes no sense to delete fields here as we would forget our
-        // identity, etc Effectively we have no caches as the fields
-        // *are* the underlying store. Calling this method only makes
-        // sense if there is some other layer (e.g disk) persistence
-        // happening.
-    }
-
     async fn load_account(&self) -> Result<Option<Account>> {
         Ok(self.account.read().unwrap().as_ref().map(|acc| acc.deep_clone()))
     }
@@ -219,7 +219,7 @@ impl CryptoStore for MemoryStore {
     }
 
     async fn save_changes(&self, changes: Changes) -> Result<()> {
-        self.save_sessions(changes.sessions).await;
+        self.save_sessions(changes.sessions);
         self.save_inbound_group_sessions(changes.inbound_group_sessions, None).await?;
         self.save_outbound_group_sessions(changes.outbound_group_sessions);
         self.save_private_identity(changes.private_identity);
@@ -231,7 +231,10 @@ impl CryptoStore for MemoryStore {
         {
             let mut identities = self.identities.write().unwrap();
             for identity in changes.identities.new.into_iter().chain(changes.identities.changed) {
-                identities.insert(identity.user_id().to_owned(), identity.clone());
+                identities.insert(
+                    identity.user_id().to_owned(),
+                    serde_json::to_string(&identity).unwrap(),
+                );
             }
         }
 
@@ -327,8 +330,8 @@ impl CryptoStore for MemoryStore {
         Ok(())
     }
 
-    async fn get_sessions(&self, sender_key: &str) -> Result<Option<Arc<Mutex<Vec<Session>>>>> {
-        Ok(self.sessions.get(sender_key))
+    async fn get_sessions(&self, sender_key: &str) -> Result<Option<Vec<Session>>> {
+        Ok(self.sessions.read().unwrap().get(sender_key).cloned())
     }
 
     async fn get_inbound_group_session(
@@ -463,19 +466,32 @@ impl CryptoStore for MemoryStore {
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
-    ) -> Result<Option<ReadOnlyDevice>> {
+    ) -> Result<Option<DeviceData>> {
         Ok(self.devices.get(user_id, device_id))
     }
 
     async fn get_user_devices(
         &self,
         user_id: &UserId,
-    ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>> {
+    ) -> Result<HashMap<OwnedDeviceId, DeviceData>> {
         Ok(self.devices.user_devices(user_id))
     }
 
-    async fn get_user_identity(&self, user_id: &UserId) -> Result<Option<ReadOnlyUserIdentities>> {
-        Ok(self.identities.read().unwrap().get(user_id).cloned())
+    async fn get_own_device(&self) -> Result<DeviceData> {
+        let account = self.load_account().await?.unwrap();
+
+        Ok(self.devices.get(&account.user_id, &account.device_id).unwrap())
+    }
+
+    async fn get_user_identity(&self, user_id: &UserId) -> Result<Option<UserIdentityData>> {
+        let serialized = self.identities.read().unwrap().get(user_id).cloned();
+        match serialized {
+            None => Ok(None),
+            Some(serialized) => {
+                let id: UserIdentityData = serde_json::from_str(serialized.as_str()).unwrap();
+                Ok(Some(id))
+            }
+        }
     }
 
     async fn is_message_known(&self, message_hash: &crate::olm::OlmMessageHash) -> Result<bool> {
@@ -619,7 +635,7 @@ mod tests {
         identities::device::testing::get_device,
         olm::{
             tests::get_account_and_session_test_helper, Account, InboundGroupSession,
-            OlmMessageHash, PrivateCrossSigningIdentity,
+            OlmMessageHash, PrivateCrossSigningIdentity, SenderData,
         },
         store::{memorystore::MemoryStore, Changes, CryptoStore, PendingChanges},
     };
@@ -632,10 +648,9 @@ mod tests {
         assert!(store.load_account().await.unwrap().is_none());
         store.save_pending_changes(PendingChanges { account: Some(account) }).await.unwrap();
 
-        store.save_sessions(vec![session.clone()]).await;
+        store.save_sessions(vec![session.clone()]);
 
         let sessions = store.get_sessions(&session.sender_key.to_base64()).await.unwrap().unwrap();
-        let sessions = sessions.lock().await;
 
         let loaded_session = &sessions[0];
 
@@ -654,6 +669,7 @@ mod tests {
             Ed25519PublicKey::from_base64("ee3Ek+J2LkkPmjGPGLhMxiKnhiX//xcqaVL4RP6EypE").unwrap(),
             room_id,
             &outbound.session_key().await,
+            SenderData::unknown(),
             outbound.settings().algorithm.to_owned(),
             None,
         )
@@ -1050,6 +1066,7 @@ mod tests {
             Ed25519PublicKey::from_base64("ee3Ek+J2LkkPmjGPGLhMxiKnhiX//xcqaVL4RP6EypE").unwrap(),
             room_id,
             &outbound.session_key().await,
+            SenderData::unknown(),
             outbound.settings().algorithm.to_owned(),
             None,
         )
@@ -1095,8 +1112,8 @@ mod integration_tests {
         },
         store::{BackupKeys, Changes, CryptoStore, PendingChanges, RoomKeyCounts, RoomSettings},
         types::events::room_key_withheld::RoomKeyWithheldEvent,
-        Account, GossipRequest, GossippedSecret, ReadOnlyDevice, ReadOnlyUserIdentities,
-        SecretInfo, Session, TrackedUser,
+        Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, Session, TrackedUser,
+        UserIdentityData,
     };
 
     /// Holds on to a MemoryStore during a test, and moves it back into STORES
@@ -1124,7 +1141,11 @@ mod integration_tests {
     /// dropping this store won't destroy its data, since
     /// [PersistentMemoryStore] is a reference-counted smart pointer
     /// to an underlying [MemoryStore].
-    async fn get_store(name: &str, _passphrase: Option<&str>) -> PersistentMemoryStore {
+    async fn get_store(
+        name: &str,
+        _passphrase: Option<&str>,
+        clear_data: bool,
+    ) -> PersistentMemoryStore {
         // Holds on to one [PersistentMemoryStore] per test, so even if the test drops
         // the store, we keep its data alive. This simulates the behaviour of
         // the other stores, which keep their data in a real DB, allowing us to
@@ -1132,22 +1153,22 @@ mod integration_tests {
         static STORES: OnceLock<Mutex<HashMap<String, PersistentMemoryStore>>> = OnceLock::new();
         let stores = STORES.get_or_init(|| Mutex::new(HashMap::new()));
 
-        stores
-            .lock()
-            .unwrap()
-            .entry(name.to_owned())
-            .or_insert_with(PersistentMemoryStore::new)
-            .clone()
+        let mut stores = stores.lock().unwrap();
+
+        if clear_data {
+            // Create a new PersistentMemoryStore
+            let new_store = PersistentMemoryStore::new();
+            stores.insert(name.to_owned(), new_store.clone());
+            new_store
+        } else {
+            stores.entry(name.to_owned()).or_insert_with(PersistentMemoryStore::new).clone()
+        }
     }
 
     /// Forwards all methods to the underlying [MemoryStore].
     #[async_trait]
     impl CryptoStore for PersistentMemoryStore {
         type Error = <MemoryStore as CryptoStore>::Error;
-
-        async fn clear_caches(&self) {
-            self.0.clear_caches().await
-        }
 
         async fn load_account(&self) -> Result<Option<Account>, Self::Error> {
             self.0.load_account().await
@@ -1176,7 +1197,7 @@ mod integration_tests {
         async fn get_sessions(
             &self,
             sender_key: &str,
-        ) -> Result<Option<Arc<tokio::sync::Mutex<Vec<Session>>>>, Self::Error> {
+        ) -> Result<Option<Vec<Session>>, Self::Error> {
             self.0.get_sessions(sender_key).await
         }
 
@@ -1254,21 +1275,25 @@ mod integration_tests {
             &self,
             user_id: &UserId,
             device_id: &DeviceId,
-        ) -> Result<Option<ReadOnlyDevice>, Self::Error> {
+        ) -> Result<Option<DeviceData>, Self::Error> {
             self.0.get_device(user_id, device_id).await
         }
 
         async fn get_user_devices(
             &self,
             user_id: &UserId,
-        ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>, Self::Error> {
+        ) -> Result<HashMap<OwnedDeviceId, DeviceData>, Self::Error> {
             self.0.get_user_devices(user_id).await
+        }
+
+        async fn get_own_device(&self) -> Result<DeviceData, Self::Error> {
+            self.0.get_own_device().await
         }
 
         async fn get_user_identity(
             &self,
             user_id: &UserId,
-        ) -> Result<Option<ReadOnlyUserIdentities>, Self::Error> {
+        ) -> Result<Option<UserIdentityData>, Self::Error> {
             self.0.get_user_identity(user_id).await
         }
 

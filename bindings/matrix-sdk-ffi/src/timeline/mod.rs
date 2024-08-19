@@ -19,9 +19,13 @@ use as_variant::as_variant;
 use content::{InReplyToDetails, RepliedToEventDetails};
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt as _};
-use matrix_sdk::attachment::{
-    AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
-    BaseThumbnailInfo, BaseVideoInfo, Thumbnail,
+use matrix_sdk::{
+    attachment::{
+        AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
+        BaseThumbnailInfo, BaseVideoInfo, Thumbnail,
+    },
+    deserialized_responses::{ShieldState as RustShieldState, ShieldStateCode},
+    Error,
 };
 use matrix_sdk_ui::timeline::{
     EventItemOrigin, LiveBackPaginationStatus, Profile, RepliedToEvent, TimelineDetails,
@@ -232,9 +236,9 @@ impl Timeline {
     pub async fn send(
         self: Arc<Self>,
         msg: Arc<RoomMessageEventContentWithoutRelation>,
-    ) -> Result<Arc<AbortSendHandle>, ClientError> {
+    ) -> Result<Arc<SendHandle>, ClientError> {
         match self.inner.send((*msg).to_owned().with_relation(None).into()).await {
-            Ok(handle) => Ok(Arc::new(AbortSendHandle { inner: Mutex::new(Some(handle)) })),
+            Ok(handle) => Ok(Arc::new(SendHandle { inner: Mutex::new(Some(handle)) })),
             Err(err) => {
                 error!("error when sending a message: {err}");
                 Err(anyhow::anyhow!(err).into())
@@ -454,25 +458,36 @@ impl Timeline {
     pub async fn send_reply(
         &self,
         msg: Arc<RoomMessageEventContentWithoutRelation>,
-        reply_item: Arc<EventTimelineItem>,
+        event_id: String,
     ) -> Result<(), ClientError> {
+        let event_id = EventId::parse(event_id)?;
+        let replied_to_info = self
+            .inner
+            .replied_to_info_from_event_id(&event_id)
+            .await
+            .map_err(|err| anyhow::anyhow!(err))?;
+
         self.inner
-            .send_reply((*msg).clone(), &reply_item.0, ForwardThread::Yes)
+            .send_reply((*msg).clone(), replied_to_info, ForwardThread::Yes)
             .await
             .map_err(|err| anyhow::anyhow!(err))?;
         Ok(())
     }
 
+    /// Edits an event from the timeline.
+    ///
+    /// If it was a local event, this will *try* to edit it, if it was not
+    /// being sent already. If the event was a remote event, then it will be
+    /// redacted by sending an edit request to the server.
+    ///
+    /// Returns whether the edit did happen. It can only return false for
+    /// local events that are being processed.
     pub async fn edit(
         &self,
+        item: Arc<EventTimelineItem>,
         new_content: Arc<RoomMessageEventContentWithoutRelation>,
-        edit_item: Arc<EventTimelineItem>,
-    ) -> Result<(), ClientError> {
-        self.inner
-            .edit((*new_content).clone(), &edit_item.0)
-            .await
-            .map_err(|err| anyhow::anyhow!(err))?;
-        Ok(())
+    ) -> Result<bool, ClientError> {
+        self.inner.edit(&item.0, (*new_content).clone()).await.map_err(ClientError::from)
     }
 
     pub async fn edit_poll(
@@ -566,7 +581,7 @@ impl Timeline {
         let transaction_id: OwnedTransactionId = transaction_id.into();
         let item = self
             .inner
-            .item_by_transaction_id(&transaction_id)
+            .local_item_by_transaction_id(&transaction_id)
             .await
             .context("Item with given transaction ID not found")?;
         Ok(Arc::new(EventTimelineItem(item)))
@@ -606,23 +621,29 @@ impl Timeline {
     ) -> Result<InReplyToDetails, ClientError> {
         let event_id = EventId::parse(&event_id_str)?;
 
-        match self.inner.room().event(&event_id).await {
-            Ok(timeline_event) => {
-                let replied_to = RepliedToEvent::try_from_timeline_event_for_room(
-                    timeline_event,
-                    self.inner.room(),
-                )
-                .await?;
+        let replied_to: Result<RepliedToEvent, Error> =
+            if let Some(event) = self.inner.item_by_event_id(&event_id).await {
+                Ok(RepliedToEvent::from_timeline_item(&event))
+            } else {
+                match self.inner.room().event(&event_id, None).await {
+                    Ok(timeline_event) => Ok(RepliedToEvent::try_from_timeline_event_for_room(
+                        timeline_event,
+                        self.inner.room(),
+                    )
+                    .await?),
+                    Err(e) => Err(e),
+                }
+            };
 
-                Ok(InReplyToDetails::new(
-                    event_id_str,
-                    RepliedToEventDetails::Ready {
-                        content: Arc::new(TimelineItemContent(replied_to.content().clone())),
-                        sender: replied_to.sender().to_string(),
-                        sender_profile: replied_to.sender_profile().into(),
-                    },
-                ))
-            }
+        match replied_to {
+            Ok(replied_to) => Ok(InReplyToDetails::new(
+                event_id_str,
+                RepliedToEventDetails::Ready {
+                    content: Arc::new(TimelineItemContent(replied_to.content().clone())),
+                    sender: replied_to.sender().to_string(),
+                    sender_profile: replied_to.sender_profile().into(),
+                },
+            )),
 
             Err(e) => Ok(InReplyToDetails::new(
                 event_id_str,
@@ -630,15 +651,35 @@ impl Timeline {
             )),
         }
     }
+
+    /// Adds a new pinned event by sending an updated `m.room.pinned_events`
+    /// event containing the new event id.
+    ///
+    /// Returns `true` if we sent the request, `false` if the event was already
+    /// pinned.
+    async fn pin_event(&self, event_id: String) -> Result<bool, ClientError> {
+        let event_id = EventId::parse(event_id).map_err(ClientError::from)?;
+        self.inner.pin_event(&event_id).await.map_err(ClientError::from)
+    }
+
+    /// Adds a new pinned event by sending an updated `m.room.pinned_events`
+    /// event without the event id we want to remove.
+    ///
+    /// Returns `true` if we sent the request, `false` if the event wasn't
+    /// pinned
+    async fn unpin_event(&self, event_id: String) -> Result<bool, ClientError> {
+        let event_id = EventId::parse(event_id).map_err(ClientError::from)?;
+        self.inner.unpin_event(&event_id).await.map_err(ClientError::from)
+    }
 }
 
 #[derive(uniffi::Object)]
-pub struct AbortSendHandle {
-    inner: Mutex<Option<matrix_sdk::send_queue::AbortSendHandle>>,
+pub struct SendHandle {
+    inner: Mutex<Option<matrix_sdk::send_queue::SendHandle>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
-impl AbortSendHandle {
+impl SendHandle {
     /// Try to abort the sending of the current event.
     ///
     /// If this returns `true`, then the sending could be aborted, because the
@@ -647,12 +688,15 @@ impl AbortSendHandle {
     ///
     /// This has an effect only on the first call; subsequent calls will always
     /// return `false`.
-    async fn abort(self: Arc<Self>) -> bool {
+    async fn abort(self: Arc<Self>) -> Result<bool, ClientError> {
         if let Some(inner) = self.inner.lock().await.take() {
-            inner.abort().await
+            Ok(inner
+                .abort()
+                .await
+                .map_err(|err| anyhow::anyhow!("error when saving in store: {err}"))?)
         } else {
             warn!("trying to abort an send handle that's already been actioned");
-            false
+            Ok(false)
         }
     }
 }
@@ -718,7 +762,6 @@ impl TimelineDiff {
             VectorDiff::PopBack => Self::PopBack,
             VectorDiff::PopFront => Self::PopFront,
             VectorDiff::Reset { values } => {
-                warn!("Timeline subscriber lagged behind and was reset");
                 Self::Reset { values: values.into_iter().map(TimelineItem::from_arc).collect() }
             }
         }
@@ -880,6 +923,34 @@ impl From<&matrix_sdk_ui::timeline::EventSendState> for EventSendState {
     }
 }
 
+/// Recommended decorations for decrypted messages, representing the message's
+/// authenticity properties.
+#[derive(uniffi::Enum)]
+pub enum ShieldState {
+    /// A red shield with a tooltip containing the associated message should be
+    /// presented.
+    Red { code: ShieldStateCode, message: String },
+    /// A grey shield with a tooltip containing the associated message should be
+    /// presented.
+    Grey { code: ShieldStateCode, message: String },
+    /// No shield should be presented.
+    None,
+}
+
+impl From<RustShieldState> for ShieldState {
+    fn from(value: RustShieldState) -> Self {
+        match value {
+            RustShieldState::Red { code, message } => {
+                Self::Red { code, message: message.to_owned() }
+            }
+            RustShieldState::Grey { code, message } => {
+                Self::Grey { code, message: message.to_owned() }
+            }
+            RustShieldState::None => Self::None,
+        }
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct EventTimelineItem(pub(crate) matrix_sdk_ui::timeline::EventTimelineItem);
 
@@ -931,12 +1002,11 @@ impl EventTimelineItem {
             .iter()
             .map(|(k, v)| Reaction {
                 key: k.to_owned(),
-                count: v.len().try_into().unwrap(),
                 senders: v
-                    .senders()
-                    .map(|v| ReactionSenderData {
-                        sender_id: v.sender_id.to_string(),
-                        timestamp: v.timestamp.0.into(),
+                    .iter()
+                    .map(|(sender_id, info)| ReactionSenderData {
+                        sender_id: sender_id.to_string(),
+                        timestamp: info.timestamp.0.into(),
                     })
                     .collect(),
             })
@@ -965,6 +1035,12 @@ impl EventTimelineItem {
 
     pub fn can_be_replied_to(&self) -> bool {
         self.0.can_be_replied_to()
+    }
+
+    /// Gets the [`ShieldState`] which can be used to decorate messages in the
+    /// recommended way.
+    pub fn get_shield(&self, strict: bool) -> Option<ShieldState> {
+        self.0.get_shield(strict).map(Into::into)
     }
 }
 

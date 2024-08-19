@@ -19,7 +19,7 @@ use ruma::events::room::MediaSource;
 
 use crate::bwi_content_scanner::ScanState::Infected;
 use crate::media::MediaFileHandle;
-use crate::Error::InconsistentState;
+use crate::Error::AuthenticationRequired;
 use crate::{Client, Result};
 
 #[derive(Debug, Clone)]
@@ -60,6 +60,6 @@ impl BWIContentScanner {
         use_cache: bool,
         temp_dir: Option<String>,
     ) -> Result<MediaFileHandle> {
-        Err(InconsistentState)
+        Err(AuthenticationRequired)
     }
 }

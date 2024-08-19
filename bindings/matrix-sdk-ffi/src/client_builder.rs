@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fs, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use matrix_sdk::{
@@ -6,20 +6,17 @@ use matrix_sdk::{
     crypto::types::qr_login::{LoginQrCodeDecodeError, QrCodeModeData},
     encryption::{BackupDownloadStrategy, EncryptionSettings},
     reqwest::Certificate,
-    ruma::{
-        api::{error::UnknownVersionError, MatrixVersion},
-        ServerName, UserId,
-    },
-    Client as MatrixClient, ClientBuildError as MatrixClientBuildError,
-    ClientBuilder as MatrixClientBuilder, IdParseError,
+    ruma::{ServerName, UserId},
+    Client as MatrixClient, ClientBuildError as MatrixClientBuildError, HttpError, IdParseError,
+    RumaApiError,
 };
+use ruma::api::error::{DeserializationError, FromHttpResponseError};
 use tracing::{debug, error};
-use url::Url;
 use zeroize::Zeroizing;
 
 use super::{client::Client, RUNTIME};
 use crate::{
-    authentication_service::OidcConfiguration, client::ClientSessionDelegate, error::ClientError,
+    authentication::OidcConfiguration, client::ClientSessionDelegate, error::ClientError,
     helpers::unwrap_or_clone_arc, task_handle::TaskHandle,
 };
 
@@ -182,10 +179,42 @@ impl From<qrcode::LoginProgress> for QrLoginProgress {
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum ClientBuildError {
+    #[error("The supplied server name is invalid.")]
+    InvalidServerName,
     #[error(transparent)]
-    Sdk(#[from] MatrixClientBuildError),
+    ServerUnreachable(HttpError),
+    #[error(transparent)]
+    WellKnownLookupFailed(RumaApiError),
+    #[error(transparent)]
+    WellKnownDeserializationError(DeserializationError),
+    #[error("The homeserver doesn't provide a trusted sliding sync proxy in its well-known configuration.")]
+    SlidingSyncNotAvailable,
+
+    #[error(transparent)]
+    Sdk(MatrixClientBuildError),
+
     #[error("Failed to build the client: {message}")]
     Generic { message: String },
+}
+
+impl From<MatrixClientBuildError> for ClientBuildError {
+    fn from(e: MatrixClientBuildError) -> Self {
+        match e {
+            MatrixClientBuildError::InvalidServerName => ClientBuildError::InvalidServerName,
+            MatrixClientBuildError::Http(e) => ClientBuildError::ServerUnreachable(e),
+            MatrixClientBuildError::AutoDiscovery(FromHttpResponseError::Server(e)) => {
+                ClientBuildError::WellKnownLookupFailed(e)
+            }
+            MatrixClientBuildError::AutoDiscovery(FromHttpResponseError::Deserialization(e)) => {
+                ClientBuildError::WellKnownDeserializationError(e)
+            }
+            MatrixClientBuildError::SlidingSyncNotAvailable => {
+                ClientBuildError::SlidingSyncNotAvailable
+            }
+
+            _ => ClientBuildError::Sdk(e),
+        }
+    }
 }
 
 impl From<IdParseError> for ClientBuildError {
@@ -217,18 +246,20 @@ pub struct ClientBuilder {
     session_path: Option<String>,
     username: Option<String>,
     homeserver_cfg: Option<HomeserverConfig>,
-    server_versions: Option<Vec<String>>,
     passphrase: Zeroizing<Option<String>>,
     user_agent: Option<String>,
+    requires_sliding_sync: bool,
     sliding_sync_proxy: Option<String>,
+    is_simplified_sliding_sync_enabled: bool,
     proxy: Option<String>,
     disable_ssl_verification: bool,
     disable_automatic_token_refresh: bool,
-    inner: MatrixClientBuilder,
     cross_process_refresh_lock_id: Option<String>,
     session_delegate: Option<Arc<dyn ClientSessionDelegate>>,
     additional_root_certificates: Vec<Vec<u8>>,
+    disable_built_in_root_certificates: bool,
     encryption_settings: EncryptionSettings,
+    request_config: Option<RequestConfig>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -239,23 +270,26 @@ impl ClientBuilder {
             session_path: None,
             username: None,
             homeserver_cfg: None,
-            server_versions: None,
             passphrase: Zeroizing::new(None),
             user_agent: None,
+            requires_sliding_sync: false,
             sliding_sync_proxy: None,
+            // By default, Simplified MSC3575 is turned off.
+            is_simplified_sliding_sync_enabled: false,
             proxy: None,
             disable_ssl_verification: false,
             disable_automatic_token_refresh: false,
-            inner: MatrixClient::builder(),
             cross_process_refresh_lock_id: None,
             session_delegate: None,
             additional_root_certificates: Default::default(),
+            disable_built_in_root_certificates: false,
             encryption_settings: EncryptionSettings {
                 auto_enable_cross_signing: false,
                 backup_download_strategy:
                     matrix_sdk::encryption::BackupDownloadStrategy::AfterDecryptionFailure,
                 auto_enable_backups: false,
             },
+            request_config: Default::default(),
         })
     }
 
@@ -264,7 +298,10 @@ impl ClientBuilder {
         process_id: String,
         session_delegate: Box<dyn ClientSessionDelegate>,
     ) -> Arc<Self> {
-        self.enable_cross_process_refresh_lock_inner(process_id, session_delegate.into())
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.cross_process_refresh_lock_id = Some(process_id);
+        builder.session_delegate = Some(session_delegate.into());
+        Arc::new(builder)
     }
 
     pub fn set_session_delegate(
@@ -290,12 +327,6 @@ impl ClientBuilder {
     pub fn username(self: Arc<Self>, username: String) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
         builder.username = Some(username);
-        Arc::new(builder)
-    }
-
-    pub fn server_versions(self: Arc<Self>, versions: Vec<String>) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.server_versions = Some(versions);
         Arc::new(builder)
     }
 
@@ -329,9 +360,21 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
+    pub fn requires_sliding_sync(self: Arc<Self>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.requires_sliding_sync = true;
+        Arc::new(builder)
+    }
+
     pub fn sliding_sync_proxy(self: Arc<Self>, sliding_sync_proxy: Option<String>) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
         builder.sliding_sync_proxy = sliding_sync_proxy;
+        Arc::new(builder)
+    }
+
+    pub fn simplified_sliding_sync(self: Arc<Self>, enable: bool) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.is_simplified_sliding_sync_enabled = enable;
         Arc::new(builder)
     }
 
@@ -360,6 +403,15 @@ impl ClientBuilder {
         let mut builder = unwrap_or_clone_arc(self);
         builder.additional_root_certificates = certificates;
 
+        Arc::new(builder)
+    }
+
+    /// Don't trust any system root certificates, only trust the certificates
+    /// provided through
+    /// [`add_root_certificates`][ClientBuilder::add_root_certificates].
+    pub fn disable_built_in_root_certificates(self: Arc<Self>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.disable_built_in_root_certificates = true;
         Arc::new(builder)
     }
 
@@ -392,90 +444,16 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
+    /// Add a default request config to this client.
+    pub fn request_config(self: Arc<Self>, config: RequestConfig) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.request_config = Some(config);
+        Arc::new(builder)
+    }
+
     pub async fn build(self: Arc<Self>) -> Result<Arc<Client>, ClientBuildError> {
-        Ok(Arc::new(self.build_inner().await?))
-    }
-
-    /// Finish the building of the client and attempt to log in using the
-    /// provided [`QrCodeData`].
-    ///
-    /// This method will build the client and immediately attempt to log the
-    /// client in using the provided [`QrCodeData`] using the login
-    /// mechanism described in [MSC4108]. As such this methods requires OIDC
-    /// support as well as sliding sync support.
-    ///
-    /// The usage of the progress_listener is required to transfer the
-    /// [`CheckCode`] to the existing client.
-    ///
-    /// [MSC4108]: https://github.com/matrix-org/matrix-spec-proposals/pull/4108
-    pub async fn build_with_qr_code(
-        self: Arc<Self>,
-        qr_code_data: &QrCodeData,
-        oidc_configuration: &OidcConfiguration,
-        progress_listener: Box<dyn QrLoginProgressListener>,
-    ) -> Result<Arc<Client>, HumanQrLoginError> {
-        if let QrCodeModeData::Reciprocate { server_name } = &qr_code_data.inner.mode_data {
-            let builder = self.server_name_or_homeserver_url(server_name.to_owned());
-
-            let client = builder.build().await.map_err(|e| {
-                error!("Couldn't build the client {e:?}");
-                HumanQrLoginError::Unknown
-            })?;
-
-            if client.sliding_sync_proxy().is_none() {
-                return Err(HumanQrLoginError::SlidingSyncNotAvailable);
-            }
-
-            let client_metadata = oidc_configuration
-                .try_into()
-                .map_err(|_| HumanQrLoginError::OidcMetadataInvalid)?;
-
-            let oidc = client.inner.oidc();
-            let login = oidc.login_with_qr_code(&qr_code_data.inner, client_metadata);
-
-            let mut progress = login.subscribe_to_progress();
-
-            // We create this task, which will get cancelled once it's dropped, just in case
-            // the progress stream doesn't end.
-            let _progress_task = TaskHandle::new(RUNTIME.spawn(async move {
-                while let Some(state) = progress.next().await {
-                    progress_listener.on_update(state.into());
-                }
-            }));
-
-            login.await?;
-
-            Ok(client)
-        } else {
-            Err(HumanQrLoginError::OtherDeviceNotSignedIn)
-        }
-    }
-}
-
-impl ClientBuilder {
-    pub(crate) fn enable_cross_process_refresh_lock_inner(
-        self: Arc<Self>,
-        process_id: String,
-        session_delegate: Arc<dyn ClientSessionDelegate>,
-    ) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.cross_process_refresh_lock_id = Some(process_id);
-        builder.session_delegate = Some(session_delegate);
-        Arc::new(builder)
-    }
-
-    pub(crate) fn set_session_delegate_inner(
-        self: Arc<Self>,
-        session_delegate: Arc<dyn ClientSessionDelegate>,
-    ) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.session_delegate = Some(session_delegate);
-        Arc::new(builder)
-    }
-
-    pub(crate) async fn build_inner(self: Arc<Self>) -> Result<Client, ClientBuildError> {
         let builder = unwrap_or_clone_arc(self);
-        let mut inner_builder = builder.inner;
+        let mut inner_builder = MatrixClient::builder();
 
         if let Some(session_path) = &builder.session_path {
             let data_path = PathBuf::from(session_path);
@@ -518,18 +496,26 @@ impl ClientBuilder {
         for certificate in builder.additional_root_certificates {
             // We don't really know what type of certificate we may get here, so let's try
             // first one type, then the other.
-            if let Ok(cert) = Certificate::from_der(&certificate) {
-                certificates.push(cert);
-            } else {
-                let cert =
-                    Certificate::from_pem(&certificate).map_err(|e| ClientBuildError::Generic {
-                        message: format!("Failed to add a root certificate {e:?}"),
+            match Certificate::from_der(&certificate) {
+                Ok(cert) => {
+                    certificates.push(cert);
+                }
+                Err(der_error) => {
+                    let cert = Certificate::from_pem(&certificate).map_err(|pem_error| {
+                        ClientBuildError::Generic {
+                            message: format!("Failed to add a root certificate as DER ({der_error:?}) or PEM ({pem_error:?})"),
+                        }
                     })?;
-                certificates.push(cert);
+                    certificates.push(cert);
+                }
             }
         }
 
         inner_builder = inner_builder.add_root_certificates(certificates);
+
+        if builder.disable_built_in_root_certificates {
+            inner_builder = inner_builder.disable_built_in_root_certificates();
+        }
 
         if let Some(proxy) = builder.proxy {
             inner_builder = inner_builder.proxy(proxy);
@@ -547,38 +533,115 @@ impl ClientBuilder {
             inner_builder = inner_builder.user_agent(user_agent);
         }
 
-        if let Some(server_versions) = builder.server_versions {
-            inner_builder = inner_builder.server_versions(
-                server_versions
-                    .iter()
-                    .map(|s| MatrixVersion::try_from(s.as_str()))
-                    .collect::<Result<Vec<MatrixVersion>, UnknownVersionError>>()
-                    .map_err(|e| ClientBuildError::Generic { message: e.to_string() })?,
-            );
+        inner_builder = inner_builder.with_encryption_settings(builder.encryption_settings);
+
+        if let Some(sliding_sync_proxy) = builder.sliding_sync_proxy {
+            inner_builder = inner_builder.sliding_sync_proxy(sliding_sync_proxy);
         }
 
-        inner_builder = inner_builder.with_encryption_settings(builder.encryption_settings);
+        inner_builder =
+            inner_builder.simplified_sliding_sync(builder.is_simplified_sliding_sync_enabled);
+
+        if builder.requires_sliding_sync {
+            inner_builder = inner_builder.requires_sliding_sync();
+        }
+
+        if let Some(config) = builder.request_config {
+            let mut updated_config = matrix_sdk::config::RequestConfig::default();
+            if let Some(retry_limit) = config.retry_limit {
+                updated_config = updated_config.retry_limit(retry_limit);
+            }
+            if let Some(timeout) = config.timeout {
+                updated_config = updated_config.timeout(Duration::from_millis(timeout));
+            }
+            if let Some(max_concurrent_requests) = config.max_concurrent_requests {
+                if max_concurrent_requests > 0 {
+                    updated_config = updated_config.max_concurrent_requests(NonZeroUsize::new(
+                        max_concurrent_requests as usize,
+                    ));
+                }
+            }
+            if let Some(retry_timeout) = config.retry_timeout {
+                updated_config = updated_config.retry_timeout(Duration::from_millis(retry_timeout));
+            }
+            inner_builder = inner_builder.request_config(updated_config);
+        }
 
         let sdk_client = inner_builder.build().await?;
 
-        // At this point, `sdk_client` might contain a `sliding_sync_proxy` that has
-        // been configured by the homeserver (if it's a `ServerName` and the
-        // `.well-known` file is filled as expected).
-        //
-        // If `builder.sliding_sync_proxy` contains `Some(_)`, it means one wants to
-        // overwrite this value. It would be an error to call
-        // `sdk_client.set_sliding_sync_proxy()` with `None`, as it would erase the
-        // `sliding_sync_proxy` if any, and it's not the intended behavior.
-        //
-        // So let's call `sdk_client.set_sliding_sync_proxy()` if and only if there is
-        // `Some(_)` value in `builder.sliding_sync_proxy`. That's really important: It
-        // might not break an existing app session, but it is likely to break a new
-        // session, which not immediate to detect if there is no test.
-        if let Some(sliding_sync_proxy) = builder.sliding_sync_proxy {
-            sdk_client.set_sliding_sync_proxy(Some(Url::parse(&sliding_sync_proxy)?));
-        }
-
-        Ok(Client::new(sdk_client, builder.cross_process_refresh_lock_id, builder.session_delegate)
-            .await?)
+        Ok(Arc::new(
+            Client::new(
+                sdk_client,
+                builder.cross_process_refresh_lock_id,
+                builder.session_delegate,
+            )
+            .await?,
+        ))
     }
+
+    /// Finish the building of the client and attempt to log in using the
+    /// provided [`QrCodeData`].
+    ///
+    /// This method will build the client and immediately attempt to log the
+    /// client in using the provided [`QrCodeData`] using the login
+    /// mechanism described in [MSC4108]. As such this methods requires OIDC
+    /// support as well as sliding sync support.
+    ///
+    /// The usage of the progress_listener is required to transfer the
+    /// [`CheckCode`] to the existing client.
+    ///
+    /// [MSC4108]: https://github.com/matrix-org/matrix-spec-proposals/pull/4108
+    pub async fn build_with_qr_code(
+        self: Arc<Self>,
+        qr_code_data: &QrCodeData,
+        oidc_configuration: &OidcConfiguration,
+        progress_listener: Box<dyn QrLoginProgressListener>,
+    ) -> Result<Arc<Client>, HumanQrLoginError> {
+        let QrCodeModeData::Reciprocate { server_name } = &qr_code_data.inner.mode_data else {
+            return Err(HumanQrLoginError::OtherDeviceNotSignedIn);
+        };
+
+        let builder = self.server_name_or_homeserver_url(server_name.to_owned());
+
+        let client = builder.build().await.map_err(|e| match e {
+            ClientBuildError::SlidingSyncNotAvailable => HumanQrLoginError::SlidingSyncNotAvailable,
+            _ => {
+                error!("Couldn't build the client {e:?}");
+                HumanQrLoginError::Unknown
+            }
+        })?;
+
+        let client_metadata =
+            oidc_configuration.try_into().map_err(|_| HumanQrLoginError::OidcMetadataInvalid)?;
+
+        let oidc = client.inner.oidc();
+        let login = oidc.login_with_qr_code(&qr_code_data.inner, client_metadata);
+
+        let mut progress = login.subscribe_to_progress();
+
+        // We create this task, which will get cancelled once it's dropped, just in case
+        // the progress stream doesn't end.
+        let _progress_task = TaskHandle::new(RUNTIME.spawn(async move {
+            while let Some(state) = progress.next().await {
+                progress_listener.on_update(state.into());
+            }
+        }));
+
+        login.await?;
+
+        Ok(client)
+    }
+}
+
+#[derive(Clone, uniffi::Record)]
+/// The config to use for HTTP requests by default in this client.
+pub struct RequestConfig {
+    /// Max number of retries.
+    retry_limit: Option<u64>,
+    /// Timeout for a request in milliseconds.
+    timeout: Option<u64>,
+    /// Max number of concurrent requests. No value means no limits.
+    max_concurrent_requests: Option<u64>,
+    /// Base delay between retries.
+    retry_timeout: Option<u64>,
 }
