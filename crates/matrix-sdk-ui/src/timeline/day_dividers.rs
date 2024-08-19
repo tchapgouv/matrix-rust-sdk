@@ -622,6 +622,7 @@ mod tests {
     fn event_with_ts(timestamp: MilliSecondsSinceUnixEpoch) -> EventTimelineItem {
         let event_kind = EventTimelineItemKind::Remote(RemoteEventTimelineItem {
             event_id: owned_event_id!("$1"),
+            transaction_id: None,
             reactions: Default::default(),
             read_receipts: Default::default(),
             is_own: false,
@@ -637,6 +638,7 @@ mod tests {
             timestamp,
             TimelineItemContent::RedactedMessage,
             event_kind,
+            false,
         )
     }
 
@@ -645,7 +647,7 @@ mod tests {
         let mut items = ObservableVector::new();
         let mut txn = items.transaction();
 
-        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None);
+        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None, false);
 
         let timestamp = MilliSecondsSinceUnixEpoch(uint!(42));
         let timestamp_next_day =
@@ -679,7 +681,7 @@ mod tests {
         let mut items = ObservableVector::new();
         let mut txn = items.transaction();
 
-        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None);
+        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None, false);
 
         let timestamp = MilliSecondsSinceUnixEpoch(uint!(42));
         let timestamp_next_day =
@@ -711,7 +713,7 @@ mod tests {
         let mut items = ObservableVector::new();
         let mut txn = items.transaction();
 
-        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None);
+        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None, false);
 
         let timestamp = MilliSecondsSinceUnixEpoch(uint!(42));
         let timestamp_next_day =
@@ -745,7 +747,7 @@ mod tests {
         let mut items = ObservableVector::new();
         let mut txn = items.transaction();
 
-        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None);
+        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None, false);
 
         let timestamp = MilliSecondsSinceUnixEpoch(uint!(42));
         let timestamp_next_day =
@@ -775,7 +777,7 @@ mod tests {
         let mut items = ObservableVector::new();
         let mut txn = items.transaction();
 
-        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None);
+        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None, false);
 
         let timestamp = MilliSecondsSinceUnixEpoch(uint!(42));
 
@@ -801,7 +803,7 @@ mod tests {
         let mut items = ObservableVector::new();
         let mut txn = items.transaction();
 
-        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None);
+        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None, false);
 
         let timestamp = MilliSecondsSinceUnixEpoch(uint!(42));
 
@@ -825,7 +827,7 @@ mod tests {
         let mut items = ObservableVector::new();
         let mut txn = items.transaction();
 
-        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None);
+        let mut meta = TimelineInnerMetadata::new(ruma::RoomVersionId::V11, None, None, false);
 
         let timestamp = MilliSecondsSinceUnixEpoch(uint!(42));
 

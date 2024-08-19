@@ -22,10 +22,10 @@ pub use bytes;
 pub use matrix_sdk_base::crypto;
 pub use matrix_sdk_base::{
     deserialized_responses,
-    store::{ComposerDraft, DynStateStore, MemoryStore, StateStoreExt},
-    DisplayName, Room as BaseRoom, RoomCreateWithCreatorEventContent, RoomHero, RoomInfo,
-    RoomMember as BaseRoomMember, RoomMemberships, RoomState, SessionMeta, StateChanges,
-    StateStore, StoreError,
+    store::{DynStateStore, MemoryStore, StateStoreExt},
+    ComposerDraft, ComposerDraftType, DisplayName, Room as BaseRoom,
+    RoomCreateWithCreatorEventContent, RoomHero, RoomInfo, RoomMember as BaseRoomMember,
+    RoomMemberships, RoomState, SessionMeta, StateChanges, StateStore, StoreError,
 };
 pub use matrix_sdk_common::*;
 pub use reqwest;
@@ -89,7 +89,7 @@ pub use room::Room;
 pub use ruma::{IdParseError, OwnedServerName, ServerName};
 #[cfg(feature = "experimental-sliding-sync")]
 pub use sliding_sync::{
-    RoomListEntry, SlidingSync, SlidingSyncBuilder, SlidingSyncList, SlidingSyncListBuilder,
+    SlidingSync, SlidingSyncBuilder, SlidingSyncList, SlidingSyncListBuilder,
     SlidingSyncListLoadingState, SlidingSyncMode, SlidingSyncRoom, UpdateSummary,
 };
 
@@ -98,6 +98,9 @@ uniffi::setup_scaffolding!();
 
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
+
+/// Contains the pinned events cache implementation.
+pub mod pinned_events_cache;
 
 #[cfg(test)]
 matrix_sdk_test::init_tracing_for_tests!();

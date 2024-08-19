@@ -27,13 +27,12 @@ use matrix_sdk_crypto::{
         PrivateCrossSigningIdentity, Session, StaticAccountData,
     },
     store::{
-        caches::SessionStore, BackupKeys, Changes, CryptoStore, CryptoStoreError, PendingChanges,
-        RoomKeyCounts, RoomSettings,
+        BackupKeys, Changes, CryptoStore, CryptoStoreError, PendingChanges, RoomKeyCounts,
+        RoomSettings,
     },
     types::events::room_key_withheld::RoomKeyWithheldEvent,
     vodozemac::base64_encode,
-    Account, GossipRequest, GossippedSecret, ReadOnlyDevice, ReadOnlyUserIdentities, SecretInfo,
-    TrackedUser,
+    Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, TrackedUser, UserIdentityData,
 };
 use matrix_sdk_store_encryption::StoreCipher;
 use ruma::{
@@ -90,7 +89,11 @@ mod keys {
 
     // backup v1
     pub const BACKUP_KEYS: &str = "backup_keys";
-    pub const BACKUP_KEY_V1: &str = "backup_key_v1";
+
+    /// Indexeddb key for the key backup version that [`RECOVERY_KEY_V1`]
+    /// corresponds to.
+    pub const BACKUP_VERSION_V1: &str = "backup_version_v1";
+
     /// Indexeddb key for the backup decryption key.
     ///
     /// Known, for historical reasons, as the recovery key. Not to be confused
@@ -109,7 +112,6 @@ pub struct IndexeddbCryptoStore {
     pub(crate) inner: IdbDatabase,
 
     serializer: IndexeddbSerializer,
-    session_cache: SessionStore,
     save_changes_lock: Arc<Mutex<()>>,
 }
 
@@ -258,11 +260,9 @@ impl IndexeddbCryptoStore {
         let serializer = IndexeddbSerializer::new(store_cipher);
         debug!("IndexedDbCryptoStore: opening main store {name}");
         let db = open_and_upgrade_db(&name, &serializer).await?;
-        let session_cache = SessionStore::new();
 
         Ok(Self {
             name,
-            session_cache,
             inner: db,
             serializer,
             static_account: RwLock::new(None),
@@ -377,6 +377,14 @@ impl IndexeddbCryptoStore {
         IndexeddbCryptoStore::open_with_store_cipher(name, None).await
     }
 
+    /// Delete the IndexedDB databases for the given name.
+    #[cfg(test)]
+    pub fn delete_stores(prefix: &str) -> Result<()> {
+        IdbDatabase::delete_by_name(&format!("{prefix:0}::matrix-sdk-crypto-meta"))?;
+        IdbDatabase::delete_by_name(&format!("{prefix:0}::matrix-sdk-crypto"))?;
+        Ok(())
+    }
+
     fn get_static_account(&self) -> Option<StaticAccountData> {
         self.static_account.read().unwrap().clone()
     }
@@ -447,6 +455,10 @@ impl IndexeddbCryptoStore {
 
     /// Process all the changes and do all encryption/serialization before the
     /// actual transaction.
+    ///
+    /// Returns a tuple where the first item is a `PendingIndexeddbChanges`
+    /// struct, and the second item is a boolean indicating whether the session
+    /// cache should be cleared.
     async fn prepare_for_transaction(&self, changes: &Changes) -> Result<PendingIndexeddbChanges> {
         let mut indexeddb_changes = PendingIndexeddbChanges::new();
 
@@ -479,9 +491,10 @@ impl IndexeddbCryptoStore {
         }
 
         if let Some(a) = &backup_version {
-            indexeddb_changes
-                .get(keys::BACKUP_KEYS)
-                .put(JsValue::from_str(keys::BACKUP_KEY_V1), self.serializer.serialize_value(&a)?);
+            indexeddb_changes.get(keys::BACKUP_KEYS).put(
+                JsValue::from_str(keys::BACKUP_VERSION_V1),
+                self.serializer.serialize_value(&a)?,
+            );
         }
 
         if !changes.sessions.is_empty() {
@@ -713,11 +726,6 @@ impl_crypto_store! {
 
         tx.await.into_result()?;
 
-        // all good, let's update our caches:indexeddb
-        for session in changes.sessions {
-            self.session_cache.add(session).await;
-        }
-
         Ok(())
     }
 
@@ -859,12 +867,14 @@ impl_crypto_store! {
         }
     }
 
-    async fn get_sessions(&self, sender_key: &str) -> Result<Option<Arc<Mutex<Vec<Session>>>>> {
-        let account_info = self.get_static_account().ok_or(CryptoStoreError::AccountUnset)?;
+    async fn get_sessions(&self, sender_key: &str) -> Result<Option<Vec<Session>>> {
+            let device_keys = self.get_own_device()
+                .await?
+                .as_device_keys()
+                .clone();
 
-        if self.session_cache.get(sender_key).is_none() {
-            let range = self.serializer.encode_to_range(keys::SESSION, sender_key)?;
-            let sessions: Vec<Session> = self
+        let range = self.serializer.encode_to_range(keys::SESSION, sender_key)?;
+        let sessions: Vec<Session> = self
                 .inner
                 .transaction_on_one_with_mode(keys::SESSION, IdbTransactionMode::Readonly)?
                 .object_store(keys::SESSION)?
@@ -873,18 +883,18 @@ impl_crypto_store! {
                 .iter()
                 .filter_map(|f| self.serializer.deserialize_value(f).ok().map(|p| {
                     Session::from_pickle(
-                        account_info.user_id.clone(),
-                        account_info.device_id.clone(),
-                        account_info.identity_keys.clone(),
+                        device_keys.clone(),
                         p,
                     )
+                        .map_err(|_| IndexeddbCryptoStoreError::CryptoStoreError(CryptoStoreError::AccountUnset))
                 }))
-                .collect::<Vec<Session>>();
+                .collect::<Result<Vec<Session>>>()?;
 
-            self.session_cache.set_for_sender(sender_key, sessions);
+        if sessions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(sessions))
         }
-
-        Ok(self.session_cache.get(sender_key))
     }
 
     async fn get_inbound_group_session(
@@ -1063,22 +1073,22 @@ impl_crypto_store! {
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
-    ) -> Result<Option<ReadOnlyDevice>> {
+    ) -> Result<Option<DeviceData>> {
         let key = self.serializer.encode_key(keys::DEVICES, (user_id, device_id));
-        Ok(self
+        self
             .inner
             .transaction_on_one_with_mode(keys::DEVICES, IdbTransactionMode::Readonly)?
             .object_store(keys::DEVICES)?
             .get(&key)?
             .await?
             .map(|i| self.serializer.deserialize_value(i))
-            .transpose()?)
+            .transpose()
     }
 
     async fn get_user_devices(
         &self,
         user_id: &UserId,
-    ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>> {
+    ) -> Result<HashMap<OwnedDeviceId, DeviceData>> {
         let range = self.serializer.encode_to_range(keys::DEVICES, user_id)?;
         Ok(self
             .inner
@@ -1088,21 +1098,28 @@ impl_crypto_store! {
             .await?
             .iter()
             .filter_map(|d| {
-                let d: ReadOnlyDevice = self.serializer.deserialize_value(d).ok()?;
+                let d: DeviceData = self.serializer.deserialize_value(d).ok()?;
                 Some((d.device_id().to_owned(), d))
             })
             .collect::<HashMap<_, _>>())
     }
 
-    async fn get_user_identity(&self, user_id: &UserId) -> Result<Option<ReadOnlyUserIdentities>> {
-        Ok(self
+    async fn get_own_device(&self) -> Result<DeviceData> {
+        let account_info = self.get_static_account().ok_or(CryptoStoreError::AccountUnset)?;
+        Ok(self.get_device(&account_info.user_id, &account_info.device_id)
+           .await?
+           .unwrap())
+    }
+
+    async fn get_user_identity(&self, user_id: &UserId) -> Result<Option<UserIdentityData>> {
+        self
             .inner
             .transaction_on_one_with_mode(keys::IDENTITIES, IdbTransactionMode::Readonly)?
             .object_store(keys::IDENTITIES)?
             .get(&self.serializer.encode_key(keys::IDENTITIES, user_id))?
             .await?
             .map(|i| self.serializer.deserialize_value(i))
-            .transpose()?)
+            .transpose()
     }
 
     async fn is_message_known(&self, hash: &OlmMessageHash) -> Result<bool> {
@@ -1208,7 +1225,7 @@ impl_crypto_store! {
             let store = tx.object_store(keys::BACKUP_KEYS)?;
 
             let backup_version = store
-                .get(&JsValue::from_str(keys::BACKUP_KEY_V1))?
+                .get(&JsValue::from_str(keys::BACKUP_VERSION_V1))?
                 .await?
                 .map(|i| self.serializer.deserialize_value(i))
                 .transpose()?;
@@ -1250,25 +1267,25 @@ impl_crypto_store! {
 
     async fn get_room_settings(&self, room_id: &RoomId) -> Result<Option<RoomSettings>> {
         let key = self.serializer.encode_key(keys::ROOM_SETTINGS, room_id);
-        Ok(self
+        self
             .inner
             .transaction_on_one_with_mode(keys::ROOM_SETTINGS, IdbTransactionMode::Readonly)?
             .object_store(keys::ROOM_SETTINGS)?
             .get(&key)?
             .await?
             .map(|v| self.serializer.deserialize_value(v))
-            .transpose()?)
+            .transpose()
     }
 
     async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self
+        self
             .inner
             .transaction_on_one_with_mode(keys::CORE, IdbTransactionMode::Readonly)?
             .object_store(keys::CORE)?
             .get(&JsValue::from_str(key))?
             .await?
             .map(|v| self.serializer.deserialize_value(v))
-            .transpose()?)
+            .transpose()
     }
 
     #[allow(clippy::unused_async)] // Mandated by trait on wasm.
@@ -1330,13 +1347,6 @@ impl_crypto_store! {
                 Ok(true)
             }
         }
-    }
-
-    #[allow(clippy::unused_async)] // Mandated by trait on wasm.
-    async fn clear_caches(&self) {
-        self.session_cache.clear()
-        // We don't need to clear `static_account` as it only contains immutable data
-        // therefore cannot get out of sync with the underlying store.
     }
 }
 
@@ -1692,13 +1702,25 @@ mod wasm_unit_tests {
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod tests {
-    use matrix_sdk_crypto::cryptostore_integration_tests;
+    use matrix_sdk_crypto::{
+        cryptostore_integration_tests,
+        store::{Changes, CryptoStore as _, DeviceChanges, PendingChanges},
+        DeviceData,
+    };
+    use matrix_sdk_test::async_test;
 
     use super::IndexeddbCryptoStore;
 
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
-    async fn get_store(name: &str, passphrase: Option<&str>) -> IndexeddbCryptoStore {
+    async fn get_store(
+        name: &str,
+        passphrase: Option<&str>,
+        clear_data: bool,
+    ) -> IndexeddbCryptoStore {
+        if clear_data {
+            IndexeddbCryptoStore::delete_stores(name).unwrap();
+        }
         match passphrase {
             Some(pass) => IndexeddbCryptoStore::open_with_passphrase(name, pass)
                 .await
@@ -1708,7 +1730,6 @@ mod tests {
                 .expect("Can't create store without passphrase"),
         }
     }
-    cryptostore_integration_tests!();
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -1726,11 +1747,17 @@ mod encrypted_tests {
 
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
-    async fn get_store(name: &str, passphrase: Option<&str>) -> IndexeddbCryptoStore {
+    async fn get_store(
+        name: &str,
+        passphrase: Option<&str>,
+        clear_data: bool,
+    ) -> IndexeddbCryptoStore {
+        if clear_data {
+            IndexeddbCryptoStore::delete_stores(name).unwrap();
+        }
+
         let pass = passphrase.unwrap_or(name);
-        // make sure to use a different store name than the equivalent unencrypted test
-        let store_name = name.to_owned() + "_enc";
-        IndexeddbCryptoStore::open_with_passphrase(&store_name, pass)
+        IndexeddbCryptoStore::open_with_passphrase(&name, pass)
             .await
             .expect("Can't create a passphrase protected store")
     }
@@ -1745,6 +1772,7 @@ mod encrypted_tests {
         let b64_passdata = base64_encode(passdata);
 
         // Initialise the store with some account data
+        IndexeddbCryptoStore::delete_stores(store_name).unwrap();
         let store = IndexeddbCryptoStore::open_with_passphrase(&store_name, &b64_passdata)
             .await
             .expect("Can't create a passphrase-protected store");

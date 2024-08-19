@@ -27,13 +27,9 @@ use matrix_sdk_crypto::{
         InboundGroupSession, OutboundGroupSession, PickledInboundGroupSession,
         PrivateCrossSigningIdentity, Session, StaticAccountData,
     },
-    store::{
-        caches::SessionStore, BackupKeys, Changes, CryptoStore, PendingChanges, RoomKeyCounts,
-        RoomSettings,
-    },
+    store::{BackupKeys, Changes, CryptoStore, PendingChanges, RoomKeyCounts, RoomSettings},
     types::events::room_key_withheld::RoomKeyWithheldEvent,
-    Account, GossipRequest, GossippedSecret, ReadOnlyDevice, ReadOnlyUserIdentities, SecretInfo,
-    TrackedUser,
+    Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, TrackedUser, UserIdentityData,
 };
 use matrix_sdk_store_encryption::StoreCipher;
 use ruma::{
@@ -64,7 +60,6 @@ pub struct SqliteCryptoStore {
 
     // DB values cached in memory
     static_account: Arc<RwLock<Option<StaticAccountData>>>,
-    session_cache: SessionStore,
     save_changes_lock: Arc<Mutex<()>>,
 }
 
@@ -113,7 +108,6 @@ impl SqliteCryptoStore {
             path: None,
             pool,
             static_account: Arc::new(RwLock::new(None)),
-            session_cache: SessionStore::new(),
             save_changes_lock: Default::default(),
         })
     }
@@ -682,13 +676,6 @@ impl SqliteObjectCryptoStoreExt for deadpool_sqlite::Object {}
 impl CryptoStore for SqliteCryptoStore {
     type Error = Error;
 
-    async fn clear_caches(&self) {
-        self.session_cache.clear()
-        // We don't need to clear `static_account` as it only contains immutable
-        // data therefore cannot get out of sync with the underlying
-        // store.
-    }
-
     async fn load_account(&self) -> Result<Option<Account>> {
         let conn = self.acquire().await?;
         if let Some(pickle) = conn.get_kv("account").await? {
@@ -755,13 +742,12 @@ impl CryptoStore for SqliteCryptoStore {
             if let Some(i) = changes.private_identity { Some(i.pickle().await) } else { None };
 
         let mut session_changes = Vec::new();
+
         for session in changes.sessions {
             let session_id = self.encode_key("session", session.session_id());
             let sender_key = self.encode_key("session", session.sender_key().to_base64());
             let pickle = session.pickle().await;
             session_changes.push((session_id, sender_key, pickle));
-
-            self.session_cache.add(session).await;
         }
 
         let mut inbound_session_changes = Vec::new();
@@ -904,31 +890,26 @@ impl CryptoStore for SqliteCryptoStore {
         self.save_changes(Changes { inbound_group_sessions: sessions, ..Changes::default() }).await
     }
 
-    async fn get_sessions(&self, sender_key: &str) -> Result<Option<Arc<Mutex<Vec<Session>>>>> {
-        let account_info = self.get_static_account().ok_or(Error::AccountUnset)?;
+    async fn get_sessions(&self, sender_key: &str) -> Result<Option<Vec<Session>>> {
+        let device_keys = self.get_own_device().await?.as_device_keys().clone();
 
-        if self.session_cache.get(sender_key).is_none() {
-            let sessions = self
-                .acquire()
-                .await?
-                .get_sessions_for_sender_key(self.encode_key("session", sender_key.as_bytes()))
-                .await?
-                .into_iter()
-                .map(|bytes| {
-                    let pickle = self.deserialize_value(&bytes)?;
-                    Ok(Session::from_pickle(
-                        account_info.user_id.clone(),
-                        account_info.device_id.clone(),
-                        account_info.identity_keys.clone(),
-                        pickle,
-                    ))
-                })
-                .collect::<Result<_>>()?;
+        let sessions: Vec<_> = self
+            .acquire()
+            .await?
+            .get_sessions_for_sender_key(self.encode_key("session", sender_key.as_bytes()))
+            .await?
+            .into_iter()
+            .map(|bytes| {
+                let pickle = self.deserialize_value(&bytes)?;
+                Session::from_pickle(device_keys.clone(), pickle).map_err(|_| Error::AccountUnset)
+            })
+            .collect::<Result<_>>()?;
 
-            self.session_cache.set_for_sender(sender_key, sessions);
+        if sessions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(sessions))
         }
-
-        Ok(self.session_cache.get(sender_key))
     }
 
     #[instrument(skip(self))]
@@ -1081,7 +1062,7 @@ impl CryptoStore for SqliteCryptoStore {
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
-    ) -> Result<Option<ReadOnlyDevice>> {
+    ) -> Result<Option<DeviceData>> {
         let user_id = self.encode_key("device", user_id.as_bytes());
         let device_id = self.encode_key("device", device_id.as_bytes());
         Ok(self
@@ -1096,7 +1077,7 @@ impl CryptoStore for SqliteCryptoStore {
     async fn get_user_devices(
         &self,
         user_id: &UserId,
-    ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>> {
+    ) -> Result<HashMap<OwnedDeviceId, DeviceData>> {
         let user_id = self.encode_key("device", user_id.as_bytes());
         self.acquire()
             .await?
@@ -1104,13 +1085,22 @@ impl CryptoStore for SqliteCryptoStore {
             .await?
             .into_iter()
             .map(|value| {
-                let device: ReadOnlyDevice = self.deserialize_value(&value)?;
+                let device: DeviceData = self.deserialize_value(&value)?;
                 Ok((device.device_id().to_owned(), device))
             })
             .collect()
     }
 
-    async fn get_user_identity(&self, user_id: &UserId) -> Result<Option<ReadOnlyUserIdentities>> {
+    async fn get_own_device(&self) -> Result<DeviceData> {
+        let account_info = self.get_static_account().ok_or(Error::AccountUnset)?;
+
+        Ok(self
+            .get_device(&account_info.user_id, &account_info.device_id)
+            .await?
+            .expect("We should be able to find our own device."))
+    }
+
+    async fn get_user_identity(&self, user_id: &UserId) -> Result<Option<UserIdentityData>> {
         let user_id = self.encode_key("identity", user_id.as_bytes());
         Ok(self
             .acquire()
@@ -1307,16 +1297,123 @@ impl CryptoStore for SqliteCryptoStore {
 
 #[cfg(test)]
 mod tests {
-    use matrix_sdk_crypto::{cryptostore_integration_tests, cryptostore_integration_tests_time};
+    use std::path::PathBuf;
+
+    use matrix_sdk_crypto::{
+        cryptostore_integration_tests, cryptostore_integration_tests_time, store::CryptoStore,
+    };
+    use matrix_sdk_test::async_test;
     use once_cell::sync::Lazy;
+    use similar_asserts::assert_eq;
     use tempfile::{tempdir, TempDir};
+    use tokio::fs;
 
     use super::SqliteCryptoStore;
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
 
-    async fn get_store(name: &str, passphrase: Option<&str>) -> SqliteCryptoStore {
+    struct TestDb {
+        // Needs to be kept alive because the Drop implementation for TempDir deletes the
+        // directory.
+        #[allow(dead_code)]
+        dir: TempDir,
+        database: SqliteCryptoStore,
+    }
+
+    async fn get_test_db() -> TestDb {
+        let db_name = "matrix-sdk-crypto.sqlite3";
+
+        let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let database_path = manifest_path.join("testing/data/storage").join(db_name);
+
+        let tmpdir = tempdir().unwrap();
+        let destination = tmpdir.path().join(db_name);
+
+        // Copy the test database to the tempdir so our test runs are idempotent.
+        std::fs::copy(&database_path, destination).unwrap();
+
+        let database =
+            SqliteCryptoStore::open(tmpdir.path(), None).await.expect("Can't open the test store");
+
+        TestDb { dir: tmpdir, database }
+    }
+
+    /// Test that we didn't regress in our storage layer by loading data from a
+    /// pre-filled database, or in other words use a test vector for this.
+    #[async_test]
+    async fn open_test_vector_store() {
+        let TestDb { dir: _, database } = get_test_db().await;
+
+        let account = database
+            .load_account()
+            .await
+            .unwrap()
+            .expect("The test database is prefilled with data, we should find an account");
+
+        let user_id = account.user_id();
+        let device_id = account.device_id();
+
+        assert_eq!(
+            user_id.as_str(),
+            "@pjtest:synapse-oidc.element.dev",
+            "The user ID should match to the one we expect."
+        );
+
+        assert_eq!(
+            device_id.as_str(),
+            "v4TqgcuIH6",
+            "The device ID should match to the one we expect."
+        );
+
+        let device = database
+            .get_device(user_id, device_id)
+            .await
+            .unwrap()
+            .expect("Our own device should be found in the store.");
+
+        assert_eq!(device.device_id(), device_id);
+        assert_eq!(device.user_id(), user_id);
+
+        assert_eq!(
+            device.ed25519_key().expect("The device should have a Ed25519 key.").to_base64(),
+            "+cxl1Gl3du5i7UJwfWnoRDdnafFF+xYdAiTYYhYLr8s"
+        );
+
+        assert_eq!(
+            device.curve25519_key().expect("The device should have a Curve25519 key.").to_base64(),
+            "4SL9eEUlpyWSUvjljC5oMjknHQQJY7WZKo5S1KL/5VU"
+        );
+
+        let identity = database
+            .get_user_identity(user_id)
+            .await
+            .unwrap()
+            .expect("The store should contain an identity.");
+
+        assert_eq!(identity.user_id(), user_id);
+
+        let identity = identity
+            .own()
+            .expect("The identity should be of the correct type, it should be our own identity.");
+
+        let master_key = identity
+            .master_key()
+            .get_first_key()
+            .expect("Our own identity should have a master key");
+
+        assert_eq!(master_key.to_base64(), "iCUEtB1RwANeqRa5epDrblLk4mer/36sylwQ5hYY3oE");
+    }
+
+    async fn get_store(
+        name: &str,
+        passphrase: Option<&str>,
+        clear_data: bool,
+    ) -> SqliteCryptoStore {
         let tmpdir_path = TMP_DIR.path().join(name);
+
+        if clear_data {
+            let _ = fs::remove_dir_all(&tmpdir_path).await;
+        }
 
         SqliteCryptoStore::open(tmpdir_path.to_str().unwrap(), passphrase)
             .await
@@ -1329,52 +1426,30 @@ mod tests {
 
 #[cfg(test)]
 mod encrypted_tests {
-    use matrix_sdk_crypto::{
-        cryptostore_integration_tests, cryptostore_integration_tests_time,
-        store::{Changes, CryptoStore as _, PendingChanges},
-    };
-    use matrix_sdk_test::async_test;
+    use matrix_sdk_crypto::{cryptostore_integration_tests, cryptostore_integration_tests_time};
     use once_cell::sync::Lazy;
     use tempfile::{tempdir, TempDir};
+    use tokio::fs;
 
     use super::SqliteCryptoStore;
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
 
-    async fn get_store(name: &str, passphrase: Option<&str>) -> SqliteCryptoStore {
+    async fn get_store(
+        name: &str,
+        passphrase: Option<&str>,
+        clear_data: bool,
+    ) -> SqliteCryptoStore {
         let tmpdir_path = TMP_DIR.path().join(name);
         let pass = passphrase.unwrap_or("default_test_password");
+
+        if clear_data {
+            let _ = fs::remove_dir_all(&tmpdir_path).await;
+        }
 
         SqliteCryptoStore::open(tmpdir_path.to_str().unwrap(), Some(pass))
             .await
             .expect("Can't create a passphrase protected store")
-    }
-
-    #[async_test]
-    async fn cache_cleared() {
-        let store = get_store("cache_cleared", None).await;
-        // Given we created a session and saved it in the store
-        let (account, session) = cryptostore_integration_tests::get_account_and_session().await;
-        let sender_key = session.sender_key.to_base64();
-
-        store
-            .save_pending_changes(PendingChanges { account: Some(account.deep_clone()) })
-            .await
-            .expect("Can't save account");
-
-        let changes = Changes { sessions: vec![session.clone()], ..Default::default() };
-        store.save_changes(changes).await.unwrap();
-
-        store.session_cache.get(&sender_key).expect("We should have a session");
-
-        // When we clear the caches
-        store.clear_caches().await;
-
-        // Then the session is no longer in the cache
-        assert!(
-            store.session_cache.get(&sender_key).is_none(),
-            "Session should not be in the cache!"
-        );
     }
 
     cryptostore_integration_tests!();

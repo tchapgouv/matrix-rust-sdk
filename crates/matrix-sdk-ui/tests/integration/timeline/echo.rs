@@ -52,18 +52,18 @@ async fn test_echo() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    mock_encryption_state(&server, false).await;
+
     let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
     let (_, mut timeline_stream) = timeline.subscribe().await;
-
-    mock_encryption_state(&server, false).await;
 
     Mock::given(method("PUT"))
         .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
         .and(header("authorization", "Bearer 1234"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&json!({ "event_id": "$wWgymRfo7ri1uQx0NXO40vLJ" })),
+                .set_body_json(json!({ "event_id": "$wWgymRfo7ri1uQx0NXO40vLJ" })),
         )
         .mount(&server)
         .await;
@@ -139,7 +139,8 @@ async fn test_retry_failed() {
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
 
-    client.send_queue().set_enabled(true);
+    client.send_queue().set_enabled(true).await;
+    mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
@@ -188,7 +189,7 @@ async fn test_retry_failed() {
         .and(header("authorization", "Bearer 1234"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&json!({ "event_id": "$wWgymRfo7ri1uQx0NXO40vLJ" })),
+                .set_body_json(json!({ "event_id": "$wWgymRfo7ri1uQx0NXO40vLJ" })),
         )
         .mount(&server)
         .await;
@@ -216,6 +217,8 @@ async fn test_dedup_by_event_id_late() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    mock_encryption_state(&server, false).await;
+
     let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
     let (_, mut timeline_stream) = timeline.subscribe().await;
@@ -229,7 +232,7 @@ async fn test_dedup_by_event_id_late() {
         .and(header("authorization", "Bearer 1234"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(&json!({ "event_id": event_id }))
+                .set_body_json(json!({ "event_id": event_id }))
                 // Not great to use a timer for this, but it's what wiremock gives us right now.
                 // Ideally we'd wait on a channel to produce a value or sth. like that.
                 .set_delay(Duration::from_millis(100)),
@@ -291,6 +294,8 @@ async fn test_cancel_failed() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    mock_encryption_state(&server, false).await;
+
     let room = client.get_room(room_id).unwrap();
     let timeline = Arc::new(room.timeline().await.unwrap());
     let (_, mut timeline_stream) =
@@ -312,7 +317,7 @@ async fn test_cancel_failed() {
     assert_matches!(value.send_state(), Some(EventSendState::SendingFailed { .. }));
 
     // Discard, assert the local echo is found
-    assert!(handle.abort().await);
+    assert!(handle.abort().await.unwrap());
 
     // Observable local echo being removed
     assert_matches!(timeline_stream.next().await, Some(VectorDiff::Remove { index: 0 }));

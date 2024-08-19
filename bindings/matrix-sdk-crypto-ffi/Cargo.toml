@@ -22,10 +22,10 @@ bundled-sqlite = ["matrix-sdk-sqlite/bundled"]
 
 [dependencies]
 anyhow = { workspace = true }
-futures-util = "0.3.28"
+futures-util = { workspace = true }
 hmac = "0.12.1"
 http = { workspace = true }
-matrix-sdk-common = { workspace = true }
+matrix-sdk-common = { workspace = true, features = ["uniffi"] }
 pbkdf2 = "0.12.2"
 rand = { workspace = true }
 ruma = { workspace = true }
@@ -33,9 +33,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 # keep in sync with uniffi dependency in matrix-sdk-ffi, and uniffi_bindgen in ffi CI job
-uniffi = { workspace = true , features = ["cli"]}
+uniffi = { workspace = true, features = ["cli"] }
 vodozemac = { workspace = true }
 zeroize = { workspace = true, features = ["zeroize_derive"] }
 

@@ -11,7 +11,10 @@ use deadpool_sqlite::{Object as SqliteConn, Pool as SqlitePool, Runtime};
 use matrix_sdk_base::{
     deserialized_responses::{RawAnySyncOrStrippedState, SyncOrStrippedState},
     media::{MediaRequest, UniqueKey},
-    store::migration_helpers::RoomInfoV1,
+    store::{
+        migration_helpers::RoomInfoV1, ChildTransactionId, DependentQueuedEvent,
+        DependentQueuedEventKind, QueuedEvent, SerializableEventContent,
+    },
     MinimalRoomMemberEvent, RoomInfo, RoomMemberships, RoomState, StateChanges, StateStore,
     StateStoreDataKey, StateStoreDataValue,
 };
@@ -29,7 +32,8 @@ use ruma::{
         GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
     serde::Raw,
-    CanonicalJsonObject, EventId, OwnedEventId, OwnedUserId, RoomId, RoomVersionId, UserId,
+    CanonicalJsonObject, EventId, OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId,
+    RoomId, RoomVersionId, TransactionId, UserId,
 };
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -55,9 +59,16 @@ mod keys {
     pub const RECEIPT: &str = "receipt";
     pub const DISPLAY_NAME: &str = "display_name";
     pub const MEDIA: &str = "media";
+    pub const SEND_QUEUE: &str = "send_queue_events";
+    pub const DEPENDENTS_SEND_QUEUE: &str = "dependent_send_queue_events";
 }
 
-const DATABASE_VERSION: u8 = 3;
+/// Identifier of the latest database version.
+///
+/// This is used to figure whether the sqlite database requires a migration.
+/// Every new SQL migration should imply a bump of this number, and changes in
+/// the [`SqliteStateStore::run_migrations`] function..
+const DATABASE_VERSION: u8 = 6;
 
 /// A sqlite based cryptostore.
 #[derive(Clone)]
@@ -213,6 +224,37 @@ impl SqliteStateStore {
             .await?;
         }
 
+        if from < 4 && to >= 4 {
+            conn.with_transaction(move |txn| {
+                // Create new table.
+                txn.execute_batch(include_str!("../migrations/state_store/003_send_queue.sql"))?;
+                Result::<_, Error>::Ok(())
+            })
+            .await?;
+        }
+
+        if from < 5 && to >= 5 {
+            conn.with_transaction(move |txn| {
+                // Create new table.
+                txn.execute_batch(include_str!(
+                    "../migrations/state_store/004_send_queue_with_roomid_value.sql"
+                ))?;
+                Result::<_, Error>::Ok(())
+            })
+            .await?;
+        }
+
+        if from < 6 && to >= 6 {
+            conn.with_transaction(move |txn| {
+                // Create new table.
+                txn.execute_batch(include_str!(
+                    "../migrations/state_store/005_send_queue_dependent_events.sql"
+                ))?;
+                Result::<_, Error>::Ok(())
+            })
+            .await?;
+        }
+
         conn.set_kv("version", vec![to]).await?;
 
         Ok(())
@@ -269,6 +311,9 @@ impl SqliteStateStore {
     fn encode_state_store_data_key(&self, key: StateStoreDataKey<'_>) -> Key {
         let key_s = match key {
             StateStoreDataKey::SyncToken => Cow::Borrowed(StateStoreDataKey::SYNC_TOKEN),
+            StateStoreDataKey::ServerCapabilities => {
+                Cow::Borrowed(StateStoreDataKey::SERVER_CAPABILITIES)
+            }
             StateStoreDataKey::Filter(f) => {
                 Cow::Owned(format!("{}:{f}", StateStoreDataKey::FILTER))
             }
@@ -403,6 +448,7 @@ trait SqliteConnectionStateStoreExt {
     fn set_display_name(&self, room_id: &[u8], name: &[u8], data: &[u8]) -> rusqlite::Result<()>;
     fn remove_display_name(&self, room_id: &[u8], name: &[u8]) -> rusqlite::Result<()>;
     fn remove_room_display_names(&self, room_id: &[u8]) -> rusqlite::Result<()>;
+    fn remove_room_send_queue(&self, room_id: &[u8]) -> rusqlite::Result<()>;
 }
 
 impl SqliteConnectionStateStoreExt for rusqlite::Connection {
@@ -607,6 +653,11 @@ impl SqliteConnectionStateStoreExt for rusqlite::Connection {
 
     fn remove_room_display_names(&self, room_id: &[u8]) -> rusqlite::Result<()> {
         self.prepare("DELETE FROM display_name WHERE room_id = ?")?.execute((room_id,))?;
+        Ok(())
+    }
+
+    fn remove_room_send_queue(&self, room_id: &[u8]) -> rusqlite::Result<()> {
+        self.prepare("DELETE FROM send_queue_events WHERE room_id = ?")?.execute((room_id,))?;
         Ok(())
     }
 }
@@ -893,6 +944,9 @@ impl StateStore for SqliteStateStore {
                     StateStoreDataKey::SyncToken => {
                         StateStoreDataValue::SyncToken(self.deserialize_value(&data)?)
                     }
+                    StateStoreDataKey::ServerCapabilities => {
+                        StateStoreDataValue::ServerCapabilities(self.deserialize_value(&data)?)
+                    }
                     StateStoreDataKey::Filter(_) => {
                         StateStoreDataValue::Filter(self.deserialize_value(&data)?)
                     }
@@ -921,6 +975,11 @@ impl StateStore for SqliteStateStore {
         let serialized_value = match key {
             StateStoreDataKey::SyncToken => self.serialize_value(
                 &value.into_sync_token().expect("Session data not a sync token"),
+            )?,
+            StateStoreDataKey::ServerCapabilities => self.serialize_value(
+                &value
+                    .into_server_capabilities()
+                    .expect("Session data not containing server capabilities"),
             )?,
             StateStoreDataKey::Filter(_) => {
                 self.serialize_value(&value.into_filter().expect("Session data not a filter"))?
@@ -1643,9 +1702,269 @@ impl StateStore for SqliteStateStore {
                 let display_name_room_id = this.encode_key(keys::DISPLAY_NAME, &room_id);
                 txn.remove_room_display_names(&display_name_room_id)?;
 
+                let send_queue_room_id = this.encode_key(keys::SEND_QUEUE, &room_id);
+                txn.remove_room_send_queue(&send_queue_room_id)?;
+
                 Ok(())
             })
             .await
+    }
+
+    async fn save_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: OwnedTransactionId,
+        content: SerializableEventContent,
+    ) -> Result<(), Self::Error> {
+        let room_id_key = self.encode_key(keys::SEND_QUEUE, room_id);
+        let room_id_value = self.serialize_value(&room_id.to_owned())?;
+
+        let content = self.serialize_json(&content)?;
+
+        // The transaction id is used both as a key (in remove/update) and a value (as
+        // it's useful for the callers), so we keep it as is, and neither hash
+        // it (with encode_key) or encrypt it (through serialize_value). After
+        // all, it carries no personal information, so this is considered fine.
+
+        self.acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached("INSERT INTO send_queue_events (room_id, room_id_val, transaction_id, content, wedged) VALUES (?, ?, ?, ?, false)")?.execute((room_id_key, room_id_value, transaction_id.to_string(), content))?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn update_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        content: SerializableEventContent,
+    ) -> Result<bool, Self::Error> {
+        let room_id = self.encode_key(keys::SEND_QUEUE, room_id);
+
+        let content = self.serialize_json(&content)?;
+        // See comment in [`Self::save_send_queue_event`] to understand why the
+        // transaction id is neither encrypted or hashed.
+        let transaction_id = transaction_id.to_string();
+
+        let num_updated = self.acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached("UPDATE send_queue_events SET wedged = false, content = ? WHERE room_id = ? AND transaction_id = ?")?.execute((content, room_id, transaction_id))
+            })
+            .await?;
+
+        Ok(num_updated > 0)
+    }
+
+    async fn remove_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+    ) -> Result<bool, Self::Error> {
+        let room_id = self.encode_key(keys::SEND_QUEUE, room_id);
+
+        // See comment in `save_send_queue_event`.
+        let transaction_id = transaction_id.to_string();
+
+        let num_deleted = self
+            .acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached(
+                    "DELETE FROM send_queue_events WHERE room_id = ? AND transaction_id = ?",
+                )?
+                .execute((room_id, &transaction_id))
+            })
+            .await?;
+
+        Ok(num_deleted > 0)
+    }
+
+    async fn load_send_queue_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<QueuedEvent>, Self::Error> {
+        let room_id = self.encode_key(keys::SEND_QUEUE, room_id);
+
+        // Note: ROWID is always present and is an auto-incremented integer counter. We
+        // want to maintain the insertion order, so we can sort using it.
+        // Note 2: transaction_id is not encoded, see why in `save_send_queue_event`.
+        let res: Vec<(String, Vec<u8>, bool)> = self
+            .acquire()
+            .await?
+            .prepare(
+                "SELECT transaction_id, content, wedged FROM send_queue_events WHERE room_id = ? ORDER BY ROWID",
+                |mut stmt| {
+                    stmt.query((room_id,))?
+                        .mapped(|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                        .collect()
+                },
+            )
+            .await?;
+
+        let mut queued_events = Vec::with_capacity(res.len());
+        for entry in res {
+            queued_events.push(QueuedEvent {
+                transaction_id: entry.0.into(),
+                event: self.deserialize_json(&entry.1)?,
+                is_wedged: entry.2,
+            });
+        }
+
+        Ok(queued_events)
+    }
+
+    async fn update_send_queue_event_status(
+        &self,
+        room_id: &RoomId,
+        transaction_id: &TransactionId,
+        wedged: bool,
+    ) -> Result<(), Self::Error> {
+        let room_id = self.encode_key(keys::SEND_QUEUE, room_id);
+
+        // See comment in `save_send_queue_event`.
+        let transaction_id = transaction_id.to_string();
+
+        self.acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached("UPDATE send_queue_events SET wedged = ? WHERE room_id = ? AND transaction_id = ?")?.execute((wedged, room_id, transaction_id))?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn load_rooms_with_unsent_events(&self) -> Result<Vec<OwnedRoomId>, Self::Error> {
+        // If the values were not encrypted, we could use `SELECT DISTINCT` here, but we
+        // have to manually do the deduplication: indeed, for all X, encrypt(X)
+        // != encrypted(X), since we use a nonce in the encryption process.
+
+        let res: Vec<Vec<u8>> = self
+            .acquire()
+            .await?
+            .prepare("SELECT room_id_val FROM send_queue_events", |mut stmt| {
+                stmt.query(())?.mapped(|row| row.get(0)).collect()
+            })
+            .await?;
+
+        // So we collect the results into a `BTreeSet` to perform the deduplication, and
+        // then rejigger that into a vector.
+        Ok(res
+            .into_iter()
+            .map(|entry| self.deserialize_value(&entry))
+            .collect::<Result<BTreeSet<OwnedRoomId>, _>>()?
+            .into_iter()
+            .collect())
+    }
+
+    async fn save_dependent_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        own_txn_id: ChildTransactionId,
+        content: DependentQueuedEventKind,
+    ) -> Result<()> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+        let content = self.serialize_json(&content)?;
+
+        // See comment in `save_send_queue_event`.
+        let parent_txn_id = parent_txn_id.to_string();
+        let own_txn_id = own_txn_id.to_string();
+
+        self.acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached(
+                    r#"INSERT INTO dependent_send_queue_events
+                         (room_id, parent_transaction_id, own_transaction_id, content)
+                       VALUES (?, ?, ?, ?)"#,
+                )?
+                .execute((room_id, parent_txn_id, own_txn_id, content))?;
+                Ok(())
+            })
+            .await
+    }
+
+    async fn update_dependent_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        parent_txn_id: &TransactionId,
+        event_id: OwnedEventId,
+    ) -> Result<usize> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+        let event_id = self.serialize_value(&event_id)?;
+
+        // See comment in `save_send_queue_event`.
+        let parent_txn_id = parent_txn_id.to_string();
+
+        self.acquire()
+            .await?
+            .with_transaction(move |txn| {
+                Ok(txn.prepare_cached(
+                    "UPDATE dependent_send_queue_events SET event_id = ? WHERE parent_transaction_id = ? and room_id = ?",
+                )?
+                .execute((event_id, parent_txn_id, room_id))?)
+            })
+            .await
+    }
+
+    async fn remove_dependent_send_queue_event(
+        &self,
+        room_id: &RoomId,
+        txn_id: &ChildTransactionId,
+    ) -> Result<bool> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+
+        // See comment in `save_send_queue_event`.
+        let txn_id = txn_id.to_string();
+
+        let num_deleted = self
+            .acquire()
+            .await?
+            .with_transaction(move |txn| {
+                txn.prepare_cached(
+                    "DELETE FROM dependent_send_queue_events WHERE own_transaction_id = ? AND room_id = ?",
+                )?
+                .execute((txn_id, room_id))
+            })
+            .await?;
+
+        Ok(num_deleted > 0)
+    }
+
+    async fn list_dependent_send_queue_events(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Vec<DependentQueuedEvent>> {
+        let room_id = self.encode_key(keys::DEPENDENTS_SEND_QUEUE, room_id);
+
+        // Note: transaction_id is not encoded, see why in `save_send_queue_event`.
+        let res: Vec<(String, String, Option<Vec<u8>>, Vec<u8>)> = self
+            .acquire()
+            .await?
+            .prepare(
+                "SELECT own_transaction_id, parent_transaction_id, event_id, content FROM dependent_send_queue_events WHERE room_id = ? ORDER BY ROWID",
+                |mut stmt| {
+                    stmt.query((room_id,))?
+                        .mapped(|row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+                        .collect()
+                },
+            )
+            .await?;
+
+        let mut dependent_events = Vec::with_capacity(res.len());
+        for entry in res {
+            dependent_events.push(DependentQueuedEvent {
+                own_transaction_id: entry.0.into(),
+                parent_transaction_id: entry.1.into(),
+                event_id: entry.2.map(|bytes| self.deserialize_value(&bytes)).transpose()?,
+                kind: self.deserialize_json(&entry.3)?,
+            });
+        }
+
+        Ok(dependent_events)
     }
 }
 
@@ -1673,6 +1992,8 @@ mod tests {
         let name = NUM.fetch_add(1, SeqCst).to_string();
         let tmpdir_path = TMP_DIR.path().join(name);
 
+        tracing::info!("using store @ {}", tmpdir_path.to_str().unwrap());
+
         Ok(SqliteStateStore::open(tmpdir_path.to_str().unwrap(), None).await.unwrap())
     }
 
@@ -1695,6 +2016,8 @@ mod encrypted_tests {
     async fn get_store() -> Result<impl StateStore, StoreError> {
         let name = NUM.fetch_add(1, SeqCst).to_string();
         let tmpdir_path = TMP_DIR.path().join(name);
+
+        tracing::info!("using store @ {}", tmpdir_path.to_str().unwrap());
 
         Ok(SqliteStateStore::open(tmpdir_path.to_str().unwrap(), Some("default_test_password"))
             .await

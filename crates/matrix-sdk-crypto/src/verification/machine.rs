@@ -40,7 +40,7 @@ use crate::{
     olm::{PrivateCrossSigningIdentity, StaticAccountData},
     requests::OutgoingRequest,
     store::{CryptoStoreError, CryptoStoreWrapper},
-    OutgoingVerificationRequest, ReadOnlyDevice, ReadOnlyUserIdentity, RoomMessageRequest,
+    DeviceData, OtherUserIdentityData, OutgoingVerificationRequest, RoomMessageRequest,
     ToDeviceRequest,
 };
 
@@ -98,7 +98,7 @@ impl VerificationMachine {
 
     pub fn request_verification(
         &self,
-        identity: &ReadOnlyUserIdentity,
+        identity: &OtherUserIdentityData,
         room_id: &RoomId,
         request_event_id: &EventId,
         methods: Option<Vec<VerificationMethod>>,
@@ -121,7 +121,7 @@ impl VerificationMachine {
 
     pub async fn start_sas(
         &self,
-        device: ReadOnlyDevice,
+        device: DeviceData,
     ) -> Result<(Sas, OutgoingVerificationRequest), CryptoStoreError> {
         let identities = self.store.get_identities(device.clone()).await?;
         let (sas, content) = Sas::start(identities, TransactionId::new(), true, None, None);
@@ -578,7 +578,7 @@ mod tests {
         let _ = VerificationMachine::new(
             alice.static_data,
             identity,
-            Arc::new(CryptoStoreWrapper::new(alice_id(), MemoryStore::new())),
+            Arc::new(CryptoStoreWrapper::new(alice_id(), alice_device_id(), MemoryStore::new())),
         );
     }
 

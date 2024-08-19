@@ -20,11 +20,12 @@ macro_rules! unwrap_or_clone_arc_into_variant {
     };
 }
 
-mod authentication_service;
+mod authentication;
 mod bwi_client_extensions;
 mod chunk_iterator;
 mod client;
 mod client_builder;
+mod element;
 mod encryption;
 mod error;
 mod event;

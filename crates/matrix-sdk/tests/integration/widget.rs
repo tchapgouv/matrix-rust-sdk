@@ -600,6 +600,232 @@ async fn send_room_name() {
     mock_server.verify().await;
 }
 
+#[async_test]
+async fn send_delayed_message_event() {
+    let (_, mock_server, driver_handle) = run_test_driver(false).await;
+
+    negotiate_capabilities(
+        &driver_handle,
+        json!([
+            "org.matrix.msc4157.send.delayed_event",
+            "org.matrix.msc2762.send.event:m.room.message"
+        ]),
+    )
+    .await;
+
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/send/m.room.message/.*$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "delay_id": "1234",
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    send_request(
+        &driver_handle,
+        "send-room-message",
+        "send_event",
+        json!({
+            "type": "m.room.message",
+            "content": {
+                "msgtype": "m.text",
+                "body": "Message from a widget!",
+            },
+            "delay":1000,
+        }),
+    )
+    .await;
+
+    // Receive the response
+    let msg = recv_message(&driver_handle).await;
+    assert_eq!(msg["api"], "fromWidget");
+    assert_eq!(msg["action"], "send_event");
+    let delay_id = msg["response"]["delay_id"].as_str().unwrap();
+    assert_eq!(delay_id, "1234");
+
+    // Make sure the event-sending endpoint was hit exactly once
+    mock_server.verify().await;
+}
+
+#[async_test]
+async fn send_delayed_state_event() {
+    let (_, mock_server, driver_handle) = run_test_driver(false).await;
+
+    negotiate_capabilities(
+        &driver_handle,
+        json!([
+            "org.matrix.msc4157.send.delayed_event",
+            "org.matrix.msc2762.send.state_event:m.room.name#"
+        ]),
+    )
+    .await;
+
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/v3/rooms/.*/state/m.room.name/?$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "delay_id": "1234",
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    send_request(
+        &driver_handle,
+        "send-room-message",
+        "send_event",
+        json!({
+            "type": "m.room.name",
+            "state_key": "",
+            "content": {
+                "name": "Room Name set by Widget",
+            },
+            "delay":1000,
+        }),
+    )
+    .await;
+
+    // Receive the response
+    let msg = recv_message(&driver_handle).await;
+    assert_eq!(msg["api"], "fromWidget");
+    assert_eq!(msg["action"], "send_event");
+    let delay_id = msg["response"]["delay_id"].as_str().unwrap();
+    assert_eq!(delay_id, "1234");
+
+    // Make sure the event-sending endpoint was hit exactly once
+    mock_server.verify().await;
+}
+
+#[async_test]
+async fn try_send_delayed_state_event_without_permission() {
+    let (_, _mock_server, driver_handle) = run_test_driver(false).await;
+
+    negotiate_capabilities(
+        &driver_handle,
+        json!(["org.matrix.msc2762.send.state_event:m.room.name#"]),
+    )
+    .await;
+
+    send_request(
+        &driver_handle,
+        "send-room-message",
+        "send_event",
+        json!({
+            "type": "m.room.name",
+            "state_key": "",
+            "content": {
+                "name": "Room Name set by Widget",
+            },
+            "delay":1000,
+        }),
+    )
+    .await;
+
+    // Receive the response
+    let msg = recv_message(&driver_handle).await;
+    assert_eq!(msg["api"], "fromWidget");
+    assert_eq!(msg["action"], "send_event");
+    let error_message = msg["response"]["error"]["message"].as_str().unwrap();
+    assert_eq!(
+        error_message,
+        "Not allowed: missing the org.matrix.msc4157.send.delayed_event capability."
+    );
+}
+
+#[async_test]
+async fn update_delayed_event() {
+    let (_, mock_server, driver_handle) = run_test_driver(false).await;
+
+    negotiate_capabilities(&driver_handle, json!(["org.matrix.msc4157.update_delayed_event",]))
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/_matrix/client/unstable/org.matrix.msc4140/delayed_events/1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    send_request(
+        &driver_handle,
+        "send-delay-update-id",
+        "org.matrix.msc4157.update_delayed_event",
+        json!({
+            "action":"refresh",
+            "delay_id": "1234",
+        }),
+    )
+    .await;
+    // Receive the response
+    let response = recv_message(&driver_handle).await;
+    print!("{:?}", response);
+    assert_eq!(response["api"], "fromWidget");
+    assert_eq!(response["action"], "org.matrix.msc4157.update_delayed_event");
+    let empty_response = response["response"].clone();
+    assert_eq!(empty_response, serde_json::from_str::<JsonValue>("{}").unwrap());
+
+    // Make sure the event-sending endpoint was hit exactly once
+    mock_server.verify().await;
+}
+
+#[async_test]
+async fn try_update_delayed_event_without_permission() {
+    let (_, _mock_server, driver_handle) = run_test_driver(false).await;
+
+    negotiate_capabilities(&driver_handle, json!([])).await;
+
+    send_request(
+        &driver_handle,
+        "send-delay-update-id",
+        "org.matrix.msc4157.update_delayed_event",
+        json!({
+            "action":"refresh",
+            "delay_id": "1234",
+        }),
+    )
+    .await;
+    // Receive the response
+    let response = recv_message(&driver_handle).await;
+    print!("{:?}", response);
+    assert_eq!(response["api"], "fromWidget");
+    assert_eq!(response["action"], "org.matrix.msc4157.update_delayed_event");
+    let error_response = response["response"]["error"]["message"].clone();
+    assert_eq!(
+        error_response.as_str().unwrap(),
+        "Not allowed: missing the org.matrix.msc4157.update_delayed_event capability."
+    );
+}
+
+#[async_test]
+async fn try_update_delayed_event_without_permission_negotiate() {
+    let (_, _mock_server, driver_handle) = run_test_driver(false).await;
+
+    send_request(
+        &driver_handle,
+        "send-delay-update-id",
+        "org.matrix.msc4157.update_delayed_event",
+        json!({
+            "action":"refresh",
+            "delay_id": "1234",
+        }),
+    )
+    .await;
+    // Wait for the corresponding response.
+    loop {
+        let response = recv_message(&driver_handle).await;
+        if response["api"] == "fromWidget"
+            && response["action"] == "org.matrix.msc4157.update_delayed_event"
+        {
+            let error_response = response["response"]["error"]["message"].clone();
+            assert_eq!(
+                error_response.as_str().unwrap(),
+                "Received send update delayed event request before capabilities were negotiated"
+            );
+            break;
+        }
+    }
+}
+
 async fn negotiate_capabilities(driver_handle: &WidgetDriverHandle, caps: JsonValue) {
     {
         // Receive toWidget capabilities request

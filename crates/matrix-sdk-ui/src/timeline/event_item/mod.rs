@@ -16,8 +16,15 @@ use std::sync::Arc;
 
 use as_variant::as_variant;
 use indexmap::IndexMap;
-use matrix_sdk::{deserialized_responses::EncryptionInfo, Client, Error};
-use matrix_sdk_base::{deserialized_responses::SyncTimelineEvent, latest_event::LatestEvent};
+use matrix_sdk::{
+    deserialized_responses::{EncryptionInfo, ShieldState},
+    send_queue::SendHandle,
+    Client, Error,
+};
+use matrix_sdk_base::{
+    deserialized_responses::{ShieldStateCode, SyncTimelineEvent, SENT_IN_CLEAR},
+    latest_event::LatestEvent,
+};
 use once_cell::sync::Lazy;
 use ruma::{
     events::{receipt::Receipt, room::message::MessageType, AnySyncTimelineEvent},
@@ -29,22 +36,21 @@ use tracing::warn;
 
 mod content;
 mod local;
-mod reactions;
 mod remote;
 
 pub use self::{
     content::{
         AnyOtherFullStateEventContent, EncryptedMessage, InReplyToDetails, MemberProfileChange,
-        MembershipChange, Message, OtherState, RepliedToEvent, RoomMembershipChange, Sticker,
-        TimelineItemContent,
+        MembershipChange, Message, OtherState, RepliedToEvent, RoomMembershipChange,
+        RoomPinnedEventsChange, Sticker, TimelineItemContent,
     },
     local::EventSendState,
-    reactions::{BundledReactions, ReactionGroup},
 };
 pub(super) use self::{
     local::LocalEventTimelineItem,
     remote::{RemoteEventOrigin, RemoteEventTimelineItem},
 };
+use super::{RepliedToInfo, ReplyContent, UnsupportedReplyItem};
 
 /// An item in the timeline that represents at least one event.
 ///
@@ -63,6 +69,11 @@ pub struct EventTimelineItem {
     pub(super) content: TimelineItemContent,
     /// The kind of event timeline item, local or remote.
     pub(super) kind: EventTimelineItemKind,
+    /// Whether or not the event belongs to an encrypted room.
+    ///
+    /// When `None` it is unknown if the room is encrypted and the item won't
+    /// return a ShieldState.
+    pub(super) is_room_encrypted: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -75,12 +86,22 @@ pub(super) enum EventTimelineItemKind {
 
 /// A wrapper that can contain either a transaction id, or an event id.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum EventItemIdentifier {
+pub enum TimelineEventItemId {
     /// The item is local, identified by its transaction id (to be used in
     /// subsequent requests).
     TransactionId(OwnedTransactionId),
     /// The item is remote, identified by its event id.
     EventId(OwnedEventId),
+}
+
+/// An handle that usually allows to perform an action on a timeline event.
+///
+/// If the item represents a remote item, then the event id is usually
+/// sufficient to perform an action on it. Otherwise, the send queue handle is
+/// returned, if available.
+pub(crate) enum TimelineItemHandle<'a> {
+    Remote(&'a EventId),
+    Local(&'a SendHandle),
 }
 
 impl EventTimelineItem {
@@ -90,17 +111,28 @@ impl EventTimelineItem {
         timestamp: MilliSecondsSinceUnixEpoch,
         content: TimelineItemContent,
         kind: EventTimelineItemKind,
+        is_room_encrypted: bool,
     ) -> Self {
-        Self { sender, sender_profile, timestamp, content, kind }
+        let is_room_encrypted = Some(is_room_encrypted);
+        Self { sender, sender_profile, timestamp, content, kind, is_room_encrypted }
     }
 
     /// If the supplied low-level `SyncTimelineEvent` is suitable for use as the
     /// `latest_event` in a message preview, wrap it as an `EventTimelineItem`.
+    ///
+    /// **Note:** Timeline items created via this constructor do **not** produce
+    /// the correct ShieldState when calling
+    /// [`get_shield`][EventTimelineItem::get_shield]. This is because they are
+    /// intended for display in the room list which a) is unlikely to show
+    /// shields and b) would incur a significant performance overhead.
     pub async fn from_latest_event(
         client: Client,
         room_id: &RoomId,
         latest_event: LatestEvent,
     ) -> Option<EventTimelineItem> {
+        // TODO: We shouldn't be returning an EventTimelineItem here because we're
+        // starting to diverge on what kind of data we need. The note above is a
+        // potential footgun which could one day turn into a security issue.
         use super::traits::RoomDataProvider;
 
         let SyncTimelineEvent { event: raw_sync_event, encryption_info, .. } =
@@ -118,7 +150,7 @@ impl EventTimelineItem {
 
         // If we don't (yet) know how to handle this type of message, return `None`
         // here. If we do, convert it into a `TimelineItemContent`.
-        let item_content = TimelineItemContent::from_latest_event_content(event)?;
+        let content = TimelineItemContent::from_latest_event_content(event)?;
 
         // We don't currently bundle any reactions with the main event. This could
         // conceivably be wanted in the message preview in future.
@@ -137,8 +169,9 @@ impl EventTimelineItem {
         // Probably the origin of the event doesn't matter for the preview.
         let origin = RemoteEventOrigin::Sync;
 
-        let event_kind = RemoteEventTimelineItem {
+        let kind = RemoteEventTimelineItem {
             event_id,
+            transaction_id: None,
             reactions,
             read_receipts,
             is_own,
@@ -163,8 +196,9 @@ impl EventTimelineItem {
         } else {
             TimelineDetails::Unavailable
         };
+        let is_room_encrypted = None;
 
-        Some(Self::new(sender, sender_profile, timestamp, item_content, event_kind))
+        Some(Self { sender, sender_profile, timestamp, content, kind, is_room_encrypted })
     }
 
     /// Check whether this item is a local echo.
@@ -198,6 +232,20 @@ impl EventTimelineItem {
     /// Get the event's send state of a local echo.
     pub fn send_state(&self) -> Option<&EventSendState> {
         as_variant!(&self.kind, EventTimelineItemKind::Local(local) => &local.send_state)
+    }
+
+    /// Get the unique identifier of this item.
+    ///
+    /// Returns the transaction ID for a local echo item that has not been sent
+    /// and the event ID for a local echo item that has been sent or a
+    /// remote item.
+    pub(crate) fn identifier(&self) -> TimelineEventItemId {
+        match &self.kind {
+            EventTimelineItemKind::Local(local) => local.identifier(),
+            EventTimelineItemKind::Remote(remote) => {
+                TimelineEventItemId::EventId(remote.event_id.clone())
+            }
+        }
     }
 
     /// Get the transaction ID of a local echo item.
@@ -239,9 +287,9 @@ impl EventTimelineItem {
     }
 
     /// Get the reactions of this item.
-    pub fn reactions(&self) -> &BundledReactions {
+    pub fn reactions(&self) -> &ReactionsByKeyBySender {
         // There's not much of a point in allowing reactions to local echoes.
-        static EMPTY_REACTIONS: Lazy<BundledReactions> = Lazy::new(Default::default);
+        static EMPTY_REACTIONS: Lazy<ReactionsByKeyBySender> = Lazy::new(Default::default);
         match &self.kind {
             EventTimelineItemKind::Local(_) => &EMPTY_REACTIONS,
             EventTimelineItemKind::Remote(remote_event) => &remote_event.reactions,
@@ -281,14 +329,11 @@ impl EventTimelineItem {
 
     /// Flag indicating this timeline item can be edited by the current user.
     pub fn is_editable(&self) -> bool {
-        // This must be in sync with the early returns of `Timeline::edit`
+        // Steps here should be in sync with [`EventTimelineItem::edit_info`] and
+        // [`Timeline::edit_poll`].
+
         if !self.is_own() {
             // In theory could work, but it's hard to compute locally.
-            return false;
-        }
-
-        if self.event_id().is_none() {
-            // Local echoes without an event id (not sent yet) can't be edited.
             return false;
         }
 
@@ -319,6 +364,28 @@ impl EventTimelineItem {
         match &self.kind {
             EventTimelineItemKind::Local(_) => None,
             EventTimelineItemKind::Remote(remote_event) => remote_event.encryption_info.as_ref(),
+        }
+    }
+
+    /// Gets the [`ShieldState`] which can be used to decorate messages in the
+    /// recommended way.
+    pub fn get_shield(&self, strict: bool) -> Option<ShieldState> {
+        if self.is_room_encrypted != Some(true) || self.is_local_echo() {
+            return None;
+        }
+
+        match self.encryption_info() {
+            Some(info) => {
+                if strict {
+                    Some(info.verification_state.to_shield_state_strict())
+                } else {
+                    Some(info.verification_state.to_shield_state_lax())
+                }
+            }
+            None => Some(ShieldState::Red {
+                code: ShieldStateCode::SentInClear,
+                message: SENT_IN_CLEAR,
+            }),
         }
     }
 
@@ -419,6 +486,48 @@ impl EventTimelineItem {
             timestamp: self.timestamp,
             content,
             kind,
+            is_room_encrypted: self.is_room_encrypted,
+        }
+    }
+
+    /// Gives the information needed to reply to the event of the item.
+    pub fn replied_to_info(&self) -> Result<RepliedToInfo, UnsupportedReplyItem> {
+        let reply_content = match self.content() {
+            TimelineItemContent::Message(msg) => ReplyContent::Message(msg.to_owned()),
+            _ => {
+                let Some(raw_event) = self.latest_json() else {
+                    return Err(UnsupportedReplyItem::MissingJson);
+                };
+
+                ReplyContent::Raw(raw_event.clone())
+            }
+        };
+
+        let Some(event_id) = self.event_id() else {
+            return Err(UnsupportedReplyItem::MissingEventId);
+        };
+
+        Ok(RepliedToInfo {
+            event_id: event_id.to_owned(),
+            sender: self.sender().to_owned(),
+            timestamp: self.timestamp(),
+            content: reply_content,
+        })
+    }
+
+    pub(super) fn handle(&self) -> TimelineItemHandle<'_> {
+        match &self.kind {
+            EventTimelineItemKind::Local(local) => {
+                if let Some(event_id) = local.event_id() {
+                    TimelineItemHandle::Remote(event_id)
+                } else {
+                    TimelineItemHandle::Local(
+                        // The send_handle must always be present, except in tests.
+                        local.send_handle.as_ref().expect("Unexpected missing send_handle"),
+                    )
+                }
+            }
+            EventTimelineItemKind::Remote(remote) => TimelineItemHandle::Remote(&remote.event_id),
         }
     }
 }
@@ -483,7 +592,7 @@ impl<T> TimelineDetails<T> {
         matches!(self, Self::Unavailable)
     }
 
-    pub(crate) fn is_ready(&self) -> bool {
+    pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready(_))
     }
 }
@@ -500,18 +609,31 @@ pub enum EventItemOrigin {
     Pagination,
 }
 
+/// Information about a single reaction stored in [`ReactionsByKeyBySender`].
+#[derive(Clone, Debug)]
+pub struct ReactionInfo {
+    pub timestamp: MilliSecondsSinceUnixEpoch,
+    /// Id of the reaction (not the reacted-to event).
+    pub id: TimelineEventItemId,
+}
+
+/// Reactions grouped by key first, then by sender.
+///
+/// This representation makes sure that a given sender has sent at most one
+/// reaction for an event.
+pub type ReactionsByKeyBySender = IndexMap<String, IndexMap<OwnedUserId, ReactionInfo>>;
+
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
     use assert_matches2::assert_let;
     use matrix_sdk::test_utils::logged_in_client;
     use matrix_sdk_base::{
-        deserialized_responses::SyncTimelineEvent, latest_event::LatestEvent, MinimalStateEvent,
-        OriginalMinimalStateEvent,
+        deserialized_responses::SyncTimelineEvent, latest_event::LatestEvent, sliding_sync::http,
+        MinimalStateEvent, OriginalMinimalStateEvent,
     };
     use matrix_sdk_test::{async_test, sync_timeline_event};
     use ruma::{
-        api::client::sync::sync_events::v4,
         events::{
             room::{
                 member::RoomMemberEventContent,
@@ -567,7 +689,7 @@ mod tests {
         let user_id = user_id!("@t:o.uk");
         let event = message_event(room_id, user_id, "**My M**", "<b>My M</b>", 122344);
         let client = logged_in_client(None).await;
-        let mut room = v4::SlidingSyncRoom::new();
+        let mut room = http::response::Room::new();
         room.timeline.push(member_event(room_id, user_id, "Alice Margatroid", "mxc://e.org/SEs"));
 
         // And the room is stored in the client so it can be extracted when needed
@@ -610,7 +732,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let room = v4::SlidingSyncRoom::new();
+        let room = http::response::Room::new();
         // Do not push the `member_event` inside the room. Let's say it's flying in the
         // `StateChanges`.
 
@@ -665,8 +787,8 @@ mod tests {
         })
     }
 
-    fn response_with_room(room_id: &RoomId, room: v4::SlidingSyncRoom) -> v4::Response {
-        let mut response = v4::Response::new("6".to_owned());
+    fn response_with_room(room_id: &RoomId, room: http::response::Room) -> http::Response {
+        let mut response = http::Response::new("6".to_owned());
         response.rooms.insert(room_id.to_owned(), room);
         response
     }

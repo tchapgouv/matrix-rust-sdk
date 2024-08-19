@@ -37,7 +37,7 @@ use crate::{
     requests::{OutgoingRequest, ToDeviceRequest},
     store::{Changes, Result as StoreResult, Store},
     types::{events::EventType, EventEncryptionAlgorithm},
-    ReadOnlyDevice,
+    DeviceData,
 };
 
 #[derive(Debug, Clone)]
@@ -102,41 +102,32 @@ impl SessionManager {
         &self,
         sender: &UserId,
         curve_key: Curve25519PublicKey,
-    ) -> StoreResult<()> {
+    ) -> OlmResult<()> {
         if let Some(device) = self.store.get_device_from_curve_key(sender, curve_key).await? {
-            let sessions = device.get_sessions().await?;
+            if let Some(session) = device.get_most_recent_session().await? {
+                info!(sender_key = ?curve_key, "Marking session to be unwedged");
 
-            if let Some(sessions) = sessions {
-                let mut sessions = sessions.lock().await;
-                sessions.sort_by_key(|s| s.creation_time);
+                let creation_time = Duration::from_secs(session.creation_time.get().into());
+                let now = Duration::from_secs(SecondsSinceUnixEpoch::now().get().into());
 
-                let session = sessions.first();
+                let should_unwedge = now
+                    .checked_sub(creation_time)
+                    .map(|elapsed| elapsed > Self::UNWEDGING_INTERVAL)
+                    .unwrap_or(true);
 
-                if let Some(session) = session {
-                    info!(sender_key = ?curve_key, "Marking session to be unwedged");
-
-                    let creation_time = Duration::from_secs(session.creation_time.get().into());
-                    let now = Duration::from_secs(SecondsSinceUnixEpoch::now().get().into());
-
-                    let should_unwedge = now
-                        .checked_sub(creation_time)
-                        .map(|elapsed| elapsed > Self::UNWEDGING_INTERVAL)
-                        .unwrap_or(true);
-
-                    if should_unwedge {
-                        self.users_for_key_claim
-                            .write()
-                            .unwrap()
-                            .entry(device.user_id().to_owned())
-                            .or_default()
-                            .insert(device.device_id().into());
-                        self.wedged_devices
-                            .write()
-                            .unwrap()
-                            .entry(device.user_id().to_owned())
-                            .or_default()
-                            .insert(device.device_id().into());
-                    }
+                if should_unwedge {
+                    self.users_for_key_claim
+                        .write()
+                        .unwrap()
+                        .entry(device.user_id().to_owned())
+                        .or_default()
+                        .insert(device.device_id().into());
+                    self.wedged_devices
+                        .write()
+                        .unwrap()
+                        .entry(device.user_id().to_owned())
+                        .or_default()
+                        .insert(device.device_id().into());
                 }
             }
         }
@@ -145,7 +136,7 @@ impl SessionManager {
     }
 
     #[allow(dead_code)]
-    pub fn is_device_wedged(&self, device: &ReadOnlyDevice) -> bool {
+    pub fn is_device_wedged(&self, device: &DeviceData) -> bool {
         self.wedged_devices
             .read()
             .unwrap()
@@ -516,7 +507,7 @@ impl SessionManager {
 
         for (user_id, user_devices) in &response.one_time_keys {
             for (device_id, key_map) in user_devices {
-                let device = match self.store.get_readonly_device(user_id, device_id).await {
+                let device = match self.store.get_device_data(user_id, device_id).await {
                     Ok(Some(d)) => d,
                     Ok(None) => {
                         warn!(
@@ -537,7 +528,8 @@ impl SessionManager {
                 };
 
                 let account = store_transaction.account().await?;
-                let session = match account.create_outbound_session(&device, key_map) {
+                let device_keys = self.store.get_own_device().await?.as_device_keys().clone();
+                let session = match account.create_outbound_session(&device, key_map, device_keys) {
                     Ok(s) => s,
                     Err(e) => {
                         warn!(
@@ -628,10 +620,10 @@ mod tests {
     use super::SessionManager;
     use crate::{
         gossiping::GossipMachine,
-        identities::{IdentityManager, ReadOnlyDevice},
+        identities::{DeviceData, IdentityManager},
         olm::{Account, PrivateCrossSigningIdentity},
         session_manager::GroupSessionCache,
-        store::{CryptoStoreWrapper, MemoryStore, PendingChanges, Store},
+        store::{Changes, CryptoStoreWrapper, DeviceChanges, MemoryStore, PendingChanges, Store},
         verification::VerificationMachine,
     };
 
@@ -679,7 +671,7 @@ mod tests {
         let device_id = device_id();
 
         let account = Account::with_device_id(user_id, device_id);
-        let store = Arc::new(CryptoStoreWrapper::new(user_id, MemoryStore::new()));
+        let store = Arc::new(CryptoStoreWrapper::new(user_id, device_id, MemoryStore::new()));
         let identity = Arc::new(Mutex::new(PrivateCrossSigningIdentity::empty(user_id)));
         let verification = VerificationMachine::new(
             account.static_data().clone(),
@@ -688,7 +680,15 @@ mod tests {
         );
 
         let store = Store::new(account.static_data().clone(), identity, store, verification);
+        let device = DeviceData::from_account(&account);
         store.save_pending_changes(PendingChanges { account: Some(account) }).await.unwrap();
+        store
+            .save_changes(Changes {
+                devices: DeviceChanges { new: vec![device], ..Default::default() },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         let session_cache = GroupSessionCache::new(store.clone());
         let identity_manager = IdentityManager::new(store.clone());
@@ -709,9 +709,9 @@ mod tests {
         let (manager, _identity_manager) = session_manager_test_helper().await;
         let mut bob = bob_account();
 
-        let bob_device = ReadOnlyDevice::from_account(&bob);
+        let bob_device = DeviceData::from_account(&bob);
 
-        manager.store.save_devices(&[bob_device]).await.unwrap();
+        manager.store.save_device_data(&[bob_device]).await.unwrap();
 
         let (txn_id, request) =
             manager.get_missing_sessions(iter::once(bob.user_id())).await.unwrap().unwrap();
@@ -748,7 +748,7 @@ mod tests {
 
         // now bob turns up, and we start tracking his devices...
         let bob = bob_account();
-        let bob_device = ReadOnlyDevice::from_account(&bob);
+        let bob_device = DeviceData::from_account(&bob);
         {
             let cache = manager.store.cache().await.unwrap();
             identity_manager
@@ -860,11 +860,11 @@ mod tests {
             .await
             .unwrap();
 
-        let bob_device = ReadOnlyDevice::from_account(&bob);
+        let bob_device = DeviceData::from_account(&bob);
         let time = SystemTime::now() - Duration::from_secs(3601);
         session.creation_time = SecondsSinceUnixEpoch::from_system_time(time).unwrap();
 
-        manager.store.save_devices(&[bob_device.clone()]).await.unwrap();
+        manager.store.save_device_data(&[bob_device.clone()]).await.unwrap();
         manager.store.save_sessions(&[session]).await.unwrap();
 
         assert!(manager.get_missing_sessions(iter::once(bob.user_id())).await.unwrap().is_none());
@@ -908,11 +908,11 @@ mod tests {
     async fn failure_handling() {
         let alice = user_id!("@alice:example.org");
         let alice_account = Account::with_device_id(alice, "DEVICEID".into());
-        let alice_device = ReadOnlyDevice::from_account(&alice_account);
+        let alice_device = DeviceData::from_account(&alice_account);
 
         let (manager, _identity_manager) = session_manager_test_helper().await;
 
-        manager.store.save_devices(&[alice_device]).await.unwrap();
+        manager.store.save_device_data(&[alice_device]).await.unwrap();
 
         let (txn_id, users_for_key_claim) =
             manager.get_missing_sessions(iter::once(alice)).await.unwrap().unwrap();
@@ -992,10 +992,10 @@ mod tests {
 
         let alice = user_id!("@alice:example.org");
         let mut alice_account = Account::with_device_id(alice, "DEVICEID".into());
-        let alice_device = ReadOnlyDevice::from_account(&alice_account);
+        let alice_device = DeviceData::from_account(&alice_account);
 
         let (manager, _identity_manager) = session_manager_test_helper().await;
-        manager.store.save_devices(&[alice_device]).await.unwrap();
+        manager.store.save_device_data(&[alice_device]).await.unwrap();
 
         // Since we don't have a session with Alice yet, the machine will try to claim
         // some keys for alice.
