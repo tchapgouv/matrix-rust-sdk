@@ -46,6 +46,8 @@ mod keys;
 
 pub use keys::{DecodeError, DecryptionError, MegolmV1BackupKey};
 
+pub use keys::{PkDecryption, PkEncryption, Message};
+
 /// A state machine that handles backing up room keys.
 ///
 /// The state machine can be activated using the

@@ -15,6 +15,7 @@ mod machine;
 mod responses;
 mod users;
 mod verification;
+mod pk;
 
 use std::{
     collections::{BTreeMap, HashMap},

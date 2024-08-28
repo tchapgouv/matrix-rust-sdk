@@ -97,6 +97,10 @@ impl PkDecryption {
         Self { key, public_key }
     }
 
+    pub fn key_bytes(&self) -> Box<[u8; 32]> {
+        self.key.to_bytes()
+    }
+
     pub fn public_key(&self) -> Curve25519PublicKey {
         self.public_key
     }
