@@ -34,8 +34,8 @@ mod account;
 pub mod attachment;
 pub mod authentication;
 
-/// BWI content scanner
-pub mod bwi_content_scanner;
+/// BWI content scanner api
+pub mod bwi_content_scanner_api;
 mod client;
 pub mod config;
 mod deduplicating_handler;

@@ -74,7 +74,6 @@ use tracing::{debug, error, instrument, trace, warn, Instrument, Span};
 use url::Url;
 
 use self::futures::SendRequest;
-use crate::bwi_content_scanner::BWIContentScanner;
 #[cfg(feature = "experimental-oidc")]
 use crate::oidc::Oidc;
 use crate::{
@@ -598,11 +597,6 @@ impl Client {
     /// Get the media manager of the client.
     pub fn media(&self) -> Media {
         Media::new(self.clone())
-    }
-
-    /// Get the content scanner of the client.
-    pub fn bwi_content_scanner(&self) -> BWIContentScanner {
-        BWIContentScanner::new(self.clone())
     }
 
     /// Get the pusher manager of the client.
