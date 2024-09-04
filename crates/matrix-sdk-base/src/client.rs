@@ -13,23 +13,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(feature = "e2e-encryption")]
+use std::ops::Deref;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt, iter,
+    sync::Arc,
 };
-#[cfg(feature = "e2e-encryption")]
-use std::{ops::Deref, sync::Arc};
 
 use eyeball::{SharedObservable, Subscriber};
 #[cfg(not(target_arch = "wasm32"))]
 use eyeball_im::{Vector, VectorDiff};
 #[cfg(not(target_arch = "wasm32"))]
 use futures_util::Stream;
-use matrix_sdk_common::instant::Instant;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_crypto::{
-    store::DynCryptoStore, EncryptionSettings, EncryptionSyncChanges, OlmError, OlmMachine,
-    ToDeviceRequest,
+    store::DynCryptoStore, CollectStrategy, EncryptionSettings, EncryptionSyncChanges, OlmError,
+    OlmMachine, ToDeviceRequest,
 };
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{
@@ -56,6 +56,7 @@ use ruma::{
     },
     push::{Action, PushConditionRoomCtx, Ruleset},
     serde::Raw,
+    time::Instant,
     OwnedRoomId, OwnedUserId, RoomId, RoomVersionId, UInt, UserId,
 };
 use tokio::sync::{broadcast, Mutex};
@@ -70,6 +71,7 @@ use crate::RoomMemberships;
 use crate::{
     deserialized_responses::{RawAnySyncOrStrippedTimelineEvent, SyncTimelineEvent},
     error::{Error, Result},
+    event_cache_store::DynEventCacheStore,
     rooms::{
         normal::{RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons},
         Room, RoomInfo, RoomState,
@@ -90,6 +92,8 @@ use crate::{
 pub struct BaseClient {
     /// Database
     pub(crate) store: Store,
+    /// The store used by the event cache.
+    event_cache_store: Arc<DynEventCacheStore>,
     /// The store used for encryption.
     ///
     /// This field is only meant to be used for `OlmMachine` initialization.
@@ -108,6 +112,11 @@ pub struct BaseClient {
     /// event contains the room and a boolean whether this event should
     /// trigger a room list update.
     pub(crate) room_info_notable_update_sender: broadcast::Sender<RoomInfoNotableUpdate>,
+
+    /// The strategy to use for picking recipient devices, when sending an
+    /// encrypted message.
+    #[cfg(feature = "e2e-encryption")]
+    pub room_key_recipient_strategy: CollectStrategy,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -138,23 +147,35 @@ impl BaseClient {
 
         BaseClient {
             store: Store::new(config.state_store),
+            event_cache_store: config.event_cache_store,
             #[cfg(feature = "e2e-encryption")]
             crypto_store: config.crypto_store,
             #[cfg(feature = "e2e-encryption")]
             olm_machine: Default::default(),
             ignore_user_list_changes: Default::default(),
             room_info_notable_update_sender,
+            #[cfg(feature = "e2e-encryption")]
+            room_key_recipient_strategy: Default::default(),
         }
     }
 
     /// Clones the current base client to use the same crypto store but a
     /// different, in-memory store config, and resets transient state.
+    #[cfg(feature = "e2e-encryption")]
     pub fn clone_with_in_memory_state_store(&self) -> Self {
         let config = StoreConfig::new().state_store(MemoryStore::new());
-
-        #[cfg(feature = "e2e-encryption")]
         let config = config.crypto_store(self.crypto_store.clone());
 
+        let mut result = Self::with_store_config(config);
+        result.room_key_recipient_strategy = self.room_key_recipient_strategy.clone();
+        result
+    }
+
+    /// Clones the current base client to use the same crypto store but a
+    /// different, in-memory store config, and resets transient state.
+    #[cfg(not(feature = "e2e-encryption"))]
+    pub fn clone_with_in_memory_state_store(&self) -> Self {
+        let config = StoreConfig::new().state_store(MemoryStore::new());
         Self::with_store_config(config)
     }
 
@@ -198,6 +219,11 @@ impl BaseClient {
     #[allow(unknown_lints, clippy::explicit_auto_deref)]
     pub fn store(&self) -> &DynStateStore {
         &*self.store
+    }
+
+    /// Get a reference to the event cache store.
+    pub fn event_cache_store(&self) -> &DynEventCacheStore {
+        &*self.event_cache_store
     }
 
     /// Is the client logged in.
@@ -840,7 +866,7 @@ impl BaseClient {
             let mut changes = StateChanges::default();
             changes.add_room(room_info.clone());
             self.store.save_changes(&changes).await?; // Update the store
-            room.set_room_info(room_info, RoomInfoNotableUpdateReasons::empty());
+            room.set_room_info(room_info, RoomInfoNotableUpdateReasons::MEMBERSHIP);
         }
 
         Ok(room)
@@ -866,7 +892,7 @@ impl BaseClient {
             let mut changes = StateChanges::default();
             changes.add_room(room_info.clone());
             self.store.save_changes(&changes).await?; // Update the store
-            room.set_room_info(room_info, RoomInfoNotableUpdateReasons::empty());
+            room.set_room_info(room_info, RoomInfoNotableUpdateReasons::MEMBERSHIP);
         }
 
         Ok(())
@@ -1391,7 +1417,11 @@ impl BaseClient {
                 let members = self.store.get_user_ids(room_id, filter).await?;
 
                 let settings = settings.ok_or(Error::EncryptionNotEnabled)?;
-                let settings = EncryptionSettings::new(settings, history_visibility, false);
+                let settings = EncryptionSettings::new(
+                    settings,
+                    history_visibility,
+                    self.room_key_recipient_strategy.clone(),
+                );
 
                 Ok(o.share_room_key(room_id, members.iter().map(Deref::deref), settings).await?)
             }
