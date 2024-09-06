@@ -41,7 +41,7 @@ use crate::{
     TaskHandle,
 };
 
-#[derive(uniffi::Enum)]
+#[derive(Debug, uniffi::Enum)]
 pub enum Membership {
     Invited,
     Joined,
@@ -245,10 +245,6 @@ impl Room {
             builder.with_focus(TimelineFocus::PinnedEvents { max_events_to_load }).build().await?;
 
         Ok(Timeline::new(timeline))
-    }
-
-    pub async fn clear_pinned_events_cache(&self) {
-        self.inner.clear_pinned_events().await;
     }
 
     pub fn is_encrypted(&self) -> Result<bool, ClientError> {

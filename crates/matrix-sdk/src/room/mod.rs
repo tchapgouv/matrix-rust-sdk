@@ -18,12 +18,11 @@ use matrix_sdk_base::{
     deserialized_responses::{
         RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState, TimelineEvent,
     },
-    instant::Instant,
     store::StateStoreExt,
     ComposerDraft, RoomInfoNotableUpdateReasons, RoomMemberships, StateChanges, StateStoreDataKey,
     StateStoreDataValue,
 };
-use matrix_sdk_common::timeout::timeout;
+use matrix_sdk_common::{deserialized_responses::SyncTimelineEvent, timeout::timeout};
 use mime::Mime;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{
@@ -80,6 +79,7 @@ use ruma::{
     },
     push::{Action, PushConditionRoomCtx},
     serde::Raw,
+    time::Instant,
     EventId, Int, MatrixToUri, MatrixUri, MxcUri, OwnedEventId, OwnedRoomId, OwnedServerName,
     OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
@@ -398,8 +398,16 @@ impl Room {
     ) -> Result<TimelineEvent> {
         let request =
             get_room_event::v3::Request::new(self.room_id().to_owned(), event_id.to_owned());
-        let event = self.client.send(request, request_config).await?.event;
-        self.try_decrypt_event(event).await
+
+        let raw_event = self.client.send(request, request_config).await?.event;
+        let event = self.try_decrypt_event(raw_event).await?;
+
+        // Save the event into the event cache, if it's set up.
+        if let Ok((cache, _handles)) = self.event_cache().await {
+            cache.save_event(event.clone().into()).await;
+        }
+
+        Ok(event)
     }
 
     /// Fetch the event with the given `EventId` in this room, using the
@@ -409,6 +417,7 @@ impl Room {
         event_id: &EventId,
         lazy_load_members: bool,
         context_size: UInt,
+        request_config: Option<RequestConfig>,
     ) -> Result<EventWithContextResponse> {
         let mut request =
             context::get_context::v3::Request::new(self.room_id().to_owned(), event_id.to_owned());
@@ -420,7 +429,7 @@ impl Room {
                 LazyLoadOptions::Enabled { include_redundant_members: false };
         }
 
-        let response = self.client.send(request, None).await?;
+        let response = self.client.send(request, request_config).await?;
 
         let target_event = if let Some(event) = response.event {
             Some(self.try_decrypt_event(event).await?)
@@ -436,6 +445,24 @@ impl Room {
             try_join_all(response.events_after.into_iter().map(|ev| self.try_decrypt_event(ev))),
         )
         .await?;
+
+        // Save the loaded events into the event cache, if it's set up.
+        if let Ok((cache, _handles)) = self.event_cache().await {
+            let mut events_to_save: Vec<SyncTimelineEvent> = Vec::new();
+            if let Some(event) = &target_event {
+                events_to_save.push(event.clone().into());
+            }
+
+            for event in &events_before {
+                events_to_save.push(event.clone().into());
+            }
+
+            for event in &events_after {
+                events_to_save.push(event.clone().into());
+            }
+
+            cache.save_events(events_to_save).await;
+        }
 
         Ok(EventWithContextResponse {
             event: target_event,
@@ -2359,12 +2386,6 @@ impl Room {
         Ok(self.room_power_levels().await?.user_can_trigger_room_notification(user_id))
     }
 
-    /// Removes the cached pinned events associated with this room.
-    pub async fn clear_pinned_events(&self) {
-        let pinned_event_ids = self.pinned_event_ids();
-        self.client.inner.pinned_event_cache.remove_bulk(&pinned_event_ids).await;
-    }
-
     /// Get a list of servers that should know this room.
     ///
     /// Uses the synced members of the room and the suggested [routing
@@ -2637,16 +2658,18 @@ impl Room {
         }
     }
 
-    /// Get the notification mode
+    /// Get the notification mode.
     pub async fn notification_mode(&self) -> Option<RoomNotificationMode> {
         if !matches!(self.state(), RoomState::Joined) {
             return None;
         }
+
         let notification_settings = self.client().notification_settings().await;
 
         // Get the user-defined mode if available
         let notification_mode =
             notification_settings.get_user_defined_room_notification_mode(self.room_id()).await;
+
         if notification_mode.is_some() {
             notification_mode
         } else if let Ok(is_encrypted) = self.is_encrypted().await {
@@ -2664,15 +2687,32 @@ impl Room {
         }
     }
 
-    /// Get the user-defined notification mode
+    /// Get the user-defined notification mode.
+    ///
+    /// The result is cached for fast and non-async call. To read the cached
+    /// result, use
+    /// [`matrix_sdk_base::Room::cached_user_defined_notification_mode`].
+    //
+    // Note for maintainers:
+    //
+    // The fact the result is cached is an important property. If you change that in
+    // the future, please review all calls to this method.
     pub async fn user_defined_notification_mode(&self) -> Option<RoomNotificationMode> {
         if !matches!(self.state(), RoomState::Joined) {
             return None;
         }
+
         let notification_settings = self.client().notification_settings().await;
 
         // Get the user-defined mode if available
-        notification_settings.get_user_defined_room_notification_mode(self.room_id()).await
+        let mode =
+            notification_settings.get_user_defined_room_notification_mode(self.room_id()).await;
+
+        if let Some(mode) = mode {
+            self.update_cached_user_defined_notification_mode(mode);
+        }
+
+        mode
     }
 
     /// Report an event as inappropriate to the homeserver's administrator.

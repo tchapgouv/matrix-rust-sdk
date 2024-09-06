@@ -33,12 +33,12 @@ use imbl::Vector;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::store::LockableCryptoStore;
 use matrix_sdk_base::{
+    event_cache_store::DynEventCacheStore,
     store::{DynStateStore, ServerCapabilities},
     sync::{Notification, RoomUpdates},
     BaseClient, RoomInfoNotableUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
     StateStoreDataKey, StateStoreDataValue, SyncOutsideWasm,
 };
-use matrix_sdk_common::instant::Instant;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{room::encryption::RoomEncryptionEventContent, InitialStateEvent};
 use ruma::{
@@ -65,6 +65,7 @@ use ruma::{
     },
     assign,
     push::Ruleset,
+    time::Instant,
     DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomAliasId, RoomId,
     RoomOrAliasId, ServerName, UInt, UserId,
 };
@@ -88,7 +89,6 @@ use crate::{
     http_client::HttpClient,
     matrix_auth::MatrixAuth,
     notification_settings::NotificationSettings,
-    pinned_events_cache::PinnedEventCache,
     room_preview::RoomPreview,
     send_queue::SendQueueData,
     sync::{RoomUpdate, SyncResponse},
@@ -287,9 +287,6 @@ pub(crate) struct ClientInner {
     /// It becomes active when [`EventCache::subscribe`] is called.
     pub(crate) event_cache: OnceCell<EventCache>,
 
-    /// A central cache for pinned events.
-    pub(crate) pinned_event_cache: PinnedEventCache,
-
     /// End-to-end encryption related state.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) e2ee: EncryptionData,
@@ -345,7 +342,6 @@ impl ClientInner {
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
             event_cache,
-            pinned_event_cache: PinnedEventCache::new(),
             send_queue_data: send_queue,
             #[cfg(feature = "e2e-encryption")]
             e2ee: EncryptionData::new(encryption_settings),
@@ -576,6 +572,11 @@ impl Client {
     /// Get a reference to the state store.
     pub fn store(&self) -> &DynStateStore {
         self.base_client().store()
+    }
+
+    /// Get a reference to the event cache store.
+    pub(crate) fn event_cache_store(&self) -> &DynEventCacheStore {
+        self.base_client().event_cache_store()
     }
 
     /// Access the native Matrix authentication API with this client.
@@ -2233,11 +2234,6 @@ impl Client {
     pub fn event_cache(&self) -> &EventCache {
         // SAFETY: always initialized in the `Client` ctor.
         self.inner.event_cache.get().unwrap()
-    }
-
-    /// The [`PinnedEventCache`] instance for this [`Client`].
-    pub fn pinned_event_cache(&self) -> &PinnedEventCache {
-        &self.inner.pinned_event_cache
     }
 }
 
