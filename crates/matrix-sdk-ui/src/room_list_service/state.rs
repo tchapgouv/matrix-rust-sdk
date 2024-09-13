@@ -15,8 +15,12 @@
 //! States and actions for the `RoomList` state machine.
 
 use std::future::ready;
+#[cfg(not(any(test, feature = "testing")))]
+use std::time::Instant;
 
 use matrix_sdk::{sliding_sync::Range, SlidingSync, SlidingSyncMode};
+#[cfg(any(test, feature = "testing"))]
+use mock_instant::global::Instant;
 
 use super::Error;
 
@@ -37,7 +41,7 @@ pub enum State {
     Recovering,
 
     /// At this state, all rooms are syncing.
-    Running,
+    Running { last_time: Instant },
 
     /// At this state, the sync has been stopped because an error happened.
     Error { from: Box<State> },
@@ -57,10 +61,18 @@ impl State {
 
             SettingUp | Recovering => {
                 set_all_rooms_to_growing_sync_mode(sliding_sync).await?;
-                Running
+                Running { last_time: Instant::now() }
             }
 
-            Running => Running,
+            Running { last_time } => {
+                // We haven't sync for a while so we should go back to recovering
+                if last_time.elapsed().as_secs() > 1800 {
+                    set_all_rooms_to_selective_sync_mode(sliding_sync).await?;
+                    Recovering
+                } else {
+                    Running { last_time: Instant::now() }
+                }
+            }
 
             Error { from: previous_state } | Terminated { from: previous_state } => {
                 match previous_state.as_ref() {
@@ -72,7 +84,7 @@ impl State {
                     }
 
                     // If the previous state was `Running`, we enter the `Recovering` state.
-                    Running => {
+                    Running { .. } => {
                         set_all_rooms_to_selective_sync_mode(sliding_sync).await?;
                         Recovering
                     }
@@ -121,6 +133,7 @@ pub const ALL_ROOMS_DEFAULT_GROWING_BATCH_SIZE: u32 = 100;
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use matrix_sdk_test::async_test;
 
     use super::{super::tests::new_room_list, *};
@@ -173,7 +186,7 @@ mod tests {
 
         // Next state.
         let state = state.next(sliding_sync).await?;
-        assert_eq!(state, State::Running);
+        assert_matches!(state, State::Running { .. });
 
         // Hypothetical error.
         {
@@ -185,7 +198,7 @@ mod tests {
             let state = state.next(sliding_sync).await?;
 
             // Now, back to the previous state.
-            assert_eq!(state, State::Running);
+            assert_matches!(state, State::Running { .. });
         }
 
         // Hypothetical termination.
@@ -199,7 +212,7 @@ mod tests {
             let state = state.next(sliding_sync).await?;
 
             // Now, back to the previous state.
-            assert_eq!(state, State::Running);
+            assert_matches!(state, State::Running { .. });
         }
 
         // Hypothetical error when recovering.

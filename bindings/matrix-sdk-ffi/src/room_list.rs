@@ -356,7 +356,7 @@ impl From<matrix_sdk_ui::room_list_service::State> for RoomListServiceState {
             S::Init => Self::Initial,
             S::SettingUp => Self::SettingUp,
             S::Recovering => Self::Recovering,
-            S::Running => Self::Running,
+            S::Running { .. } => Self::Running,
             S::Error { .. } => Self::Error,
             S::Terminated { .. } => Self::Terminated,
         }

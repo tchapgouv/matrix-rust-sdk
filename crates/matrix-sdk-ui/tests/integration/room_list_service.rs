@@ -1,7 +1,4 @@
-use std::{
-    ops::Not,
-    time::{Duration, Instant},
-};
+use std::{ops::Not, time::Duration};
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
@@ -19,6 +16,7 @@ use matrix_sdk_ui::{
     timeline::{TimelineItemKind, VirtualTimelineItem},
     RoomListService,
 };
+use mock_instant::global::MockClock;
 use ruma::{
     api::client::room::create_room::v3::Request as CreateRoomRequest,
     assign, event_id,
@@ -36,6 +34,7 @@ use wiremock::{
 use crate::timeline::sliding_sync::{assert_timeline_stream, timeline_event};
 
 async fn new_room_list_service() -> Result<(Client, MockServer, RoomListService), Error> {
+    MockClock::set_time(Duration::ZERO);
     let (client, server) = logged_in_client_with_server().await;
     let room_list = RoomListService::new(client.clone()).await?;
 
@@ -370,7 +369,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = SettingUp => Running,
+        states = SettingUp => Running { .. },
         assert request = {
             "conn_id": "room-list",
             "lists": {
@@ -394,7 +393,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Running => Running,
+        states = Running { .. } => Running { .. },
         assert request = {
             "conn_id": "room-list",
             "lists": {
@@ -418,7 +417,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Running => Running,
+        states = Running { .. } => Running { .. },
         assert request = {
             "conn_id": "room-list",
             "lists": {
@@ -442,7 +441,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Running => Running,
+        states = Running { .. } => Running { .. },
         assert request = {
             "conn_id": "room-list",
             "lists": {
@@ -505,7 +504,7 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
 
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
-            states = SettingUp => Running,
+            states = SettingUp => Running { .. },
             assert request >= {
                 "lists": {
                     ALL_ROOMS: {
@@ -532,7 +531,7 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
 
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
-            states = Running => Running,
+            states = Running { .. } => Running { .. },
             assert request >= {
                 "lists": {
                     ALL_ROOMS: {
@@ -551,6 +550,103 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
             },
         };
     }
+
+    Ok(())
+}
+
+#[async_test]
+async fn test_sync_resumes_after_a_while() -> Result<(), Error> {
+    let (_, server, room_list) = new_room_list_service().await?;
+
+    let sync = room_list.sync();
+    pin_mut!(sync);
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = Init => SettingUp,
+        assert request >= {
+            "lists": {
+                ALL_ROOMS: {
+                    "ranges": [[0, 19]],
+                },
+            },
+        },
+        respond with = {
+            "pos": "0",
+            "lists": {
+                ALL_ROOMS: {
+                    "count": 200,
+                },
+            },
+            "rooms": {},
+        },
+    };
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = SettingUp => Running { .. },
+        assert request >= {
+            "lists": {
+                ALL_ROOMS: {
+                    "ranges": [[0, 99]],
+                },
+            },
+        },
+        respond with = {
+            "pos": "1",
+            "lists": {
+                ALL_ROOMS: {
+                    "count": 200,
+                },
+            },
+            "rooms": {},
+        },
+    };
+
+    MockClock::advance(Duration::from_secs(1800 + 1));
+
+    // We haven't sync for a while so we should be back to paginated sync
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = Running { .. } => Recovering,
+        assert request >= {
+            "lists": {
+                ALL_ROOMS: {
+                    "ranges": [[0, 19]],
+                },
+            },
+        },
+        respond with = {
+            "pos": "0",
+            "lists": {
+                ALL_ROOMS: {
+                    "count": 200,
+                },
+            },
+            "rooms": {},
+        },
+    };
+
+    sync_then_assert_request_and_fake_response! {
+        [server, room_list, sync]
+        states = Recovering => Running { .. },
+        assert request >= {
+            "lists": {
+                ALL_ROOMS: {
+                    "ranges": [[0, 99]],
+                },
+            },
+        },
+        respond with = {
+            "pos": "1",
+            "lists": {
+                ALL_ROOMS: {
+                    "count": 200,
+                },
+            },
+            "rooms": {},
+        },
+    };
 
     Ok(())
 }
@@ -658,7 +754,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Recovering => Running,
+        states = Recovering => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -681,7 +777,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
         sync matches Some(Err(_)),
-        states = Running => Error { .. },
+        states = Running { .. } => Error { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -727,7 +823,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Recovering => Running,
+        states = Recovering => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -749,7 +845,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Running => Running,
+        states = Running { .. } => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -772,7 +868,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
         sync matches Some(Err(_)),
-        states = Running => Error { .. },
+        states = Running { .. } => Error { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -819,7 +915,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Recovering => Running,
+        states = Recovering => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -910,7 +1006,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
     // Do a regular sync from the `Recovering` state.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Recovering => Running,
+        states = Recovering => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -964,7 +1060,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
     // Do a regular sync from the `Recovering` state.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Recovering => Running,
+        states = Recovering => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -987,7 +1083,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
     // Do a regular sync from the `Running` state.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Running => Running,
+        states = Running { .. } => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -1058,7 +1154,7 @@ async fn test_loading_states() -> Result<(), Error> {
 
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
-            states = SettingUp => Running,
+            states = SettingUp => Running { .. },
             assert request >= {
                 "lists": {
                     ALL_ROOMS: {
@@ -1088,7 +1184,7 @@ async fn test_loading_states() -> Result<(), Error> {
 
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
-            states = Running => Running,
+            states = Running { .. } => Running { .. },
             assert request >= {
                 "lists": {
                     ALL_ROOMS: {
@@ -1224,7 +1320,7 @@ async fn test_entries_stream() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = SettingUp => Running,
+        states = SettingUp => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -1326,7 +1422,7 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = SettingUp => Running,
+        states = SettingUp => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -1435,7 +1531,7 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Running => Running,
+        states = Running { .. } => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -1601,7 +1697,7 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Running => Running,
+        states = Running { .. } => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -1769,7 +1865,7 @@ async fn test_room_sorting() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = SettingUp => Running,
+        states = SettingUp => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -1854,7 +1950,7 @@ async fn test_room_sorting() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Running => Running,
+        states = Running { .. } => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -1928,7 +2024,7 @@ async fn test_room_sorting() -> Result<(), Error> {
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Running => Running,
+        states = Running { .. } => Running { .. },
         assert request >= {
             "lists": {
                 ALL_ROOMS: {
@@ -2581,7 +2677,7 @@ async fn test_sync_indicator() -> Result<(), Error> {
         };
 
         ($sync_indicator:ident, $pattern:pat, under $time:expr $(,)?) => {
-            let now = Instant::now();
+            let now = std::time::Instant::now();
             assert_matches!($sync_indicator.next().await, Some($pattern));
             assert!(now.elapsed() < $time);
         };
@@ -2682,7 +2778,7 @@ async fn test_sync_indicator() -> Result<(), Error> {
     // Request 2.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = SettingUp => Running,
+        states = SettingUp => Running { .. },
         assert request >= {},
         respond with = {
             "pos": "1",
@@ -2696,7 +2792,7 @@ async fn test_sync_indicator() -> Result<(), Error> {
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
         sync matches Some(Err(_)),
-        states = Running => Error { .. },
+        states = Running { .. } => Error { .. },
         assert request >= {},
         respond with = (code 400) {
             "error": "foo",
@@ -2725,7 +2821,7 @@ async fn test_sync_indicator() -> Result<(), Error> {
     // Request 5.
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
-        states = Recovering => Running,
+        states = Recovering => Running { .. },
         assert request >= {},
         respond with = {
             "pos": "3",

@@ -315,7 +315,7 @@ impl RoomListService {
                         (SyncIndicator::Show, delay_before_showing)
                     }
 
-                    State::SettingUp | State::Recovering | State::Running | State::Terminated { .. } => {
+                    State::SettingUp | State::Recovering | State::Running {..} | State::Terminated { .. } => {
                         (SyncIndicator::Hide, delay_before_hiding)
                     }
                 };
@@ -610,13 +610,17 @@ mod tests {
         let _ = sync.next().await;
 
         // State is `Terminated`, as expected!
-        assert_eq!(room_list.state.get(), State::Terminated { from: Box::new(State::Running) });
+        assert_matches!(room_list.state.get(), State::Terminated { from } => {
+            assert_matches!(from.as_ref(), State::Running { .. });
+        });
 
         // Now, let's make the sliding sync session to expire.
         room_list.expire_sync_session().await;
 
         // State is `Error`, as a regular session expiration would generate!
-        assert_eq!(room_list.state.get(), State::Error { from: Box::new(State::Running) });
+        assert_matches!(room_list.state.get(), State::Error { from } => {
+            assert_matches!(from.as_ref(), State::Running { .. });
+        });
 
         Ok(())
     }

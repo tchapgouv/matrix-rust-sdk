@@ -15,6 +15,8 @@ rustls-tls = ["matrix-sdk/rustls-tls"]
 
 uniffi = ["dep:uniffi", "matrix-sdk/uniffi", "matrix-sdk-base/uniffi"]
 
+testing = ["dep:mock_instant", "matrix-sdk/testing", "matrix-sdk-base/testing"]
+
 # Add support for encrypted extensible events.
 unstable-msc3956 = ["ruma/unstable-msc3956"]
 
@@ -38,6 +40,7 @@ itertools = { workspace = true }
 matrix-sdk = { workspace = true, features = ["experimental-sliding-sync", "e2e-encryption"] }
 matrix-sdk-base = { workspace = true }
 mime = "0.3.16"
+mock_instant = { workspace = true, optional = true }
 once_cell = { workspace = true }
 pin-project-lite = { workspace = true }
 ruma = { workspace = true, features = ["html", "unstable-msc3381"] }
@@ -57,9 +60,14 @@ assert_matches2 = { workspace = true }
 eyeball-im-util = { workspace = true }
 matrix-sdk = { workspace = true, features = ["testing"] }
 matrix-sdk-test = { workspace = true }
+mock_instant = { workspace = true }
 stream_assert = { workspace = true }
 tempfile = "3.3.0"
 wiremock = { workspace = true }
+
+[[test]]
+name = "integration"
+required-features = ["testing"]
 
 [lints]
 workspace = true

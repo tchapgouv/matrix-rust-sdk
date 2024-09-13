@@ -3519,6 +3519,7 @@ dependencies = [
  "matrix-sdk-base",
  "matrix-sdk-test",
  "mime",
+ "mock_instant",
  "once_cell",
  "pin-project-lite",
  "ruma",
@@ -3608,6 +3609,12 @@ dependencies = [
  "wasi",
  "windows-sys 0.48.0",
 ]
+
+[[package]]
+name = "mock_instant"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdcebb6db83796481097dedc7747809243cc81d9ed83e6a938b76d4ea0b249cf"
 
 [[package]]
 name = "multiverse"
