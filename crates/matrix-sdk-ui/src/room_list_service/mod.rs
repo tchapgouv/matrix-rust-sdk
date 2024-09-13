@@ -90,6 +90,9 @@ pub struct RoomListService {
     ///
     /// `RoomListService` is a simple state-machine.
     state: SharedObservable<State>,
+
+    /// State machine used to transition between the states.
+    state_machine: StateMachine,
 }
 
 impl RoomListService {
@@ -172,7 +175,12 @@ impl RoomListService {
         // Eagerly subscribe the event cache to sync responses.
         client.event_cache().subscribe()?;
 
-        Ok(Self { client, sliding_sync, state: SharedObservable::new(State::Init) })
+        Ok(Self {
+            client,
+            sliding_sync,
+            state: SharedObservable::new(State::Init),
+            state_machine: StateMachine::new(),
+        })
     }
 
     /// Start to sync the room list.
@@ -207,8 +215,9 @@ impl RoomListService {
             loop {
                 debug!("Run a sync iteration");
 
+                let current_state = self.state.get();
                 // Calculate the next state, and run the associated actions.
-                let next_state = self.state.get().next(&self.sliding_sync).await?;
+                let next_state = self.state_machine.next(current_state, &self.sliding_sync).await?;
 
                 // Do the sync.
                 match sync.next().await {
