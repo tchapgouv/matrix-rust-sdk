@@ -14,13 +14,12 @@
 
 //! States and actions for the `RoomList` state machine.
 
-use std::future::ready;
-#[cfg(not(any(test, feature = "testing")))]
-use std::time::Instant;
+use std::{
+    future::ready,
+    time::{Duration, Instant},
+};
 
 use matrix_sdk::{sliding_sync::Range, SlidingSync, SlidingSyncMode};
-#[cfg(any(test, feature = "testing"))]
-use mock_instant::global::Instant;
 
 use super::Error;
 
@@ -41,7 +40,7 @@ pub enum State {
     Recovering,
 
     /// At this state, all rooms are syncing.
-    Running { last_time: Instant },
+    Running,
 
     /// At this state, the sync has been stopped because an error happened.
     Error { from: Box<State> },
@@ -50,27 +49,43 @@ pub enum State {
     Terminated { from: Box<State> },
 }
 
-impl State {
+#[derive(Clone, Debug, PartialEq)]
+pub struct StateMachine {
+    last_sync_date: Instant,
+    delay_before_recover: Option<Duration>,
+}
+
+impl StateMachine {
+    pub(super) fn new(delay_before_recover: Option<Duration>) -> Self {
+        StateMachine { last_sync_date: Instant::now(), delay_before_recover }
+    }
+
     /// Transition to the next state, and execute the associated transition's
     /// [`Actions`].
-    pub(super) async fn next(&self, sliding_sync: &SlidingSync) -> Result<Self, Error> {
+    pub(super) async fn next(
+        &self,
+        current: State,
+        sliding_sync: &SlidingSync,
+    ) -> Result<State, Error> {
         use State::*;
 
-        let next_state = match self {
+        let next_state = match current {
             Init => SettingUp,
 
             SettingUp | Recovering => {
                 set_all_rooms_to_growing_sync_mode(sliding_sync).await?;
-                Running { last_time: Instant::now() }
+                Running
             }
 
-            Running { last_time } => {
+            Running => {
                 // We haven't sync for a while so we should go back to recovering
-                if last_time.elapsed().as_secs() > 1800 {
+                if self.delay_before_recover.is_some_and(|delay_before_recover| {
+                    self.last_sync_date.elapsed() > delay_before_recover
+                }) {
                     set_all_rooms_to_selective_sync_mode(sliding_sync).await?;
                     Recovering
                 } else {
-                    Running { last_time: Instant::now() }
+                    Running
                 }
             }
 
@@ -84,7 +99,7 @@ impl State {
                     }
 
                     // If the previous state was `Running`, we enter the `Recovering` state.
-                    Running { .. } => {
+                    Running => {
                         set_all_rooms_to_selective_sync_mode(sliding_sync).await?;
                         Recovering
                     }
@@ -133,7 +148,6 @@ pub const ALL_ROOMS_DEFAULT_GROWING_BATCH_SIZE: u32 = 100;
 
 #[cfg(test)]
 mod tests {
-    use assert_matches::assert_matches;
     use matrix_sdk_test::async_test;
 
     use super::{super::tests::new_room_list, *};
@@ -143,12 +157,16 @@ mod tests {
         let room_list = new_room_list().await?;
         let sliding_sync = room_list.sliding_sync();
 
+        let state_machine = StateMachine::new(None);
+
         // First state.
         let state = State::Init;
 
         // Hypothetical error.
         {
-            let state = State::Error { from: Box::new(state.clone()) }.next(sliding_sync).await?;
+            let state = state_machine
+                .next(State::Error { from: Box::new(state.clone()) }, sliding_sync)
+                .await?;
 
             // Back to the previous state.
             assert_eq!(state, State::Init);
@@ -156,20 +174,23 @@ mod tests {
 
         // Hypothetical termination.
         {
-            let state =
-                State::Terminated { from: Box::new(state.clone()) }.next(sliding_sync).await?;
+            let state = state_machine
+                .next(State::Terminated { from: Box::new(state.clone()) }, sliding_sync)
+                .await?;
 
             // Back to the previous state.
             assert_eq!(state, State::Init);
         }
 
         // Next state.
-        let state = state.next(sliding_sync).await?;
+        let state = state_machine.next(state, sliding_sync).await?;
         assert_eq!(state, State::SettingUp);
 
         // Hypothetical error.
         {
-            let state = State::Error { from: Box::new(state.clone()) }.next(sliding_sync).await?;
+            let state = state_machine
+                .next(State::Error { from: Box::new(state.clone()) }, sliding_sync)
+                .await?;
 
             // Back to the previous state.
             assert_eq!(state, State::SettingUp);
@@ -177,48 +198,53 @@ mod tests {
 
         // Hypothetical termination.
         {
-            let state =
-                State::Terminated { from: Box::new(state.clone()) }.next(sliding_sync).await?;
+            let state = state_machine
+                .next(State::Terminated { from: Box::new(state.clone()) }, sliding_sync)
+                .await?;
 
             // Back to the previous state.
             assert_eq!(state, State::SettingUp);
         }
 
         // Next state.
-        let state = state.next(sliding_sync).await?;
-        assert_matches!(state, State::Running { .. });
+        let state = state_machine.next(state, sliding_sync).await?;
+        assert_eq!(state, State::Running);
 
         // Hypothetical error.
         {
-            let state = State::Error { from: Box::new(state.clone()) }.next(sliding_sync).await?;
+            let state = state_machine
+                .next(State::Error { from: Box::new(state.clone()) }, sliding_sync)
+                .await?;
 
             // Jump to the **recovering** state!
             assert_eq!(state, State::Recovering);
 
-            let state = state.next(sliding_sync).await?;
+            let state = state_machine.next(state, sliding_sync).await?;
 
             // Now, back to the previous state.
-            assert_matches!(state, State::Running { .. });
+            assert_eq!(state, State::Running);
         }
 
         // Hypothetical termination.
         {
-            let state =
-                State::Terminated { from: Box::new(state.clone()) }.next(sliding_sync).await?;
+            let state = state_machine
+                .next(State::Terminated { from: Box::new(state.clone()) }, sliding_sync)
+                .await?;
 
             // Jump to the **recovering** state!
             assert_eq!(state, State::Recovering);
 
-            let state = state.next(sliding_sync).await?;
+            let state = state_machine.next(state, sliding_sync).await?;
 
             // Now, back to the previous state.
-            assert_matches!(state, State::Running { .. });
+            assert_eq!(state, State::Running);
         }
 
         // Hypothetical error when recovering.
         {
-            let state =
-                State::Error { from: Box::new(State::Recovering) }.next(sliding_sync).await?;
+            let state = state_machine
+                .next(State::Error { from: Box::new(State::Recovering) }, sliding_sync)
+                .await?;
 
             // Back to the previous state.
             assert_eq!(state, State::Recovering);
@@ -226,8 +252,9 @@ mod tests {
 
         // Hypothetical termination when recovering.
         {
-            let state =
-                State::Terminated { from: Box::new(State::Recovering) }.next(sliding_sync).await?;
+            let state = state_machine
+                .next(State::Terminated { from: Box::new(State::Recovering) }, sliding_sync)
+                .await?;
 
             // Back to the previous state.
             assert_eq!(state, State::Recovering);

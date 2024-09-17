@@ -473,7 +473,7 @@ impl SyncServiceBuilder {
     pub async fn build(self) -> Result<SyncService, Error> {
         let encryption_sync_permit = Arc::new(AsyncMutex::new(EncryptionSyncPermit::new()));
 
-        let room_list = RoomListService::new(self.client.clone()).await?;
+        let room_list = RoomListService::new(self.client.clone(), None).await?; // TODO
 
         let encryption_sync = Arc::new(
             EncryptionSyncService::new(

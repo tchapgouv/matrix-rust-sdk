@@ -90,6 +90,8 @@ pub struct RoomListService {
     ///
     /// `RoomListService` is a simple state-machine.
     state: SharedObservable<State>,
+
+    state_machine: StateMachine,
 }
 
 impl RoomListService {
@@ -100,19 +102,29 @@ impl RoomListService {
     ///
     /// This won't start an encryption sync, and it's the user's responsibility
     /// to create one in this case using `EncryptionSync`.
-    pub async fn new(client: Client) -> Result<Self, Error> {
-        Self::new_internal(client, false).await
+    pub async fn new(
+        client: Client,
+        delay_before_recover: Option<Duration>,
+    ) -> Result<Self, Error> {
+        Self::new_internal(client, false, delay_before_recover).await
     }
 
     /// Create a new `RoomList` that enables encryption.
     ///
     /// This will include syncing the encryption information, so there must not
     /// be any instance of `EncryptionSync` running in the background.
-    pub async fn new_with_encryption(client: Client) -> Result<Self, Error> {
-        Self::new_internal(client, true).await
+    pub async fn new_with_encryption(
+        client: Client,
+        delay_before_recover: Option<Duration>,
+    ) -> Result<Self, Error> {
+        Self::new_internal(client, true, delay_before_recover).await
     }
 
-    async fn new_internal(client: Client, with_encryption: bool) -> Result<Self, Error> {
+    async fn new_internal(
+        client: Client,
+        with_encryption: bool,
+        delay_before_recover: Option<Duration>,
+    ) -> Result<Self, Error> {
         let mut builder = client
             .sliding_sync("room-list")
             .map_err(Error::SlidingSync)?
@@ -172,7 +184,12 @@ impl RoomListService {
         // Eagerly subscribe the event cache to sync responses.
         client.event_cache().subscribe()?;
 
-        Ok(Self { client, sliding_sync, state: SharedObservable::new(State::Init) })
+        Ok(Self {
+            client,
+            sliding_sync,
+            state: SharedObservable::new(State::Init),
+            state_machine: StateMachine::new(delay_before_recover),
+        })
     }
 
     /// Start to sync the room list.
@@ -207,8 +224,9 @@ impl RoomListService {
             loop {
                 debug!("Run a sync iteration");
 
+                let current_state = self.state.get();
                 // Calculate the next state, and run the associated actions.
-                let next_state = self.state.get().next(&self.sliding_sync).await?;
+                let next_state = self.state_machine.next(current_state, &self.sliding_sync).await?;
 
                 // Do the sync.
                 match sync.next().await {
@@ -315,7 +333,7 @@ impl RoomListService {
                         (SyncIndicator::Show, delay_before_showing)
                     }
 
-                    State::SettingUp | State::Recovering | State::Running {..} | State::Terminated { .. } => {
+                    State::SettingUp | State::Recovering | State::Running | State::Terminated { .. } => {
                         (SyncIndicator::Hide, delay_before_hiding)
                     }
                 };
@@ -498,7 +516,7 @@ mod tests {
     pub(super) async fn new_room_list() -> Result<RoomListService, Error> {
         let (client, _) = new_client().await;
 
-        RoomListService::new(client).await
+        RoomListService::new(client, None).await
     }
 
     struct SlidingSyncMatcher;
@@ -515,7 +533,7 @@ mod tests {
         let (client, _) = new_client().await;
 
         {
-            let room_list = RoomListService::new(client.clone()).await?;
+            let room_list = RoomListService::new(client.clone(), None).await?;
             assert_matches!(room_list.sliding_sync().version(), SlidingSyncVersion::Native);
         }
 
@@ -523,7 +541,7 @@ mod tests {
             let url = Url::parse("https://foo.matrix/").unwrap();
             client.set_sliding_sync_version(SlidingSyncVersion::Proxy { url: url.clone() });
 
-            let room_list = RoomListService::new(client.clone()).await?;
+            let room_list = RoomListService::new(client.clone(), None).await?;
             assert_matches!(
                 room_list.sliding_sync().version(),
                 SlidingSyncVersion::Proxy { url: given_url } => {
@@ -558,12 +576,12 @@ mod tests {
     async fn test_no_to_device_and_e2ee_if_not_explicitly_set() -> Result<(), Error> {
         let (client, _) = new_client().await;
 
-        let no_encryption = RoomListService::new(client.clone()).await?;
+        let no_encryption = RoomListService::new(client.clone(), None).await?;
         let extensions = no_encryption.sliding_sync.extensions_config();
         assert_eq!(extensions.e2ee.enabled, None);
         assert_eq!(extensions.to_device.enabled, None);
 
-        let with_encryption = RoomListService::new_with_encryption(client).await?;
+        let with_encryption = RoomListService::new_with_encryption(client, None).await?;
         let extensions = with_encryption.sliding_sync.extensions_config();
         assert_eq!(extensions.e2ee.enabled, Some(true));
         assert_eq!(extensions.to_device.enabled, Some(true));
@@ -575,7 +593,7 @@ mod tests {
     async fn test_expire_sliding_sync_session_manually() -> Result<(), Error> {
         let (client, server) = new_client().await;
 
-        let room_list = RoomListService::new(client).await?;
+        let room_list = RoomListService::new(client, None).await?;
 
         let sync = room_list.sync();
         pin_mut!(sync);
@@ -610,17 +628,13 @@ mod tests {
         let _ = sync.next().await;
 
         // State is `Terminated`, as expected!
-        assert_matches!(room_list.state.get(), State::Terminated { from } => {
-            assert_matches!(from.as_ref(), State::Running { .. });
-        });
+        assert_eq!(room_list.state.get(), State::Terminated { from: Box::new(State::Running) });
 
         // Now, let's make the sliding sync session to expire.
         room_list.expire_sync_session().await;
 
         // State is `Error`, as a regular session expiration would generate!
-        assert_matches!(room_list.state.get(), State::Error { from } => {
-            assert_matches!(from.as_ref(), State::Running { .. });
-        });
+        assert_eq!(room_list.state.get(), State::Error { from: Box::new(State::Running) });
 
         Ok(())
     }
