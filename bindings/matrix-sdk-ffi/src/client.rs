@@ -48,6 +48,9 @@ use matrix_sdk_ui::notification_client::{
     NotificationProcessSetup as MatrixNotificationProcessSetup,
 };
 use mime::Mime;
+use ruma::events::room::history_visibility::{
+    HistoryVisibility, RoomHistoryVisibilityEventContent,
+};
 use ruma::{
     api::client::{
         alias::get_alias, discovery::discover_homeserver::AuthenticationServerInfo,
@@ -1295,6 +1298,15 @@ impl From<CreateRoomParameters> for create_room::v3::Request {
             content.url = Some(url.into());
             initial_state.push(InitialStateEvent::new(content).to_raw_any());
         }
+
+        // BWI specific: create room with HistoryVisibility set to Invited
+        initial_state.push(
+            InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(
+                HistoryVisibility::Invited,
+            ))
+            .to_raw_any(),
+        );
+
         request.initial_state = initial_state;
 
         if let Some(power_levels) = value.power_level_content_override {
