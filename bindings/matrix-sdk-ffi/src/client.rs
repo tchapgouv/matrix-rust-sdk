@@ -42,15 +42,11 @@ use matrix_sdk::{
     sliding_sync::Version as SdkSlidingSyncVersion,
     AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
 };
-use matrix_sdk_bwi::room_alias::BWIRoomAlias;
 use matrix_sdk_ui::notification_client::{
     NotificationClient as MatrixNotificationClient,
     NotificationProcessSetup as MatrixNotificationProcessSetup,
 };
 use mime::Mime;
-use ruma::events::room::history_visibility::{
-    HistoryVisibility, RoomHistoryVisibilityEventContent,
-};
 use ruma::{
     api::client::{
         alias::get_alias, discovery::discover_homeserver::AuthenticationServerInfo,
@@ -1265,12 +1261,7 @@ impl From<CreateRoomParameters> for create_room::v3::Request {
         request.is_direct = value.is_direct;
         request.visibility = value.visibility.into();
         request.preset = Some(value.preset.into());
-        // BWI specific: create room alias
-        if !value.is_direct {
-            if let Some(room_name) = &request.name {
-                request.room_alias_name = Some(BWIRoomAlias::alias_for_room_name(room_name));
-            }
-        }
+
         request.invite = match value.invite {
             Some(invite) => invite
                 .iter()
@@ -1298,14 +1289,6 @@ impl From<CreateRoomParameters> for create_room::v3::Request {
             content.url = Some(url.into());
             initial_state.push(InitialStateEvent::new(content).to_raw_any());
         }
-
-        // BWI specific: create room with HistoryVisibility set to Invited
-        initial_state.push(
-            InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(
-                HistoryVisibility::Invited,
-            ))
-            .to_raw_any(),
-        );
 
         request.initial_state = initial_state;
 

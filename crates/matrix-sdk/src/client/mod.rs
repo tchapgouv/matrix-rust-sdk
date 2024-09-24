@@ -69,11 +69,12 @@ use ruma::{
     DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomAliasId, RoomId,
     RoomOrAliasId, ServerName, UInt, UserId,
 };
+use ruma::events::room::history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent};
 use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, Mutex, OnceCell, RwLock, RwLockReadGuard};
 use tracing::{debug, error, instrument, trace, warn, Instrument, Span};
 use url::Url;
-
+use matrix_sdk_bwi::room_alias::BWIRoomAlias;
 use self::futures::SendRequest;
 #[cfg(feature = "experimental-oidc")]
 use crate::oidc::Oidc;
@@ -1285,11 +1286,21 @@ impl Client {
     /// assert!(client.create_room(request).await.is_ok());
     /// # };
     /// ```
-    pub async fn create_room(&self, request: create_room::v3::Request) -> Result<Room> {
+    pub async fn create_room(&self, mut request: create_room::v3::Request) -> Result<Room> {
         let invite = request.invite.clone();
         let is_direct_room = request.is_direct;
-        let response = self.send(request, None).await?;
 
+        // BWI specific: create room alias
+        if !is_direct_room {
+            if let Some(room_name) = &request.name {
+                request.room_alias_name = Some(BWIRoomAlias::alias_for_room_name(room_name));
+            }
+        }
+
+        // BWI specific: #5991 create room with HistoryVisibility set to invite
+        request.initial_state.push(InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(HistoryVisibility::Invited)).to_raw_any());
+
+        let response = self.send(request, None).await?;
         let base_room = self.base_client().get_or_create_room(&response.room_id, RoomState::Joined);
 
         let joined_room = Room::new(self.clone(), base_room);
