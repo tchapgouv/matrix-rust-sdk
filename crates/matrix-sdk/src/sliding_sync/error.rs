@@ -7,6 +7,11 @@ use tokio::task::JoinError;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
+    /// Sliding sync has been configured with a missing version. See
+    /// [`crate::sliding_sync::Version`].
+    #[error("Sliding sync version is missing")]
+    VersionIsMissing,
+
     /// The response we've received from the server can't be parsed or doesn't
     /// match up with the current expectations on the client side. A
     /// `sync`-restart might be required.
@@ -48,4 +53,14 @@ pub enum Error {
         /// The original `JoinError`.
         error: JoinError,
     },
+
+    /// No Olm machine.
+    #[cfg(feature = "e2e-encryption")]
+    #[error("The Olm machine is missing")]
+    NoOlmMachine,
+
+    /// An error occurred during a E2EE operation.
+    #[cfg(feature = "e2e-encryption")]
+    #[error(transparent)]
+    CryptoStoreError(#[from] matrix_sdk_base::crypto::CryptoStoreError),
 }

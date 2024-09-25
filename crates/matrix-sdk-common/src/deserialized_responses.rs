@@ -21,6 +21,8 @@ use ruma::{
     DeviceKeyAlgorithm, OwnedDeviceId, OwnedEventId, OwnedUserId,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
 
 use crate::debug::{DebugRawEvent, DebugStructExt};
 
@@ -187,6 +189,22 @@ pub enum VerificationLevel {
     None(DeviceLinkProblem),
 }
 
+impl fmt::Display for VerificationLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        let display = match self {
+            VerificationLevel::UnverifiedIdentity => "The sender's identity was not verified",
+            VerificationLevel::PreviouslyVerified => {
+                "The sender's identity was previously verified but has changed"
+            }
+            VerificationLevel::UnsignedDevice => {
+                "The sending device was not signed by the user's identity"
+            }
+            VerificationLevel::None(..) => "The sending device is not known",
+        };
+        write!(f, "{}", display)
+    }
+}
+
 /// The sub-enum containing detailed information on why we were not able to link
 /// a message back to a device.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -225,8 +243,9 @@ pub enum ShieldState {
 }
 
 /// A machine-readable representation of the authenticity for a `ShieldState`.
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub enum ShieldStateCode {
     /// Not enough information available to check the authenticity.
     AuthenticityNotGuaranteed,

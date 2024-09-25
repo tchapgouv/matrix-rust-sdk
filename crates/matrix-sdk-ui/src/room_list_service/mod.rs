@@ -69,7 +69,7 @@ use matrix_sdk::{
 use matrix_sdk_base::sliding_sync::http;
 pub use room::*;
 pub use room_list::*;
-use ruma::{assign, events::StateEventType, OwnedRoomId, RoomId};
+use ruma::{assign, directory::RoomTypeFilter, events::StateEventType, OwnedRoomId, RoomId};
 pub use state::*;
 use thiserror::Error;
 use tokio::time::timeout;
@@ -158,7 +158,7 @@ impl RoomListService {
                         // If unset, both invited and joined rooms are returned. If false, no invited rooms are
                         // returned. If true, only invited rooms are returned.
                         is_invite: None,
-                        not_room_types: vec!["m.space".to_owned()],
+                        not_room_types: vec![RoomTypeFilter::Space],
                     }))),
             )
             .await
@@ -455,11 +455,13 @@ pub enum SyncIndicator {
 mod tests {
     use std::future::ready;
 
+    use assert_matches::assert_matches;
     use futures_util::{pin_mut, StreamExt};
     use matrix_sdk::{
         config::RequestConfig,
         matrix_auth::{MatrixSession, MatrixSessionTokens},
         reqwest::Url,
+        sliding_sync::Version as SlidingSyncVersion,
         Client, SlidingSyncMode,
     };
     use matrix_sdk_base::SessionMeta;
@@ -513,17 +515,20 @@ mod tests {
 
         {
             let room_list = RoomListService::new(client.clone()).await?;
-
-            assert!(room_list.sliding_sync().sliding_sync_proxy().is_none());
+            assert_matches!(room_list.sliding_sync().version(), SlidingSyncVersion::Native);
         }
 
         {
             let url = Url::parse("https://foo.matrix/").unwrap();
-            client.set_sliding_sync_proxy(Some(url.clone()));
+            client.set_sliding_sync_version(SlidingSyncVersion::Proxy { url: url.clone() });
 
             let room_list = RoomListService::new(client.clone()).await?;
-
-            assert_eq!(room_list.sliding_sync().sliding_sync_proxy(), Some(url));
+            assert_matches!(
+                room_list.sliding_sync().version(),
+                SlidingSyncVersion::Proxy { url: given_url } => {
+                    assert_eq!(&url, given_url);
+                }
+            );
         }
 
         Ok(())
