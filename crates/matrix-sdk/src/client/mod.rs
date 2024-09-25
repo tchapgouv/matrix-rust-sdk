@@ -39,6 +39,10 @@ use matrix_sdk_base::{
     BaseClient, RoomInfoNotableUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
     StateStoreDataKey, StateStoreDataValue, SyncOutsideWasm,
 };
+use matrix_sdk_bwi::room_alias::BWIRoomAlias;
+use ruma::events::room::history_visibility::{
+    HistoryVisibility, RoomHistoryVisibilityEventContent,
+};
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{room::encryption::RoomEncryptionEventContent, InitialStateEvent};
 use ruma::{
@@ -69,12 +73,10 @@ use ruma::{
     DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedServerName, RoomAliasId, RoomId,
     RoomOrAliasId, ServerName, UInt, UserId,
 };
-use ruma::events::room::history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent};
 use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, Mutex, OnceCell, RwLock, RwLockReadGuard};
 use tracing::{debug, error, instrument, trace, warn, Instrument, Span};
 use url::Url;
-use matrix_sdk_bwi::room_alias::BWIRoomAlias;
 use self::futures::SendRequest;
 #[cfg(feature = "experimental-oidc")]
 use crate::oidc::Oidc;
@@ -1298,7 +1300,12 @@ impl Client {
         }
 
         // BWI specific: #5991 create room with HistoryVisibility set to invite
-        request.initial_state.push(InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(HistoryVisibility::Invited)).to_raw_any());
+        request.initial_state.push(
+            InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(
+                HistoryVisibility::Invited,
+            ))
+            .to_raw_any(),
+        );
 
         let response = self.send(request, None).await?;
         let base_room = self.base_client().get_or_create_room(&response.room_id, RoomState::Joined);
