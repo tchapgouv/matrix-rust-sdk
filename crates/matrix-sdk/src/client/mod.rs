@@ -22,6 +22,34 @@ use std::{
     sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak},
 };
 
+use self::futures::SendRequest;
+#[cfg(feature = "experimental-oidc")]
+use crate::oidc::Oidc;
+#[cfg(feature = "experimental-sliding-sync")]
+use crate::sliding_sync::Version as SlidingSyncVersion;
+use crate::{
+    authentication::{AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback},
+    config::RequestConfig,
+    deduplicating_handler::DeduplicatingHandler,
+    error::{HttpError, HttpResult},
+    event_cache::EventCache,
+    event_handler::{
+        EventHandler, EventHandlerDropGuard, EventHandlerHandle, EventHandlerStore, SyncEvent,
+    },
+    http_client::HttpClient,
+    matrix_auth::MatrixAuth,
+    notification_settings::NotificationSettings,
+    room_preview::RoomPreview,
+    send_queue::SendQueueData,
+    sync::{RoomUpdate, SyncResponse},
+    Account, AuthApi, AuthSession, Error, Media, Pusher, RefreshTokenError, Result, Room,
+    TransmissionProgress,
+};
+#[cfg(feature = "e2e-encryption")]
+use crate::{
+    encryption::{Encryption, EncryptionData, EncryptionSettings, VerificationState},
+    store_locks::CrossProcessStoreLock,
+};
 use eyeball::{SharedObservable, Subscriber};
 #[cfg(not(target_arch = "wasm32"))]
 use eyeball_im::VectorDiff;
@@ -38,6 +66,10 @@ use matrix_sdk_base::{
     sync::{Notification, RoomUpdates},
     BaseClient, RoomInfoNotableUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
     StateStoreDataKey, StateStoreDataValue, SyncOutsideWasm,
+};
+use matrix_sdk_bwi::room_alias::BWIRoomAlias;
+use ruma::events::room::history_visibility::{
+    HistoryVisibility, RoomHistoryVisibilityEventContent,
 };
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{room::encryption::RoomEncryptionEventContent, InitialStateEvent};
@@ -73,35 +105,6 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, Mutex, OnceCell, RwLock, RwLockReadGuard};
 use tracing::{debug, error, instrument, trace, warn, Instrument, Span};
 use url::Url;
-
-use self::futures::SendRequest;
-#[cfg(feature = "experimental-oidc")]
-use crate::oidc::Oidc;
-#[cfg(feature = "experimental-sliding-sync")]
-use crate::sliding_sync::Version as SlidingSyncVersion;
-use crate::{
-    authentication::{AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback},
-    config::RequestConfig,
-    deduplicating_handler::DeduplicatingHandler,
-    error::{HttpError, HttpResult},
-    event_cache::EventCache,
-    event_handler::{
-        EventHandler, EventHandlerDropGuard, EventHandlerHandle, EventHandlerStore, SyncEvent,
-    },
-    http_client::HttpClient,
-    matrix_auth::MatrixAuth,
-    notification_settings::NotificationSettings,
-    room_preview::RoomPreview,
-    send_queue::SendQueueData,
-    sync::{RoomUpdate, SyncResponse},
-    Account, AuthApi, AuthSession, Error, Media, Pusher, RefreshTokenError, Result, Room,
-    TransmissionProgress,
-};
-#[cfg(feature = "e2e-encryption")]
-use crate::{
-    encryption::{Encryption, EncryptionData, EncryptionSettings, VerificationState},
-    store_locks::CrossProcessStoreLock,
-};
 
 mod builder;
 pub(crate) mod futures;
@@ -1285,11 +1288,26 @@ impl Client {
     /// assert!(client.create_room(request).await.is_ok());
     /// # };
     /// ```
-    pub async fn create_room(&self, request: create_room::v3::Request) -> Result<Room> {
+    pub async fn create_room(&self, mut request: create_room::v3::Request) -> Result<Room> {
         let invite = request.invite.clone();
         let is_direct_room = request.is_direct;
-        let response = self.send(request, None).await?;
 
+        // BWI specific: create room alias
+        if !is_direct_room {
+            if let Some(room_name) = &request.name {
+                request.room_alias_name = Some(BWIRoomAlias::alias_for_room_name(room_name));
+            }
+        }
+
+        // BWI specific: #5991 create room with HistoryVisibility set to invite
+        request.initial_state.push(
+            InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(
+                HistoryVisibility::Invited,
+            ))
+            .to_raw_any(),
+        );
+
+        let response = self.send(request, None).await?;
         let base_room = self.base_client().get_or_create_room(&response.room_id, RoomState::Joined);
 
         let joined_room = Room::new(self.clone(), base_room);
