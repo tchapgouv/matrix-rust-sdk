@@ -3453,7 +3453,7 @@ dependencies = [
  "byteorder",
  "image",
  "qrcode 0.14.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "ruma-common 0.13.0 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
+ "ruma-common 0.13.0 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
  "thiserror",
  "vodozemac",
 ]
@@ -5024,35 +5024,12 @@ dependencies = [
  "assign",
  "js_int",
  "js_option",
- "ruma-client-api 0.18.0 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
- "ruma-common 0.13.0 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
- "ruma-events 0.28.1 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
+ "ruma-client-api 0.18.0 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
+ "ruma-common 0.13.0 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
+ "ruma-events 0.28.1 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
  "ruma-federation-api",
  "ruma-html",
  "ruma-push-gateway-api",
- "web-time",
-]
-
-[[package]]
-name = "ruma-client-api"
-version = "0.18.0"
-source = "git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741#bb6d4c531aebb571fed4b1948df0118244762741"
-dependencies = [
- "as_variant",
- "assign",
- "bytes",
- "date_header",
- "http",
- "js_int",
- "js_option",
- "maplit",
- "ruma-common 0.13.0 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
- "ruma-events 0.28.1 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
- "serde",
- "serde_html_form",
- "serde_json",
- "thiserror",
- "url",
  "web-time",
 ]
 
@@ -5080,35 +5057,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "ruma-common"
-version = "0.13.0"
+name = "ruma-client-api"
+version = "0.18.0"
 source = "git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741#bb6d4c531aebb571fed4b1948df0118244762741"
 dependencies = [
  "as_variant",
- "base64 0.22.1",
+ "assign",
  "bytes",
- "form_urlencoded",
- "getrandom",
+ "date_header",
  "http",
- "indexmap 2.2.6",
- "js-sys",
  "js_int",
- "konst",
- "percent-encoding",
- "rand",
- "regex",
- "ruma-identifiers-validation 0.9.5 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
- "ruma-macros 0.13.0 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
+ "js_option",
+ "maplit",
+ "ruma-common 0.13.0 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
+ "ruma-events 0.28.1 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
  "serde",
  "serde_html_form",
  "serde_json",
  "thiserror",
- "time",
- "tracing",
  "url",
- "uuid",
  "web-time",
- "wildmatch",
 ]
 
 [[package]]
@@ -5140,26 +5108,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "ruma-events"
-version = "0.28.1"
+name = "ruma-common"
+version = "0.13.0"
 source = "git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741#bb6d4c531aebb571fed4b1948df0118244762741"
 dependencies = [
  "as_variant",
+ "base64 0.22.1",
+ "bytes",
+ "form_urlencoded",
+ "getrandom",
+ "http",
  "indexmap 2.2.6",
+ "js-sys",
  "js_int",
- "js_option",
+ "konst",
  "percent-encoding",
- "pulldown-cmark",
+ "rand",
  "regex",
- "ruma-common 0.13.0 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
- "ruma-html",
- "ruma-identifiers-validation 0.9.5 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
- "ruma-macros 0.13.0 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
+ "ruma-identifiers-validation 0.9.5 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
+ "ruma-macros 0.13.0 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
  "serde",
+ "serde_html_form",
  "serde_json",
  "thiserror",
+ "time",
  "tracing",
  "url",
+ "uuid",
  "web-time",
  "wildmatch",
 ]
@@ -5188,6 +5163,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruma-events"
+version = "0.28.1"
+source = "git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741#bb6d4c531aebb571fed4b1948df0118244762741"
+dependencies = [
+ "as_variant",
+ "indexmap 2.2.6",
+ "js_int",
+ "js_option",
+ "percent-encoding",
+ "pulldown-cmark",
+ "regex",
+ "ruma-common 0.13.0 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
+ "ruma-html",
+ "ruma-identifiers-validation 0.9.5 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
+ "ruma-macros 0.13.0 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "url",
+ "web-time",
+ "wildmatch",
+]
+
+[[package]]
 name = "ruma-federation-api"
 version = "0.9.0"
 source = "git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741#bb6d4c531aebb571fed4b1948df0118244762741"
@@ -5195,8 +5195,8 @@ dependencies = [
  "http",
  "js_int",
  "mime",
- "ruma-common 0.13.0 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
- "ruma-events 0.28.1 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
+ "ruma-common 0.13.0 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
+ "ruma-events 0.28.1 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
  "serde",
  "serde_json",
 ]
@@ -5216,7 +5216,7 @@ dependencies = [
 [[package]]
 name = "ruma-identifiers-validation"
 version = "0.9.5"
-source = "git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741#bb6d4c531aebb571fed4b1948df0118244762741"
+source = "git+https://github.com/ruma/ruma?rev=79289381444e886c454302e1e8f5b5f62f249a57#79289381444e886c454302e1e8f5b5f62f249a57"
 dependencies = [
  "js_int",
  "thiserror",
@@ -5225,26 +5225,10 @@ dependencies = [
 [[package]]
 name = "ruma-identifiers-validation"
 version = "0.9.5"
-source = "git+https://github.com/ruma/ruma?rev=79289381444e886c454302e1e8f5b5f62f249a57#79289381444e886c454302e1e8f5b5f62f249a57"
+source = "git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741#bb6d4c531aebb571fed4b1948df0118244762741"
 dependencies = [
  "js_int",
  "thiserror",
-]
-
-[[package]]
-name = "ruma-macros"
-version = "0.13.0"
-source = "git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741#bb6d4c531aebb571fed4b1948df0118244762741"
-dependencies = [
- "cfg-if",
- "once_cell",
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "ruma-identifiers-validation 0.9.5 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
- "serde",
- "syn 2.0.72",
- "toml 0.8.15",
 ]
 
 [[package]]
@@ -5263,13 +5247,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruma-macros"
+version = "0.13.0"
+source = "git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741#bb6d4c531aebb571fed4b1948df0118244762741"
+dependencies = [
+ "cfg-if",
+ "once_cell",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "ruma-identifiers-validation 0.9.5 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
+ "serde",
+ "syn 2.0.72",
+ "toml 0.8.15",
+]
+
+[[package]]
 name = "ruma-push-gateway-api"
 version = "0.9.0"
 source = "git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741#bb6d4c531aebb571fed4b1948df0118244762741"
 dependencies = [
  "js_int",
- "ruma-common 0.13.0 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
- "ruma-events 0.28.1 (git+https://github.com/matrix-org/ruma?rev=17f6e555528512319e706bb2cfe68a12ec5603b6)",
+ "ruma-common 0.13.0 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
+ "ruma-events 0.28.1 (git+https://github.com/matrix-org/ruma?rev=bb6d4c531aebb571fed4b1948df0118244762741)",
  "serde",
  "serde_json",
 ]
