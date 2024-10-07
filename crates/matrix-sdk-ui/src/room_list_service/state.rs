@@ -188,7 +188,7 @@ mod tests {
 
         // Hypothetical termination.
         {
-            state_machine.current.set(State::Terminated { from: Box::new(state_machine.get()) });
+            state_machine.set(State::Terminated { from: Box::new(state_machine.get()) });
 
             // Back to the previous state.
             assert_eq!(state_machine.next(sliding_sync).await?, State::Init);
@@ -207,7 +207,7 @@ mod tests {
 
         // Hypothetical termination.
         {
-            state_machine.current.set(State::Terminated { from: Box::new(state_machine.get()) });
+            state_machine.set(State::Terminated { from: Box::new(state_machine.get()) });
 
             // Back to the previous state.
             assert_eq!(state_machine.next(sliding_sync).await?, State::SettingUp);
@@ -229,7 +229,7 @@ mod tests {
 
         // Hypothetical termination.
         {
-            state_machine.current.set(State::Terminated { from: Box::new(state_machine.get()) });
+            state_machine.set(State::Terminated { from: Box::new(state_machine.get()) });
 
             // Jump to the **recovering** state!
             assert_eq!(state_machine.next(sliding_sync).await?, State::Recovering);
