@@ -88,7 +88,7 @@ impl StateMachine {
     pub(super) async fn next(&self, sliding_sync: &SlidingSync) -> Result<State, Error> {
         use State::*;
 
-        self.set(match self.get() {
+        let next_state = match self.get() {
             Init => SettingUp,
 
             SettingUp | Recovering => {
@@ -125,9 +125,11 @@ impl StateMachine {
                     state => state.to_owned(),
                 }
             }
-        });
+        };
 
-        Ok(self.get())
+        self.set(next_state.clone());
+
+        Ok(next_state)
     }
 }
 
