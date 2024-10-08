@@ -51,7 +51,7 @@ pub enum State {
 }
 
 /// Default value for `StateMachine::delay_before_recover`.
-const DEFAULT_DELAY_BEFORE_RECOVER: Duration = Duration::from_mins(30);
+const DEFAULT_DELAY_BEFORE_RECOVER: Duration = Duration::from_secs(1800);
 
 /// The state machine used to transition between the [`State`]s.
 #[derive(Clone, Debug)]
