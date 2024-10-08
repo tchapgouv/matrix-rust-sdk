@@ -341,7 +341,7 @@ impl RoomListService {
                     // Update the `current_state`.
                     current_state = next_state;
                 } else {
-                    // Something is broken with `self.state`. Let's stop this stream too.
+                    // Something is broken with the state. Let's stop this stream too.
                     break;
                 }
             }

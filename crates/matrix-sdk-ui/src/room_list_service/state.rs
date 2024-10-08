@@ -57,7 +57,7 @@ const DEFAULT_DELAY_BEFORE_RECOVER: Duration = Duration::from_secs(1800);
 #[derive(Clone, Debug)]
 pub struct StateMachine {
     /// The current state of the `RoomListService`.
-    current: SharedObservable<State>,
+    state: SharedObservable<State>,
 
     /// Last time a sync has happend.
     ///
@@ -79,7 +79,7 @@ pub struct StateMachine {
 impl StateMachine {
     pub(super) fn new() -> Self {
         StateMachine {
-            current: SharedObservable::new(State::Init),
+            state: SharedObservable::new(State::Init),
             last_sync_date: Instant::now(),
             delay_before_recover: DEFAULT_DELAY_BEFORE_RECOVER,
         }
@@ -87,17 +87,17 @@ impl StateMachine {
 
     /// Get the current state.
     pub(super) fn get(&self) -> State {
-        self.current.get()
+        self.state.get()
     }
 
     /// Set the new state.
     pub(super) fn set(&self, state: State) {
-        self.current.set(state);
+        self.state.set(state);
     }
 
     /// Subscribe to state updates.
     pub fn subscribe(&self) -> Subscriber<State> {
-        self.current.subscribe()
+        self.state.subscribe()
     }
 
     /// Transition to the next state, and execute the associated transition's
