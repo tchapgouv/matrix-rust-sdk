@@ -145,8 +145,6 @@ impl StateMachine {
             }
         };
 
-        self.set(next_state.clone());
-
         Ok(next_state)
     }
 }
