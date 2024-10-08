@@ -52,7 +52,7 @@ pub enum State {
 }
 
 /// Default value for `StateMachine::state_lifespan`.
-const MAXIMUM_STATE_AGE: Duration = Duration::from_secs(1800);
+const DEFAULT_STATE_LIFESPAN: Duration = Duration::from_secs(1800);
 
 /// The state machine used to transition between the [`State`]s.
 #[derive(Clone, Debug)]
@@ -84,7 +84,7 @@ impl StateMachine {
         StateMachine {
             state: SharedObservable::new(State::Init),
             last_state_update_time: Arc::new(Mutex::new(Instant::now())),
-            state_lifespan: MAXIMUM_STATE_AGE,
+            state_lifespan: DEFAULT_STATE_LIFESPAN,
         }
     }
 
