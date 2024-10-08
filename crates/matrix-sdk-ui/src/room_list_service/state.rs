@@ -50,7 +50,8 @@ pub enum State {
     Terminated { from: Box<State> },
 }
 
-const DEFAULT_DELAY_BEFORE_RECOVER: Duration = Duration::from_secs(1800);
+/// Default value for `StateMachine::delay_before_recover`.
+const DEFAULT_DELAY_BEFORE_RECOVER: Duration = Duration::from_mins(30);
 
 /// The state machine used to transition between the [`State`]s.
 #[derive(Clone, Debug)]
@@ -58,7 +59,20 @@ pub struct StateMachine {
     /// The current state of the `RoomListService`.
     current: SharedObservable<State>,
 
+    /// Last time a sync has happend.
+    ///
+    /// This information is useful when we want to go back to an initial state
+    /// if the last sync is too old, i.e. has happend too long ago. Why do we
+    /// need to do that? Because in some cases, the user might have received
+    /// many updates between two distant syncs. If the sliding sync list range
+    /// was too large, like 0..=499, the next sync is likely to be heavy and
+    /// potentially slow. In this case, it's preferable to jump back onto an
+    /// initial state, with a smaller range, so that the next sync will be
+    /// fast for the client.
     last_sync_date: Instant,
+
+    /// To be used in coordination with `Self::last_sync_date`, it represents
+    /// the maximum time before considering the previous sync as “too old”.
     delay_before_recover: Duration,
 }
 
@@ -71,14 +85,17 @@ impl StateMachine {
         }
     }
 
+    /// Get the current state.
     pub(super) fn get(&self) -> State {
         self.current.get()
     }
 
+    /// Set the new state.
     pub(super) fn set(&self, state: State) {
         self.current.set(state);
     }
 
+    /// Subscribe to state updates.
     pub fn subscribe(&self) -> Subscriber<State> {
         self.current.subscribe()
     }
@@ -97,7 +114,8 @@ impl StateMachine {
             }
 
             Running => {
-                // We haven't sync for a while so we should go back to recovering
+                // We haven't sync for a while, we go back to `Recovering` to avoid requesting
+                // potentially large data.
                 if self.last_sync_date.elapsed() > self.delay_before_recover {
                     set_all_rooms_to_selective_sync_mode(sliding_sync).await?;
                     Recovering
