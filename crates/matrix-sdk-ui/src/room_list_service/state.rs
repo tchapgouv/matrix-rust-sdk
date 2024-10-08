@@ -184,6 +184,7 @@ pub const ALL_ROOMS_DEFAULT_GROWING_BATCH_SIZE: u32 = 100;
 #[cfg(test)]
 mod tests {
     use matrix_sdk_test::async_test;
+    use tokio::time::sleep;
 
     use super::{super::tests::new_room_list, *};
 
@@ -199,7 +200,8 @@ mod tests {
             state_machine.set(State::Error { from: Box::new(state_machine.get()) });
 
             // Back to the previous state.
-            assert_eq!(state_machine.next(sliding_sync).await?, State::Init);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Init);
         }
 
         // Hypothetical termination.
@@ -207,18 +209,21 @@ mod tests {
             state_machine.set(State::Terminated { from: Box::new(state_machine.get()) });
 
             // Back to the previous state.
-            assert_eq!(state_machine.next(sliding_sync).await?, State::Init);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Init);
         }
 
         // Next state.
-        assert_eq!(state_machine.next(sliding_sync).await?, State::SettingUp);
+        state_machine.set(state_machine.next(sliding_sync).await?);
+        assert_eq!(state_machine.get(), State::SettingUp);
 
         // Hypothetical error.
         {
             state_machine.set(State::Error { from: Box::new(state_machine.get()) });
 
             // Back to the previous state.
-            assert_eq!(state_machine.next(sliding_sync).await?, State::SettingUp);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::SettingUp);
         }
 
         // Hypothetical termination.
@@ -226,21 +231,25 @@ mod tests {
             state_machine.set(State::Terminated { from: Box::new(state_machine.get()) });
 
             // Back to the previous state.
-            assert_eq!(state_machine.next(sliding_sync).await?, State::SettingUp);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::SettingUp);
         }
 
         // Next state.
-        assert_eq!(state_machine.next(sliding_sync).await?, State::Running);
+        state_machine.set(state_machine.next(sliding_sync).await?);
+        assert_eq!(state_machine.get(), State::Running);
 
         // Hypothetical error.
         {
             state_machine.set(State::Error { from: Box::new(state_machine.get()) });
 
             // Jump to the **recovering** state!
-            assert_eq!(state_machine.next(sliding_sync).await?, State::Recovering);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Recovering);
 
             // Now, back to the previous state.
-            assert_eq!(state_machine.next(sliding_sync).await?, State::Running);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
         }
 
         // Hypothetical termination.
@@ -248,10 +257,12 @@ mod tests {
             state_machine.set(State::Terminated { from: Box::new(state_machine.get()) });
 
             // Jump to the **recovering** state!
-            assert_eq!(state_machine.next(sliding_sync).await?, State::Recovering);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Recovering);
 
             // Now, back to the previous state.
-            assert_eq!(state_machine.next(sliding_sync).await?, State::Running);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
         }
 
         // Hypothetical error when recovering.
@@ -259,7 +270,8 @@ mod tests {
             state_machine.set(State::Error { from: Box::new(State::Recovering) });
 
             // Back to the previous state.
-            assert_eq!(state_machine.next(sliding_sync).await?, State::Recovering);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Recovering);
         }
 
         // Hypothetical termination when recovering.
@@ -267,7 +279,8 @@ mod tests {
             state_machine.set(State::Terminated { from: Box::new(State::Recovering) });
 
             // Back to the previous state.
-            assert_eq!(state_machine.next(sliding_sync).await?, State::Recovering);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Recovering);
         }
 
         Ok(())
@@ -279,21 +292,57 @@ mod tests {
         let sliding_sync = room_list.sliding_sync();
 
         let mut state_machine = StateMachine::new();
-        state_machine.delay_before_recover = Duration::from_millis(50);
+        state_machine.state_lifespan = Duration::from_millis(50);
 
-        assert_eq!(state_machine.next(sliding_sync).await?, State::SettingUp);
+        {
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::SettingUp);
 
-        assert_eq!(state_machine.next(sliding_sync).await?, State::Running);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
 
-        // We haven't reach `delay_before_recover` yet so should still be running
-        assert_eq!(state_machine.next(sliding_sync).await?, State::Running);
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
+        }
 
-        // `delay_before_recover` reached, time to recover
-        assert_eq!(state_machine.next(sliding_sync).await?, State::Recovering);
+        // Time passes.
+        sleep(Duration::from_millis(100)).await;
 
-        assert_eq!(state_machine.next(sliding_sync).await?, State::Running);
+        {
+            // Time has elapsed, time to recover.
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Recovering);
+
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
+
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
+
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
+        }
+
+        // Time passes, again. Just to test everything is going well.
+        sleep(Duration::from_millis(100)).await;
+
+        {
+            // Time has elapsed, time to recover.
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Recovering);
+
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
+
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
+
+            state_machine.set(state_machine.next(sliding_sync).await?);
+            assert_eq!(state_machine.get(), State::Running);
+        }
 
         Ok(())
     }
