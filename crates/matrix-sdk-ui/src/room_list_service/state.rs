@@ -16,6 +16,7 @@
 
 use std::{
     future::ready,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -50,8 +51,8 @@ pub enum State {
     Terminated { from: Box<State> },
 }
 
-/// Default value for `StateMachine::delay_before_recover`.
-const DEFAULT_DELAY_BEFORE_RECOVER: Duration = Duration::from_secs(1800);
+/// Default value for `StateMachine::state_lifespan`.
+const MAXIMUM_STATE_AGE: Duration = Duration::from_secs(1800);
 
 /// The state machine used to transition between the [`State`]s.
 #[derive(Clone, Debug)]
@@ -59,29 +60,31 @@ pub struct StateMachine {
     /// The current state of the `RoomListService`.
     state: SharedObservable<State>,
 
-    /// Last time a sync has happend.
+    /// Last time the state has been updated.
     ///
-    /// This information is useful when we want to go back to an initial state
-    /// if the last sync is too old, i.e. has happend too long ago. Why do we
-    /// need to do that? Because in some cases, the user might have received
-    /// many updates between two distant syncs. If the sliding sync list range
-    /// was too large, like 0..=499, the next sync is likely to be heavy and
-    /// potentially slow. In this case, it's preferable to jump back onto an
-    /// initial state, with a smaller range, so that the next sync will be
-    /// fast for the client.
-    last_sync_date: Instant,
+    /// When the state has not been updated since a long time, we want to enter
+    /// the [`State::Recovering`] state. Why do we need to do that? Because in
+    /// some cases, the user might have received many updates between two
+    /// distant syncs. If the sliding sync list range was too large, like
+    /// 0..=499, the next sync is likely to be heavy and potentially slow.
+    /// In this case, it's preferable to jump back onto `Recovering`, which will
+    /// reset the range, so that the next sync will be fast for the client.
+    ///
+    /// To be used in coordination with `Self::state_lifespan`.
+    last_state_update_time: Arc<Mutex<Instant>>,
 
-    /// To be used in coordination with `Self::last_sync_date`, it represents
-    /// the maximum time before considering the previous sync as “too old”.
-    delay_before_recover: Duration,
+    /// The maximum time before considering the state as “too old”.
+    ///
+    /// To be used in coordination with `Self::last_state_update_time`.
+    state_lifespan: Duration,
 }
 
 impl StateMachine {
     pub(super) fn new() -> Self {
         StateMachine {
             state: SharedObservable::new(State::Init),
-            last_sync_date: Instant::now(),
-            delay_before_recover: DEFAULT_DELAY_BEFORE_RECOVER,
+            last_state_update_time: Arc::new(Mutex::new(Instant::now())),
+            state_lifespan: MAXIMUM_STATE_AGE,
         }
     }
 
@@ -91,7 +94,12 @@ impl StateMachine {
     }
 
     /// Set the new state.
+    ///
+    /// Setting a new state will update `Self::last_state_update`.
     pub(super) fn set(&self, state: State) {
+        let mut last_state_update_time = self.last_state_update_time.lock().unwrap();
+        *last_state_update_time = Instant::now();
+
         self.state.set(state);
     }
 
@@ -114,10 +122,12 @@ impl StateMachine {
             }
 
             Running => {
-                // We haven't sync for a while, we go back to `Recovering` to avoid requesting
-                // potentially large data.
-                if self.last_sync_date.elapsed() > self.delay_before_recover {
+                // We haven't changed the state for a while, we go back to `Recovering` to avoid
+                // requesting potentially large data. See `Self::last_state_update` to learn
+                // the details.
+                if self.last_state_update_time.lock().unwrap().elapsed() > self.state_lifespan {
                     set_all_rooms_to_selective_sync_mode(sliding_sync).await?;
+
                     Recovering
                 } else {
                     Running
