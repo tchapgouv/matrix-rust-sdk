@@ -109,6 +109,16 @@ debug = 0
 quote = { opt-level = 2 }
 sha2 = { opt-level = 2 }
 
+# Custom profile for as fast as possible sdk builds
+[profile.bwibuild]
+inherits = "dev"
+opt-level = 1
+
+# Custom profile for as fast sdk builds with better debug info
+[profile.bwidbg]
+inherits = "bwibuild"
+debug = 2
+
 # Custom profile with full debugging info, use `--profile dbg` to select
 [profile.dbg]
 inherits = "dev"
