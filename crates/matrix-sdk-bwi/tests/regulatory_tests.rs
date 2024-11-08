@@ -14,4 +14,17 @@
  * limitations under the License.
  */
 
-pub mod regulatory;
+use matrix_sdk_bwi::regulatory::organization::BWIOrganization;
+
+const TEST_URL: &str = "example.com";
+
+#[tokio::test]
+async fn test_regulatory_from_well_known_file() {
+    let organization = BWIOrganization::from_homeserver_url(TEST_URL).await.unwrap();
+
+    let imprint_url = organization.get_imprint();
+    let privacy_policy_url = organization.get_data_privacy();
+
+    assert_eq!(imprint_url.as_url(), "https://www.bwi.de/impressum");
+    assert_eq!(privacy_policy_url.as_url(), "https://messenger.bwi.de/datenschutz-bundesmessenger");
+}

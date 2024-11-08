@@ -14,4 +14,20 @@
  * limitations under the License.
  */
 
-pub mod regulatory;
+pub trait BWIDataPrivacySource: Sync + Send {
+    fn get_data_privacy(&self) -> BWIDataPrivacy;
+}
+
+pub struct BWIDataPrivacy {
+    data_privacy_policy_url: String,
+}
+
+impl BWIDataPrivacy {
+    pub fn new(data_privacy_policy_url: &str) -> Self {
+        Self { data_privacy_policy_url: String::from(data_privacy_policy_url) }
+    }
+
+    pub fn as_url(&self) -> &str {
+        &self.data_privacy_policy_url
+    }
+}

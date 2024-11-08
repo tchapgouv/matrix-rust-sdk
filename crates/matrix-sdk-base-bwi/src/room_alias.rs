@@ -36,7 +36,7 @@ mod tests {
     #[test]
     fn alias_for_empty_string() {
         let room_name = "";
-        let alias = BWIRoomAlias::alias_for_room_name(&room_name.to_string());
+        let alias = BWIRoomAlias::alias_for_room_name(room_name);
         assert!(alias.parse::<u128>().is_ok());
         assert!(alias.len() > 10);
     }
@@ -44,14 +44,14 @@ mod tests {
     #[test]
     fn alias_for_lowercase_string() {
         let room_name = "abc123def";
-        let alias = BWIRoomAlias::alias_for_room_name(&room_name.to_string());
+        let alias = BWIRoomAlias::alias_for_room_name(room_name);
         assert!(alias.starts_with(room_name));
     }
 
     #[test]
     fn alias_for_uppercase_string() {
         let room_name = "AbC123dEf";
-        let alias = BWIRoomAlias::alias_for_room_name(&room_name.to_string());
+        let alias = BWIRoomAlias::alias_for_room_name(room_name);
         let room_name_lowercase = room_name.to_lowercase();
         assert!(alias.starts_with(room_name_lowercase.as_str()));
     }
@@ -61,7 +61,7 @@ mod tests {
         let room_name = "AbC123dEf";
         let special_chars = "Öü$";
         let room_name_with_special_chars = special_chars.to_owned() + room_name;
-        let alias = BWIRoomAlias::alias_for_room_name(&room_name_with_special_chars.to_string());
+        let alias = BWIRoomAlias::alias_for_room_name(&room_name_with_special_chars);
         let room_name_lowercase = room_name.to_lowercase();
         assert!(alias.starts_with(room_name_lowercase.as_str()));
     }

@@ -14,4 +14,7 @@
  * limitations under the License.
  */
 
-pub mod regulatory;
+pub mod data_privacy;
+pub mod imprint;
+pub mod organization;
+pub mod well_known_file;
