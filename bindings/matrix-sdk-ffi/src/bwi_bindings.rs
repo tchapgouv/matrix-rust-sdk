@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use crate::bwi_bindings::PasswordStrength::{Strong, Weak};
 use crate::error::ClientError;
 use crate::error::ClientError::Generic;
 use matrix_sdk_bwi::regulatory::organization::BWIOrganization;
@@ -40,4 +41,19 @@ pub async fn get_data_privacy_as_url(homeserver_url: &str) -> Result<String, Cli
             ),
         })?;
     Ok(String::from(organization.get_data_privacy().as_url()))
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum PasswordStrength {
+    Weak,
+    Medium,
+    Strong,
+}
+
+pub fn get_password_strength(password: &str) -> PasswordStrength {
+    if password.is_empty() {
+        Weak
+    } else {
+        Strong
+    }
 }
