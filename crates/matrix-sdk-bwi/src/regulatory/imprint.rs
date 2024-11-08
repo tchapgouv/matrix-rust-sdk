@@ -14,4 +14,20 @@
  * limitations under the License.
  */
 
-pub mod regulatory;
+pub struct BWIImprint {
+    imprint_url: String,
+}
+
+pub trait BWIImprintSource: Sync + Send {
+    fn get_imprint(&self) -> BWIImprint;
+}
+
+impl BWIImprint {
+    pub fn new(imprint_url: &str) -> Self {
+        Self { imprint_url: String::from(imprint_url) }
+    }
+
+    pub fn as_url(&self) -> &str {
+        &self.imprint_url
+    }
+}

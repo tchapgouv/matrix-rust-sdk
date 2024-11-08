@@ -21,7 +21,9 @@ macro_rules! unwrap_or_clone_arc_into_variant {
 }
 
 mod authentication;
-
+/// BWI extension for exposing api calls
+mod bwi_bindings;
+/// BWI end
 mod chunk_iterator;
 mod client;
 mod client_builder;
