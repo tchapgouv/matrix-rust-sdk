@@ -18,6 +18,7 @@ uniffi = { workspace = true, optional = true }
 thiserror = "1.0.63"
 anyhow = "1.0.86"
 url = "2.5.2"
+zxcvbn = { workspace = true }
 
 [lints]
 workspace = true

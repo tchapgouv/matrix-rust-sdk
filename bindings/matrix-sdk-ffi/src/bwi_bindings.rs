@@ -13,10 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-use crate::bwi_bindings::PasswordStrength::{Strong, Weak};
+use crate::bwi_bindings::PasswordStrength::{Medium, Strong, Weak};
 use crate::error::ClientError;
 use crate::error::ClientError::Generic;
+use matrix_sdk_bwi::password_evaluator::{BWIPasswordEvaluator, BWIPasswordStrength};
 use matrix_sdk_bwi::regulatory::organization::BWIOrganization;
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -50,10 +50,12 @@ pub enum PasswordStrength {
     Strong,
 }
 
+#[uniffi::export]
 pub fn get_password_strength(password: &str) -> PasswordStrength {
-    if password.is_empty() {
-        Weak
-    } else {
-        Strong
+    let pwd_strength = BWIPasswordEvaluator::get_password_strength(password);
+    match pwd_strength {
+        BWIPasswordStrength::Weak => Weak,
+        BWIPasswordStrength::Medium => Medium,
+        BWIPasswordStrength::Strong => Strong,
     }
 }

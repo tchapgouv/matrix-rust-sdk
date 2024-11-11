@@ -14,4 +14,5 @@
  * limitations under the License.
  */
 
+pub mod password_evaluator;
 pub mod regulatory;
