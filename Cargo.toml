@@ -80,6 +80,7 @@ url = "2.5.0"
 vodozemac = { version = "0.7.0" }
 wiremock = "0.6.0"
 zeroize = "1.6.0"
+zxcvbn = "3.1.0"
 
 matrix-sdk = { path = "crates/matrix-sdk", version = "0.7.0", default-features = false }
 matrix-sdk-bwi = { path = "crates/matrix-sdk-bwi", version = "0.1.0", default-features = false }
