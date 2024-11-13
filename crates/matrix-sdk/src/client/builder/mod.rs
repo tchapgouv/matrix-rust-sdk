@@ -29,7 +29,7 @@ use tracing::{debug, field::debug, instrument, Span};
 
 use super::{Client, ClientInner};
 #[cfg(feature = "e2e-encryption")]
-use crate::crypto::CollectStrategy;
+use crate::crypto::{CollectStrategy, TrustRequirement};
 #[cfg(feature = "e2e-encryption")]
 use crate::encryption::EncryptionSettings;
 #[cfg(not(target_arch = "wasm32"))]
@@ -99,6 +99,8 @@ pub struct ClientBuilder {
     encryption_settings: EncryptionSettings,
     #[cfg(feature = "e2e-encryption")]
     room_key_recipient_strategy: CollectStrategy,
+    #[cfg(feature = "e2e-encryption")]
+    decryption_trust_requirement: TrustRequirement,
 }
 
 impl ClientBuilder {
@@ -118,6 +120,8 @@ impl ClientBuilder {
             encryption_settings: Default::default(),
             #[cfg(feature = "e2e-encryption")]
             room_key_recipient_strategy: Default::default(),
+            #[cfg(feature = "e2e-encryption")]
+            decryption_trust_requirement: TrustRequirement::Untrusted,
         }
     }
 
@@ -204,6 +208,7 @@ impl ClientBuilder {
             path: path.as_ref().to_owned(),
             cache_path: None,
             passphrase: passphrase.map(ToOwned::to_owned),
+            event_cache_store_lock_holder: "matrix-sdk".to_owned(),
         };
         self
     }
@@ -221,6 +226,7 @@ impl ClientBuilder {
             path: path.as_ref().to_owned(),
             cache_path: Some(cache_path.as_ref().to_owned()),
             passphrase: passphrase.map(ToOwned::to_owned),
+            event_cache_store_lock_holder: "matrix-sdk".to_owned(),
         };
         self
     }
@@ -231,6 +237,7 @@ impl ClientBuilder {
         self.store_config = BuilderStoreConfig::IndexedDb {
             name: name.to_owned(),
             passphrase: passphrase.map(ToOwned::to_owned),
+            event_cache_store_lock_holder: "matrix-sdk".to_owned(),
         };
         self
     }
@@ -407,6 +414,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the trust requirement to be used when decrypting events.
+    #[cfg(feature = "e2e-encryption")]
+    pub fn with_decryption_trust_requirement(
+        mut self,
+        trust_requirement: TrustRequirement,
+    ) -> Self {
+        self.decryption_trust_requirement = trust_requirement;
+        self
+    }
+
     /// Create a [`Client`] with the options set on this builder.
     ///
     /// # Errors
@@ -445,6 +462,7 @@ impl ClientBuilder {
             #[cfg(feature = "e2e-encryption")]
             {
                 client.room_key_recipient_strategy = self.room_key_recipient_strategy;
+                client.decryption_trust_requirement = self.decryption_trust_requirement;
             }
             client
         };
@@ -536,7 +554,12 @@ async fn build_store_config(
     #[allow(clippy::infallible_destructuring_match)]
     let store_config = match builder_config {
         #[cfg(feature = "sqlite")]
-        BuilderStoreConfig::Sqlite { path, cache_path, passphrase } => {
+        BuilderStoreConfig::Sqlite {
+            path,
+            cache_path,
+            passphrase,
+            event_cache_store_lock_holder,
+        } => {
             let store_config = StoreConfig::new()
                 .state_store(
                     matrix_sdk_sqlite::SqliteStateStore::open(&path, passphrase.as_deref()).await?,
@@ -547,6 +570,8 @@ async fn build_store_config(
                         passphrase.as_deref(),
                     )
                     .await?,
+                    "default-key".to_owned(),
+                    event_cache_store_lock_holder,
                 );
 
             #[cfg(feature = "e2e-encryption")]
@@ -558,8 +583,13 @@ async fn build_store_config(
         }
 
         #[cfg(feature = "indexeddb")]
-        BuilderStoreConfig::IndexedDb { name, passphrase } => {
-            build_indexeddb_store_config(&name, passphrase.as_deref()).await?
+        BuilderStoreConfig::IndexedDb { name, passphrase, event_cache_store_lock_holder } => {
+            build_indexeddb_store_config(
+                &name,
+                passphrase.as_deref(),
+                event_cache_store_lock_holder,
+            )
+            .await?
         }
 
         BuilderStoreConfig::Custom(config) => config,
@@ -573,6 +603,7 @@ async fn build_store_config(
 async fn build_indexeddb_store_config(
     name: &str,
     passphrase: Option<&str>,
+    event_cache_store_lock_holder: String,
 ) -> Result<StoreConfig, ClientBuildError> {
     #[cfg(feature = "e2e-encryption")]
     let store_config = {
@@ -589,7 +620,11 @@ async fn build_indexeddb_store_config(
 
     let store_config = {
         tracing::warn!("The IndexedDB backend does not implement an event cache store, falling back to the in-memory event cache store…");
-        store_config.event_cache_store(matrix_sdk_base::event_cache_store::MemoryStore::new())
+        store_config.event_cache_store(
+            matrix_sdk_base::event_cache_store::MemoryStore::new(),
+            "default-key".to_owned(),
+            event_cache_store_lock_holder,
+        )
     };
 
     Ok(store_config)
@@ -599,6 +634,7 @@ async fn build_indexeddb_store_config(
 async fn build_indexeddb_store_config(
     _name: &str,
     _passphrase: Option<&str>,
+    _event_cache_store_lock_holder: String,
 ) -> Result<StoreConfig, ClientBuildError> {
     panic!("the IndexedDB is only available on the 'wasm32' arch")
 }
@@ -643,11 +679,13 @@ enum BuilderStoreConfig {
         path: std::path::PathBuf,
         cache_path: Option<std::path::PathBuf>,
         passphrase: Option<String>,
+        event_cache_store_lock_holder: String,
     },
     #[cfg(feature = "indexeddb")]
     IndexedDb {
         name: String,
         passphrase: Option<String>,
+        event_cache_store_lock_holder: String,
     },
     Custom(StoreConfig),
 }
@@ -707,19 +745,6 @@ pub enum ClientBuildError {
     #[cfg(feature = "sqlite")]
     #[error(transparent)]
     SqliteStore(#[from] matrix_sdk_sqlite::OpenStoreError),
-}
-
-impl ClientBuildError {
-    /// Assert that a valid homeserver URL was given to the builder and no other
-    /// invalid options were specified, which means the only possible error
-    /// case is [`Self::Http`].
-    #[doc(hidden)]
-    pub fn assert_valid_builder_args(self) -> HttpError {
-        match self {
-            ClientBuildError::Http(e) => e,
-            _ => unreachable!("homeserver URL was asserted to be valid"),
-        }
-    }
 }
 
 // The http mocking library is not supported for wasm32
@@ -1029,6 +1054,37 @@ pub(crate) mod tests {
 
         // Then, sliding sync has the correct native version.
         assert_matches!(client.sliding_sync_version(), SlidingSyncVersion::Native);
+    }
+
+    #[async_test]
+    #[cfg(feature = "e2e-encryption")]
+    async fn test_set_up_decryption_trust_requirement_cross_signed() {
+        let homeserver = make_mock_homeserver().await;
+        let builder = ClientBuilder::new()
+            .server_name_or_homeserver_url(homeserver.uri())
+            .with_decryption_trust_requirement(TrustRequirement::CrossSigned);
+
+        let client = builder.build().await.unwrap();
+        assert_matches!(
+            client.base_client().decryption_trust_requirement,
+            TrustRequirement::CrossSigned
+        );
+    }
+
+    #[async_test]
+    #[cfg(feature = "e2e-encryption")]
+    async fn test_set_up_decryption_trust_requirement_untrusted() {
+        let homeserver = make_mock_homeserver().await;
+
+        let builder = ClientBuilder::new()
+            .server_name_or_homeserver_url(homeserver.uri())
+            .with_decryption_trust_requirement(TrustRequirement::Untrusted);
+
+        let client = builder.build().await.unwrap();
+        assert_matches!(
+            client.base_client().decryption_trust_requirement,
+            TrustRequirement::Untrusted
+        );
     }
 
     /* Helper functions */

@@ -14,6 +14,7 @@
 
 use std::future::Future;
 
+use eyeball::Subscriber;
 use futures_util::FutureExt as _;
 use indexmap::IndexMap;
 #[cfg(test)]
@@ -22,7 +23,7 @@ use matrix_sdk::{
     deserialized_responses::TimelineEvent, event_cache::paginator::PaginableRoom, BoxFuture,
     Result, Room,
 };
-use matrix_sdk_base::latest_event::LatestEvent;
+use matrix_sdk_base::{latest_event::LatestEvent, RoomInfo};
 use ruma::{
     events::{
         fully_read::FullyReadEventContent,
@@ -35,7 +36,7 @@ use ruma::{
 };
 use tracing::{debug, error};
 
-use super::{Profile, TimelineBuilder};
+use super::{Profile, RedactError, TimelineBuilder};
 use crate::timeline::{self, pinned_events_loader::PinnedEventsRoom, Timeline};
 
 pub trait RoomExt {
@@ -107,6 +108,8 @@ pub(super) trait RoomDataProvider:
         reason: Option<&'a str>,
         transaction_id: Option<OwnedTransactionId>,
     ) -> BoxFuture<'a, Result<(), super::Error>>;
+
+    fn room_info(&self) -> Subscriber<RoomInfo>;
 }
 
 impl RoomDataProvider for Room {
@@ -266,10 +269,15 @@ impl RoomDataProvider for Room {
             let _ = self
                 .redact(event_id, reason, transaction_id)
                 .await
+                .map_err(RedactError::HttpError)
                 .map_err(super::Error::RedactError)?;
             Ok(())
         }
         .boxed()
+    }
+
+    fn room_info(&self) -> Subscriber<RoomInfo> {
+        self.subscribe_info()
     }
 }
 
@@ -296,6 +304,6 @@ impl Decryptor for (matrix_sdk_base::crypto::OlmMachine, ruma::OwnedRoomId) {
             DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
         let event =
             olm_machine.decrypt_room_event(raw.cast_ref(), room_id, &decryption_settings).await?;
-        Ok(event)
+        Ok(event.into())
     }
 }

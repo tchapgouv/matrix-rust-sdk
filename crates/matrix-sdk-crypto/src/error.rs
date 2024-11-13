@@ -27,7 +27,7 @@ use crate::{
     types::{events::room_key_withheld::WithheldCode, SignedKey},
 };
 #[cfg(doc)]
-use crate::{CollectStrategy, Device, LocalTrust, UserIdentity};
+use crate::{CollectStrategy, Device, LocalTrust, OtherUserIdentity};
 
 pub type OlmResult<T> = Result<T, OlmError>;
 pub type MegolmResult<T> = Result<T, MegolmError>;
@@ -120,6 +120,8 @@ pub enum MegolmError {
     /// An encrypted message wasn't decrypted, because the sender's
     /// cross-signing identity did not satisfy the requested
     /// [`crate::TrustRequirement`].
+    ///
+    /// The nested value is the sender's current verification level.
     #[error("decryption failed because trust requirement not satisfied: {0}")]
     SenderIdentityNotTrusted(VerificationLevel),
 }
@@ -303,13 +305,6 @@ pub enum SessionCreationError {
     )]
     OneTimeKeyMissing(OwnedUserId, OwnedDeviceId),
 
-    /// The one-time key algorithm is unsupported.
-    #[error(
-        "Tried to create a new Olm session for {0} {1}, but the one-time \
-        key algorithm is unsupported"
-    )]
-    OneTimeKeyUnknown(OwnedUserId, OwnedDeviceId),
-
     /// Failed to verify the one-time key signatures.
     #[error(
         "Failed to verify the signature of a one-time key, key: {one_time_key:?}, \
@@ -405,7 +400,7 @@ pub enum SessionRecipientCollectionError {
     /// * re-verify the problematic recipients, or
     ///
     /// * withdraw verification of the problematic recipients with
-    ///   [`UserIdentity::withdraw_verification`], or
+    ///   [`OtherUserIdentity::withdraw_verification`], or
     ///
     /// * set the trust level of all of the devices belonging to the problematic
     ///   recipients to [`LocalTrust::Ignored`] or [`LocalTrust::BlackListed`]

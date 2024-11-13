@@ -15,7 +15,7 @@
 // limitations under the License.
 
 use matrix_sdk_base::{
-    media::{MediaFormat, MediaRequest},
+    media::{MediaFormat, MediaRequestParameters},
     store::StateStoreExt,
     StateStoreDataKey, StateStoreDataValue,
 };
@@ -217,7 +217,7 @@ impl Account {
     /// ```
     pub async fn get_avatar(&self, format: MediaFormat) -> Result<Option<Vec<u8>>> {
         if let Some(url) = self.get_avatar_url().await? {
-            let request = MediaRequest { source: MediaSource::Plain(url), format };
+            let request = MediaRequestParameters { source: MediaSource::Plain(url), format };
             Ok(Some(self.client.media().get_media_content(&request, true).await?))
         } else {
             Ok(None)
@@ -360,6 +360,9 @@ impl Account {
     ///   information for the interactive auth and the same request needs to be
     ///   made but this time with some `auth_data` provided.
     ///
+    /// * `erase` - Whether the user would like their content to be erased as
+    ///   much as possible from the server.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -376,7 +379,7 @@ impl Account {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let client = Client::new(homeserver).await?;
     /// # let account = client.account();
-    /// let response = account.deactivate(None, None).await;
+    /// let response = account.deactivate(None, None, false).await;
     ///
     /// // Proceed with UIAA.
     /// # anyhow::Ok(()) };
@@ -388,10 +391,12 @@ impl Account {
         &self,
         id_server: Option<&str>,
         auth_data: Option<AuthData>,
+        erase_data: bool,
     ) -> Result<deactivate::v3::Response> {
         let request = assign!(deactivate::v3::Request::new(), {
             id_server: id_server.map(ToOwned::to_owned),
             auth: auth_data,
+            erase: erase_data,
         });
         Ok(self.client.send(request, None).await?)
     }

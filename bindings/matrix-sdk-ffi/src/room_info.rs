@@ -11,6 +11,7 @@ use crate::{
 #[derive(uniffi::Record)]
 pub struct RoomInfo {
     id: String,
+    creator: Option<String>,
     /// The room's name from the room state event if received from sync, or one
     /// that's been computed otherwise.
     display_name: Option<String>,
@@ -66,10 +67,12 @@ impl RoomInfo {
         for (id, level) in power_levels_map.iter() {
             user_power_levels.insert(id.to_string(), *level);
         }
-        let pinned_event_ids = room.pinned_event_ids().iter().map(|id| id.to_string()).collect();
+        let pinned_event_ids =
+            room.pinned_event_ids().unwrap_or_default().iter().map(|id| id.to_string()).collect();
 
         Ok(Self {
             id: room.room_id().to_string(),
+            creator: room.creator().as_ref().map(ToString::to_string),
             display_name: room.cached_display_name().map(|name| name.to_string()),
             raw_name: room.name(),
             topic: room.topic(),
@@ -88,7 +91,10 @@ impl RoomInfo {
                     .await
                     .ok()
                     .and_then(|details| details.inviter)
-                    .map(Into::into),
+                    .map(TryInto::try_into)
+                    .transpose()
+                    .ok()
+                    .flatten(),
                 _ => None,
             },
             heroes: room.heroes().into_iter().map(Into::into).collect(),

@@ -18,7 +18,10 @@ use as_variant::as_variant;
 use eyeball_im::{ObservableVectorTransaction, ObservableVectorTransactionEntry};
 use indexmap::IndexMap;
 use matrix_sdk::{
-    crypto::types::events::UtdCause, deserialized_responses::EncryptionInfo, send_queue::SendHandle,
+    crypto::types::events::UtdCause,
+    deserialized_responses::{EncryptionInfo, UnableToDecryptInfo},
+    ring_buffer::RingBuffer,
+    send_queue::SendHandle,
 };
 use ruma::{
     events::{
@@ -34,6 +37,7 @@ use ruma::{
         receipt::Receipt,
         relation::Replacement,
         room::{
+            encrypted::RoomEncryptedEventContent,
             member::RoomMemberEventContent,
             message::{self, RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
         },
@@ -41,25 +45,25 @@ use ruma::{
         AnySyncTimelineEvent, BundledMessageLikeRelations, EventContent, FullStateEventContent,
         MessageLikeEventType, StateEventType, SyncStateEvent,
     },
-    html::RemoveReplyFallback,
     serde::Raw,
-    MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId, RoomVersionId,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
+    RoomVersionId,
 };
 use tracing::{debug, error, field::debug, info, instrument, trace, warn};
 
 use super::{
-    controller::{TimelineMetadata, TimelineStateTransaction},
+    controller::{PendingEditKind, TimelineMetadata, TimelineStateTransaction},
     day_dividers::DayDividerAdjuster,
     event_item::{
+        extract_bundled_edit_event_json, extract_poll_edit_content, extract_room_msg_edit_content,
         AnyOtherFullStateEventContent, EventSendState, EventTimelineItemKind,
-        LocalEventTimelineItem, Profile, ReactionsByKeyBySender, RemoteEventOrigin,
+        LocalEventTimelineItem, PollState, Profile, ReactionsByKeyBySender, RemoteEventOrigin,
         RemoteEventTimelineItem, TimelineEventItemId,
     },
-    polls::PollState,
     reactions::FullReactionKey,
     util::{rfind_event_by_id, rfind_event_item},
-    EventTimelineItem, InReplyToDetails, Message, OtherState, Sticker, TimelineDetails,
-    TimelineItem, TimelineItemContent,
+    EventTimelineItem, InReplyToDetails, OtherState, Sticker, TimelineDetails, TimelineItem,
+    TimelineItemContent,
 };
 use crate::{
     events::SyncTimelineEventWithoutContent,
@@ -67,8 +71,8 @@ use crate::{
         controller::PendingEdit,
         event_item::{ReactionInfo, ReactionStatus},
         reactions::PendingReaction,
+        RepliedToEvent,
     },
-    DEFAULT_SANITIZER_MODE,
 };
 
 /// When adding an event, useful information related to the source of the event.
@@ -99,6 +103,18 @@ pub(super) enum Flow {
     },
 }
 
+impl Flow {
+    /// If the flow is remote, returns the associated event id.
+    pub(crate) fn event_id(&self) -> Option<&EventId> {
+        as_variant!(self, Flow::Remote { event_id, .. } => event_id)
+    }
+
+    /// If the flow is remote, returns the associated full raw event.
+    pub(crate) fn raw_event(&self) -> Option<&Raw<AnySyncTimelineEvent>> {
+        as_variant!(self, Flow::Remote { raw_event, .. } => raw_event)
+    }
+}
+
 pub(super) struct TimelineEventContext {
     pub(super) sender: OwnedUserId,
     pub(super) sender_profile: Option<Profile>,
@@ -122,6 +138,12 @@ pub(super) enum TimelineEventKind {
     Message {
         content: AnyMessageLikeEventContent,
         relations: BundledMessageLikeRelations<AnySyncMessageLikeEvent>,
+    },
+
+    /// An encrypted event that could not be decrypted
+    UnableToDecrypt {
+        content: RoomEncryptedEventContent,
+        unable_to_decrypt_info: UnableToDecryptInfo,
     },
 
     /// Some remote event that was redacted a priori, i.e. we never had the
@@ -159,7 +181,11 @@ pub(super) enum TimelineEventKind {
 
 impl TimelineEventKind {
     /// Creates a new `TimelineEventKind` with the given event and room version.
-    pub fn from_event(event: AnySyncTimelineEvent, room_version: &RoomVersionId) -> Self {
+    pub fn from_event(
+        event: AnySyncTimelineEvent,
+        room_version: &RoomVersionId,
+        unable_to_decrypt_info: Option<UnableToDecryptInfo>,
+    ) -> Self {
         match event {
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(ev)) => {
                 if let Some(redacts) = ev.redacts(room_version).map(ToOwned::to_owned) {
@@ -169,6 +195,22 @@ impl TimelineEventKind {
                 }
             }
             AnySyncTimelineEvent::MessageLike(ev) => match ev.original_content() {
+                Some(AnyMessageLikeEventContent::RoomEncrypted(content)) => {
+                    // An event which is still encrypted.
+                    if let Some(unable_to_decrypt_info) = unable_to_decrypt_info {
+                        Self::UnableToDecrypt { content, unable_to_decrypt_info }
+                    } else {
+                        // If we get here, it means that some part of the code has created a
+                        // `SyncTimelineEvent` containing an `m.room.encrypted` event
+                        // without decrypting it. Possibly this means that encryption has not been
+                        // configured.
+                        // We treat it the same as any other message-like event.
+                        Self::Message {
+                            content: AnyMessageLikeEventContent::RoomEncrypted(content),
+                            relations: ev.relations(),
+                        }
+                    }
+                }
                 Some(content) => Self::Message { content, relations: ev.relations() },
                 None => Self::RedactedMessage { event_type: ev.event_type() },
             },
@@ -233,10 +275,11 @@ pub(super) enum TimelineItemPosition {
     /// recent).
     End { origin: RemoteEventOrigin },
 
-    /// A single item is updated.
+    /// A single item is updated, after it's been successfully decrypted.
     ///
-    /// This only happens when a UTD must be replaced with the decrypted event.
-    Update(usize),
+    /// This happens when an item that was a UTD must be replaced with the
+    /// decrypted event.
+    UpdateDecrypted(usize),
 }
 
 /// The outcome of handling a single event with
@@ -289,7 +332,6 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         mut self,
         day_divider_adjuster: &mut DayDividerAdjuster,
         event_kind: TimelineEventKind,
-        raw_event: Option<&Raw<AnySyncTimelineEvent>>,
     ) -> HandleEventResult {
         let span = tracing::Span::current();
 
@@ -328,27 +370,13 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
                 AnyMessageLikeEventContent::RoomMessage(c) => {
                     if should_add {
-                        self.add_item(TimelineItemContent::message(c, relations, self.items));
-                    }
-                }
-
-                AnyMessageLikeEventContent::RoomEncrypted(c) => {
-                    // TODO: Handle replacements if the replaced event is also UTD
-                    let cause = UtdCause::determine(raw_event);
-                    self.add_item(TimelineItemContent::unable_to_decrypt(c, cause));
-
-                    // Let the hook know that we ran into an unable-to-decrypt that is added to the
-                    // timeline.
-                    if let Some(hook) = self.meta.unable_to_decrypt_hook.as_ref() {
-                        if let Flow::Remote { event_id, .. } = &self.ctx.flow {
-                            hook.on_utd(event_id, cause).await;
-                        }
+                        self.handle_room_message(c, relations);
                     }
                 }
 
                 AnyMessageLikeEventContent::Sticker(content) => {
                     if should_add {
-                        self.add_item(TimelineItemContent::Sticker(Sticker { content }));
+                        self.add_item(TimelineItemContent::Sticker(Sticker { content }), None);
                     }
                 }
 
@@ -358,7 +386,11 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
                 AnyMessageLikeEventContent::UnstablePollStart(
                     UnstablePollStartEventContent::New(c),
-                ) => self.handle_poll_start(c, should_add),
+                ) => {
+                    if should_add {
+                        self.handle_poll_start(c, relations)
+                    }
+                }
 
                 AnyMessageLikeEventContent::UnstablePollResponse(c) => self.handle_poll_response(c),
 
@@ -366,13 +398,13 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
                 AnyMessageLikeEventContent::CallInvite(_) => {
                     if should_add {
-                        self.add_item(TimelineItemContent::CallInvite);
+                        self.add_item(TimelineItemContent::CallInvite, None);
                     }
                 }
 
                 AnyMessageLikeEventContent::CallNotify(_) => {
                     if should_add {
-                        self.add_item(TimelineItemContent::CallNotify)
+                        self.add_item(TimelineItemContent::CallNotify, None)
                     }
                 }
 
@@ -385,9 +417,24 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 }
             },
 
+            TimelineEventKind::UnableToDecrypt { content, unable_to_decrypt_info } => {
+                // TODO: Handle replacements if the replaced event is also UTD
+                let raw_event = self.ctx.flow.raw_event();
+                let cause = UtdCause::determine(raw_event, &unable_to_decrypt_info);
+                self.add_item(TimelineItemContent::unable_to_decrypt(content, cause), None);
+
+                // Let the hook know that we ran into an unable-to-decrypt that is added to the
+                // timeline.
+                if let Some(hook) = self.meta.unable_to_decrypt_hook.as_ref() {
+                    if let Some(event_id) = &self.ctx.flow.event_id() {
+                        hook.on_utd(event_id, cause).await;
+                    }
+                }
+            }
+
             TimelineEventKind::RedactedMessage { event_type } => {
                 if event_type != MessageLikeEventType::Reaction && should_add {
-                    self.add_item(TimelineItemContent::RedactedMessage);
+                    self.add_item(TimelineItemContent::RedactedMessage, None);
                 }
             }
 
@@ -397,35 +444,36 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
             TimelineEventKind::RoomMember { user_id, content, sender } => {
                 if should_add {
-                    self.add_item(TimelineItemContent::room_member(user_id, content, sender));
+                    self.add_item(TimelineItemContent::room_member(user_id, content, sender), None);
                 }
             }
 
             TimelineEventKind::OtherState { state_key, content } => {
+                // Update room encryption if a `m.room.encryption` event is found in the
+                // timeline
                 if should_add {
-                    self.add_item(TimelineItemContent::OtherState(OtherState {
-                        state_key,
-                        content,
-                    }));
+                    self.add_item(
+                        TimelineItemContent::OtherState(OtherState { state_key, content }),
+                        None,
+                    );
                 }
             }
 
             TimelineEventKind::FailedToParseMessageLike { event_type, error } => {
                 if should_add {
-                    self.add_item(TimelineItemContent::FailedToParseMessageLike {
-                        event_type,
-                        error,
-                    });
+                    self.add_item(
+                        TimelineItemContent::FailedToParseMessageLike { event_type, error },
+                        None,
+                    );
                 }
             }
 
             TimelineEventKind::FailedToParseState { event_type, state_key, error } => {
                 if should_add {
-                    self.add_item(TimelineItemContent::FailedToParseState {
-                        event_type,
-                        state_key,
-                        error,
-                    });
+                    self.add_item(
+                        TimelineItemContent::FailedToParseState { event_type, state_key, error },
+                        None,
+                    );
                 }
             }
         }
@@ -433,7 +481,8 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         if !self.result.item_added {
             trace!("No new item added");
 
-            if let Flow::Remote { position: TimelineItemPosition::Update(idx), .. } = self.ctx.flow
+            if let Flow::Remote { position: TimelineItemPosition::UpdateDecrypted(idx), .. } =
+                self.ctx.flow
             {
                 // If add was not called, that means the UTD event is one that
                 // wouldn't normally be visible. Remove it.
@@ -449,20 +498,69 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         self.result
     }
 
+    /// Handles a new room message by adding it to the timeline.
+    #[instrument(skip_all)]
+    fn handle_room_message(
+        &mut self,
+        msg: RoomMessageEventContent,
+        relations: BundledMessageLikeRelations<AnySyncMessageLikeEvent>,
+    ) {
+        // Always remove the pending edit, if there's any. The reason is that if
+        // there's an edit in the relations mapping, we want to prefer it over any
+        // other pending edit, since it's more likely to be up to date, and we
+        // don't want to apply another pending edit on top of it.
+        let pending_edit = self
+            .ctx
+            .flow
+            .event_id()
+            .and_then(|event_id| {
+                Self::maybe_unstash_pending_edit(&mut self.meta.pending_edits, event_id)
+            })
+            .and_then(|edit| match edit.kind {
+                PendingEditKind::RoomMessage(replacement) => {
+                    Some((Some(edit.event_json), replacement.new_content))
+                }
+                _ => None,
+            });
+
+        let (edit_json, edit_content) = extract_room_msg_edit_content(relations)
+            .map(|content| {
+                let edit_json = self.ctx.flow.raw_event().and_then(extract_bundled_edit_event_json);
+                (edit_json, content)
+            })
+            .or(pending_edit)
+            .unzip();
+
+        let edit_json = edit_json.flatten();
+
+        self.add_item(TimelineItemContent::message(msg, edit_content, self.items), edit_json);
+    }
+
     #[instrument(skip_all, fields(replacement_event_id = ?replacement.event_id))]
     fn handle_room_message_edit(
         &mut self,
         replacement: Replacement<RoomMessageEventContentWithoutRelation>,
     ) {
         if let Some((item_pos, item)) = rfind_event_by_id(self.items, &replacement.event_id) {
-            if let Some(new_item) = self.apply_msg_edit(&item, replacement) {
+            let edit_json = self.ctx.flow.raw_event().cloned();
+            if let Some(new_item) = self.apply_msg_edit(&item, replacement.new_content, edit_json) {
                 trace!("Applied edit");
-                self.items.set(item_pos, TimelineItem::new(new_item, item.internal_id.to_owned()));
+
+                let internal_id = item.internal_id.to_owned();
+
+                // Update all events that replied to this message with the edited content.
+                Self::maybe_update_responses(self.items, &replacement.event_id, &new_item);
+
+                // Update the event itself.
+                self.items.set(item_pos, TimelineItem::new(new_item, internal_id));
                 self.result.items_updated += 1;
             }
-        } else if let Flow::Remote { position, .. } = &self.ctx.flow {
+        } else if let Flow::Remote { position, raw_event, .. } = &self.ctx.flow {
             let replaced_event_id = replacement.event_id.clone();
-            let replacement = PendingEdit::RoomMessage(replacement);
+            let replacement = PendingEdit {
+                kind: PendingEditKind::RoomMessage(replacement),
+                event_json: raw_event.clone(),
+            };
             self.stash_pending_edit(*position, replaced_event_id, replacement);
         } else {
             debug!("Local message edit for a timeline item not found, discarding");
@@ -470,6 +568,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
     }
 
     /// Try to stash a pending edit, if it makes sense to do so.
+    #[instrument(skip(self, replacement))]
     fn stash_pending_edit(
         &mut self,
         position: TimelineItemPosition,
@@ -477,7 +576,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         replacement: PendingEdit,
     ) {
         match position {
-            TimelineItemPosition::Start { .. } | TimelineItemPosition::Update(_) => {
+            TimelineItemPosition::Start { .. } | TimelineItemPosition::UpdateDecrypted(_) => {
                 // Only insert the edit if there wasn't any other edit
                 // before.
                 //
@@ -492,9 +591,9 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                     .meta
                     .pending_edits
                     .iter()
-                    .any(|(event_id, _)| *event_id == replaced_event_id)
+                    .any(|edit| edit.edited_event() == replaced_event_id)
                 {
-                    self.meta.pending_edits.push((replaced_event_id, replacement));
+                    self.meta.pending_edits.push(replacement);
                     debug!("Timeline item not found, stashing edit");
                 } else {
                     debug!("Timeline item not found, but there was a previous edit for the event: discarding");
@@ -506,46 +605,22 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 // forward-pagination: it's fine to overwrite the previous one, if
                 // available.
                 let edits = &mut self.meta.pending_edits;
-                if let Some(pos) =
-                    edits.iter().position(|(event_id, _)| *event_id == replaced_event_id)
-                {
-                    edits.remove(pos);
-                }
-                edits.push((replaced_event_id, replacement));
+                let _ = Self::maybe_unstash_pending_edit(edits, &replaced_event_id);
+                edits.push(replacement);
                 debug!("Timeline item not found, stashing edit");
             }
         }
     }
 
-    /// If there's a pending edit for an item, apply it immediately, returning
-    /// an updated [`EventTimelineItem`]. Otherwise, return `None`.
+    /// Look for a pending edit for the given event, and remove it from the list
+    /// and return it, if found.
     fn maybe_unstash_pending_edit(
-        &mut self,
-        item: &EventTimelineItem,
-    ) -> Option<EventTimelineItem> {
-        let mut find_and_remove_pending = |event_id| {
-            let edits = &mut self.meta.pending_edits;
-            let pos = edits.iter().position(|(prev_event_id, _)| prev_event_id == event_id)?;
-            Some(edits.remove(pos).unwrap().1)
-        };
-
-        if let Flow::Remote { event_id, .. } = &self.ctx.flow {
-            match item.content() {
-                TimelineItemContent::Message(..) => {
-                    let pending = find_and_remove_pending(event_id)?;
-                    let edit = as_variant!(pending, PendingEdit::RoomMessage)?;
-                    self.apply_msg_edit(item, edit)
-                }
-                TimelineItemContent::Poll(..) => {
-                    let pending = find_and_remove_pending(event_id)?;
-                    let edit = as_variant!(pending, PendingEdit::Poll)?;
-                    self.apply_poll_edit(item, edit)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        }
+        edits: &mut RingBuffer<PendingEdit>,
+        event_id: &EventId,
+    ) -> Option<PendingEdit> {
+        let pos = edits.iter().position(|edit| edit.edited_event() == event_id)?;
+        trace!(edited_event = %event_id, "unstashed pending edit");
+        Some(edits.remove(pos).unwrap())
     }
 
     /// Try applying an edit to an existing [`EventTimelineItem`].
@@ -555,7 +630,8 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
     fn apply_msg_edit(
         &self,
         item: &EventTimelineItem,
-        replacement: Replacement<RoomMessageEventContentWithoutRelation>,
+        new_content: RoomMessageEventContentWithoutRelation,
+        edit_json: Option<Raw<AnySyncTimelineEvent>>,
     ) -> Option<EventTimelineItem> {
         if self.ctx.sender != item.sender() {
             info!(
@@ -573,25 +649,10 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             return None;
         };
 
-        let mut msgtype = replacement.new_content.msgtype;
+        let mut new_msg = msg.clone();
+        new_msg.apply_edit(new_content);
 
-        // Edit's content is never supposed to contain the reply fallback.
-        msgtype.sanitize(DEFAULT_SANITIZER_MODE, RemoveReplyFallback::No);
-
-        let new_content = TimelineItemContent::Message(Message {
-            msgtype,
-            in_reply_to: msg.in_reply_to.clone(),
-            thread_root: msg.thread_root.clone(),
-            edited: true,
-            mentions: replacement.new_content.mentions,
-        });
-
-        let edit_json = match &self.ctx.flow {
-            Flow::Local { .. } => None,
-            Flow::Remote { raw_event, .. } => Some(raw_event.clone()),
-        };
-
-        let mut new_item = item.with_content(new_content, edit_json);
+        let mut new_item = item.with_content(TimelineItemContent::Message(new_msg), edit_json);
 
         if let EventTimelineItemKind::Remote(remote_event) = &item.kind {
             if let Flow::Remote { encryption_info, .. } = &self.ctx.flow {
@@ -689,9 +750,12 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         replacement: Replacement<NewUnstablePollStartEventContentWithoutRelation>,
     ) {
         let Some((item_pos, item)) = rfind_event_by_id(self.items, &replacement.event_id) else {
-            if let Flow::Remote { position, .. } = &self.ctx.flow {
+            if let Flow::Remote { position, raw_event, .. } = &self.ctx.flow {
                 let replaced_event_id = replacement.event_id.clone();
-                let replacement = PendingEdit::Poll(replacement);
+                let replacement = PendingEdit {
+                    kind: PendingEditKind::Poll(replacement),
+                    event_json: raw_event.clone(),
+                };
                 self.stash_pending_edit(*position, replaced_event_id, replacement);
             } else {
                 debug!("Local poll edit for a timeline item not found, discarding");
@@ -699,7 +763,9 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             return;
         };
 
-        let Some(new_item) = self.apply_poll_edit(item.inner, replacement) else {
+        let edit_json = self.ctx.flow.raw_event().cloned();
+
+        let Some(new_item) = self.apply_poll_edit(item.inner, replacement, edit_json) else {
             return;
         };
 
@@ -712,6 +778,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         &self,
         item: &EventTimelineItem,
         replacement: Replacement<NewUnstablePollStartEventContentWithoutRelation>,
+        edit_json: Option<Raw<AnySyncTimelineEvent>>,
     ) -> Option<EventTimelineItem> {
         if self.ctx.sender != item.sender() {
             info!(
@@ -726,7 +793,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             return None;
         };
 
-        let new_content = match poll_state.edit(&replacement.new_content) {
+        let new_content = match poll_state.edit(replacement.new_content) {
             Some(edited_poll_state) => TimelineItemContent::Poll(edited_poll_state),
             None => {
                 info!("Not applying edit to a poll that's already ended");
@@ -734,27 +801,52 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             }
         };
 
-        let edit_json = match &self.ctx.flow {
-            Flow::Local { .. } => None,
-            Flow::Remote { raw_event, .. } => Some(raw_event.clone()),
-        };
-
         Some(item.with_content(new_content, edit_json))
     }
 
     /// Adds a new poll to the timeline.
-    fn handle_poll_start(&mut self, c: NewUnstablePollStartEventContent, should_add: bool) {
-        let mut poll_state = PollState::new(c);
+    fn handle_poll_start(
+        &mut self,
+        c: NewUnstablePollStartEventContent,
+        relations: BundledMessageLikeRelations<AnySyncMessageLikeEvent>,
+    ) {
+        // Always remove the pending edit, if there's any. The reason is that if
+        // there's an edit in the relations mapping, we want to prefer it over any
+        // other pending edit, since it's more likely to be up to date, and we
+        // don't want to apply another pending edit on top of it.
+        let pending_edit = self
+            .ctx
+            .flow
+            .event_id()
+            .and_then(|event_id| {
+                Self::maybe_unstash_pending_edit(&mut self.meta.pending_edits, event_id)
+            })
+            .and_then(|edit| match edit.kind {
+                PendingEditKind::Poll(replacement) => {
+                    Some((Some(edit.event_json), replacement.new_content))
+                }
+                _ => None,
+            });
 
-        if let Flow::Remote { event_id, .. } = &self.ctx.flow {
+        let (edit_json, edit_content) = extract_poll_edit_content(relations)
+            .map(|content| {
+                let edit_json = self.ctx.flow.raw_event().and_then(extract_bundled_edit_event_json);
+                (edit_json, content)
+            })
+            .or(pending_edit)
+            .unzip();
+
+        let mut poll_state = PollState::new(c, edit_content);
+
+        if let Some(event_id) = self.ctx.flow.event_id() {
             // Applying the cache to remote events only because local echoes
             // don't have an event ID that could be referenced by responses yet.
             self.meta.pending_poll_events.apply_pending(event_id, &mut poll_state);
         }
 
-        if should_add {
-            self.add_item(TimelineItemContent::Poll(poll_state));
-        }
+        let edit_json = edit_json.flatten();
+
+        self.add_item(TimelineItemContent::Poll(poll_state), edit_json);
     }
 
     fn handle_poll_response(&mut self, c: UnstablePollResponseEventContent) {
@@ -837,7 +929,13 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                     debug!("event item is already redacted");
                 } else {
                     let new_item = item.redact(&self.meta.room_version);
-                    self.items.set(idx, TimelineItem::new(new_item, item.internal_id.to_owned()));
+                    let internal_id = item.internal_id.to_owned();
+
+                    // Look for any timeline event that's a reply to the redacted event, and redact
+                    // the replied-to event there as well.
+                    Self::maybe_update_responses(self.items, &redacted, &new_item);
+
+                    self.items.set(idx, TimelineItem::new(new_item, internal_id));
                     self.result.items_updated += 1;
                 }
             } else {
@@ -846,26 +944,6 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         } else {
             debug!("Timeline item not found, discarding redaction");
         };
-
-        // Look for any timeline event that's a reply to the redacted event, and redact
-        // the replied-to event there as well.
-        self.items.for_each(|mut entry| {
-            let Some(event_item) = entry.as_event() else { return };
-            let Some(message) = event_item.content.as_message() else { return };
-            let Some(in_reply_to) = message.in_reply_to() else { return };
-            let TimelineDetails::Ready(replied_to_event) = &in_reply_to.event else { return };
-            if redacted == in_reply_to.event_id {
-                let replied_to_event = replied_to_event.redact(&self.meta.room_version);
-                let in_reply_to = InReplyToDetails {
-                    event_id: in_reply_to.event_id.clone(),
-                    event: TimelineDetails::Ready(Box::new(replied_to_event)),
-                };
-                let content = TimelineItemContent::Message(message.with_in_reply_to(in_reply_to));
-                let new_item = entry.with_kind(event_item.with_content(content, None));
-
-                ObservableVectorTransactionEntry::set(&mut entry, new_item);
-            }
-        });
     }
 
     /// Attempts to redact a reaction, local or remote.
@@ -904,12 +982,15 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             }
         }
 
-        warn!("Reaction to redact was missing from the reaction or user map");
         false
     }
 
     /// Add a new event item in the timeline.
-    fn add_item(&mut self, content: TimelineItemContent) {
+    fn add_item(
+        &mut self,
+        content: TimelineItemContent,
+        edit_json: Option<Raw<AnySyncTimelineEvent>>,
+    ) {
         self.result.item_added = true;
 
         let sender = self.ctx.sender.to_owned();
@@ -931,7 +1012,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                     | TimelineItemPosition::End { origin } => origin,
 
                     // For updates, reuse the origin of the encrypted event.
-                    TimelineItemPosition::Update(idx) => self.items[idx]
+                    TimelineItemPosition::UpdateDecrypted(idx) => self.items[idx]
                         .as_event()
                         .and_then(|ev| Some(ev.as_remote()?.origin))
                         .unwrap_or_else(|| {
@@ -948,14 +1029,18 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                     is_highlighted: self.ctx.is_highlighted,
                     encryption_info: encryption_info.clone(),
                     original_json: Some(raw_event.clone()),
-                    latest_edit_json: None,
+                    latest_edit_json: edit_json,
                     origin,
                 }
                 .into()
             }
         };
 
-        let is_room_encrypted = self.meta.is_room_encrypted;
+        let is_room_encrypted = if let Ok(is_room_encrypted) = self.meta.is_room_encrypted.read() {
+            is_room_encrypted.unwrap_or_default()
+        } else {
+            false
+        };
 
         let mut item = EventTimelineItem::new(
             sender,
@@ -966,10 +1051,6 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             reactions,
             is_room_encrypted,
         );
-
-        if let Some(edited_item) = self.maybe_unstash_pending_edit(&item) {
-            item = edited_item;
-        }
 
         match &self.ctx.flow {
             Flow::Local { .. } => {
@@ -1079,8 +1160,16 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 }
             }
 
-            Flow::Remote { position: TimelineItemPosition::Update(idx), .. } => {
+            Flow::Remote {
+                event_id: decrypted_event_id,
+                position: TimelineItemPosition::UpdateDecrypted(idx),
+                ..
+            } => {
                 trace!("Updating timeline item at position {idx}");
+
+                // Update all events that replied to this previously encrypted message.
+                Self::maybe_update_responses(self.items, decrypted_event_id, &item);
+
                 let internal_id = self.items[*idx].internal_id.clone();
                 self.items.set(*idx, TimelineItem::new(item, internal_id));
             }
@@ -1092,6 +1181,34 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         }
     }
 
+    /// After updating the timeline item `new_item` which id is
+    /// `target_event_id`, update other items that are responses to this item.
+    fn maybe_update_responses(
+        items: &mut ObservableVectorTransaction<'_, Arc<TimelineItem>>,
+        target_event_id: &EventId,
+        new_item: &EventTimelineItem,
+    ) {
+        items.for_each(|mut entry| {
+            let Some(event_item) = entry.as_event() else { return };
+            let Some(message) = event_item.content.as_message() else { return };
+            let Some(in_reply_to) = message.in_reply_to() else { return };
+            if target_event_id == in_reply_to.event_id {
+                trace!(reply_event_id = ?event_item.identifier(), "Updating response to edited event");
+                let in_reply_to = InReplyToDetails {
+                    event_id: in_reply_to.event_id.clone(),
+                    event: TimelineDetails::Ready(Box::new(
+                        RepliedToEvent::from_timeline_item(new_item),
+                    )),
+                };
+                let new_reply_content =
+                TimelineItemContent::Message(message.with_in_reply_to(in_reply_to));
+                let new_reply_item =
+                entry.with_kind(event_item.with_content(new_reply_content, None));
+                ObservableVectorTransactionEntry::set(&mut entry, new_reply_item);
+            }
+        });
+    }
+
     fn pending_reactions(
         &mut self,
         content: &TimelineItemContent,
@@ -1101,28 +1218,25 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             return None;
         }
 
-        match &self.ctx.flow {
-            Flow::Local { .. } => None,
-            Flow::Remote { event_id, .. } => {
-                let reactions = self.meta.reactions.pending.remove(event_id)?;
-                let mut bundled = ReactionsByKeyBySender::default();
+        self.ctx.flow.event_id().and_then(|event_id| {
+            let reactions = self.meta.reactions.pending.remove(event_id)?;
+            let mut bundled = ReactionsByKeyBySender::default();
 
-                for (reaction_event_id, reaction) in reactions {
-                    let group: &mut IndexMap<OwnedUserId, ReactionInfo> =
-                        bundled.entry(reaction.key).or_default();
+            for (reaction_event_id, reaction) in reactions {
+                let group: &mut IndexMap<OwnedUserId, ReactionInfo> =
+                    bundled.entry(reaction.key).or_default();
 
-                    group.insert(
-                        reaction.sender_id,
-                        ReactionInfo {
-                            timestamp: reaction.timestamp,
-                            status: ReactionStatus::RemoteToRemote(reaction_event_id),
-                        },
-                    );
-                }
-
-                Some(bundled)
+                group.insert(
+                    reaction.sender_id,
+                    ReactionInfo {
+                        timestamp: reaction.timestamp,
+                        status: ReactionStatus::RemoteToRemote(reaction_event_id),
+                    },
+                );
             }
-        }
+
+            Some(bundled)
+        })
     }
 }
 

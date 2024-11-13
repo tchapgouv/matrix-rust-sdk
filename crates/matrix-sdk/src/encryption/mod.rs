@@ -47,13 +47,7 @@ use ruma::{
         uiaa::{AuthData, UiaaInfo},
     },
     assign,
-    events::room::{
-        message::{
-            AudioMessageEventContent, FileInfo, FileMessageEventContent, ImageMessageEventContent,
-            MessageType, VideoInfo, VideoMessageEventContent,
-        },
-        ImageInfo, MediaSource, ThumbnailInfo,
-    },
+    events::room::{MediaSource, ThumbnailInfo},
     DeviceId, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
 };
 use serde::Deserialize;
@@ -64,7 +58,7 @@ use vodozemac::Curve25519PublicKey;
 
 use self::{
     backups::{types::BackupClientState, Backups},
-    futures::PrepareEncryptedFile,
+    futures::UploadEncryptedFile,
     identities::{Device, DeviceUpdates, IdentityUpdates, UserDevices, UserIdentity},
     recovery::{Recovery, RecoveryState},
     secret_storage::SecretStorage,
@@ -72,7 +66,7 @@ use self::{
     verification::{SasVerification, Verification, VerificationRequest},
 };
 use crate::{
-    attachment::{AttachmentConfig, Thumbnail},
+    attachment::Thumbnail,
     client::{ClientInner, WeakClient},
     error::HttpResult,
     store_locks::CrossProcessStoreLockGuard,
@@ -444,123 +438,69 @@ impl Client {
     /// # let client = Client::new(homeserver).await?;
     /// # let room = client.get_room(&room_id!("!test:example.com")).unwrap();
     /// let mut reader = std::io::Cursor::new(b"Hello, world!");
-    /// let encrypted_file = client.prepare_encrypted_file(&mime::TEXT_PLAIN, &mut reader).await?;
+    /// let encrypted_file = client.upload_encrypted_file(&mime::TEXT_PLAIN, &mut reader).await?;
     ///
     /// room.send(CustomEventContent { encrypted_file }).await?;
     /// # anyhow::Ok(()) };
     /// ```
-    pub fn prepare_encrypted_file<'a, R: Read + ?Sized + 'a>(
+    pub fn upload_encrypted_file<'a, R: Read + ?Sized + 'a>(
         &'a self,
         content_type: &'a mime::Mime,
         reader: &'a mut R,
-    ) -> PrepareEncryptedFile<'a, R> {
-        PrepareEncryptedFile::new(self, content_type, reader)
+    ) -> UploadEncryptedFile<'a, R> {
+        UploadEncryptedFile::new(self, content_type, reader)
     }
 
-    /// Encrypt and upload the file to be read from `reader` and construct an
-    /// attachment message.
-    pub(crate) async fn prepare_encrypted_attachment_message(
+    /// Encrypt and upload the file and thumbnails, and return the source
+    /// information.
+    pub(crate) async fn upload_encrypted_media_and_thumbnail(
         &self,
-        filename: &str,
         content_type: &mime::Mime,
-        data: Vec<u8>,
-        config: AttachmentConfig,
+        data: &[u8],
+        thumbnail: Option<Thumbnail>,
         send_progress: SharedObservable<TransmissionProgress>,
-    ) -> Result<MessageType> {
+    ) -> Result<(MediaSource, Option<(MediaSource, Box<ThumbnailInfo>)>)> {
         let upload_thumbnail =
-            self.upload_encrypted_thumbnail(config.thumbnail, content_type, send_progress.clone());
+            self.upload_encrypted_thumbnail(thumbnail, content_type, send_progress.clone());
 
         let upload_attachment = async {
             let mut cursor = Cursor::new(data);
-            self.prepare_encrypted_file(content_type, &mut cursor)
+            self.upload_encrypted_file(content_type, &mut cursor)
                 .with_send_progress_observable(send_progress)
                 .await
         };
 
-        let ((thumbnail_source, thumbnail_info), file) =
-            try_join(upload_thumbnail, upload_attachment).await?;
+        let (thumbnail, file) = try_join(upload_thumbnail, upload_attachment).await?;
 
-        // if config.caption is set, use it as body, and filename as the file name
-        // otherwise, body is the filename, and the filename is not set
-        // https://github.com/tulir/matrix-spec-proposals/blob/body-as-caption/proposals/2530-body-as-caption.md
-        let (body, filename) = match config.caption {
-            Some(caption) => (caption, Some(filename.to_owned())),
-            None => (filename.to_owned(), None),
-        };
-
-        Ok(match content_type.type_() {
-            mime::IMAGE => {
-                let info = assign!(config.info.map(ImageInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content = assign!(ImageMessageEventContent::encrypted(body, file), {
-                    info: Some(Box::new(info)),
-                    formatted: config.formatted_caption,
-                    filename
-                });
-                MessageType::Image(content)
-            }
-            mime::AUDIO => {
-                let audio_message_event_content = AudioMessageEventContent::encrypted(body, file);
-                MessageType::Audio(crate::media::update_audio_message_event(
-                    audio_message_event_content,
-                    content_type,
-                    config.info,
-                ))
-            }
-            mime::VIDEO => {
-                let info = assign!(config.info.map(VideoInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content = assign!(VideoMessageEventContent::encrypted(body, file), {
-                    info: Some(Box::new(info)),
-                    formatted: config.formatted_caption,
-                    filename
-                });
-                MessageType::Video(content)
-            }
-            _ => {
-                let info = assign!(config.info.map(FileInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content = assign!(FileMessageEventContent::encrypted(body, file), {
-                    info: Some(Box::new(info))
-                });
-                MessageType::File(content)
-            }
-        })
+        Ok((MediaSource::Encrypted(Box::new(file)), thumbnail))
     }
 
+    /// Uploads an encrypted thumbnail to the media repository, and returns
+    /// its source and extra information.
     async fn upload_encrypted_thumbnail(
         &self,
         thumbnail: Option<Thumbnail>,
         content_type: &mime::Mime,
         send_progress: SharedObservable<TransmissionProgress>,
-    ) -> Result<(Option<MediaSource>, Option<Box<ThumbnailInfo>>)> {
-        if let Some(thumbnail) = thumbnail {
-            let mut cursor = Cursor::new(thumbnail.data);
+    ) -> Result<Option<(MediaSource, Box<ThumbnailInfo>)>> {
+        let Some(thumbnail) = thumbnail else {
+            return Ok(None);
+        };
 
-            let file = self
-                .prepare_encrypted_file(content_type, &mut cursor)
-                .with_send_progress_observable(send_progress)
-                .await?;
+        let mut cursor = Cursor::new(thumbnail.data);
 
-            #[rustfmt::skip]
+        let file = self
+            .upload_encrypted_file(content_type, &mut cursor)
+            .with_send_progress_observable(send_progress)
+            .await?;
+
+        #[rustfmt::skip]
             let thumbnail_info =
                 assign!(thumbnail.info.map(ThumbnailInfo::from).unwrap_or_default(), {
                     mimetype: Some(thumbnail.content_type.as_ref().to_owned())
                 });
 
-            Ok((Some(MediaSource::Encrypted(Box::new(file))), Some(Box::new(thumbnail_info))))
-        } else {
-            Ok((None, None))
-        }
+        Ok(Some((MediaSource::Encrypted(Box::new(file)), Box::new(thumbnail_info))))
     }
 
     /// Claim one-time keys creating new Olm sessions.
@@ -621,7 +561,7 @@ impl Client {
         request: &RoomMessageRequest,
     ) -> Result<send_message_event::v3::Response> {
         let content = request.content.clone();
-        let txn_id = &request.txn_id;
+        let txn_id = request.txn_id.clone();
         let room_id = &request.room_id;
 
         self.get_room(room_id)
@@ -834,7 +774,7 @@ impl Encryption {
     /// # anyhow::Ok(()) };
     /// ```
     pub fn verification_state(&self) -> Subscriber<VerificationState> {
-        self.client.inner.verification_state.subscribe()
+        self.client.inner.verification_state.subscribe_reset()
     }
 
     /// Get a verification object with the given flow id.
@@ -1664,6 +1604,10 @@ impl Encryption {
 
         let this = self.clone();
         tasks.setup_e2ee = Some(spawn(async move {
+            // Update the current state first, so we don't have to wait for the result of
+            // network requests
+            this.update_verification_state().await;
+
             if this.settings().auto_enable_cross_signing {
                 if let Err(e) = this.bootstrap_cross_signing_if_needed(auth_data).await {
                     error!("Couldn't bootstrap cross signing {e:?}");
@@ -1676,8 +1620,6 @@ impl Encryption {
             if let Err(e) = this.recovery().setup().await {
                 error!("Couldn't setup and resume recovery {e:?}");
             }
-
-            this.update_verification_state().await;
         }));
     }
 
@@ -1756,7 +1698,14 @@ impl Encryption {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        ops::Not,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use matrix_sdk_base::SessionMeta;
     use matrix_sdk_test::{
@@ -1771,13 +1720,15 @@ mod tests {
     use serde_json::json;
     use wiremock::{
         matchers::{header, method, path_regex},
-        Mock, MockServer, ResponseTemplate,
+        Mock, MockServer, Request, ResponseTemplate,
     };
 
     use crate::{
+        assert_next_matches_with_timeout,
         config::RequestConfig,
+        encryption::VerificationState,
         matrix_auth::{MatrixSession, MatrixSessionTokens},
-        test_utils::logged_in_client,
+        test_utils::{logged_in_client, no_retry_test_client, set_client_session},
         Client,
     };
 
@@ -2076,5 +2027,41 @@ mod tests {
         // Re-taking the lock doesn't update the olm machine.
         let after_taking_lock_second_time = client.olm_machine().await.as_ref().unwrap().clone();
         assert!(after_taking_lock_first_time.same_as(&after_taking_lock_second_time));
+    }
+
+    #[async_test]
+    async fn test_update_verification_state_is_updated_before_any_requests_happen() {
+        // Given a client and a server
+        let client = no_retry_test_client(None).await;
+        let server = MockServer::start().await;
+
+        // When we subscribe to its verification state
+        let mut verification_state = client.encryption().verification_state();
+
+        // We can get its initial value, and it's Unknown
+        assert_next_matches_with_timeout!(verification_state, VerificationState::Unknown);
+
+        // We set up a mocked request to check this endpoint is not called before
+        // reading the new state
+        let keys_requested = Arc::new(AtomicBool::new(false));
+        let inner_bool = keys_requested.clone();
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"/_matrix/client/r0/user/.*/account_data/m.secret_storage.default_key",
+            ))
+            .respond_with(move |_req: &Request| {
+                inner_bool.fetch_or(true, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(json!({}))
+            })
+            .mount(&server)
+            .await;
+
+        // When the session is initialised and the encryption tasks spawn
+        set_client_session(&client).await;
+
+        // Then we can get an updated value without waiting for any network requests
+        assert!(keys_requested.load(Ordering::SeqCst).not());
+        assert_next_matches_with_timeout!(verification_state, VerificationState::Unverified);
     }
 }
