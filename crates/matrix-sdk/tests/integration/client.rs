@@ -874,7 +874,9 @@ async fn test_create_dm_encrypted() {
                     return false;
                 };
 
-                if v.len() != 1 {
+                // BWI specific: We also have a visibility Event (so we have two instead of one event)
+                // original code if v.len() != 1 {
+                if v.len() != 2 {
                     return false;
                 }
 
