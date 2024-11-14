@@ -20,7 +20,7 @@ use matrix_sdk::{
     SendOutsideWasm, SyncOutsideWasm,
 };
 use matrix_sdk_base::deserialized_responses::SyncTimelineEvent;
-use ruma::{EventId, MilliSecondsSinceUnixEpoch, OwnedEventId};
+use ruma::{events::relation::RelationType, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId};
 use thiserror::Error;
 use tracing::{debug, warn};
 
@@ -61,6 +61,7 @@ impl PinnedEventsLoader {
         let pinned_event_ids: Vec<OwnedEventId> = self
             .room
             .pinned_event_ids()
+            .unwrap_or_default()
             .into_iter()
             .rev()
             .take(self.max_events_to_load)
@@ -76,8 +77,13 @@ impl PinnedEventsLoader {
         let mut loaded_events: Vec<SyncTimelineEvent> =
             stream::iter(pinned_event_ids.into_iter().map(|event_id| {
                 let provider = self.room.clone();
+                let relations_filter =
+                    Some(vec![RelationType::Annotation, RelationType::Replacement]);
                 async move {
-                    match provider.load_event_with_relations(&event_id, request_config).await {
+                    match provider
+                        .load_event_with_relations(&event_id, request_config, relations_filter)
+                        .await
+                    {
                         Ok((event, related_events)) => {
                             let mut events = vec![event];
                             events.extend(related_events);
@@ -104,7 +110,7 @@ impl PinnedEventsLoader {
 
         // Sort using chronological ordering (oldest -> newest)
         loaded_events.sort_by_key(|item| {
-            item.event
+            item.raw()
                 .deserialize()
                 .map(|e| e.origin_server_ts())
                 .unwrap_or_else(|_| MilliSecondsSinceUnixEpoch::now())
@@ -117,14 +123,19 @@ impl PinnedEventsLoader {
 pub trait PinnedEventsRoom: SendOutsideWasm + SyncOutsideWasm {
     /// Load a single room event using the cache or network and any events
     /// related to it, if they are cached.
+    ///
+    /// You can control which types of related events are retrieved using
+    /// `related_event_filters`. A `None` value will retrieve any type of
+    /// related event.
     fn load_event_with_relations<'a>(
         &'a self,
         event_id: &'a EventId,
         request_config: Option<RequestConfig>,
+        related_event_filters: Option<Vec<RelationType>>,
     ) -> BoxFuture<'a, Result<(SyncTimelineEvent, Vec<SyncTimelineEvent>), PaginatorError>>;
 
     /// Get the pinned event ids for a room.
-    fn pinned_event_ids(&self) -> Vec<OwnedEventId>;
+    fn pinned_event_ids(&self) -> Option<Vec<OwnedEventId>>;
 
     /// Checks whether an event id is pinned in this room.
     ///
@@ -138,10 +149,12 @@ impl PinnedEventsRoom for Room {
         &'a self,
         event_id: &'a EventId,
         request_config: Option<RequestConfig>,
+        related_event_filters: Option<Vec<RelationType>>,
     ) -> BoxFuture<'a, Result<(SyncTimelineEvent, Vec<SyncTimelineEvent>), PaginatorError>> {
         async move {
             if let Ok((cache, _handles)) = self.event_cache().await {
-                if let Some(ret) = cache.event_with_relations(event_id).await {
+                if let Some(ret) = cache.event_with_relations(event_id, related_event_filters).await
+                {
                     debug!("Loaded pinned event {event_id} and related events from cache");
                     return Ok(ret);
                 }
@@ -156,7 +169,7 @@ impl PinnedEventsRoom for Room {
         .boxed()
     }
 
-    fn pinned_event_ids(&self) -> Vec<OwnedEventId> {
+    fn pinned_event_ids(&self) -> Option<Vec<OwnedEventId>> {
         self.clone_info().pinned_event_ids()
     }
 

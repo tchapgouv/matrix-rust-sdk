@@ -24,7 +24,7 @@ use crate::{
 #[track_caller]
 pub fn assert_event_matches_msg<E: Clone + Into<SyncTimelineEvent>>(event: &E, expected: &str) {
     let event: SyncTimelineEvent = event.clone().into();
-    let event = event.event.deserialize().unwrap();
+    let event = event.raw().deserialize().unwrap();
     assert_let!(
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(message)) = event
     );
@@ -100,11 +100,13 @@ pub async fn logged_in_client_with_server() -> (Client, wiremock::MockServer) {
     (client, server)
 }
 
-/// Asserts the next item in a [`Stream`] can be loaded in the given timeout in
-/// the given timeout in milliseconds.
+/// Asserts the next item in a `Stream` or `Subscriber` can be loaded in the
+/// given timeout in the given timeout in milliseconds.
 #[macro_export]
 macro_rules! assert_next_with_timeout {
     ($stream:expr, $timeout_ms:expr) => {{
+        // Needed for subscribers, as they won't use the StreamExt features
+        #[allow(unused_imports)]
         use futures_util::StreamExt as _;
         tokio::time::timeout(std::time::Duration::from_millis($timeout_ms), $stream.next())
             .await
@@ -113,8 +115,8 @@ macro_rules! assert_next_with_timeout {
     }};
 }
 
-/// Assert the next item in a [`Stream`] matches the provided pattern in the
-/// given timeout in milliseconds.
+/// Assert the next item in a `Stream` or `Subscriber` matches the provided
+/// pattern in the given timeout in milliseconds.
 ///
 /// If no timeout is provided, a default `100ms` value will be used.
 #[macro_export]

@@ -20,22 +20,22 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use as_variant::as_variant;
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use matrix_sdk::{
+    assert_next_matches_with_timeout,
     crypto::{decrypt_room_key_export, types::events::UtdCause, OlmMachine},
     test_utils::test_client_builder,
 };
-use matrix_sdk_test::{async_test, BOB};
+use matrix_sdk_base::deserialized_responses::{SyncTimelineEvent, UnableToDecryptReason};
+use matrix_sdk_test::{async_test, ALICE, BOB};
 use ruma::{
-    assign,
-    events::{
-        room::encrypted::{
-            EncryptedEventScheme, MegolmV1AesSha2ContentInit, Relation, Replacement,
-            RoomEncryptedEventContent,
-        },
-        AnySyncTimelineEvent,
+    assign, event_id,
+    events::room::encrypted::{
+        EncryptedEventScheme, MegolmV1AesSha2ContentInit, Relation, Replacement,
+        RoomEncryptedEventContent,
     },
     room_id,
     serde::Raw,
@@ -46,7 +46,7 @@ use stream_assert::assert_next_matches;
 
 use super::TestTimeline;
 use crate::{
-    timeline::{EncryptedMessage, TimelineItemContent},
+    timeline::{EncryptedMessage, TimelineDetails, TimelineItemContent},
     unable_to_decrypt_hook::{UnableToDecryptHook, UnableToDecryptInfo, UtdHookManager},
 };
 
@@ -107,7 +107,8 @@ async fn test_retry_message_decryption() {
                 ),
                 None,
             ))
-            .sender(&BOB),
+            .sender(&BOB)
+            .into_utd_sync_timeline_event(),
         )
         .await;
 
@@ -217,7 +218,11 @@ async fn test_retry_edit_decryption() {
         .into(),
     );
     timeline
-        .handle_live_event(f.event(RoomEncryptedEventContent::new(encrypted, None)).sender(&BOB))
+        .handle_live_event(
+            f.event(RoomEncryptedEventContent::new(encrypted, None))
+                .sender(&BOB)
+                .into_utd_sync_timeline_event(),
+        )
         .await;
 
     let event_id =
@@ -244,7 +249,8 @@ async fn test_retry_edit_decryption() {
             f.event(assign!(RoomEncryptedEventContent::new(encrypted, None), {
                 relates_to: Some(Relation::Replacement(Replacement::new(event_id))),
             }))
-            .sender(&BOB),
+            .sender(&BOB)
+            .into_utd_sync_timeline_event(),
         )
         .await;
 
@@ -323,7 +329,8 @@ async fn test_retry_edit_and_more() {
                  mBZdKIaqDTUBFvcvbn2gQaWtUipQdJQRKyv2h0AWveVkv75lp5hRb7jolCi08oMX8cM+V3Zzyi7\
                  mlPAzZjDz0PaRbQwfbMTTHkcL7TZybBi4vLX4f5ZR2Iiysc7gw",
             ))
-            .sender(&BOB),
+            .sender(&BOB)
+            .into_utd_sync_timeline_event(),
         )
         .await;
 
@@ -339,7 +346,9 @@ async fn test_retry_edit_and_more() {
     );
     timeline
         .handle_live_event(
-            f.event(assign!(msg2, { relates_to: Some(Relation::Replacement(Replacement::new(event_id))) })).sender(&BOB),
+            f.event(assign!(msg2, { relates_to: Some(Relation::Replacement(Replacement::new(event_id))) }))
+                .sender(&BOB)
+                .into_utd_sync_timeline_event(),
         )
         .await;
 
@@ -351,7 +360,8 @@ async fn test_retry_edit_and_more() {
                  2r/fEvAW/9QB+N6fX4g9729bt5ftXRqa5QI7NA351RNUveRHxVvx+2x0WJArQjYGRk7tMS2rUto\
                  IYt2ZY17nE1UJjN7M87STnCF9c9qy4aGNqIpeVIht6XbtgD7gQ",
             ))
-            .sender(&BOB),
+            .sender(&BOB)
+            .into_utd_sync_timeline_event(),
         )
         .await;
 
@@ -424,7 +434,8 @@ async fn test_retry_message_decryption_highlighted() {
                 ),
                 None,
             ))
-            .sender(&BOB),
+            .sender(&BOB)
+            .into_utd_sync_timeline_event(),
         )
         .await;
 
@@ -475,7 +486,7 @@ async fn test_utd_cause_for_nonmember_event_is_found() {
     let mut stream = timeline.subscribe().await;
 
     // When we add an event with "membership: leave"
-    timeline.handle_live_event(raw_event_with_unsigned(json!({ "membership": "leave" }))).await;
+    timeline.handle_live_event(utd_event_with_unsigned(json!({ "membership": "leave" }))).await;
 
     // Then its UTD cause is membership
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -484,7 +495,7 @@ async fn test_utd_cause_for_nonmember_event_is_found() {
         TimelineItemContent::UnableToDecrypt(EncryptedMessage::MegolmV1AesSha2 { cause, .. }) =
             event.content()
     );
-    assert_eq!(*cause, UtdCause::Membership);
+    assert_eq!(*cause, UtdCause::SentBeforeWeJoined);
 }
 
 #[async_test]
@@ -495,7 +506,7 @@ async fn test_utd_cause_for_nonmember_event_is_found_unstable_prefix() {
 
     // When we add an event with "io.element.msc4115.membership: leave"
     timeline
-        .handle_live_event(raw_event_with_unsigned(
+        .handle_live_event(utd_event_with_unsigned(
             json!({ "io.element.msc4115.membership": "leave" }),
         ))
         .await;
@@ -507,7 +518,7 @@ async fn test_utd_cause_for_nonmember_event_is_found_unstable_prefix() {
         TimelineItemContent::UnableToDecrypt(EncryptedMessage::MegolmV1AesSha2 { cause, .. }) =
             event.content()
     );
-    assert_eq!(*cause, UtdCause::Membership);
+    assert_eq!(*cause, UtdCause::SentBeforeWeJoined);
 }
 
 #[async_test]
@@ -517,7 +528,7 @@ async fn test_utd_cause_for_member_event_is_unknown() {
     let mut stream = timeline.subscribe().await;
 
     // When we add an event with "membership: join"
-    timeline.handle_live_event(raw_event_with_unsigned(json!({ "membership": "join" }))).await;
+    timeline.handle_live_event(utd_event_with_unsigned(json!({ "membership": "join" }))).await;
 
     // Then its UTD cause is membership
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -536,7 +547,7 @@ async fn test_utd_cause_for_missing_membership_is_unknown() {
     let mut stream = timeline.subscribe().await;
 
     // When we add an event with no membership in unsigned
-    timeline.handle_live_event(raw_event_with_unsigned(json!({}))).await;
+    timeline.handle_live_event(utd_event_with_unsigned(json!({}))).await;
 
     // Then its UTD cause is membership
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -548,8 +559,130 @@ async fn test_utd_cause_for_missing_membership_is_unknown() {
     assert_eq!(*cause, UtdCause::Unknown);
 }
 
-fn raw_event_with_unsigned(unsigned: serde_json::Value) -> Raw<AnySyncTimelineEvent> {
-    Raw::from_json(
+#[async_test]
+async fn test_retry_decryption_updates_response() {
+    const SESSION_ID: &str = "gM8i47Xhu0q52xLfgUXzanCMpLinoyVyH7R58cBuVBU";
+    const SESSION_KEY: &[u8] = b"\
+        -----BEGIN MEGOLM SESSION DATA-----\n\
+        ASKcWoiAVUM97482UAi83Avce62hSLce7i5JhsqoF6xeAAAACqt2Cg3nyJPRWTTMXxXH7TXnkfdlmBXbQtq5\
+        bpHo3LRijcq2Gc6TXilESCmJN14pIsfKRJrWjZ0squ/XsoTFytuVLWwkNaW3QF6obeg2IoVtJXLMPdw3b2vO\
+        vgwGY3OMP0XafH13j1vcb6YLzvgLkZQLnYvd47hv3yK/9GmKS9tokuaQ7dCVYckYcIOS09EDTs70YdxUd5WG\
+        rQynATCLFP1p/NAGv70r9MK7Cy/mNpjD0r4qC7UEDIoi1kOWzHgnLo19wtvwsb8Fg8ATxcs3Wmtj8hIUYpDx\
+        ia4sM10zbytUuaPUAfCDf42IyxdmOnGe1CueXhgI71y+RW0s0argNqUt7jB70JT0o9CyX6UBGRaqLk2MPY9T\
+        hUu5J8X3UgIa6rcbWigzohzWm9rdbEHFrSWqjpfQYMaAKQQgETrjSy4XTrp2RhC2oNqG/hylI4ab+F4X6fpH\
+        DYP1NqNMP5g36xNu7LhDnrUB5qsPjYOmWORxGLfudpF3oLYCSlr3DgHqEIB6HjQblLZ3KQuPBse3zxyROTnS\
+        AhdPH4a/z1wioFtKNVph3hecsiKEdqnz4Y2coSIdhz58mJ9JWNQoFAENE5CSsoEZAGvafYZVpW4C75YY2zq1\
+        wIeiFi1dT43/jLAUGkslsi1VvnyfUu8qO404RxYO3XHoGLMFoFLOO+lZ+VGci2Vz10AhxJhEBHxRKxw4k2uB\
+        HztoSJUr/2Y\n\
+        -----END MEGOLM SESSION DATA-----";
+
+    let timeline = TestTimeline::new();
+    let mut stream = timeline.subscribe_events().await;
+
+    let original_event_id = event_id!("$original");
+    let f = &timeline.factory;
+    timeline
+        .handle_live_event(
+            f.event(RoomEncryptedEventContent::new(
+                EncryptedEventScheme::MegolmV1AesSha2(
+                    MegolmV1AesSha2ContentInit {
+                        ciphertext: "\
+                            AwgAEtABPRMavuZMDJrPo6pGQP4qVmpcuapuXtzKXJyi3YpEsjSWdzuRKIgJzD4P\
+                            cSqJM1A8kzxecTQNJsC5q22+KSFEPxPnI4ltpm7GFowSoPSW9+bFdnlfUzEP1jPq\
+                            YevHAsMJp2fRKkzQQbPordrUk1gNqEpGl4BYFeRqKl9GPdKFwy45huvQCLNNueql\
+                            CFZVoYMuhxrfyMiJJAVNTofkr2um2mKjDTlajHtr39pTG8k0eOjSXkLOSdZvNOMz\
+                            hGhSaFNeERSA2G2YbeknOvU7MvjiO0AKuxaAe1CaVhAI14FCgzrJ8g0y5nly+n7x\
+                            QzL2G2Dn8EoXM5Iqj8W99iokQoVsSrUEnaQ1WnSIfewvDDt4LCaD/w7PGETMCQ"
+                            .to_owned(),
+                        sender_key: "DeHIg4gwhClxzFYcmNntPNF9YtsdZbmMy8+3kzCMXHA".to_owned(),
+                        device_id: "NLAZCWIOCO".into(),
+                        session_id: SESSION_ID.into(),
+                    }
+                    .into(),
+                ),
+                None,
+            ))
+            .event_id(original_event_id)
+            .sender(&BOB)
+            .into_utd_sync_timeline_event(),
+        )
+        .await;
+
+    timeline
+        .handle_live_event(f.text_msg("well said!").reply_to(original_event_id).sender(&ALICE))
+        .await;
+
+    // We receive the UTD.
+    {
+        let event = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+        assert_let!(
+            TimelineItemContent::UnableToDecrypt(EncryptedMessage::MegolmV1AesSha2 {
+                session_id,
+                ..
+            }) = event.content()
+        );
+        assert_eq!(session_id, SESSION_ID);
+    }
+
+    // We receive the text response.
+    {
+        let event = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+        let msg = event.content().as_message().unwrap();
+        assert_eq!(msg.body(), "well said!");
+
+        let reply_details = msg.in_reply_to().unwrap();
+        assert_eq!(reply_details.event_id, original_event_id);
+
+        let replied_to = as_variant!(&reply_details.event, TimelineDetails::Ready).unwrap();
+        assert!(replied_to.content.as_unable_to_decrypt().is_some());
+    }
+
+    // Import a room key backup.
+    let own_user_id = user_id!("@example:morheus.localhost");
+    let exported_keys = decrypt_room_key_export(Cursor::new(SESSION_KEY), "1234").unwrap();
+
+    let olm_machine = OlmMachine::new(own_user_id, "SomeDeviceId".into()).await;
+    olm_machine.store().import_exported_room_keys(exported_keys, |_, _| {}).await.unwrap();
+
+    // Retry decrypting the UTD.
+    timeline
+        .controller
+        .retry_event_decryption_test(
+            room_id!("!DovneieKSTkdHKpIXy:morpheus.localhost"),
+            olm_machine,
+            Some(iter::once(SESSION_ID.to_owned()).collect()),
+        )
+        .await;
+
+    // The response is updated.
+    {
+        let event = assert_next_matches_with_timeout!(
+            stream,
+            VectorDiff::Set { index: 1, value } => value
+        );
+
+        let msg = event.content().as_message().unwrap();
+        assert_eq!(msg.body(), "well said!");
+
+        let reply_details = msg.in_reply_to().unwrap();
+        assert_eq!(reply_details.event_id, original_event_id);
+
+        let replied_to = as_variant!(&reply_details.event, TimelineDetails::Ready).unwrap();
+        assert_eq!(replied_to.content.as_message().unwrap().body(), "It's a secret to everybody");
+    }
+
+    // The event itself is decrypted.
+    {
+        let event = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
+        assert_matches!(event.encryption_info(), Some(_));
+        assert_let!(TimelineItemContent::Message(message) = event.content());
+        assert_eq!(message.body(), "It's a secret to everybody");
+        assert!(!event.is_highlighted());
+    }
+}
+
+fn utd_event_with_unsigned(unsigned: serde_json::Value) -> SyncTimelineEvent {
+    let raw = Raw::from_json(
         to_raw_value(&json!({
             "event_id": "$myevent",
             "sender": "@u:s",
@@ -566,5 +699,13 @@ fn raw_event_with_unsigned(unsigned: serde_json::Value) -> Raw<AnySyncTimelineEv
 
         }))
         .unwrap(),
+    );
+
+    SyncTimelineEvent::new_utd_event(
+        raw,
+        matrix_sdk::deserialized_responses::UnableToDecryptInfo {
+            session_id: Some("SESSION_ID".into()),
+            reason: UnableToDecryptReason::MissingMegolmSession,
+        },
     )
 }

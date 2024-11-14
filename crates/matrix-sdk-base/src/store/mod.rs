@@ -57,9 +57,10 @@ use ruma::{
     EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
+use tracing::warn;
 
 use crate::{
-    event_cache_store::{DynEventCacheStore, IntoEventCacheStore},
+    event_cache_store,
     rooms::{normal::RoomInfoNotableUpdate, RoomInfo, RoomState},
     MinimalRoomMemberEvent, Room, RoomStateFilter, SessionMeta,
 };
@@ -67,16 +68,20 @@ use crate::{
 pub(crate) mod ambiguity_map;
 mod memory_store;
 pub mod migration_helpers;
+mod send_queue;
 
 #[cfg(any(test, feature = "testing"))]
 pub use self::integration_tests::StateStoreIntegrationTests;
 pub use self::{
     memory_store::MemoryStore,
+    send_queue::{
+        ChildTransactionId, DependentQueuedRequest, DependentQueuedRequestKind,
+        FinishUploadThumbnailInfo, QueueWedgeError, QueuedRequest, QueuedRequestKind,
+        SentMediaInfo, SentRequestKey, SerializableEventContent,
+    },
     traits::{
-        ChildTransactionId, ComposerDraft, ComposerDraftType, DependentQueuedEvent,
-        DependentQueuedEventKind, DynStateStore, IntoStateStore, QueuedEvent,
-        SerializableEventContent, ServerCapabilities, StateStore, StateStoreDataKey,
-        StateStoreDataValue, StateStoreExt,
+        ComposerDraft, ComposerDraftType, DynStateStore, IntoStateStore, ServerCapabilities,
+        StateStore, StateStoreDataKey, StateStoreDataValue, StateStoreExt,
     },
 };
 
@@ -171,6 +176,36 @@ impl Store {
         &self.sync_lock
     }
 
+    /// Load the room infos from the inner `StateStore`.
+    ///
+    /// Applies migrations to the room infos if needed.
+    async fn load_room_infos(&self) -> Result<Vec<RoomInfo>> {
+        let mut room_infos = self.inner.get_room_infos().await?;
+        let mut migrated_room_infos = Vec::with_capacity(room_infos.len());
+
+        for room_info in room_infos.iter_mut() {
+            if room_info.apply_migrations(self.inner.clone()).await {
+                migrated_room_infos.push(room_info.clone());
+            }
+        }
+
+        if !migrated_room_infos.is_empty() {
+            let changes = StateChanges {
+                room_infos: migrated_room_infos
+                    .into_iter()
+                    .map(|room_info| (room_info.room_id.clone(), room_info))
+                    .collect(),
+                ..Default::default()
+            };
+
+            if let Err(error) = self.inner.save_changes(&changes).await {
+                warn!("Failed to save migrated room infos: {error}");
+            }
+        }
+
+        Ok(room_infos)
+    }
+
     /// Set the meta of the session.
     ///
     /// Restores the state of this `Store` from the given `SessionMeta` and the
@@ -183,7 +218,7 @@ impl Store {
         room_info_notable_update_sender: &broadcast::Sender<RoomInfoNotableUpdate>,
     ) -> Result<()> {
         {
-            let room_infos = self.inner.get_room_infos().await?;
+            let room_infos = self.load_room_infos().await?;
 
             let mut rooms = self.rooms.write().unwrap();
 
@@ -273,6 +308,17 @@ impl Store {
             })
             .clone()
     }
+
+    /// Forget the room with the given room ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The id of the room that should be forgotten.
+    pub(crate) async fn forget_room(&self, room_id: &RoomId) -> Result<()> {
+        self.inner.remove_room(room_id).await?;
+        self.rooms.write().unwrap().remove(room_id);
+        Ok(())
+    }
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -360,15 +406,6 @@ impl StateChanges {
         self.room_infos.insert(room.room_id.clone(), room);
     }
 
-    /// Update the `StateChanges` struct with the given `AnyBasicEvent`.
-    pub fn add_account_data(
-        &mut self,
-        event: AnyGlobalAccountDataEvent,
-        raw_event: Raw<AnyGlobalAccountDataEvent>,
-    ) {
-        self.account_data.insert(event.event_type(), raw_event);
-    }
-
     /// Update the `StateChanges` struct with the given room with a new
     /// `AnyBasicEvent`.
     pub fn add_room_account_data(
@@ -453,7 +490,7 @@ pub struct StoreConfig {
     #[cfg(feature = "e2e-encryption")]
     pub(crate) crypto_store: Arc<DynCryptoStore>,
     pub(crate) state_store: Arc<DynStateStore>,
-    pub(crate) event_cache_store: Arc<DynEventCacheStore>,
+    pub(crate) event_cache_store: event_cache_store::EventCacheStoreLock,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -471,8 +508,11 @@ impl StoreConfig {
             #[cfg(feature = "e2e-encryption")]
             crypto_store: matrix_sdk_crypto::store::MemoryStore::new().into_crypto_store(),
             state_store: Arc::new(MemoryStore::new()),
-            event_cache_store: crate::event_cache_store::MemoryStore::new()
-                .into_event_cache_store(),
+            event_cache_store: event_cache_store::EventCacheStoreLock::new(
+                event_cache_store::MemoryStore::new(),
+                "default-key".to_owned(),
+                "matrix-sdk-base".to_owned(),
+            ),
         }
     }
 
@@ -492,8 +532,15 @@ impl StoreConfig {
     }
 
     /// Set a custom implementation of an `EventCacheStore`.
-    pub fn event_cache_store(mut self, event_cache_store: impl IntoEventCacheStore) -> Self {
-        self.event_cache_store = event_cache_store.into_event_cache_store();
+    ///
+    /// The `key` and `holder` arguments represent the key and holder inside the
+    /// [`CrossProcessStoreLock::new`][matrix_sdk_common::store_locks::CrossProcessStoreLock::new].
+    pub fn event_cache_store<S>(mut self, event_cache_store: S, key: String, holder: String) -> Self
+    where
+        S: event_cache_store::IntoEventCacheStore,
+    {
+        self.event_cache_store =
+            event_cache_store::EventCacheStoreLock::new(event_cache_store, key, holder);
         self
     }
 }

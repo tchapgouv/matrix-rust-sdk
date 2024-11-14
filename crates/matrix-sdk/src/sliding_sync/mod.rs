@@ -36,7 +36,7 @@ use async_stream::stream;
 pub use client::{Version, VersionBuilder};
 use futures_core::stream::Stream;
 pub use matrix_sdk_base::sliding_sync::http;
-use matrix_sdk_common::timer;
+use matrix_sdk_common::{deserialized_responses::SyncTimelineEvent, timer};
 use ruma::{
     api::{client::error::ErrorKind, OutgoingRequest},
     assign, OwnedEventId, OwnedRoomId, RoomId,
@@ -151,12 +151,13 @@ impl SlidingSync {
         &self,
         room_ids: &[&RoomId],
         settings: Option<http::request::RoomSubscription>,
+        cancel_in_flight_request: bool,
     ) {
         let settings = settings.unwrap_or_default();
         let mut sticky = self.inner.sticky.write().unwrap();
         let room_subscriptions = &mut sticky.data_mut().room_subscriptions;
 
-        let mut skip_sync_loop = false;
+        let mut skip_over_current_sync_loop_iteration = false;
 
         for room_id in room_ids {
             // If the room subscription already exists, let's not
@@ -172,11 +173,11 @@ impl SlidingSync {
 
                 entry.insert((RoomSubscriptionState::default(), settings.clone()));
 
-                skip_sync_loop = true;
+                skip_over_current_sync_loop_iteration = true;
             }
         }
 
-        if skip_sync_loop {
+        if cancel_in_flight_request && skip_over_current_sync_loop_iteration {
             self.inner.internal_channel_send_if_possible(
                 SlidingSyncInternalMessage::SyncLoopSkipOverCurrentIteration,
             );
@@ -344,7 +345,7 @@ impl SlidingSync {
                         if let Some(joined_room) = sync_response.rooms.join.remove(&room_id) {
                             joined_room.timeline.events
                         } else {
-                            room_data.timeline.drain(..).map(Into::into).collect()
+                            room_data.timeline.drain(..).map(SyncTimelineEvent::new).collect()
                         };
 
                     match rooms_map.get_mut(&room_id) {
@@ -1105,7 +1106,7 @@ mod tests {
     use matrix_sdk_test::async_test;
     use ruma::{
         api::client::error::ErrorKind, assign, owned_room_id, room_id, serde::Raw, uint,
-        DeviceKeyAlgorithm, OwnedRoomId, TransactionId,
+        OwnedRoomId, TransactionId,
     };
     use serde::Deserialize;
     use serde_json::json;
@@ -1219,7 +1220,7 @@ mod tests {
         // Members are now synced! We can start subscribing and see how it goes.
         assert!(room0.are_members_synced());
 
-        sliding_sync.subscribe_to_rooms(&[room_id_0, room_id_1], None);
+        sliding_sync.subscribe_to_rooms(&[room_id_0, room_id_1], None, true);
 
         // OK, we have subscribed to some rooms. Let's check on `room0` if members are
         // now marked as not synced.
@@ -1260,7 +1261,7 @@ mod tests {
         // Members are synced, good, good.
         assert!(room0.are_members_synced());
 
-        sliding_sync.subscribe_to_rooms(&[room_id_0], None);
+        sliding_sync.subscribe_to_rooms(&[room_id_0], None, false);
 
         // Members are still synced: because we have already subscribed to the
         // room, the members aren't marked as unsynced.
@@ -1280,7 +1281,7 @@ mod tests {
         let room_id_2 = room_id!("!r2:bar.org");
 
         // Subscribe to two rooms.
-        sliding_sync.subscribe_to_rooms(&[room_id_0, room_id_1], None);
+        sliding_sync.subscribe_to_rooms(&[room_id_0, room_id_1], None, false);
 
         {
             let sticky = sliding_sync.inner.sticky.read().unwrap();
@@ -1292,7 +1293,7 @@ mod tests {
         }
 
         // Subscribe to one more room.
-        sliding_sync.subscribe_to_rooms(&[room_id_2], None);
+        sliding_sync.subscribe_to_rooms(&[room_id_2], None, false);
 
         {
             let sticky = sliding_sync.inner.sticky.read().unwrap();
@@ -1314,7 +1315,7 @@ mod tests {
         }
 
         // Subscribe to one room again.
-        sliding_sync.subscribe_to_rooms(&[room_id_2], None);
+        sliding_sync.subscribe_to_rooms(&[room_id_2], None, false);
 
         {
             let sticky = sliding_sync.inner.sticky.read().unwrap();
@@ -2302,7 +2303,7 @@ mod tests {
         let no_local_events = room_id!("!crepe:example.org");
         let already_limited = room_id!("!paris:example.org");
 
-        let response_timeline = vec![event_c.event.clone(), event_d.event.clone()];
+        let response_timeline = vec![event_c.raw().clone(), event_d.raw().clone()];
 
         let local_rooms = BTreeMap::from_iter([
             (
@@ -2385,21 +2386,21 @@ mod tests {
                 no_overlap.to_owned(),
                 assign!(http::response::Room::default(), {
                     initial: Some(true),
-                    timeline: vec![event_c.event.clone(), event_d.event.clone()],
+                    timeline: vec![event_c.raw().clone(), event_d.raw().clone()],
                 }),
             ),
             (
                 partial_overlap.to_owned(),
                 assign!(http::response::Room::default(), {
                     initial: Some(true),
-                    timeline: vec![event_c.event.clone(), event_d.event.clone()],
+                    timeline: vec![event_c.raw().clone(), event_d.raw().clone()],
                 }),
             ),
             (
                 complete_overlap.to_owned(),
                 assign!(http::response::Room::default(), {
                     initial: Some(true),
-                    timeline: vec![event_c.event.clone(), event_d.event.clone()],
+                    timeline: vec![event_c.raw().clone(), event_d.raw().clone()],
                 }),
             ),
             (
@@ -2413,7 +2414,7 @@ mod tests {
                 no_local_events.to_owned(),
                 assign!(http::response::Room::default(), {
                     initial: Some(true),
-                    timeline: vec![event_c.event.clone(), event_d.event.clone()],
+                    timeline: vec![event_c.raw().clone(), event_d.raw().clone()],
                 }),
             ),
             (
@@ -2421,7 +2422,7 @@ mod tests {
                 assign!(http::response::Room::default(), {
                     initial: Some(true),
                     limited: true,
-                    timeline: vec![event_c.event, event_d.event],
+                    timeline: vec![event_c.into_raw(), event_d.into_raw()],
                 }),
             ),
         ]);
@@ -2688,6 +2689,8 @@ mod tests {
     #[async_test]
     #[cfg(feature = "e2e-encryption")]
     async fn test_process_only_encryption_events() -> Result<()> {
+        use ruma::OneTimeKeyAlgorithm;
+
         let room = owned_room_id!("!croissant:example.org");
 
         let server = MockServer::start().await;
@@ -2704,7 +2707,7 @@ mod tests {
 
             extensions: assign!(http::response::Extensions::default(), {
                 e2ee: assign!(http::response::E2EE::default(), {
-                    device_one_time_keys_count: BTreeMap::from([(DeviceKeyAlgorithm::SignedCurve25519, uint!(42))])
+                    device_one_time_keys_count: BTreeMap::from([(OneTimeKeyAlgorithm::SignedCurve25519, uint!(42))])
                 }),
                 to_device: Some(assign!(http::response::ToDevice::default(), {
                     next_batch: "to-device-token".to_owned(),

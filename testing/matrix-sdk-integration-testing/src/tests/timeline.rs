@@ -96,17 +96,15 @@ async fn test_toggling_reaction() -> Result<()> {
             items.iter().find_map(|item| {
                 let event = item.as_event()?;
                 if !event.is_local_echo() && event.content().as_message()?.body().trim() == "hi!" {
-                    event
-                        .event_id()
-                        .map(|event_id| (item.unique_id().to_owned(), event_id.to_owned()))
+                    event.event_id().map(ToOwned::to_owned)
                 } else {
                     None
                 }
             })
         };
 
-        if let Some(pair) = find_event_id(&items) {
-            return Ok(pair);
+        if let Some(event_id) = find_event_id(&items) {
+            return Ok(event_id);
         }
 
         warn!(?items, "Waiting for updates…");
@@ -114,8 +112,8 @@ async fn test_toggling_reaction() -> Result<()> {
         while let Some(diff) = stream.next().await {
             warn!(?diff, "received a diff");
             diff.apply(&mut items);
-            if let Some(pair) = find_event_id(&items) {
-                return Ok(pair);
+            if let Some(event_id) = find_event_id(&items) {
+                return Ok(event_id);
             }
         }
 
@@ -130,7 +128,7 @@ async fn test_toggling_reaction() -> Result<()> {
     debug!("Sending initial message…");
     timeline.send(RoomMessageEventContent::text_plain("hi!").into()).await.unwrap();
 
-    let (msg_uid, event_id) = timeout(Duration::from_secs(10), event_id_task)
+    let event_id = timeout(Duration::from_secs(10), event_id_task)
         .await
         .expect("timeout")
         .expect("failed to join tokio task")
@@ -150,10 +148,13 @@ async fn test_toggling_reaction() -> Result<()> {
         diff.apply(&mut items);
     }
 
-    let message_position = items
+    let (message_position, item_id) = items
         .iter()
         .enumerate()
-        .find_map(|(i, item)| (item.as_event()?.event_id()? == event_id).then_some(i))
+        .find_map(|(i, item)| {
+            let item = item.as_event()?;
+            (item.event_id()? == event_id).then_some((i, item.identifier()))
+        })
         .expect("couldn't find the final position for the event id");
 
     let reaction_key = "👍".to_owned();
@@ -163,7 +164,7 @@ async fn test_toggling_reaction() -> Result<()> {
         debug!("Starting the toggle reaction tests…");
 
         // Add the reaction.
-        timeline.toggle_reaction(&msg_uid, &reaction_key).await.expect("toggling reaction");
+        timeline.toggle_reaction(&item_id, &reaction_key).await.expect("toggling reaction");
 
         // Local echo is added.
         {
@@ -192,7 +193,7 @@ async fn test_toggling_reaction() -> Result<()> {
 
         // Redact the reaction.
         timeline
-            .toggle_reaction(&msg_uid, &reaction_key)
+            .toggle_reaction(&item_id, &reaction_key)
             .await
             .expect("toggling reaction the second time");
 
@@ -265,12 +266,11 @@ async fn test_stale_local_echo_time_abort_edit() {
     // It is then sent. The timeline stream can be racy here:
     //
     // - either the local echo is marked as sent *before*, and we receive an update
-    //   for this before
-    // the remote echo.
+    //   for this before the remote echo.
     // - or the remote echo comes up faster.
     //
     // Handle both orderings.
-    while let Ok(Some(vector_diff)) = timeout(Duration::from_secs(1), stream.next()).await {
+    while let Ok(Some(vector_diff)) = timeout(Duration::from_secs(3), stream.next()).await {
         let VectorDiff::Set { index: 0, value: echo } = vector_diff else {
             panic!("unexpected diff: {vector_diff:#?}");
         };
@@ -289,16 +289,14 @@ async fn test_stale_local_echo_time_abort_edit() {
     }
 
     // Now do a crime: try to edit the local echo.
-    let did_edit = timeline
+    // The edit works on the local echo and applies to the remote echo \o/.
+    timeline
         .edit(
-            &local_echo,
+            &local_echo.identifier(),
             EditedContent::RoomMessage(RoomMessageEventContent::text_plain("bonjour").into()),
         )
         .await
         .unwrap();
-
-    // The edit works on the local echo and applies to the remote echo \o/.
-    assert!(did_edit);
 
     let vector_diff = timeout(Duration::from_secs(5), stream.next()).await.unwrap().unwrap();
     let remote_echo = assert_matches!(vector_diff, VectorDiff::Set { index: 0, value } => value);

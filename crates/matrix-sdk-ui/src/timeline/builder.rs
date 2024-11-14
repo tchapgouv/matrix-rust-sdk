@@ -158,13 +158,12 @@ impl TimelineBuilder {
         let (_, mut event_subscriber) = room_event_cache.subscribe().await?;
 
         let is_pinned_events = matches!(focus, TimelineFocus::PinnedEvents { .. });
-        let is_room_encrypted =
-            room.is_encrypted().await.map_err(|_| Error::UnknownEncryptionState)?;
+        let is_room_encrypted = room.is_encrypted().await.ok();
 
         let controller = TimelineController::new(
             room,
             focus.clone(),
-            internal_id_prefix,
+            internal_id_prefix.clone(),
             unable_to_decrypt_hook,
             is_room_encrypted,
         )
@@ -196,12 +195,24 @@ impl TimelineBuilder {
             None
         };
 
+        let encryption_changes_handle = spawn({
+            let inner = controller.clone();
+            async move {
+                inner.handle_encryption_state_changes().await;
+            }
+        });
+
         let room_update_join_handle = spawn({
             let room_event_cache = room_event_cache.clone();
             let inner = controller.clone();
 
-            let span =
-                info_span!(parent: Span::none(), "room_update_handler", room_id = ?room.room_id());
+            let span = info_span!(
+                parent: Span::none(),
+                "live_update_handler",
+                room_id = ?room.room_id(),
+                focus = focus.debug_string(),
+                prefix = internal_id_prefix
+            );
             span.follows_from(Span::current());
 
             async move {
@@ -301,7 +312,13 @@ impl TimelineBuilder {
                     timeline.handle_local_echo(echo).await;
                 }
 
-                let span = info_span!(parent: Span::none(), "local_echo_handler", room_id = ?room.room_id());
+                let span = info_span!(
+                    parent: Span::none(),
+                    "local_echo_handler",
+                    room_id = ?room.room_id(),
+                    focus = focus.debug_string(),
+                    prefix = internal_id_prefix
+                );
                 span.follows_from(Span::current());
 
                 // React to future local echoes too.
@@ -421,6 +438,7 @@ impl TimelineBuilder {
                 room_key_backup_enabled_join_handle,
                 local_echo_listener_handle,
                 _event_cache_drop_handle: event_cache_drop,
+                encryption_changes_handle,
             }),
         };
 

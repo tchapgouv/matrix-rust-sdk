@@ -39,7 +39,7 @@ use crate::{
         Result as StoreResult, Store, StoreCache, StoreCacheGuard, UserKeyQueryResult,
     },
     types::{CrossSigningKey, DeviceKeys, MasterPubkey, SelfSigningPubkey, UserSigningPubkey},
-    CryptoStoreError, LocalTrust, OwnUserIdentity, SignatureError, UserIdentities,
+    CryptoStoreError, LocalTrust, OwnUserIdentity, SignatureError, UserIdentity,
 };
 
 enum DeviceChange {
@@ -749,7 +749,7 @@ impl IdentityManager {
             .store
             .get_identity(self.user_id())
             .await?
-            .and_then(UserIdentities::own)
+            .and_then(UserIdentity::own)
             .filter(|own| own.is_verified());
 
         for (user_id, master_key) in &response.master_keys {
@@ -2098,12 +2098,8 @@ pub(crate) mod tests {
         // We should now have an identity for the user but no pin violation
         // (pinned master key is the current one)
         assert!(!other_identity.has_pin_violation());
-        let first_device = manager
-            .store
-            .get_device_data(other_user, DataSet::first_device_id())
-            .await
-            .unwrap()
-            .unwrap();
+        let first_device =
+            manager.store.get_device_data(other_user, DataSet::device_a()).await.unwrap().unwrap();
         assert!(first_device.is_cross_signed_by_owner(&identity));
 
         // We receive a new keys update for that user, with a new identity
@@ -2122,23 +2118,15 @@ pub(crate) mod tests {
         // violation
         assert!(other_identity.has_pin_violation());
 
-        let second_device = manager
-            .store
-            .get_device_data(other_user, DataSet::second_device_id())
-            .await
-            .unwrap()
-            .unwrap();
+        let second_device =
+            manager.store.get_device_data(other_user, DataSet::device_b()).await.unwrap().unwrap();
 
         // There is a new device signed by the new identity
         assert!(second_device.is_cross_signed_by_owner(&identity));
 
         // The first device should not be signed by the new identity
-        let first_device = manager
-            .store
-            .get_device_data(other_user, DataSet::first_device_id())
-            .await
-            .unwrap()
-            .unwrap();
+        let first_device =
+            manager.store.get_device_data(other_user, DataSet::device_a()).await.unwrap().unwrap();
         assert!(!first_device.is_cross_signed_by_owner(&identity));
 
         let remember_previous_identity = other_identity.clone();
@@ -2200,7 +2188,7 @@ pub(crate) mod tests {
     // Set up a machine do initial own key query and import cross-signing secret to
     // make the current session verified.
     async fn common_verified_identity_changes_machine_setup() -> OlmMachine {
-        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+        use test_json::keys_query_sets::VerificationViolationTestData as DataSet;
 
         let machine = OlmMachine::new(DataSet::own_id(), device_id!("LOCAL")).await;
 
@@ -2220,7 +2208,7 @@ pub(crate) mod tests {
     }
     #[async_test]
     async fn test_manager_verified_latch_setup_on_new_identities() {
-        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+        use test_json::keys_query_sets::VerificationViolationTestData as DataSet;
 
         let machine = common_verified_identity_changes_machine_setup().await;
 
@@ -2276,7 +2264,7 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_manager_verified_identity_changes_setup_on_updated_identities() {
-        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+        use test_json::keys_query_sets::VerificationViolationTestData as DataSet;
 
         let machine = common_verified_identity_changes_machine_setup().await;
 
@@ -2318,7 +2306,7 @@ pub(crate) mod tests {
     // The cross signing secrets are not yet uploaded.
     // Then query keys for carol and bob (both signed by own identity)
     async fn common_verified_identity_changes_own_trust_change_machine_setup() -> OlmMachine {
-        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+        use test_json::keys_query_sets::VerificationViolationTestData as DataSet;
 
         // Start on a non-verified session
         let machine = OlmMachine::new(DataSet::own_id(), device_id!("LOCAL")).await;
@@ -2352,7 +2340,7 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_manager_verified_identity_changes_setup_on_own_identity_trust_change() {
-        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+        use test_json::keys_query_sets::VerificationViolationTestData as DataSet;
         let machine = common_verified_identity_changes_own_trust_change_machine_setup().await;
 
         let own_identity =
@@ -2389,7 +2377,7 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_manager_verified_identity_change_setup_on_import_secrets() {
-        use test_json::keys_query_sets::PreviouslyVerifiedTestData as DataSet;
+        use test_json::keys_query_sets::VerificationViolationTestData as DataSet;
         let machine = common_verified_identity_changes_own_trust_change_machine_setup().await;
 
         let own_identity =
