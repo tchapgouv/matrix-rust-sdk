@@ -1,5 +1,10 @@
 use std::{fs, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
 
+use super::{client::Client, RUNTIME};
+use crate::{
+    authentication::OidcConfiguration, client::ClientSessionDelegate, error::ClientError,
+    helpers::unwrap_or_clone_arc, task_handle::TaskHandle,
+};
 use futures_util::StreamExt;
 use matrix_sdk::{
     authentication::qrcode::{self, DeviceCodeErrorResponseType, LoginFailureReason},
@@ -21,12 +26,6 @@ use ruma::api::error::{DeserializationError, FromHttpResponseError};
 use tracing::{debug, error};
 use url::Url;
 use zeroize::Zeroizing;
-
-use super::{client::Client, RUNTIME};
-use crate::{
-    authentication::OidcConfiguration, client::ClientSessionDelegate, error::ClientError,
-    helpers::unwrap_or_clone_arc, task_handle::TaskHandle,
-};
 
 /// A list of bytes containing a certificate in DER or PEM form.
 pub type CertificateBytes = Vec<u8>;
@@ -204,6 +203,10 @@ pub enum ClientBuildError {
     Sdk(MatrixClientBuildError),
     #[error("Failed to build the client: {message}")]
     Generic { message: String },
+    // BWI specific
+    #[error("None of the provided public keys verifies the signature of the server")]
+    ServerIsNotVerified,
+    // end BWI specific
 }
 
 impl From<MatrixClientBuildError> for ClientBuildError {
@@ -220,6 +223,7 @@ impl From<MatrixClientBuildError> for ClientBuildError {
             MatrixClientBuildError::SlidingSyncVersion(e) => {
                 ClientBuildError::SlidingSyncVersion(e)
             }
+            MatrixClientBuildError::ServerIsNotVerified => ClientBuildError::ServerIsNotVerified,
             _ => ClientBuildError::Sdk(e),
         }
     }
@@ -251,6 +255,9 @@ impl From<ClientError> for ClientBuildError {
 
 #[derive(Clone, uniffi::Object)]
 pub struct ClientBuilder {
+    // BWI specific
+    public_keys_for_jwt_token_validation: Option<Vec<String>>,
+    // end BWI specific
     session_paths: Option<SessionPaths>,
     username: Option<String>,
     homeserver_cfg: Option<HomeserverConfig>,
@@ -275,6 +282,9 @@ impl ClientBuilder {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            // BWI specific
+            public_keys_for_jwt_token_validation: None,
+            // end BWI specific
             session_paths: None,
             username: None,
             homeserver_cfg: None,
@@ -331,6 +341,19 @@ impl ClientBuilder {
         builder.session_paths = Some(SessionPaths { data_path, cache_path });
         Arc::new(builder)
     }
+
+    // BWI specific
+    /// set the public keys that could be used for validating
+    /// the identity of the server via the jwt token flow
+    pub fn public_keys_for_jwt_token_validation(
+        self: Arc<Self>,
+        public_keys_for_jwt: Vec<String>,
+    ) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.public_keys_for_jwt_token_validation = Some(public_keys_for_jwt);
+        Arc::new(builder)
+    }
+    // end BWI specific
 
     pub fn username(self: Arc<Self>, username: String) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
@@ -537,6 +560,17 @@ impl ClientBuilder {
         }
 
         inner_builder = inner_builder.add_root_certificates(certificates);
+
+        // BWI-specific
+        inner_builder = match builder.public_keys_for_jwt_token_validation {
+            None => Err(ClientBuildError::ServerIsNotVerified),
+            Some(keys) => Ok({
+                inner_builder
+                    .public_keys_for_jwt_from_strings(&keys)
+                    .map_err(|_| ClientBuildError::ServerIsNotVerified)?
+            }),
+        }?;
+        // end BWI specific
 
         if builder.disable_built_in_root_certificates {
             inner_builder = inner_builder.disable_built_in_root_certificates();

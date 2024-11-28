@@ -760,18 +760,18 @@ impl Client {
             .await?)
     }
 
-    pub fn set_content_scanner_url(&self, url: String) {}
+    pub fn set_content_scanner_url(&self, _url: String) {}
 
     pub async fn get_content_scanner_result_for_attachment(
         &self,
-        media_source: Arc<MediaSource>,
+        _media_source: Arc<MediaSource>,
     ) -> Result<ScanState, ClientError> {
         Ok(Infected)
     }
 
     pub async fn download_attachment_from_content_scanner(
         &self,
-        media_source: Arc<MediaSource>,
+        _media_source: Arc<MediaSource>,
     ) -> Result<Vec<u8>, ClientError> {
         Err(anyhow!("This method is not implemented, but your file is infected anyway!").into())
     }
