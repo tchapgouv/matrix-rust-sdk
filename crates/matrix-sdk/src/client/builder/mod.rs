@@ -116,7 +116,7 @@ impl ClientBuilder {
     pub(crate) fn new() -> Self {
         Self {
             // BWI specific
-            public_keys_for_jwt_validation: None,
+            public_keys_for_jwt_validation: Some(Vec::new()),
             // end BWI specific
             homeserver_cfg: None,
             #[cfg(feature = "experimental-sliding-sync")]
@@ -222,6 +222,11 @@ impl ClientBuilder {
             .collect();
         self.public_keys_for_jwt_validation = Some(public_keys);
         Ok(self)
+    }
+
+    pub fn without_server_jwt_token_validation(mut self) -> Self {
+        self.public_keys_for_jwt_validation = None;
+        self
     }
     // end BWI specific
 
@@ -587,7 +592,7 @@ impl ClientBuilder {
         homeserver_url: &Url,
     ) -> Result<(), BWIJWTTokenValidationError> {
         match public_keys_for_jwt_validation {
-            None => Err(BWIJWTTokenValidationError::NoPublicKeysProvided()),
+            None => Ok(()),
             Some(public_keys) => {
                 let token_validator = BWITokenValidator::for_homeserver(homeserver_url.to_owned());
                 token_validator.validate_with_keys(&public_keys).await
@@ -816,6 +821,9 @@ pub enum ClientBuildError {
 // The http mocking library is not supported for wasm32
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod tests {
+    use super::*;
+    #[cfg(feature = "experimental-sliding-sync")]
+    use crate::sliding_sync::Version as SlidingSyncVersion;
     use assert_matches::assert_matches;
     use matrix_sdk_test::{async_test, test_json};
     use serde_json::{json_internal, Value as JsonValue};
@@ -824,10 +832,6 @@ pub(crate) mod tests {
         matchers::{method, path},
         Mock, MockServer, ResponseTemplate,
     };
-
-    use super::*;
-    #[cfg(feature = "experimental-sliding-sync")]
-    use crate::sliding_sync::Version as SlidingSyncVersion;
 
     #[test]
     fn test_sanitize_server_name() {
@@ -901,7 +905,10 @@ pub(crate) mod tests {
     async fn test_discovery_direct_legacy() {
         // Given a homeserver without a well-known file.
         let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new();
+        let mut builder = ClientBuilder::new()
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
 
         // When building a client with the server's URL.
         builder = builder.server_name_or_homeserver_url(homeserver.uri());
@@ -917,7 +924,10 @@ pub(crate) mod tests {
         // Given a homeserver without a well-known file and with a custom sliding sync
         // proxy injected.
         let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new();
+        let mut builder = ClientBuilder::new()
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
         #[cfg(feature = "experimental-sliding-sync")]
         let url = {
             let url = Url::parse("https://localhost:1234").unwrap();
@@ -974,7 +984,10 @@ pub(crate) mod tests {
         // doesn't support sliding sync.
         let server = MockServer::start().await;
         let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new();
+        let mut builder = ClientBuilder::new()
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
 
         Mock::given(method("GET"))
             .and(path("/.well-known/matrix/client"))
@@ -1002,7 +1015,10 @@ pub(crate) mod tests {
         // sliding sync proxy.
         let server = MockServer::start().await;
         let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new();
+        let mut builder = ClientBuilder::new()
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
 
         Mock::given(method("GET"))
             .and(path("/.well-known/matrix/client"))
@@ -1037,7 +1053,10 @@ pub(crate) mod tests {
         // sliding sync proxy.
         let server = MockServer::start().await;
         let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new();
+        let mut builder = ClientBuilder::new()
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
 
         Mock::given(method("GET"))
             .and(path("/.well-known/matrix/client"))
@@ -1073,7 +1092,10 @@ pub(crate) mod tests {
     async fn test_sliding_sync_discover_proxy() {
         // Given a homeserver with a `.well-known` file.
         let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new();
+        let mut builder = ClientBuilder::new()
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
 
         let expected_url = Url::parse("https://localhost:1234").unwrap();
 
@@ -1108,7 +1130,10 @@ pub(crate) mod tests {
     async fn test_sliding_sync_discover_native() {
         // Given a homeserver with a `/versions` file.
         let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new();
+        let mut builder = ClientBuilder::new()
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
 
         // When building the client with sliding sync to auto-discover the
         // native version.
@@ -1128,7 +1153,10 @@ pub(crate) mod tests {
         let homeserver = make_mock_homeserver().await;
         let builder = ClientBuilder::new()
             .server_name_or_homeserver_url(homeserver.uri())
-            .with_decryption_trust_requirement(TrustRequirement::CrossSigned);
+            .with_decryption_trust_requirement(TrustRequirement::CrossSigned)
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
 
         let client = builder.build().await.unwrap();
         assert_matches!(
@@ -1144,7 +1172,10 @@ pub(crate) mod tests {
 
         let builder = ClientBuilder::new()
             .server_name_or_homeserver_url(homeserver.uri())
-            .with_decryption_trust_requirement(TrustRequirement::Untrusted);
+            .with_decryption_trust_requirement(TrustRequirement::Untrusted)
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
 
         let client = builder.build().await.unwrap();
         assert_matches!(

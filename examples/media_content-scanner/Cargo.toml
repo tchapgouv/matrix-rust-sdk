@@ -6,7 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1"
-tokio = { version = "1.24.2", features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = "0.3.15"
 url = { workspace = true }
 # when copy-pasting this, please use a git dependency or make sure that you

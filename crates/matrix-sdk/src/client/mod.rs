@@ -2429,6 +2429,9 @@ pub(crate) mod tests {
 
         let client = Client::builder()
             .insecure_server_name_no_tls(alice.server_name())
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -2758,6 +2761,9 @@ pub(crate) mod tests {
         let client = Client::builder()
             .insecure_server_name_no_tls(server_name)
             .store_config(StoreConfig::new().state_store(memory_store.clone()))
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -2777,6 +2783,9 @@ pub(crate) mod tests {
         let client = Client::builder()
             .insecure_server_name_no_tls(server_name)
             .store_config(StoreConfig::new().state_store(memory_store.clone()))
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();

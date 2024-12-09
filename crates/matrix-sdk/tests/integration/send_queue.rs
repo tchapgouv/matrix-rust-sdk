@@ -1778,6 +1778,9 @@ async fn test_reloading_rooms_with_unsent_events() {
         .server_versions([MatrixVersion::V1_0])
         .store_config(StoreConfig::new().state_store(store.clone()))
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();
@@ -1855,6 +1858,9 @@ async fn test_reloading_rooms_with_unsent_events() {
         .server_versions([MatrixVersion::V1_0])
         .store_config(StoreConfig::new().state_store(store))
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();

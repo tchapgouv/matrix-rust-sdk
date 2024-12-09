@@ -1373,6 +1373,9 @@ async fn test_restore_room() {
         .homeserver_url("http://localhost:1234")
         .request_config(RequestConfig::new().disable_retry())
         .store_config(store_config)
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();

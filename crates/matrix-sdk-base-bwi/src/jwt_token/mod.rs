@@ -97,31 +97,39 @@ impl BWITokenValidator {
     }
 
     fn homeserver_domain(&self) -> String {
-        self.homeserver_url.domain().expect("The url of the domain should be valid").to_string()
+        self.homeserver_url.domain().expect("The url of the domain should be valid").to_owned()
     }
 
     pub async fn validate_with_keys(
         &self,
-        keys: &Vec<BWIPublicKeyForJWTTokenValidation>,
+        keys: &[BWIPublicKeyForJWTTokenValidation],
     ) -> Result<(), BWIJWTTokenValidationError> {
-        let is_any_token_valid = self
-            .fetch_jwt_token(self.jwt_url())
-            .await?
-            .iter()
-            .any(|token| self.validate_jwt_token_with_keys(&token, &keys));
-        if is_any_token_valid {
-            Ok(())
-        } else {
-            Err(BWIJWTTokenValidationError::NoValidPublicKey())
+        if keys.is_empty() {
+            return Err(BWIJWTTokenValidationError::NoPublicKeysProvided());
+        }
+
+        let tokens = self.fetch_jwt_token(self.jwt_url()).await?;
+
+        match self.validate_jwt_tokens_with_keys(&mut tokens.into_iter(), keys) {
+            true => Ok(()),
+            false => Err(BWIJWTTokenValidationError::NoValidPublicKey()),
         }
     }
 
     fn validate_jwt_token_with_keys(
         &self,
         token: &str,
-        keys: &Vec<BWIPublicKeyForJWTTokenValidation>,
+        keys: &[BWIPublicKeyForJWTTokenValidation],
     ) -> bool {
-        keys.iter().any(|key| self.validate_jwt_token_with_key(&token, &key))
+        keys.iter().any(|key| self.validate_jwt_token_with_key(token, key))
+    }
+
+    fn validate_jwt_tokens_with_keys(
+        &self,
+        tokens: &mut impl Iterator<Item = String>,
+        keys: &[BWIPublicKeyForJWTTokenValidation],
+    ) -> bool {
+        tokens.any(|token| self.validate_jwt_token_with_keys(&token, keys))
     }
 
     fn validate_jwt_token_with_key(
@@ -133,7 +141,7 @@ impl BWITokenValidator {
         validation.sub = Some(self.homeserver_domain());
         validation.set_required_spec_claims(&["exp", "sub"]);
         let decoding_key = key.as_decoding_key().expect("Failed to decode key");
-        match decode::<BWIJwtToken>(&encoded_token, &decoding_key, &validation) {
+        match decode::<BWIJwtToken>(encoded_token, &decoding_key, &validation) {
             Ok(_token) => true,
             Err(e) => match e.kind() {
                 InvalidSignature => {
@@ -164,3 +172,6 @@ impl BWITokenValidator {
         Ok(token_array)
     }
 }
+
+#[cfg(test)]
+mod test;
