@@ -528,6 +528,9 @@ mod tests {
                 <&ServerName>::try_from(server.address().to_string().as_str()).unwrap(),
             )
             .server_versions([MatrixVersion::V1_0])
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -567,6 +570,9 @@ mod tests {
         let client = Client::builder()
             .homeserver_url(homeserver)
             .server_versions([MatrixVersion::V1_0])
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();

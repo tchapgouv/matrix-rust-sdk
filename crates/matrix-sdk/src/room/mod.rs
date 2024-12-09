@@ -3489,6 +3489,9 @@ mod tests {
             .homeserver_url("http://localhost:1234")
             .request_config(RequestConfig::new().disable_retry())
             .sqlite_store(&sqlite_path, None)
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -3531,6 +3534,9 @@ mod tests {
                 .homeserver_url("http://localhost:1234")
                 .request_config(RequestConfig::new().disable_retry())
                 .sqlite_store(&sqlite_path, None)
+                // BWI-specific
+                .without_server_jwt_token_validation()
+                // end BWI-specific
                 .build()
                 .await
                 .unwrap();

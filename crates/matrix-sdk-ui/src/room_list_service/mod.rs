@@ -491,6 +491,9 @@ mod tests {
             .homeserver_url(server.uri())
             .server_versions([MatrixVersion::V1_0])
             .request_config(RequestConfig::new().disable_retry())
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();

@@ -327,6 +327,9 @@ async fn test_own_verification() {
         .homeserver_url(server.server.uri())
         .server_versions([MatrixVersion::V1_0])
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();
@@ -411,6 +414,9 @@ async fn test_reset_cross_signing_resets_verification() {
         .homeserver_url(server.server.uri())
         .server_versions([MatrixVersion::V1_0])
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();
@@ -464,6 +470,9 @@ async fn test_reset_cross_signing_resets_verification() {
         .homeserver_url(server.server.uri())
         .server_versions([MatrixVersion::V1_0])
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();
@@ -508,6 +517,9 @@ async fn test_unchecked_mutual_verification() {
         .homeserver_url(server.server.uri())
         .server_versions([MatrixVersion::V1_0])
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();
@@ -526,6 +538,9 @@ async fn test_unchecked_mutual_verification() {
         .homeserver_url(server.server.uri())
         .server_versions([MatrixVersion::V1_0])
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();
