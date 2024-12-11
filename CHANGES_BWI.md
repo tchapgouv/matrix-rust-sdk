@@ -5,6 +5,8 @@ Upstream merge ✨:
 
 Features ✨: 
 - MESSENGER-6669 add jwt validation for home server
+- MESSENGER-6525 provide imprint and privacy links from wellknown
+- MESSENGER-5983 set room alias when creating a room
 - MESSENGER-5991 set room history visibility at create room
 
 Improvements 🙌:
