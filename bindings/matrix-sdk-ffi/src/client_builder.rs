@@ -283,7 +283,7 @@ impl ClientBuilder {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             // BWI specific
-            public_keys_for_jwt_token_validation: None,
+            public_keys_for_jwt_token_validation: Some(Vec::new()),
             // end BWI specific
             session_paths: None,
             username: None,
@@ -343,7 +343,7 @@ impl ClientBuilder {
     }
 
     // BWI specific
-    /// set the public keys that could be used for validating
+    /// Set the public keys that could be used for validating
     /// the identity of the server via the jwt token flow
     pub fn public_keys_for_jwt_token_validation(
         self: Arc<Self>,
@@ -351,6 +351,13 @@ impl ClientBuilder {
     ) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
         builder.public_keys_for_jwt_token_validation = Some(public_keys_for_jwt);
+        Arc::new(builder)
+    }
+
+    /// Disable Jwt-Token validation
+    pub fn without_jwt_token_validation(self: Arc<Self>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.public_keys_for_jwt_token_validation = None;
         Arc::new(builder)
     }
     // end BWI specific
@@ -563,7 +570,7 @@ impl ClientBuilder {
 
         // BWI-specific
         inner_builder = match builder.public_keys_for_jwt_token_validation {
-            None => Err(ClientBuildError::ServerIsNotVerified),
+            None => Ok::<_, ClientBuildError>(inner_builder.without_server_jwt_token_validation()),
             Some(keys) => Ok({
                 inner_builder
                     .public_keys_for_jwt_from_strings(&keys)
