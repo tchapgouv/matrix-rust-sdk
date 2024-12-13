@@ -18,8 +18,7 @@ use matrix_sdk::{
                 message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
             },
             room_key::ToDeviceRoomKeyEvent,
-            AnyMessageLikeEventContent, AnySyncTimelineEvent, AnyTimelineEvent,
-            OriginalSyncMessageLikeEvent,
+            AnyMessageLikeEventContent, AnySyncTimelineEvent, OriginalSyncMessageLikeEvent,
         },
         serde::Raw,
         EventEncryptionAlgorithm, OwnedEventId, OwnedRoomId, RoomId,
@@ -133,7 +132,7 @@ impl ClientWrapper {
         sqlite_dir: Option<&Path>,
         app_identifier: Option<String>,
     ) -> Self {
-        let builder = TestClientBuilder::new(username).randomize_username();
+        let builder = TestClientBuilder::new(username);
 
         let builder = if let Some(sqlite_dir) = sqlite_dir {
             builder.use_sqlite_dir(sqlite_dir)
@@ -244,8 +243,7 @@ impl ClientWrapper {
             room.send(RoomMessageEventContent::text_plain(message.to_owned()))
                 .await
                 .expect("Sending message failed")
-                .event_id
-                .to_owned(),
+                .event_id,
             message.to_owned(),
         )
     }
@@ -424,9 +422,9 @@ async fn decrypt_event(
         return None;
     };
 
-    let Ok(deserialized) = decrypted.event.deserialize() else { return None };
+    let Ok(deserialized) = decrypted.raw().deserialize() else { return None };
 
-    let AnyTimelineEvent::MessageLike(message) = &deserialized else { return None };
+    let AnySyncTimelineEvent::MessageLike(message) = &deserialized else { return None };
 
     let Some(AnyMessageLikeEventContent::RoomMessage(content)) = message.original_content() else {
         return None;

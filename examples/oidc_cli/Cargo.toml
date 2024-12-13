@@ -3,23 +3,24 @@ name = "example-oidc-cli"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "Apache-2.0"
 
 [[bin]]
 name = "example-oidc-cli"
 test = false
 
 [dependencies]
-anyhow = "1"
+anyhow = { workspace = true }
 axum = "0.7.4"
 dirs = "5.0.1"
-futures-util = { version = "0.3.21", default-features = false }
+futures-util = { workspace = true }
 matrix-sdk-ui = { path = "../../crates/matrix-sdk-ui" }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { version = "1.24.2", features = ["macros", "rt-multi-thread"] }
-tower = { version = "0.4.13", features = ["make"] }
-tracing-subscriber = "0.3.15"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.4.13", features = ["util"] }
+tracing-subscriber = { workspace = true }
 url = { workspace = true }
 
 [dependencies.matrix-sdk]
@@ -28,3 +29,6 @@ features = ["experimental-oidc"]
 
 [lints]
 workspace = true
+
+[package.metadata.release]
+release = false

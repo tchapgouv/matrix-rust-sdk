@@ -1,5 +1,10 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
 # unreleased
 
+- Add `BaseClient::room_key_recipient_strategy` field
 - Replace the `Notification` type from Ruma in `SyncResponse` and `StateChanges` by a custom one
 - The ambiguity maps in `SyncResponse` are moved to `JoinedRoom` and `LeftRoom`
 - `AmbiguityCache` contains the room member's user ID
@@ -10,6 +15,11 @@
 - `Client::get_rooms` and `Client::get_rooms_filtered` are renamed
   `Client::rooms` and `Client::rooms_filtered`.
 - `Client::get_stripped_rooms` has finally been removed.
+- `Media::get_thumbnail` and `MediaFormat::Thumbnail` allow to request an animated thumbnail
+  - They both take a `MediaThumbnailSettings` instead of `MediaThumbnailSize`.
+- The `StateStore` methods to access data in the media cache where moved to a separate
+  `EventCacheStore` trait.
+- The `instant` module was removed, use the `ruma::time` module instead.
 
 # 0.7.0
 

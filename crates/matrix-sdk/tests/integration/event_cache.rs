@@ -3,21 +3,15 @@ use std::{future::ready, ops::ControlFlow, time::Duration};
 use assert_matches2::{assert_let, assert_matches};
 use matrix_sdk::{
     event_cache::{
-        BackPaginationOutcome, EventCacheError, RoomEventCacheUpdate,
+        paginator::PaginatorState, BackPaginationOutcome, EventCacheError, RoomEventCacheUpdate,
         TimelineHasBeenResetWhilePaginating,
     },
     test_utils::{assert_event_matches_msg, events::EventFactory, logged_in_client_with_server},
 };
 use matrix_sdk_test::{
-    async_test, EventBuilder, GlobalAccountDataTestEvent, JoinedRoomBuilder, SyncResponseBuilder,
+    async_test, GlobalAccountDataTestEvent, JoinedRoomBuilder, SyncResponseBuilder,
 };
-use ruma::{
-    event_id,
-    events::{room::message::RoomMessageEventContent, AnyTimelineEvent},
-    room_id,
-    serde::Raw,
-    user_id,
-};
+use ruma::{event_id, events::AnyTimelineEvent, room_id, serde::Raw, user_id};
 use serde_json::json;
 use tokio::{spawn, time::timeout};
 use wiremock::{
@@ -40,8 +34,8 @@ async fn test_must_explicitly_subscribe() {
 
     let room_id = room_id!("!omelette:fromage.fr");
 
-    // Make sure the client is aware of the room.
     {
+        // Make sure the client is aware of the room.
         let mut sync_builder = SyncResponseBuilder::new();
         sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
         let response_body = sync_builder.build_json_sync_response();
@@ -259,31 +253,6 @@ async fn test_ignored_unignored() {
     assert!(subscriber.is_empty());
 }
 
-macro_rules! non_sync_events {
-    ( @_ $builder:expr, [ ( $room_id:expr , $event_id:literal : $msg:literal ) $(, $( $rest:tt )* )? ] [ $( $accumulator:tt )* ] ) => {
-        non_sync_events!(
-            @_ $builder,
-            [ $( $( $rest )* )? ]
-            [ $( $accumulator )*
-              $builder.make_message_event_with_id(
-                user_id!("@a:b.c"),
-                $room_id,
-                event_id!($event_id),
-                RoomMessageEventContent::text_plain($msg)
-              ),
-            ]
-        )
-    };
-
-    ( @_ $builder:expr, [] [ $( $accumulator:tt )* ] ) => {
-        vec![ $( $accumulator )* ]
-    };
-
-    ( $builder:expr, [ $( $all:tt )* ] ) => {
-        non_sync_events!( @_ $builder, [ $( $all )* ] [] )
-    };
-}
-
 /// Puts a mounting point for /messages for a pagination request, matching
 /// against a precise `from` token given as `expected_from`, and returning the
 /// chunk of events and the next token as `end` (if available).
@@ -291,10 +260,10 @@ async fn mock_messages(
     server: &MockServer,
     expected_from: &str,
     next_token: Option<&str>,
-    chunk: Vec<Raw<AnyTimelineEvent>>,
+    chunk: Vec<impl Into<Raw<AnyTimelineEvent>>>,
 ) {
     let response_json = json!({
-        "chunk": chunk,
+        "chunk": chunk.into_iter().map(|item| item.into()).collect::<Vec<_>>(),
         "start": "t392-516_47314_0_7_1_1_1_11444_1",
         "end": next_token,
     });
@@ -321,7 +290,7 @@ async fn test_backpaginate_once() {
     // token,
     let room_id = room_id!("!omelette:fromage.fr");
 
-    let event_builder = EventBuilder::new();
+    let f = EventFactory::new().room(room_id).sender(user_id!("@a:b.c"));
     let mut sync_builder = SyncResponseBuilder::new();
 
     {
@@ -329,10 +298,7 @@ async fn test_backpaginate_once() {
             JoinedRoomBuilder::new(room_id)
                 // Note to self: a timeline must have at least single event to be properly
                 // serialized.
-                .add_timeline_event(event_builder.make_sync_message_event(
-                    user_id!("@a:b.c"),
-                    RoomMessageEventContent::text_plain("heyo"),
-                ))
+                .add_timeline_event(f.text_msg("heyo"))
                 .set_timeline_prev_batch("prev_batch".to_owned()),
         );
         let response_body = sync_builder.build_json_sync_response();
@@ -363,14 +329,17 @@ async fn test_backpaginate_once() {
             &server,
             "prev_batch",
             None,
-            non_sync_events!(event_builder, [ (room_id, "$2": "world"), (room_id, "$3": "hello") ]),
+            vec![
+                f.text_msg("world").event_id(event_id!("$2")),
+                f.text_msg("hello").event_id(event_id!("$3")),
+            ],
         )
         .await;
 
         // Then if I backpaginate,
         let pagination = room_event_cache.pagination();
 
-        assert!(pagination.get_or_wait_for_token().await.is_some());
+        assert!(pagination.get_or_wait_for_token(None).await.is_some());
 
         pagination.run_backwards(20, once).await.unwrap()
     };
@@ -399,7 +368,7 @@ async fn test_backpaginate_many_times_with_many_iterations() {
     // token,
     let room_id = room_id!("!omelette:fromage.fr");
 
-    let event_builder = EventBuilder::new();
+    let f = EventFactory::new().room(room_id).sender(user_id!("@a:b.c"));
     let mut sync_builder = SyncResponseBuilder::new();
 
     {
@@ -407,10 +376,7 @@ async fn test_backpaginate_many_times_with_many_iterations() {
             JoinedRoomBuilder::new(room_id)
                 // Note to self: a timeline must have at least single event to be properly
                 // serialized.
-                .add_timeline_event(event_builder.make_sync_message_event(
-                    user_id!("@a:b.c"),
-                    RoomMessageEventContent::text_plain("heyo"),
-                ))
+                .add_timeline_event(f.text_msg("heyo"))
                 .set_timeline_prev_batch("prev_batch".to_owned()),
         );
         let response_body = sync_builder.build_json_sync_response();
@@ -444,7 +410,10 @@ async fn test_backpaginate_many_times_with_many_iterations() {
         &server,
         "prev_batch",
         Some("prev_batch2"),
-        non_sync_events!(event_builder, [ (room_id, "$2": "world"), (room_id, "$3": "hello") ]),
+        vec![
+            f.text_msg("world").event_id(event_id!("$2")),
+            f.text_msg("hello").event_id(event_id!("$3")),
+        ],
     )
     .await;
 
@@ -453,13 +422,13 @@ async fn test_backpaginate_many_times_with_many_iterations() {
         &server,
         "prev_batch2",
         None,
-        non_sync_events!(event_builder, [ (room_id, "$4": "oh well"), ]),
+        vec![f.text_msg("oh well").event_id(event_id!("$4"))],
     )
     .await;
 
     // Then if I backpaginate in a loop,
     let pagination = room_event_cache.pagination();
-    while pagination.get_or_wait_for_token().await.is_some() {
+    while pagination.get_or_wait_for_token(None).await.is_some() {
         pagination
             .run_backwards(20, |outcome, timeline_has_been_reset| {
                 num_paginations += 1;
@@ -515,7 +484,7 @@ async fn test_backpaginate_many_times_with_one_iteration() {
     // token,
     let room_id = room_id!("!omelette:fromage.fr");
 
-    let event_builder = EventBuilder::new();
+    let f = EventFactory::new().room(room_id).sender(user_id!("@a:b.c"));
     let mut sync_builder = SyncResponseBuilder::new();
 
     {
@@ -523,10 +492,7 @@ async fn test_backpaginate_many_times_with_one_iteration() {
             JoinedRoomBuilder::new(room_id)
                 // Note to self: a timeline must have at least single event to be properly
                 // serialized.
-                .add_timeline_event(event_builder.make_sync_message_event(
-                    user_id!("@a:b.c"),
-                    RoomMessageEventContent::text_plain("heyo"),
-                ))
+                .add_timeline_event(f.text_msg("heyo"))
                 .set_timeline_prev_batch("prev_batch".to_owned()),
         );
         let response_body = sync_builder.build_json_sync_response();
@@ -560,7 +526,10 @@ async fn test_backpaginate_many_times_with_one_iteration() {
         &server,
         "prev_batch",
         Some("prev_batch2"),
-        non_sync_events!(event_builder, [ (room_id, "$2": "world"), (room_id, "$3": "hello") ]),
+        vec![
+            f.text_msg("world").event_id(event_id!("$2")),
+            f.text_msg("hello").event_id(event_id!("$3")),
+        ],
     )
     .await;
 
@@ -569,13 +538,13 @@ async fn test_backpaginate_many_times_with_one_iteration() {
         &server,
         "prev_batch2",
         None,
-        non_sync_events!(event_builder, [ (room_id, "$4": "oh well"), ]),
+        vec![f.text_msg("oh well").event_id(event_id!("$4"))],
     )
     .await;
 
     // Then if I backpaginate in a loop,
     let pagination = room_event_cache.pagination();
-    while pagination.get_or_wait_for_token().await.is_some() {
+    while pagination.get_or_wait_for_token(None).await.is_some() {
         pagination
             .run_backwards(20, |outcome, timeline_has_been_reset| {
                 num_paginations += 1;
@@ -722,7 +691,7 @@ async fn test_reset_while_backpaginating() {
     // Run the pagination!
     let pagination = room_event_cache.pagination();
 
-    let first_token = pagination.get_or_wait_for_token().await;
+    let first_token = pagination.get_or_wait_for_token(None).await;
     assert!(first_token.is_some());
 
     let backpagination = spawn({
@@ -752,7 +721,7 @@ async fn test_reset_while_backpaginating() {
     assert!(!events.is_empty());
 
     // Now if we retrieve the oldest token, it's set to something else.
-    let second_token = pagination.get_or_wait_for_token().await.unwrap();
+    let second_token = pagination.get_or_wait_for_token(None).await.unwrap();
     assert!(first_token.unwrap() != second_token);
     assert_eq!(second_token, "third_backpagination");
 }
@@ -770,7 +739,7 @@ async fn test_backpaginating_without_token() {
     // token,
     let room_id = room_id!("!omelette:fromage.fr");
 
-    let event_builder = EventBuilder::new();
+    let f = EventFactory::new().room(room_id).sender(user_id!("@a:b.c"));
     let mut sync_builder = SyncResponseBuilder::new();
 
     {
@@ -794,7 +763,9 @@ async fn test_backpaginating_without_token() {
         .and(path_regex(r"^/_matrix/client/r0/rooms/.*/messages$"))
         .and(header("authorization", "Bearer 1234"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "chunk": non_sync_events!(event_builder, [(room_id, "$2": "hi")]),
+            "chunk": vec![
+                f.text_msg("hi").event_id(event_id!("$2")).into_raw_timeline()
+            ],
             "start": "t392-516_47314_0_7_1_1_1_11444_1",
         })))
         .expect(1)
@@ -803,7 +774,7 @@ async fn test_backpaginating_without_token() {
 
     // We don't have a token.
     let pagination = room_event_cache.pagination();
-    assert!(pagination.get_or_wait_for_token().await.is_none());
+    assert!(pagination.get_or_wait_for_token(None).await.is_none());
 
     // If we try to back-paginate with a token, it will hit the end of the timeline
     // and give us the resulting event.
@@ -815,6 +786,103 @@ async fn test_backpaginating_without_token() {
     // And we get notified about the new event.
     assert_event_matches_msg(&events[0], "hi");
     assert_eq!(events.len(), 1);
+
+    assert!(room_stream.is_empty());
+}
+
+#[async_test]
+async fn test_limited_timeline_resets_pagination() {
+    let (client, server) = logged_in_client_with_server().await;
+
+    let event_cache = client.event_cache();
+
+    // Immediately subscribe the event cache to sync updates.
+    event_cache.subscribe().unwrap();
+
+    // If I sync and get informed I've joined The Room, without a previous batch
+    // token,
+    let room_id = room_id!("!omelette:fromage.fr");
+    let f = EventFactory::new().room(room_id).sender(user_id!("@a:b.c"));
+    let mut sync_builder = SyncResponseBuilder::new();
+
+    {
+        sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+        let response_body = sync_builder.build_json_sync_response();
+
+        mock_sync(&server, response_body, None).await;
+        client.sync_once(Default::default()).await.unwrap();
+        server.reset().await;
+    }
+
+    let (room_event_cache, _drop_handles) =
+        client.get_room(room_id).unwrap().event_cache().await.unwrap();
+
+    let (events, mut room_stream) = room_event_cache.subscribe().await.unwrap();
+
+    assert!(events.is_empty());
+    assert!(room_stream.is_empty());
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/messages$"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "chunk": vec![
+                f.text_msg("hi").event_id(event_id!("$2")).into_raw_timeline()
+            ],
+            "start": "t392-516_47314_0_7_1_1_1_11444_1",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // At the beginning, the paginator is in the initial state.
+    let pagination = room_event_cache.pagination();
+    let mut pagination_status = pagination.status();
+    assert_eq!(pagination_status.get(), PaginatorState::Initial);
+
+    // If we try to back-paginate with a token, it will hit the end of the timeline
+    // and give us the resulting event.
+    let BackPaginationOutcome { events, reached_start } =
+        pagination.run_backwards(20, once).await.unwrap();
+
+    assert_eq!(events.len(), 1);
+    assert!(reached_start);
+
+    // And the paginator state delives this as an update, and is internally
+    // consistent with it:
+    assert_eq!(
+        timeout(Duration::from_secs(1), pagination_status.next()).await,
+        Ok(Some(PaginatorState::Idle))
+    );
+    assert!(pagination.hit_timeline_start());
+
+    // When a limited sync comes back from the server,
+    {
+        sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).set_timeline_limited());
+        let response_body = sync_builder.build_json_sync_response();
+
+        mock_sync(&server, response_body, None).await;
+        client.sync_once(Default::default()).await.unwrap();
+        server.reset().await;
+    }
+
+    // We receive an update about the limited timeline.
+    assert_matches!(
+        timeout(Duration::from_secs(1), room_stream.recv()).await,
+        Ok(Ok(RoomEventCacheUpdate::Clear))
+    );
+
+    // The paginator state is reset: status set to Initial, hasn't hit the timeline
+    // start.
+    assert!(!pagination.hit_timeline_start());
+    assert_eq!(pagination_status.get(), PaginatorState::Initial);
+
+    // We receive an update about the paginator status.
+    let next_state = timeout(Duration::from_secs(1), pagination_status.next())
+        .await
+        .expect("timeout")
+        .expect("no update");
+    assert_eq!(next_state, PaginatorState::Initial);
 
     assert!(room_stream.is_empty());
 }

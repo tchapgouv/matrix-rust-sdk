@@ -20,8 +20,8 @@ use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{config::SyncSettings, room::Receipts, test_utils::logged_in_client_with_server};
 use matrix_sdk_test::{
-    async_test, sync_timeline_event, EphemeralTestEvent, JoinedRoomBuilder,
-    RoomAccountDataTestEvent, SyncResponseBuilder, ALICE, BOB,
+    async_test, mocks::mock_encryption_state, sync_timeline_event, EphemeralTestEvent,
+    JoinedRoomBuilder, RoomAccountDataTestEvent, SyncResponseBuilder, ALICE, BOB,
 };
 use matrix_sdk_ui::timeline::RoomExt;
 use ruma::{
@@ -35,6 +35,7 @@ use ruma::{
     room_id, user_id, RoomVersionId,
 };
 use serde_json::json;
+use stream_assert::{assert_pending, assert_ready};
 use wiremock::{
     matchers::{body_json, header, method, path_regex},
     Mock, ResponseTemplate,
@@ -71,11 +72,15 @@ async fn test_read_receipts_updates() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    mock_encryption_state(&server, false).await;
+
     let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
     let (items, mut timeline_stream) = timeline.subscribe().await;
+    let mut own_receipts_subscriber = timeline.subscribe_own_user_read_receipts_changed().await;
 
     assert!(items.is_empty());
+    assert_pending!(own_receipts_subscriber);
 
     let own_receipt = timeline.latest_user_read_receipt(own_user_id).await;
     assert_matches!(own_receipt, None);
@@ -134,6 +139,9 @@ async fn test_read_receipts_updates() {
 
     let (own_receipt_event_id, _) = timeline.latest_user_read_receipt(own_user_id).await.unwrap();
     assert_eq!(own_receipt_event_id, first_event.event_id().unwrap());
+
+    assert_ready!(own_receipts_subscriber);
+    assert_pending!(own_receipts_subscriber);
 
     // Implicit read receipt of @alice:localhost.
     assert_let!(Some(VectorDiff::PushBack { value: second_item }) = timeline_stream.next().await);
@@ -255,6 +263,8 @@ async fn test_read_receipts_updates() {
     let (bob_receipt_event_id, _) = timeline.latest_user_read_receipt(bob).await.unwrap();
     assert_eq!(bob_receipt_event_id, third_event_id);
 
+    assert_pending!(own_receipts_subscriber);
+
     // Private read receipt is updated.
     sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_ephemeral_event(
         EphemeralTestEvent::Custom(json!({
@@ -278,6 +288,9 @@ async fn test_read_receipts_updates() {
     let (own_user_receipt_event_id, _) =
         timeline.latest_user_read_receipt(own_user_id).await.unwrap();
     assert_eq!(own_user_receipt_event_id, second_event_id);
+
+    assert_ready!(own_receipts_subscriber);
+    assert_pending!(own_receipts_subscriber);
 }
 
 #[async_test]
@@ -298,6 +311,8 @@ async fn test_read_receipts_updates_on_filtered_events() {
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
+
+    mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline_builder().event_filter(filter_notice).build().await.unwrap();
@@ -506,6 +521,8 @@ async fn test_send_single_receipt() {
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
+
+    mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
@@ -854,6 +871,8 @@ async fn test_mark_as_read() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    mock_encryption_state(&server, false).await;
+
     let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
 
@@ -956,6 +975,8 @@ async fn test_send_multiple_receipts() {
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
+
+    mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
@@ -1170,6 +1191,8 @@ async fn test_latest_user_read_receipt() {
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
+
+    mock_encryption_state(&server, false).await;
 
     let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();

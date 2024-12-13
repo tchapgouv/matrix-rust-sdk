@@ -17,18 +17,22 @@
 use std::{io::Error as IoError, sync::Arc, time::Duration};
 
 use as_variant::as_variant;
+use http::StatusCode;
 #[cfg(feature = "qrcode")]
 use matrix_sdk_base::crypto::ScanError;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::{
     CryptoStoreError, DecryptorError, KeyExportError, MegolmError, OlmError,
 };
-use matrix_sdk_base::{Error as SdkBaseError, RoomState, StoreError};
+use matrix_sdk_base::{
+    event_cache_store::EventCacheStoreError, Error as SdkBaseError, QueueWedgeError, RoomState,
+    StoreError,
+};
 use reqwest::Error as ReqwestError;
 use ruma::{
     api::{
         client::{
-            error::{ErrorBody, ErrorKind},
+            error::{ErrorBody, ErrorKind, RetryAfter},
             uiaa::{UiaaInfo, UiaaResponse},
         },
         error::{FromHttpResponseError, IntoHttpError},
@@ -41,7 +45,7 @@ use serde_json::Error as JsonError;
 use thiserror::Error;
 use url::ParseError as UrlParseError;
 
-use crate::store_locks::LockStoreError;
+use crate::{event_cache::EventCacheError, media::MediaError, store_locks::LockStoreError};
 
 /// Result type of the matrix-sdk.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -151,55 +155,101 @@ impl HttpError {
     /// Returns whether an HTTP error response should be qualified as transient
     /// or permanent.
     pub(crate) fn retry_kind(&self) -> RetryKind {
-        use ruma::api::client::error::{ErrorBody, ErrorKind, RetryAfter};
+        match self {
+            // If it was a plain network error, it's either that we're disconnected from the
+            // internet, or that the remote is, so retry a few times.
+            HttpError::Reqwest(_) => RetryKind::NetworkFailure,
 
-        use crate::RumaApiError;
-
-        // If it was a plain network error, it's either that we're disconnected from the
-        // internet, or that the remote is, so retry a few times.
-        if matches!(self, Self::Reqwest(..)) {
-            return RetryKind::Transient { retry_after: None };
-        }
-
-        if let Some(api_error) = self.as_ruma_api_error() {
-            let status_code = match api_error {
-                RumaApiError::ClientApi(e) => match e.body {
-                    ErrorBody::Standard {
-                        kind: ErrorKind::LimitExceeded { retry_after }, ..
-                    } => {
-                        let retry_after = retry_after.and_then(|retry_after| match retry_after {
-                            RetryAfter::Delay(d) => Some(d),
-                            RetryAfter::DateTime(_) => None,
-                        });
-                        return RetryKind::Transient { retry_after };
-                    }
-                    _ => Some(e.status_code),
-                },
-                RumaApiError::Uiaa(_) => None,
-                RumaApiError::Other(e) => Some(e.status_code),
-            };
-
-            if let Some(status_code) = status_code {
-                if status_code.is_server_error() {
-                    return RetryKind::Transient { retry_after: None };
-                }
+            HttpError::Api(FromHttpResponseError::Server(api_error)) => {
+                RetryKind::from_api_error(api_error)
             }
+            _ => RetryKind::Permanent,
         }
-
-        RetryKind::Permanent
     }
 }
 
-/// How should we behave with respect to retry behavior after an `HttpError`
+/// How should we behave with respect to retry behavior after an [`HttpError`]
 /// happened?
 pub(crate) enum RetryKind {
+    /// The request failed because of an error at the network layer.
+    NetworkFailure,
+
+    /// The request failed with a "transient" error, meaning it could be retried
+    /// either soon, or after a given amount of time expressed in
+    /// `retry_after`.
     Transient {
         // This is used only for attempts to retry, so on non-wasm32 code (in the `native` module).
         #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
         retry_after: Option<Duration>,
     },
 
+    /// The request failed with a non-transient error, and retrying it would
+    /// likely cause the same error again, so it's not worth retrying.
     Permanent,
+}
+
+impl RetryKind {
+    /// Construct a [`RetryKind`] from a Ruma API error.
+    ///
+    /// The Ruma API error is for errors which have the standard error response
+    /// format defined in the [spec].
+    ///
+    /// [spec]: https://spec.matrix.org/v1.11/client-server-api/#standard-error-response
+    fn from_api_error(api_error: &RumaApiError) -> Self {
+        use ruma::api::client::Error;
+
+        match api_error {
+            RumaApiError::ClientApi(client_error) => {
+                let Error { status_code, body, .. } = client_error;
+
+                match body {
+                    ErrorBody::Standard { kind, .. } => match kind {
+                        ErrorKind::LimitExceeded { retry_after } => {
+                            RetryKind::from_retry_after(retry_after.as_ref())
+                        }
+                        ErrorKind::Unrecognized => RetryKind::Permanent,
+                        _ => RetryKind::from_status_code(*status_code),
+                    },
+                    _ => RetryKind::from_status_code(*status_code),
+                }
+            }
+            RumaApiError::Other(e) => RetryKind::from_status_code(e.status_code),
+            RumaApiError::Uiaa(_) => RetryKind::Permanent,
+        }
+    }
+
+    /// Create a [`RetryKind`] if we have found a [`RetryAfter`] defined in an
+    /// error.
+    ///
+    /// This method should be used for errors where the server explicitly tells
+    /// us how long we must wait before we retry the request again.
+    fn from_retry_after(retry_after: Option<&RetryAfter>) -> Self {
+        let retry_after = retry_after
+            .and_then(|retry_after| match retry_after {
+                RetryAfter::Delay(d) => Some(d),
+                RetryAfter::DateTime(_) => None,
+            })
+            .copied();
+
+        Self::Transient { retry_after }
+    }
+
+    /// Construct a [`RetryKind`] from a HTTP [`StatusCode`].
+    ///
+    /// This should be used if we don't have a more specific Matrix style error
+    /// which gives us more information about the nature of the error, i.e.
+    /// if we received an error from a reverse proxy while the Matrix
+    /// homeserver is down.
+    fn from_status_code(status_code: StatusCode) -> Self {
+        // If the status code is 429, this is requesting a retry in HTTP, without the
+        // custom `errcode`. Treat that as a retriable request with no specified
+        // retry_after delay.
+        if status_code == StatusCode::TOO_MANY_REQUESTS || status_code.is_server_error() {
+            RetryKind::Transient { retry_after: None }
+        } else {
+            RetryKind::Permanent
+        }
+    }
 }
 
 /// Internal representation of errors.
@@ -266,6 +316,10 @@ pub enum Error {
     #[error(transparent)]
     StateStore(#[from] StoreError),
 
+    /// An error occurred in the event cache store.
+    #[error(transparent)]
+    EventCacheStore(#[from] EventCacheStoreError),
+
     /// An error encountered when trying to parse an identifier.
     #[error(transparent)]
     Identifier(#[from] IdParseError),
@@ -283,11 +337,6 @@ pub enum Error {
     #[error(transparent)]
     UserTagName(#[from] InvalidUserTagName),
 
-    /// An error while processing images.
-    #[cfg(feature = "image-proc")]
-    #[error(transparent)]
-    ImageError(#[from] ImageError),
-
     /// An error occurred within sliding-sync
     #[cfg(feature = "experimental-sliding-sync")]
     #[error(transparent)]
@@ -298,11 +347,6 @@ pub enum Error {
     /// different.
     #[error("wrong room state: {0}")]
     WrongRoomState(WrongRoomState),
-
-    /// The client is in inconsistent state. This happens when we set a room to
-    /// a specific type, but then cannot get it in this type.
-    #[error("The internal client state is inconsistent.")]
-    InconsistentState,
 
     /// Session callbacks have been set multiple times.
     #[error("session callbacks have been set multiple times")]
@@ -317,11 +361,28 @@ pub enum Error {
     #[error("a concurrent request failed; see logs for details")]
     ConcurrentRequestFailed,
 
-    /// An other error was raised
-    /// this might happen because encryption was enabled on the base-crate
+    /// An other error was raised.
+    ///
+    /// This might happen because encryption was enabled on the base-crate
     /// but not here and that raised.
     #[error("unknown error: {0}")]
     UnknownError(Box<dyn std::error::Error + Send + Sync>),
+
+    /// An error coming from the event cache subsystem.
+    #[error(transparent)]
+    EventCache(#[from] EventCacheError),
+
+    /// An item has been wedged in the send queue.
+    #[error(transparent)]
+    SendQueueWedgeError(#[from] QueueWedgeError),
+
+    /// Backups are not enabled
+    #[error("backups are not enabled")]
+    BackupNotEnabled,
+
+    /// An error happened during handling of a media subrequest.
+    #[error(transparent)]
+    Media(#[from] MediaError),
 }
 
 #[rustfmt::skip] // stop rustfmt breaking the `<code>` in docs across multiple lines
@@ -443,25 +504,42 @@ impl From<ReqwestError> for Error {
     }
 }
 
-/// All possible errors that can happen during image processing.
-#[cfg(feature = "image-proc")]
-#[derive(Error, Debug)]
-pub enum ImageError {
-    /// Error processing the image data.
-    #[error(transparent)]
-    Proc(#[from] image::ImageError),
+/// Errors that can happen when interacting with the beacon API.
+#[derive(Debug, Error)]
+pub enum BeaconError {
+    // A network error occurred.
+    #[error("Network error: {0}")]
+    Network(#[from] HttpError),
 
-    /// Error parsing the mimetype of the image.
-    #[error(transparent)]
-    Mime(#[from] mime::FromStrError),
+    // The beacon information is not found.
+    #[error("Existing beacon information not found.")]
+    NotFound,
 
-    /// The image format is not supported.
-    #[error("the image format is not supported")]
-    FormatNotSupported,
+    // The redacted event is not an error, but it's not useful for the client.
+    #[error("Beacon event is redacted and cannot be processed.")]
+    Redacted,
 
-    /// The thumbnail size is bigger than the original image.
-    #[error("the thumbnail size is bigger than the original image size")]
-    ThumbnailBiggerThanOriginal,
+    // The client must join the room to access the beacon information.
+    #[error("Must join the room to access beacon information.")]
+    Stripped,
+
+    // The beacon event could not be deserialized.
+    #[error("Deserialization error: {0}")]
+    Deserialization(#[from] serde_json::Error),
+
+    // The beacon event is expired.
+    #[error("The beacon event has expired.")]
+    NotLive,
+
+    // Allow for other errors to be wrapped.
+    #[error("Other error: {0}")]
+    Other(Box<Error>),
+}
+
+impl From<Error> for BeaconError {
+    fn from(err: Error) -> Self {
+        BeaconError::Other(Box::new(err))
+    }
 }
 
 /// Errors that can happen when refreshing an access token.

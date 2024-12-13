@@ -20,7 +20,7 @@ use ruma::{
     encryption::{CrossSigningKey, DeviceKeys},
     owned_device_id, owned_user_id,
     serde::Raw,
-    user_id, DeviceId, DeviceKeyId, OwnedDeviceId, OwnedUserId,
+    user_id, CrossSigningKeyId, DeviceId, OwnedDeviceId, OwnedUserId,
 };
 use serde_json::json;
 use wiremock::{
@@ -239,8 +239,10 @@ fn mock_keys_signature_upload(keys: Arc<Mutex<Keys>>) -> impl Fn(&Request) -> Re
                 if let Some(existing_master_key) = keys.master.get_mut(&user) {
                     let mut existing = existing_master_key.deserialize().unwrap();
 
-                    let target =
-                        DeviceKeyId::from_parts(ruma::DeviceKeyAlgorithm::Ed25519, key_id.into());
+                    let target = CrossSigningKeyId::from_parts(
+                        ruma::SigningKeyAlgorithm::Ed25519,
+                        key_id.try_into().unwrap(),
+                    );
 
                     if existing.keys.contains_key(&target) {
                         let param: CrossSigningKey = serde_json::from_str(raw_key.get()).unwrap();
@@ -325,6 +327,9 @@ async fn test_own_verification() {
         .homeserver_url(server.server.uri())
         .server_versions([MatrixVersion::V1_0])
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();
@@ -409,6 +414,9 @@ async fn test_reset_cross_signing_resets_verification() {
         .homeserver_url(server.server.uri())
         .server_versions([MatrixVersion::V1_0])
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();
@@ -462,6 +470,9 @@ async fn test_reset_cross_signing_resets_verification() {
         .homeserver_url(server.server.uri())
         .server_versions([MatrixVersion::V1_0])
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();
@@ -506,6 +517,9 @@ async fn test_unchecked_mutual_verification() {
         .homeserver_url(server.server.uri())
         .server_versions([MatrixVersion::V1_0])
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();
@@ -524,6 +538,9 @@ async fn test_unchecked_mutual_verification() {
         .homeserver_url(server.server.uri())
         .server_versions([MatrixVersion::V1_0])
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();

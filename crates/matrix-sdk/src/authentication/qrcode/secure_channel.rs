@@ -178,10 +178,7 @@ impl EstablishedSecureChannel {
             if response == LOGIN_OK_MESSAGE {
                 Ok(ret)
             } else {
-                Err(Error::SecureChannelMessage {
-                    expected: LOGIN_OK_MESSAGE,
-                    received: response.to_owned(),
-                })
+                Err(Error::SecureChannelMessage { expected: LOGIN_OK_MESSAGE, received: response })
             }
         }
     }
@@ -350,7 +347,7 @@ pub(super) mod test {
     }
 
     #[async_test]
-    async fn creation() {
+    async fn test_creation() {
         let server = MockServer::start().await;
         let rendezvous_server = MockedRendezvousServer::new(&server, "abcdEFG12345").await;
 

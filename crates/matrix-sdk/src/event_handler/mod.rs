@@ -388,7 +388,7 @@ impl Client {
 
         for item in timeline_events {
             let TimelineEventDetails { event_type, state_key, unsigned } =
-                item.event.deserialize_as()?;
+                item.raw().deserialize_as()?;
 
             let redacted = unsigned.and_then(|u| u.redacted_because).is_some();
             let (handler_kind_g, handler_kind_r) = match state_key {
@@ -396,8 +396,8 @@ impl Client {
                 None => (HandlerKind::MessageLike, HandlerKind::message_like_redacted(redacted)),
             };
 
-            let raw_event = item.event.json();
-            let encryption_info = item.encryption_info.as_ref();
+            let raw_event = item.raw().json();
+            let encryption_info = item.encryption_info();
             let push_actions = &item.push_actions;
 
             // Event handlers for possibly-redacted timeline events
@@ -602,7 +602,7 @@ mod tests {
     });
 
     #[async_test]
-    async fn add_event_handler() -> crate::Result<()> {
+    async fn test_add_event_handler() -> crate::Result<()> {
         let client = logged_in_client(None).await;
 
         let member_count = Arc::new(AtomicU8::new(0));
@@ -692,7 +692,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn add_room_event_handler() -> crate::Result<()> {
+    #[allow(dependency_on_unit_never_type_fallback)]
+    async fn test_add_room_event_handler() -> crate::Result<()> {
         let client = logged_in_client(None).await;
 
         let room_id_a = room_id!("!foo:example.org");
@@ -753,7 +754,8 @@ mod tests {
     }
 
     #[async_test]
-    async fn remove_event_handler() -> crate::Result<()> {
+    #[allow(dependency_on_unit_never_type_fallback)]
+    async fn test_remove_event_handler() -> crate::Result<()> {
         let client = logged_in_client(None).await;
 
         let member_count = Arc::new(AtomicU8::new(0));
@@ -798,7 +800,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn event_handler_drop_guard() {
+    async fn test_event_handler_drop_guard() {
         let client = no_retry_test_client(None).await;
 
         let handle = client.add_event_handler(|_ev: OriginalSyncRoomMemberEvent| async {});
@@ -814,7 +816,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn use_client_in_handler() {
+    async fn test_use_client_in_handler() {
         // This used to not work because we were requiring `Send` of event
         // handler futures even on WASM, where practically all futures that do
         // I/O aren't.
@@ -830,7 +832,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn raw_event_handler() -> crate::Result<()> {
+    async fn test_raw_event_handler() -> crate::Result<()> {
         let client = logged_in_client(None).await;
         let counter = Arc::new(AtomicU8::new(0));
         client.add_event_handler_context(counter.clone());
@@ -850,7 +852,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn enum_event_handler() -> crate::Result<()> {
+    async fn test_enum_event_handler() -> crate::Result<()> {
         let client = logged_in_client(None).await;
         let counter = Arc::new(AtomicU8::new(0));
         client.add_event_handler_context(counter.clone());

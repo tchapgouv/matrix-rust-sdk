@@ -27,7 +27,7 @@ use ruma::{
     SecondsSinceUnixEpoch, TransactionId, UInt, UserId,
 };
 use tokio::sync::Mutex;
-use tracing::{debug, info, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn, Span};
 
 use super::{
     cache::{RequestInfo, VerificationCache},
@@ -40,7 +40,7 @@ use crate::{
     olm::{PrivateCrossSigningIdentity, StaticAccountData},
     requests::OutgoingRequest,
     store::{CryptoStoreError, CryptoStoreWrapper},
-    OutgoingVerificationRequest, ReadOnlyDevice, ReadOnlyUserIdentity, RoomMessageRequest,
+    DeviceData, OtherUserIdentityData, OutgoingVerificationRequest, RoomMessageRequest,
     ToDeviceRequest,
 };
 
@@ -98,7 +98,7 @@ impl VerificationMachine {
 
     pub fn request_verification(
         &self,
-        identity: &ReadOnlyUserIdentity,
+        identity: &OtherUserIdentityData,
         room_id: &RoomId,
         request_event_id: &EventId,
         methods: Option<Vec<VerificationMethod>>,
@@ -121,7 +121,7 @@ impl VerificationMachine {
 
     pub async fn start_sas(
         &self,
-        device: ReadOnlyDevice,
+        device: DeviceData,
     ) -> Result<(Sas, OutgoingVerificationRequest), CryptoStoreError> {
         let identities = self.store.get_identities(device.clone()).await?;
         let (sas, content) = Sas::start(identities, TransactionId::new(), true, None, None);
@@ -306,7 +306,7 @@ impl VerificationMachine {
         Ok(())
     }
 
-    #[instrument(skip_all)]
+    #[instrument(skip_all, fields(flow_id))]
     pub async fn receive_any_event(
         &self,
         event: impl Into<AnyEvent<'_>>,
@@ -317,6 +317,7 @@ impl VerificationMachine {
             // This isn't a verification event, return early.
             return Ok(());
         };
+        Span::current().record("flow_id", flow_id.as_str());
 
         let flow_id_mismatch = || {
             warn!(
@@ -340,6 +341,7 @@ impl VerificationMachine {
         match &content {
             AnyVerificationContent::Request(r) => {
                 info!(
+                    sender = ?event.sender(),
                     from_device = r.from_device().as_str(),
                     "Received a new verification request",
                 );
@@ -369,12 +371,20 @@ impl VerificationMachine {
                     return Ok(());
                 }
 
+                let Some(device_data) =
+                    self.store.get_device(event.sender(), r.from_device()).await?
+                else {
+                    warn!("Could not retrieve the device data for the incoming verification request, ignoring it");
+                    return Ok(());
+                };
+
                 let request = VerificationRequest::from_request(
                     self.verifications.clone(),
                     self.store.clone(),
                     event.sender(),
                     flow_id,
                     r,
+                    device_data,
                 );
 
                 self.insert_request(request);
@@ -402,7 +412,13 @@ impl VerificationMachine {
                 };
 
                 if request.flow_id() == &flow_id {
-                    request.receive_ready(event.sender(), c);
+                    if let Some(device_data) =
+                        self.store.get_device(event.sender(), c.from_device()).await?
+                    {
+                        request.receive_ready(event.sender(), c, device_data);
+                    } else {
+                        warn!("Could not retrieve the data for the accepting device, ignoring it");
+                    }
                 } else {
                     flow_id_mismatch();
                 }
@@ -572,18 +588,18 @@ mod tests {
     }
 
     #[async_test]
-    async fn create() {
+    async fn test_create() {
         let alice = Account::with_device_id(alice_id(), alice_device_id());
         let identity = Arc::new(Mutex::new(PrivateCrossSigningIdentity::empty(alice_id())));
         let _ = VerificationMachine::new(
             alice.static_data,
             identity,
-            Arc::new(CryptoStoreWrapper::new(alice_id(), MemoryStore::new())),
+            Arc::new(CryptoStoreWrapper::new(alice_id(), alice_device_id(), MemoryStore::new())),
         );
     }
 
     #[async_test]
-    async fn full_flow() {
+    async fn test_full_flow() {
         let (alice_machine, bob) = setup_verification_machine().await;
 
         let alice = alice_machine.get_sas(bob.user_id(), bob.flow_id().as_str()).unwrap();
@@ -639,10 +655,10 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[allow(unknown_lints, clippy::unchecked_duration_subtraction)]
     #[async_test]
-    async fn timing_out() {
+    async fn test_timing_out() {
         use std::time::Duration;
 
-        use matrix_sdk_common::instant::Instant;
+        use ruma::time::Instant;
 
         let (alice_machine, bob) = setup_verification_machine().await;
         let alice = alice_machine.get_sas(bob.user_id(), bob.flow_id().as_str()).unwrap();
@@ -663,7 +679,7 @@ mod tests {
     /// Test to ensure that we cancel both verifications if a second one gets
     /// started while another one is going on.
     #[async_test]
-    async fn double_verification_cancellation() {
+    async fn test_double_verification_cancellation() {
         let (machine, bob_store) = verification_machine().await;
 
         let alice_device =
@@ -705,7 +721,7 @@ mod tests {
     /// Test to ensure that we cancel both verification requests if a second one
     /// gets started while another one is going on.
     #[async_test]
-    async fn double_verification_request_cancellation() {
+    async fn test_double_verification_request_cancellation() {
         let (machine, bob_store) = verification_machine().await;
 
         // Start the first verification request.
@@ -724,12 +740,12 @@ mod tests {
         let content: OutgoingContent = request.try_into().unwrap();
 
         machine
-            .receive_any_event(&wrap_any_to_device_content(bob_request.other_user(), content))
+            .receive_any_event(&wrap_any_to_device_content(bob_request.own_user_id(), content))
             .await
             .unwrap();
 
         let alice_request =
-            machine.get_request(bob_request.other_user(), bob_request.flow_id().as_str()).unwrap();
+            machine.get_request(bob_request.own_user_id(), bob_request.flow_id().as_str()).unwrap();
 
         // We're not yet cancelled.
         assert!(!alice_request.is_cancelled());
@@ -748,12 +764,12 @@ mod tests {
         let content: OutgoingContent = request.try_into().unwrap();
 
         machine
-            .receive_any_event(&wrap_any_to_device_content(bob_request.other_user(), content))
+            .receive_any_event(&wrap_any_to_device_content(bob_request.own_user_id(), content))
             .await
             .unwrap();
 
         let second_request =
-            machine.get_request(bob_request.other_user(), bob_request.flow_id().as_str()).unwrap();
+            machine.get_request(bob_request.own_user_id(), bob_request.flow_id().as_str()).unwrap();
 
         // Make sure we fetched the new one.
         assert_eq!(second_request.flow_id().as_str(), second_transaction_id);
@@ -767,7 +783,7 @@ mod tests {
     /// flow_id) the existing request is not cancelled and the new one is
     /// ignored
     #[async_test]
-    async fn ignore_identical_verification_request() {
+    async fn test_ignore_identical_verification_request() {
         let (machine, bob_store) = verification_machine().await;
 
         // Start the first verification request.
@@ -786,12 +802,12 @@ mod tests {
         let content: OutgoingContent = request.try_into().unwrap();
 
         machine
-            .receive_any_event(&wrap_any_to_device_content(bob_request.other_user(), content))
+            .receive_any_event(&wrap_any_to_device_content(bob_request.own_user_id(), content))
             .await
             .unwrap();
 
         let first_request =
-            machine.get_request(bob_request.other_user(), bob_request.flow_id().as_str()).unwrap();
+            machine.get_request(bob_request.own_user_id(), bob_request.flow_id().as_str()).unwrap();
 
         // We're not yet cancelled.
         assert!(!first_request.is_cancelled());
@@ -810,12 +826,12 @@ mod tests {
         let content: OutgoingContent = request.try_into().unwrap();
 
         machine
-            .receive_any_event(&wrap_any_to_device_content(bob_request.other_user(), content))
+            .receive_any_event(&wrap_any_to_device_content(bob_request.own_user_id(), content))
             .await
             .unwrap();
 
         let second_request =
-            machine.get_request(bob_request.other_user(), bob_request.flow_id().as_str()).unwrap();
+            machine.get_request(bob_request.own_user_id(), bob_request.flow_id().as_str()).unwrap();
 
         // None of the requests are cancelled
         assert!(!first_request.is_cancelled());

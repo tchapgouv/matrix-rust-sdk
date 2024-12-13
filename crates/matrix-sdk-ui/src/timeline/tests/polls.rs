@@ -1,3 +1,4 @@
+use matrix_sdk_base::deserialized_responses::SyncTimelineEvent;
 use matrix_sdk_test::{async_test, ALICE, BOB};
 use ruma::{
     events::{
@@ -14,12 +15,10 @@ use ruma::{
     server_name, EventId, OwnedEventId, UserId,
 };
 
-use crate::timeline::{
-    polls::PollState, tests::TestTimeline, EventTimelineItem, TimelineItemContent,
-};
+use crate::timeline::{event_item::PollState, tests::TestTimeline, EventTimelineItem};
 
 #[async_test]
-async fn poll_is_displayed() {
+async fn test_poll_is_displayed() {
     let timeline = TestTimeline::new();
 
     timeline.send_poll_start(&ALICE, fakes::poll_a()).await;
@@ -30,14 +29,14 @@ async fn poll_is_displayed() {
 }
 
 #[async_test]
-async fn edited_poll_is_displayed() {
+async fn test_edited_poll_is_displayed() {
     let timeline = TestTimeline::new();
 
     timeline.send_poll_start(&ALICE, fakes::poll_a()).await;
     let event = timeline.poll_event().await;
     let event_id = event.event_id().unwrap();
     timeline.send_poll_edit(&ALICE, event_id, fakes::poll_b()).await;
-    let poll_state = event.poll_state();
+    let poll_state = event.content().as_poll().unwrap();
     let edited_poll_state = timeline.poll_state().await;
 
     assert_poll_start_eq(&poll_state.start_event_content.poll_start, &fakes::poll_a());
@@ -47,7 +46,7 @@ async fn edited_poll_is_displayed() {
 }
 
 #[async_test]
-async fn voting_adds_the_vote_to_the_results() {
+async fn test_voting_adds_the_vote_to_the_results() {
     let timeline = TestTimeline::new();
     timeline.send_poll_start(&ALICE, fakes::poll_a()).await;
     let poll_id = timeline.poll_event().await.event_id().unwrap().to_owned();
@@ -61,7 +60,7 @@ async fn voting_adds_the_vote_to_the_results() {
 }
 
 #[async_test]
-async fn ending_a_poll_sets_end_time_to_results() {
+async fn test_ending_a_poll_sets_end_time_to_results() {
     let timeline = TestTimeline::new();
     timeline.send_poll_start(&ALICE, fakes::poll_a()).await;
     let poll_id = timeline.poll_event().await.event_id().unwrap().to_owned();
@@ -74,7 +73,7 @@ async fn ending_a_poll_sets_end_time_to_results() {
 }
 
 #[async_test]
-async fn only_the_last_vote_from_a_user_is_counted() {
+async fn test_only_the_last_vote_from_a_user_is_counted() {
     let timeline = TestTimeline::new();
     timeline.send_poll_start(&ALICE, fakes::poll_a()).await;
     let poll_id = timeline.poll_event().await.event_id().unwrap().to_owned();
@@ -91,7 +90,7 @@ async fn only_the_last_vote_from_a_user_is_counted() {
 }
 
 #[async_test]
-async fn votes_after_end_are_discarded() {
+async fn test_votes_after_end_are_discarded() {
     let timeline = TestTimeline::new();
     timeline.send_poll_start(&ALICE, fakes::poll_a()).await;
     let poll_id = timeline.poll_event().await.event_id().unwrap().to_owned();
@@ -108,7 +107,7 @@ async fn votes_after_end_are_discarded() {
 }
 
 #[async_test]
-async fn multiple_end_events_are_discarded() {
+async fn test_multiple_end_events_are_discarded() {
     let timeline = TestTimeline::new();
     timeline.send_poll_start(&ALICE, fakes::poll_a()).await;
     let poll_id = timeline.poll_event().await.event_id().unwrap().to_owned();
@@ -128,7 +127,7 @@ async fn multiple_end_events_are_discarded() {
 }
 
 #[async_test]
-async fn a_somewhat_complex_voting_session_yields_the_expected_outcome() {
+async fn test_a_somewhat_complex_voting_session_yields_the_expected_outcome() {
     let timeline = TestTimeline::new();
     timeline.send_poll_start(&ALICE, fakes::poll_a()).await;
     let poll_id = timeline.poll_event().await.event_id().unwrap().to_owned();
@@ -160,7 +159,7 @@ async fn a_somewhat_complex_voting_session_yields_the_expected_outcome() {
 }
 
 #[async_test]
-async fn events_received_before_start_are_not_lost() {
+async fn test_events_received_before_start_are_not_lost() {
     let timeline = TestTimeline::new();
     let poll_id: OwnedEventId = EventId::new(server_name!("dummy.server"));
 
@@ -189,7 +188,7 @@ async fn events_received_before_start_are_not_lost() {
 
 impl TestTimeline {
     async fn event_items(&self) -> Vec<EventTimelineItem> {
-        self.inner.items().await.iter().filter_map(|item| item.as_event().cloned()).collect()
+        self.controller.items().await.iter().filter_map(|item| item.as_event().cloned()).collect()
     }
 
     async fn poll_event(&self) -> EventTimelineItem {
@@ -197,14 +196,14 @@ impl TestTimeline {
     }
 
     async fn poll_state(&self) -> PollState {
-        self.event_items().await[0].clone().poll_state()
+        self.event_items().await[0].content().as_poll().unwrap().clone()
     }
 
     async fn send_poll_start(&self, sender: &UserId, content: UnstablePollStartContentBlock) {
         let event_content = AnyMessageLikeEventContent::UnstablePollStart(
             NewUnstablePollStartEventContent::new(content).into(),
         );
-        self.handle_live_message_event(sender, event_content).await;
+        self.handle_live_event(self.factory.event(event_content).sender(sender)).await;
     }
 
     async fn send_poll_start_with_id(
@@ -218,7 +217,7 @@ impl TestTimeline {
         );
         let event =
             self.event_builder.make_sync_message_event_with_id(sender, event_id, event_content);
-        self.handle_live_event(event).await;
+        self.handle_live_event(SyncTimelineEvent::new(event)).await;
     }
 
     async fn send_poll_response(&self, sender: &UserId, answers: Vec<&str>, poll_id: &EventId) {
@@ -228,14 +227,14 @@ impl TestTimeline {
                 poll_id.to_owned(),
             ),
         );
-        self.handle_live_message_event(sender, event_content).await
+        self.handle_live_event(self.factory.event(event_content).sender(sender)).await
     }
 
     async fn send_poll_end(&self, sender: &UserId, text: &str, poll_id: &EventId) {
         let event_content = AnyMessageLikeEventContent::UnstablePollEnd(
             UnstablePollEndEventContent::new(text, poll_id.to_owned()),
         );
-        self.handle_live_message_event(sender, event_content).await
+        self.handle_live_event(self.factory.event(event_content).sender(sender)).await
     }
 
     async fn send_poll_edit(
@@ -247,16 +246,7 @@ impl TestTimeline {
         let content =
             ReplacementUnstablePollStartEventContent::new(content, original_id.to_owned());
         let event_content = AnyMessageLikeEventContent::UnstablePollStart(content.into());
-        self.handle_live_message_event(sender, event_content).await
-    }
-}
-
-impl EventTimelineItem {
-    fn poll_state(self) -> PollState {
-        match self.content() {
-            TimelineItemContent::Poll(poll_state) => poll_state.clone(),
-            _ => panic!("Not a poll state"),
-        }
+        self.handle_live_event(self.factory.event(event_content).sender(sender)).await
     }
 }
 

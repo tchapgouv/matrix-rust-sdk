@@ -37,31 +37,28 @@ use matrix_sdk_common::executor::spawn;
 use ruma::{
     api::client::{
         keys::{
-            get_keys, upload_keys, upload_signing_keys::v3::Request as UploadSigningKeysRequest,
+            get_keys, upload_keys, upload_signatures::v3::Request as UploadSignaturesRequest,
+            upload_signing_keys::v3::Request as UploadSigningKeysRequest,
         },
         message::send_message_event,
         to_device::send_event_to_device::v3::{
             Request as RumaToDeviceRequest, Response as ToDeviceResponse,
         },
-        uiaa::AuthData,
+        uiaa::{AuthData, UiaaInfo},
     },
     assign,
-    events::room::{
-        message::{
-            AudioMessageEventContent, FileInfo, FileMessageEventContent, ImageMessageEventContent,
-            MessageType, VideoInfo, VideoMessageEventContent,
-        },
-        ImageInfo, MediaSource, ThumbnailInfo,
-    },
+    events::room::{MediaSource, ThumbnailInfo},
     DeviceId, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
 };
-use tokio::sync::RwLockReadGuard;
+use serde::Deserialize;
+use tokio::sync::{Mutex, RwLockReadGuard};
 use tracing::{debug, error, instrument, trace, warn};
+use url::Url;
 use vodozemac::Curve25519PublicKey;
 
 use self::{
     backups::{types::BackupClientState, Backups},
-    futures::PrepareEncryptedFile,
+    futures::UploadEncryptedFile,
     identities::{Device, DeviceUpdates, IdentityUpdates, UserDevices, UserIdentity},
     recovery::{Recovery, RecoveryState},
     secret_storage::SecretStorage,
@@ -69,11 +66,11 @@ use self::{
     verification::{SasVerification, Verification, VerificationRequest},
 };
 use crate::{
-    attachment::{AttachmentConfig, Thumbnail},
+    attachment::Thumbnail,
     client::{ClientInner, WeakClient},
     error::HttpResult,
     store_locks::CrossProcessStoreLockGuard,
-    Client, Error, Result, Room, TransmissionProgress,
+    Client, Error, HttpError, Result, Room, TransmissionProgress,
 };
 
 pub mod backups;
@@ -134,6 +131,20 @@ impl EncryptionData {
         {
             tasks.download_room_keys = Some(BackupDownloadTask::new(weak_client));
         }
+    }
+
+    /// Initialize the background task which listens for changes in the
+    /// [`backups::BackupState`] and updataes the [`recovery::RecoveryState`].
+    ///
+    /// This should happen after the usual tasks have been set up and after the
+    /// E2EE initialization tasks have been set up.
+    pub fn initialize_recovery_state_update_task(&self, client: &Client) {
+        let mut guard = self.tasks.lock().unwrap();
+
+        let future = Recovery::update_state_after_backup_state_change(client);
+        let join_handle = spawn(future);
+
+        guard.update_recovery_state_after_backup = Some(join_handle);
     }
 }
 
@@ -213,6 +224,151 @@ impl CrossProcessLockStoreGuardWithGeneration {
     }
 }
 
+/// A stateful struct remembering the cross-signing keys we need to upload.
+///
+/// Since the `/_matrix/client/v3/keys/device_signing/upload` might require
+/// additional authentication, this struct will contain information on the type
+/// of authentication the user needs to complete before the upload might be
+/// continued.
+///
+/// More info can be found in the [spec].
+///
+/// [spec]: https://spec.matrix.org/v1.11/client-server-api/#post_matrixclientv3keysdevice_signingupload
+#[derive(Debug)]
+pub struct CrossSigningResetHandle {
+    client: Client,
+    upload_request: UploadSigningKeysRequest,
+    signatures_request: UploadSignaturesRequest,
+    auth_type: CrossSigningResetAuthType,
+    is_cancelled: Mutex<bool>,
+}
+
+impl CrossSigningResetHandle {
+    /// Set up a new `CrossSigningResetHandle`.
+    pub fn new(
+        client: Client,
+        upload_request: UploadSigningKeysRequest,
+        signatures_request: UploadSignaturesRequest,
+        auth_type: CrossSigningResetAuthType,
+    ) -> Self {
+        Self {
+            client,
+            upload_request,
+            signatures_request,
+            auth_type,
+            is_cancelled: Mutex::new(false),
+        }
+    }
+
+    /// Get the [`CrossSigningResetAuthType`] this cross-signing reset process
+    /// is using.
+    pub fn auth_type(&self) -> &CrossSigningResetAuthType {
+        &self.auth_type
+    }
+
+    /// Continue the cross-signing reset by either waiting for the
+    /// authentication to be done on the side of the OIDC issuer or by
+    /// providing additional [`AuthData`] the homeserver requires.
+    pub async fn auth(&self, auth: Option<AuthData>) -> Result<()> {
+        let mut upload_request = self.upload_request.clone();
+        upload_request.auth = auth;
+
+        while let Err(e) = self.client.send(upload_request.clone(), None).await {
+            if *self.is_cancelled.lock().await {
+                return Ok(());
+            }
+
+            if e.as_uiaa_response().is_none() {
+                return Err(e.into());
+            }
+        }
+
+        self.client.send(self.signatures_request.clone(), None).await?;
+
+        Ok(())
+    }
+
+    /// Cancel the ongoing identity reset process
+    pub async fn cancel(&self) {
+        *self.is_cancelled.lock().await = true;
+    }
+}
+
+/// information about the additional authentication that is required before the
+/// cross-signing keys can be uploaded.
+#[derive(Debug, Clone)]
+pub enum CrossSigningResetAuthType {
+    /// The homeserver requires user-interactive authentication.
+    Uiaa(UiaaInfo),
+    /// OIDC is used for authentication and the user needs to open a URL to
+    /// approve the upload of cross-signing keys.
+    Oidc(OidcCrossSigningResetInfo),
+}
+
+impl CrossSigningResetAuthType {
+    #[allow(clippy::unused_async)]
+    async fn new(
+        #[allow(unused_variables)] client: &Client,
+        error: &HttpError,
+    ) -> Result<Option<Self>> {
+        if let Some(auth_info) = error.as_uiaa_response() {
+            #[cfg(feature = "experimental-oidc")]
+            if client.oidc().issuer().is_some() {
+                OidcCrossSigningResetInfo::from_auth_info(client, auth_info)
+                    .map(|t| Some(CrossSigningResetAuthType::Oidc(t)))
+            } else {
+                Ok(Some(CrossSigningResetAuthType::Uiaa(auth_info.clone())))
+            }
+
+            #[cfg(not(feature = "experimental-oidc"))]
+            Ok(Some(CrossSigningResetAuthType::Uiaa(auth_info.clone())))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// OIDC specific information about the required authentication for the upload
+/// of cross-signing keys.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OidcCrossSigningResetInfo {
+    /// The URL where the user can approve the reset of the cross-signing keys.
+    pub approval_url: Url,
+}
+
+impl OidcCrossSigningResetInfo {
+    #[cfg(feature = "experimental-oidc")]
+    fn from_auth_info(
+        // This is used if the OIDC feature is enabled.
+        #[allow(unused_variables)] client: &Client,
+        auth_info: &UiaaInfo,
+    ) -> Result<Self> {
+        let parameters =
+            serde_json::from_str::<OidcCrossSigningResetUiaaParameters>(auth_info.params.get())?;
+
+        Ok(OidcCrossSigningResetInfo { approval_url: parameters.reset.url })
+    }
+}
+
+/// The parsed `parameters` part of a [`ruma::api::client::uiaa::UiaaInfo`]
+/// response
+#[cfg(feature = "experimental-oidc")]
+#[derive(Debug, Deserialize)]
+struct OidcCrossSigningResetUiaaParameters {
+    /// The URL where the user can approve the reset of the cross-signing keys.
+    #[serde(rename = "org.matrix.cross_signing_reset")]
+    reset: OidcCrossSigningResetUiaaResetParameter,
+}
+
+/// The `org.matrix.cross_signing_reset` part of the Uiaa response `parameters``
+/// dictionary.
+#[cfg(feature = "experimental-oidc")]
+#[derive(Debug, Deserialize)]
+struct OidcCrossSigningResetUiaaResetParameter {
+    /// The URL where the user can approve the reset of the cross-signing keys.
+    url: Url,
+}
+
 impl Client {
     pub(crate) async fn olm_machine(&self) -> RwLockReadGuard<'_, Option<OlmMachine>> {
         self.base_client().olm_machine().await
@@ -282,124 +438,69 @@ impl Client {
     /// # let client = Client::new(homeserver).await?;
     /// # let room = client.get_room(&room_id!("!test:example.com")).unwrap();
     /// let mut reader = std::io::Cursor::new(b"Hello, world!");
-    /// let encrypted_file = client.prepare_encrypted_file(&mime::TEXT_PLAIN, &mut reader).await?;
+    /// let encrypted_file = client.upload_encrypted_file(&mime::TEXT_PLAIN, &mut reader).await?;
     ///
     /// room.send(CustomEventContent { encrypted_file }).await?;
     /// # anyhow::Ok(()) };
     /// ```
-    pub fn prepare_encrypted_file<'a, R: Read + ?Sized + 'a>(
+    pub fn upload_encrypted_file<'a, R: Read + ?Sized + 'a>(
         &'a self,
         content_type: &'a mime::Mime,
         reader: &'a mut R,
-    ) -> PrepareEncryptedFile<'a, R> {
-        PrepareEncryptedFile::new(self, content_type, reader)
+    ) -> UploadEncryptedFile<'a, R> {
+        UploadEncryptedFile::new(self, content_type, reader)
     }
 
-    /// Encrypt and upload the file to be read from `reader` and construct an
-    /// attachment message.
-    pub(crate) async fn prepare_encrypted_attachment_message(
+    /// Encrypt and upload the file and thumbnails, and return the source
+    /// information.
+    pub(crate) async fn upload_encrypted_media_and_thumbnail(
         &self,
-        filename: &str,
         content_type: &mime::Mime,
-        data: Vec<u8>,
-        config: AttachmentConfig,
+        data: &[u8],
+        thumbnail: Option<Thumbnail>,
         send_progress: SharedObservable<TransmissionProgress>,
-    ) -> Result<MessageType> {
+    ) -> Result<(MediaSource, Option<(MediaSource, Box<ThumbnailInfo>)>)> {
         let upload_thumbnail =
-            self.upload_encrypted_thumbnail(config.thumbnail, content_type, send_progress.clone());
+            self.upload_encrypted_thumbnail(thumbnail, content_type, send_progress.clone());
 
         let upload_attachment = async {
             let mut cursor = Cursor::new(data);
-            self.prepare_encrypted_file(content_type, &mut cursor)
+            self.upload_encrypted_file(content_type, &mut cursor)
                 .with_send_progress_observable(send_progress)
                 .await
         };
 
-        let ((thumbnail_source, thumbnail_info), file) =
-            try_join(upload_thumbnail, upload_attachment).await?;
+        let (thumbnail, file) = try_join(upload_thumbnail, upload_attachment).await?;
 
-        // if config.caption is set, use it as body, and filename as the file name
-        // otherwise, body is the filename, and the filename is not set
-        // https://github.com/tulir/matrix-spec-proposals/blob/body-as-caption/proposals/2530-body-as-caption.md
-        let (body, filename) = match config.caption {
-            Some(caption) => (caption, Some(filename.to_owned())),
-            None => (filename.to_owned(), None),
-        };
-
-        Ok(match content_type.type_() {
-            mime::IMAGE => {
-                let info = assign!(config.info.map(ImageInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content = assign!(ImageMessageEventContent::encrypted(body.to_owned(), file), {
-                    info: Some(Box::new(info)),
-                    formatted: config.formatted_caption,
-                    filename
-                });
-                MessageType::Image(content)
-            }
-            mime::AUDIO => {
-                let audio_message_event_content =
-                    AudioMessageEventContent::encrypted(body.to_owned(), file);
-                MessageType::Audio(crate::media::update_audio_message_event(
-                    audio_message_event_content,
-                    content_type,
-                    config.info,
-                ))
-            }
-            mime::VIDEO => {
-                let info = assign!(config.info.map(VideoInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content = assign!(VideoMessageEventContent::encrypted(body.to_owned(), file), {
-                    info: Some(Box::new(info)),
-                    formatted: config.formatted_caption,
-                    filename
-                });
-                MessageType::Video(content)
-            }
-            _ => {
-                let info = assign!(config.info.map(FileInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content = assign!(FileMessageEventContent::encrypted(body.to_owned(), file), {
-                    info: Some(Box::new(info))
-                });
-                MessageType::File(content)
-            }
-        })
+        Ok((MediaSource::Encrypted(Box::new(file)), thumbnail))
     }
 
+    /// Uploads an encrypted thumbnail to the media repository, and returns
+    /// its source and extra information.
     async fn upload_encrypted_thumbnail(
         &self,
         thumbnail: Option<Thumbnail>,
         content_type: &mime::Mime,
         send_progress: SharedObservable<TransmissionProgress>,
-    ) -> Result<(Option<MediaSource>, Option<Box<ThumbnailInfo>>)> {
-        if let Some(thumbnail) = thumbnail {
-            let mut cursor = Cursor::new(thumbnail.data);
+    ) -> Result<Option<(MediaSource, Box<ThumbnailInfo>)>> {
+        let Some(thumbnail) = thumbnail else {
+            return Ok(None);
+        };
 
-            let file = self
-                .prepare_encrypted_file(content_type, &mut cursor)
-                .with_send_progress_observable(send_progress)
-                .await?;
+        let mut cursor = Cursor::new(thumbnail.data);
 
-            #[rustfmt::skip]
+        let file = self
+            .upload_encrypted_file(content_type, &mut cursor)
+            .with_send_progress_observable(send_progress)
+            .await?;
+
+        #[rustfmt::skip]
             let thumbnail_info =
                 assign!(thumbnail.info.map(ThumbnailInfo::from).unwrap_or_default(), {
                     mimetype: Some(thumbnail.content_type.as_ref().to_owned())
                 });
 
-            Ok((Some(MediaSource::Encrypted(Box::new(file))), Some(Box::new(thumbnail_info))))
-        } else {
-            Ok((None, None))
-        }
+        Ok(Some((MediaSource::Encrypted(Box::new(file)), Box::new(thumbnail_info))))
     }
 
     /// Claim one-time keys creating new Olm sessions.
@@ -460,7 +561,7 @@ impl Client {
         request: &RoomMessageRequest,
     ) -> Result<send_message_event::v3::Response> {
         let content = request.content.clone();
-        let txn_id = &request.txn_id;
+        let txn_id = request.txn_id.clone();
         let room_id = &request.room_id;
 
         self.get_room(room_id)
@@ -673,7 +774,7 @@ impl Encryption {
     /// # anyhow::Ok(()) };
     /// ```
     pub fn verification_state(&self) -> Subscriber<VerificationState> {
-        self.client.inner.verification_state.subscribe()
+        self.client.inner.verification_state.subscribe_reset()
     }
 
     /// Get a verification object with the given flow id.
@@ -980,10 +1081,10 @@ impl Encryption {
     /// # Arguments
     ///
     /// * `auth_data` - This request requires user interactive auth, the first
-    /// request needs to set this to `None` and will always fail with an
-    /// `UiaaResponse`. The response will contain information for the
-    /// interactive auth and the same request needs to be made but this time
-    /// with some `auth_data` provided.
+    ///   request needs to set this to `None` and will always fail with an
+    ///   `UiaaResponse`. The response will contain information for the
+    ///   interactive auth and the same request needs to be made but this time
+    ///   with some `auth_data` provided.
     ///
     /// # Examples
     ///
@@ -1039,6 +1140,83 @@ impl Encryption {
         Ok(())
     }
 
+    /// Reset the cross-signing keys.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::{ruma::api::client::uiaa, Client, encryption::CrossSigningResetAuthType};
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// # let user_id = unimplemented!();
+    /// let encryption = client.encryption();
+    ///       
+    /// if let Some(handle) = encryption.reset_cross_signing().await? {
+    ///     match handle.auth_type() {
+    ///         CrossSigningResetAuthType::Uiaa(uiaa) => {
+    ///             use matrix_sdk::ruma::api::client::uiaa;
+    ///
+    ///             let password = "1234".to_owned();
+    ///             let mut password = uiaa::Password::new(user_id, password);
+    ///             password.session = uiaa.session;
+    ///
+    ///             handle.auth(Some(uiaa::AuthData::Password(password))).await?;
+    ///         }
+    ///         CrossSigningResetAuthType::Oidc(o) => {
+    ///             println!(
+    ///                 "To reset your end-to-end encryption cross-signing identity, \
+    ///                 you first need to approve it at {}",
+    ///                 o.approval_url
+    ///             );
+    ///             handle.auth(None).await?;
+    ///         }
+    ///     }
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn reset_cross_signing(&self) -> Result<Option<CrossSigningResetHandle>> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
+
+        let CrossSigningBootstrapRequests {
+            upload_keys_req,
+            upload_signing_keys_req,
+            upload_signatures_req,
+        } = olm.bootstrap_cross_signing(true).await?;
+
+        let upload_signing_keys_req = assign!(UploadSigningKeysRequest::new(), {
+            auth: None,
+            master_key: upload_signing_keys_req.master_key.map(|c| c.to_raw()),
+            self_signing_key: upload_signing_keys_req.self_signing_key.map(|c| c.to_raw()),
+            user_signing_key: upload_signing_keys_req.user_signing_key.map(|c| c.to_raw()),
+        });
+
+        if let Some(req) = upload_keys_req {
+            self.client.send_outgoing_request(req).await?;
+        }
+
+        if let Err(error) = self.client.send(upload_signing_keys_req.clone(), None).await {
+            if let Some(auth_type) = CrossSigningResetAuthType::new(&self.client, &error).await? {
+                let client = self.client.clone();
+
+                Ok(Some(CrossSigningResetHandle::new(
+                    client,
+                    upload_signing_keys_req,
+                    upload_signatures_req,
+                    auth_type,
+                )))
+            } else {
+                Err(error.into())
+            }
+        } else {
+            self.client.send(upload_signatures_req, None).await?;
+
+            Ok(None)
+        }
+    }
+
     /// Query the user's own device keys, if, and only if, we didn't have their
     /// identity in the first place.
     async fn ensure_initial_key_query(&self) -> Result<()> {
@@ -1067,10 +1245,10 @@ impl Encryption {
     /// # Arguments
     ///
     /// * `auth_data` - This request requires user interactive auth, the first
-    /// request needs to set this to `None` and will always fail with an
-    /// `UiaaResponse`. The response will contain information for the
-    /// interactive auth and the same request needs to be made but this time
-    /// with some `auth_data` provided.
+    ///   request needs to set this to `None` and will always fail with an
+    ///   `UiaaResponse`. The response will contain information for the
+    ///   interactive auth and the same request needs to be made but this time
+    ///   with some `auth_data` provided.
     ///
     /// # Examples
     /// ```no_run
@@ -1126,13 +1304,12 @@ impl Encryption {
     /// * `path` - The file path where the exported key file will be saved.
     ///
     /// * `passphrase` - The passphrase that will be used to encrypt the
-    ///   exported
-    /// room keys.
+    ///   exported room keys.
     ///
     /// * `predicate` - A closure that will be called for every known
-    /// `InboundGroupSession`, which represents a room key. If the closure
-    /// returns `true` the `InboundGroupSessoin` will be included in the export,
-    /// if the closure returns `false` it will not be included.
+    ///   `InboundGroupSession`, which represents a room key. If the closure
+    ///   returns `true` the `InboundGroupSessoin` will be included in the
+    ///   export, if the closure returns `false` it will not be included.
     ///
     /// # Panics
     ///
@@ -1202,7 +1379,7 @@ impl Encryption {
     /// * `path` - The file path where the exported key file will can be found.
     ///
     /// * `passphrase` - The passphrase that should be used to decrypt the
-    /// exported room keys.
+    ///   exported room keys.
     ///
     /// Returns a tuple of numbers that represent the number of sessions that
     /// were imported and the total number of sessions that were found in the
@@ -1416,17 +1593,21 @@ impl Encryption {
     /// # Arguments
     ///
     /// * `auth_data` - Some requests may require re-authentication. To prevent
-    /// the user from having to re-enter their password (or use other methods),
-    /// we can provide the authentication data here. This is necessary for
-    /// uploading cross-signing keys. However, please note that there is a
-    /// proposal (MSC3967) to remove this requirement, which would allow for
-    /// the initial upload of cross-signing keys without authentication,
-    /// rendering this parameter obsolete.
+    ///   the user from having to re-enter their password (or use other
+    ///   methods), we can provide the authentication data here. This is
+    ///   necessary for uploading cross-signing keys. However, please note that
+    ///   there is a proposal (MSC3967) to remove this requirement, which would
+    ///   allow for the initial upload of cross-signing keys without
+    ///   authentication, rendering this parameter obsolete.
     pub(crate) fn spawn_initialization_task(&self, auth_data: Option<AuthData>) {
         let mut tasks = self.client.inner.e2ee.tasks.lock().unwrap();
 
         let this = self.clone();
         tasks.setup_e2ee = Some(spawn(async move {
+            // Update the current state first, so we don't have to wait for the result of
+            // network requests
+            this.update_verification_state().await;
+
             if this.settings().auto_enable_cross_signing {
                 if let Err(e) = this.bootstrap_cross_signing_if_needed(auth_data).await {
                     error!("Couldn't bootstrap cross signing {e:?}");
@@ -1439,8 +1620,6 @@ impl Encryption {
             if let Err(e) = this.recovery().setup().await {
                 error!("Couldn't setup and resume recovery {e:?}");
             }
-
-            this.update_verification_state().await;
         }));
     }
 
@@ -1519,7 +1698,14 @@ impl Encryption {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        ops::Not,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use matrix_sdk_base::SessionMeta;
     use matrix_sdk_test::{
@@ -1534,13 +1720,15 @@ mod tests {
     use serde_json::json;
     use wiremock::{
         matchers::{header, method, path_regex},
-        Mock, MockServer, ResponseTemplate,
+        Mock, MockServer, Request, ResponseTemplate,
     };
 
     use crate::{
+        assert_next_matches_with_timeout,
         config::RequestConfig,
+        encryption::VerificationState,
         matrix_auth::{MatrixSession, MatrixSessionTokens},
-        test_utils::logged_in_client,
+        test_utils::{logged_in_client, no_retry_test_client, set_client_session},
         Client,
     };
 
@@ -1677,6 +1865,9 @@ mod tests {
             .homeserver_url("http://localhost:1234")
             .request_config(RequestConfig::new().disable_retry())
             .sqlite_store(&sqlite_path, None)
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -1686,6 +1877,9 @@ mod tests {
             .homeserver_url("http://localhost:1234")
             .request_config(RequestConfig::new().disable_retry())
             .sqlite_store(sqlite_path, None)
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -1785,6 +1979,9 @@ mod tests {
             .homeserver_url("http://localhost:1234")
             .request_config(RequestConfig::new().disable_retry())
             .sqlite_store(&sqlite_path, None)
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -1804,6 +2001,9 @@ mod tests {
                 .homeserver_url("http://localhost:1234")
                 .request_config(RequestConfig::new().disable_retry())
                 .sqlite_store(sqlite_path, None)
+                // BWI-specific
+                .without_server_jwt_token_validation()
+                // end BWI-specific
                 .build()
                 .await
                 .unwrap();
@@ -1839,5 +2039,41 @@ mod tests {
         // Re-taking the lock doesn't update the olm machine.
         let after_taking_lock_second_time = client.olm_machine().await.as_ref().unwrap().clone();
         assert!(after_taking_lock_first_time.same_as(&after_taking_lock_second_time));
+    }
+
+    #[async_test]
+    async fn test_update_verification_state_is_updated_before_any_requests_happen() {
+        // Given a client and a server
+        let client = no_retry_test_client(None).await;
+        let server = MockServer::start().await;
+
+        // When we subscribe to its verification state
+        let mut verification_state = client.encryption().verification_state();
+
+        // We can get its initial value, and it's Unknown
+        assert_next_matches_with_timeout!(verification_state, VerificationState::Unknown);
+
+        // We set up a mocked request to check this endpoint is not called before
+        // reading the new state
+        let keys_requested = Arc::new(AtomicBool::new(false));
+        let inner_bool = keys_requested.clone();
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"/_matrix/client/r0/user/.*/account_data/m.secret_storage.default_key",
+            ))
+            .respond_with(move |_req: &Request| {
+                inner_bool.fetch_or(true, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(json!({}))
+            })
+            .mount(&server)
+            .await;
+
+        // When the session is initialised and the encryption tasks spawn
+        set_client_session(&client).await;
+
+        // Then we can get an updated value without waiting for any network requests
+        assert!(keys_requested.load(Ordering::SeqCst).not());
+        assert_next_matches_with_timeout!(verification_state, VerificationState::Unverified);
     }
 }

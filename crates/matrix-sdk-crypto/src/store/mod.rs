@@ -65,9 +65,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::{backups::BackupMachine, identities::OwnUserIdentity};
 use crate::{
     gossiping::GossippedSecret,
-    identities::{
-        user::UserIdentities, Device, ReadOnlyDevice, ReadOnlyUserIdentities, UserDevices,
-    },
+    identities::{user::UserIdentity, Device, DeviceData, UserDevices, UserIdentityData},
     olm::{
         Account, ExportedRoomKey, InboundGroupSession, OlmMessageHash, OutboundGroupSession,
         PrivateCrossSigningIdentity, Session, StaticAccountData,
@@ -77,7 +75,7 @@ use crate::{
         EventEncryptionAlgorithm, MegolmBackupV1Curve25519AesSha2Secrets, SecretsBundle,
     },
     verification::VerificationMachine,
-    CrossSigningStatus, ReadOnlyOwnUserIdentity, RoomKeyImportResult,
+    CrossSigningStatus, OwnUserIdentityData, RoomKeyImportResult,
 };
 
 pub mod caches;
@@ -217,7 +215,7 @@ impl KeyQueryManager {
             Err(_) => {
                 warn!(
                     user_id = ?user,
-                    "The user has a pending `/key/query` request which did \
+                    "The user has a pending `/keys/query` request which did \
                     not finish yet, some devices might be missing."
                 );
 
@@ -347,13 +345,16 @@ impl<'a> SyncedKeyQueryManager<'a> {
 #[derive(Debug)]
 pub(crate) struct StoreCache {
     store: Arc<CryptoStoreWrapper>,
-
     tracked_users: StdRwLock<BTreeSet<OwnedUserId>>,
     loaded_tracked_users: RwLock<bool>,
     account: Mutex<Option<Account>>,
 }
 
 impl StoreCache {
+    pub(crate) fn store_wrapper(&self) -> &CryptoStoreWrapper {
+        self.store.as_ref()
+    }
+
     /// Returns a reference to the `Account`.
     ///
     /// Either load the account from the cache, or the store if missing from
@@ -576,9 +577,9 @@ impl Changes {
 #[derive(Debug, Clone, Default)]
 #[allow(missing_docs)]
 pub struct IdentityChanges {
-    pub new: Vec<ReadOnlyUserIdentities>,
-    pub changed: Vec<ReadOnlyUserIdentities>,
-    pub unchanged: Vec<ReadOnlyUserIdentities>,
+    pub new: Vec<UserIdentityData>,
+    pub changed: Vec<UserIdentityData>,
+    pub unchanged: Vec<UserIdentityData>,
 }
 
 impl IdentityChanges {
@@ -591,9 +592,9 @@ impl IdentityChanges {
     fn into_maps(
         self,
     ) -> (
-        BTreeMap<OwnedUserId, ReadOnlyUserIdentities>,
-        BTreeMap<OwnedUserId, ReadOnlyUserIdentities>,
-        BTreeMap<OwnedUserId, ReadOnlyUserIdentities>,
+        BTreeMap<OwnedUserId, UserIdentityData>,
+        BTreeMap<OwnedUserId, UserIdentityData>,
+        BTreeMap<OwnedUserId, UserIdentityData>,
     ) {
         let new: BTreeMap<_, _> = self
             .new
@@ -620,19 +621,19 @@ impl IdentityChanges {
 #[derive(Debug, Clone, Default)]
 #[allow(missing_docs)]
 pub struct DeviceChanges {
-    pub new: Vec<ReadOnlyDevice>,
-    pub changed: Vec<ReadOnlyDevice>,
-    pub deleted: Vec<ReadOnlyDevice>,
+    pub new: Vec<DeviceData>,
+    pub changed: Vec<DeviceData>,
+    pub deleted: Vec<DeviceData>,
 }
 
 /// Convert the devices and vectors contained in the [`DeviceChanges`] into
 /// a [`DeviceUpdates`] struct.
 ///
-/// The [`DeviceChanges`] will contain vectors of [`ReadOnlyDevice`]s which
+/// The [`DeviceChanges`] will contain vectors of [`DeviceData`]s which
 /// we want to convert to a [`Device`].
 fn collect_device_updates(
     verification_machine: VerificationMachine,
-    own_identity: Option<ReadOnlyOwnUserIdentity>,
+    own_identity: Option<OwnUserIdentityData>,
     identities: IdentityChanges,
     devices: DeviceChanges,
 ) -> DeviceUpdates {
@@ -641,7 +642,7 @@ fn collect_device_updates(
 
     let (new_identities, changed_identities, unchanged_identities) = identities.into_maps();
 
-    let map_device = |device: ReadOnlyDevice| {
+    let map_device = |device: DeviceData| {
         let device_owner_identity = new_identities
             .get(device.user_id())
             .or_else(|| changed_identities.get(device.user_id()))
@@ -690,7 +691,7 @@ pub struct DeviceUpdates {
     pub changed: BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, Device>>,
 }
 
-/// Updates about [`UserIdentities`] which got received over the `/keys/query`
+/// Updates about [`UserIdentity`]s which got received over the `/keys/query`
 /// endpoint.
 #[derive(Clone, Debug, Default)]
 pub struct IdentityUpdates {
@@ -699,11 +700,11 @@ pub struct IdentityUpdates {
     /// A identity being in this list does not necessarily mean that the
     /// identity was just created, it just means that it's the first time
     /// we're seeing this identity.
-    pub new: BTreeMap<OwnedUserId, UserIdentities>,
+    pub new: BTreeMap<OwnedUserId, UserIdentity>,
     /// The list of changed identities.
-    pub changed: BTreeMap<OwnedUserId, UserIdentities>,
+    pub changed: BTreeMap<OwnedUserId, UserIdentity>,
     /// The list of unchanged identities.
-    pub unchanged: BTreeMap<OwnedUserId, UserIdentities>,
+    pub unchanged: BTreeMap<OwnedUserId, UserIdentity>,
 }
 
 /// The private part of a backup key.
@@ -913,6 +914,20 @@ impl From<&InboundGroupSession> for RoomKeyInfo {
     }
 }
 
+/// Information on a room key that has been withheld
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RoomKeyWithheldInfo {
+    /// The room where the key is used.
+    pub room_id: OwnedRoomId,
+
+    /// The ID of the session that the key is for.
+    pub session_id: String,
+
+    /// The `m.room_key.withheld` event that notified us that the key is being
+    /// withheld.
+    pub withheld_event: RoomKeyWithheldEvent,
+}
+
 impl Store {
     /// Create a new Store.
     pub(crate) fn new(
@@ -998,6 +1013,13 @@ impl Store {
         self.save_changes(changes).await
     }
 
+    pub(crate) async fn get_sessions(
+        &self,
+        sender_key: &str,
+    ) -> Result<Option<Arc<Mutex<Vec<Session>>>>> {
+        self.inner.store.get_sessions(sender_key).await
+    }
+
     pub(crate) async fn save_changes(&self, changes: Changes) -> Result<()> {
         self.inner.store.save_changes(changes).await
     }
@@ -1027,7 +1049,7 @@ impl Store {
 
     #[cfg(test)]
     /// Testing helper to allow to save only a set of devices
-    pub(crate) async fn save_devices(&self, devices: &[ReadOnlyDevice]) -> Result<()> {
+    pub(crate) async fn save_device_data(&self, devices: &[DeviceData]) -> Result<()> {
         let changes = Changes {
             devices: DeviceChanges { changed: devices.to_vec(), ..Default::default() },
             ..Default::default()
@@ -1056,22 +1078,29 @@ impl Store {
             .and_then(|d| d.display_name().map(|d| d.to_owned())))
     }
 
-    /// Get the read-only device associated with `device_id` for `user_id`
-    pub(crate) async fn get_readonly_device(
+    /// Get the device data for the given [`UserId`] and [`DeviceId`].
+    ///
+    /// *Note*: This method will include our own device which is always present
+    /// in the store.
+    pub(crate) async fn get_device_data(
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
-    ) -> Result<Option<ReadOnlyDevice>> {
+    ) -> Result<Option<DeviceData>> {
         self.inner.store.get_device(user_id, device_id).await
     }
 
-    /// Get the read-only version of all the devices that the given user has.
+    /// Get the device data for the given [`UserId`] and [`DeviceId`].
     ///
-    /// *Note*: This doesn't return our own device.
-    pub(crate) async fn get_readonly_devices_filtered(
+    /// *Note*: This method will **not** include our own device.
+    ///
+    /// Use this method if you need a list of recipients for a given user, since
+    /// we don't want to encrypt for our own device, otherwise take a look at
+    /// the [`Store::get_device_data_for_user`] method.
+    pub(crate) async fn get_device_data_for_user_filtered(
         &self,
         user_id: &UserId,
-    ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>> {
+    ) -> Result<HashMap<OwnedDeviceId, DeviceData>> {
         self.inner.store.get_user_devices(user_id).await.map(|mut d| {
             if user_id == self.user_id() {
                 d.remove(self.device_id());
@@ -1080,19 +1109,26 @@ impl Store {
         })
     }
 
-    /// Get the read-only version of all the devices that the given user has.
+    /// Get the [`DeviceData`] for all the devices a user has.
     ///
-    /// *Note*: This does also return our own device.
-    pub(crate) async fn get_readonly_devices_unfiltered(
+    /// *Note*: This method will include our own device which is always present
+    /// in the store.
+    ///
+    /// Use this method if you need to operate on or update all devices of a
+    /// user, otherwise take a look at the
+    /// [`Store::get_device_data_for_user_filtered`] method.
+    pub(crate) async fn get_device_data_for_user(
         &self,
         user_id: &UserId,
-    ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>> {
+    ) -> Result<HashMap<OwnedDeviceId, DeviceData>> {
         self.inner.store.get_user_devices(user_id).await
     }
 
-    /// Get a device for the given user with the given curve25519 key.
+    /// Get a [`Device`] for the given user with the given
+    /// [`Curve25519PublicKey`] key.
     ///
-    /// *Note*: This doesn't return our own device.
+    /// *Note*: This method will include our own device which is always present
+    /// in the store.
     pub(crate) async fn get_device_from_curve_key(
         &self,
         user_id: &UserId,
@@ -1103,11 +1139,17 @@ impl Store {
             .map(|d| d.devices().find(|d| d.curve25519_key() == Some(curve_key)))
     }
 
-    /// Get all devices associated with the given `user_id`
+    /// Get all devices associated with the given [`UserId`].
     ///
-    /// *Note*: This does also return our own device.
+    /// This method is more expensive than the
+    /// [`Store::get_device_data_for_user`] method, since a [`Device`]
+    /// requires the [`OwnUserIdentityData`] and the [`UserIdentityData`] of the
+    /// device owner to be fetched from the store as well.
+    ///
+    /// *Note*: This method will include our own device which is always present
+    /// in the store.
     pub(crate) async fn get_user_devices(&self, user_id: &UserId) -> Result<UserDevices> {
-        let devices = self.get_readonly_devices_unfiltered(user_id).await?;
+        let devices = self.get_device_data_for_user(user_id).await?;
 
         let own_identity = self
             .inner
@@ -1125,39 +1167,61 @@ impl Store {
         })
     }
 
-    /// Get a Device copy associated with `device_id` for `user_id`
+    /// Get a [`Device`] for the given user with the given [`DeviceId`].
+    ///
+    /// This method is more expensive than the [`Store::get_device_data`] method
+    /// since a [`Device`] requires the [`OwnUserIdentityData`] and the
+    /// [`UserIdentityData`] of the device owner to be fetched from the
+    /// store as well.
+    ///
+    /// *Note*: This method will include our own device which is always present
+    /// in the store.
     pub(crate) async fn get_device(
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
     ) -> Result<Option<Device>> {
+        if let Some(device_data) = self.inner.store.get_device(user_id, device_id).await? {
+            Ok(Some(self.wrap_device_data(device_data).await?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Create a new device using the supplied [`DeviceData`]. Normally we would
+    /// call [`Self::get_device`] to find an existing device inside this
+    /// store. Only call this if you have some existing DeviceData and want
+    /// to wrap it with the extra information provided by a [`Device`].
+    pub(crate) async fn wrap_device_data(&self, device_data: DeviceData) -> Result<Device> {
         let own_identity = self
             .inner
             .store
             .get_user_identity(self.user_id())
             .await?
             .and_then(|i| i.own().cloned());
-        let device_owner_identity = self.inner.store.get_user_identity(user_id).await?;
 
-        Ok(self.inner.store.get_device(user_id, device_id).await?.map(|d| Device {
-            inner: d,
+        let device_owner_identity =
+            self.inner.store.get_user_identity(device_data.user_id()).await?;
+
+        Ok(Device {
+            inner: device_data,
             verification_machine: self.inner.verification_machine.clone(),
             own_identity,
             device_owner_identity,
-        }))
+        })
     }
 
     ///  Get the Identity of `user_id`
-    pub(crate) async fn get_identity(&self, user_id: &UserId) -> Result<Option<UserIdentities>> {
+    pub(crate) async fn get_identity(&self, user_id: &UserId) -> Result<Option<UserIdentity>> {
         let own_identity = self
             .inner
             .store
             .get_user_identity(self.user_id())
             .await?
-            .and_then(as_variant!(ReadOnlyUserIdentities::Own));
+            .and_then(as_variant!(UserIdentityData::Own));
 
         Ok(self.inner.store.get_user_identity(user_id).await?.map(|i| {
-            UserIdentities::new(
+            UserIdentity::new(
                 self.clone(),
                 i,
                 self.inner.verification_machine.to_owned(),
@@ -1251,7 +1315,7 @@ impl Store {
 
             if diff.none_differ() {
                 public_identity.mark_as_verified();
-                changes.identities.changed.push(ReadOnlyUserIdentities::Own(public_identity.inner));
+                changes.identities.changed.push(UserIdentityData::Own(public_identity.inner));
             }
 
             info!(?status, "Successfully imported the private cross-signing keys");
@@ -1355,7 +1419,7 @@ impl Store {
         );
 
         changes.private_identity = Some(identity.clone());
-        changes.identities.new.push(ReadOnlyUserIdentities::Own(public_identity));
+        changes.identities.new.push(UserIdentityData::Own(public_identity));
 
         Ok(self.save_changes(changes).await?)
     }
@@ -1463,6 +1527,20 @@ impl Store {
         self.inner.store.room_keys_received_stream()
     }
 
+    /// Receive notifications of received `m.room_key.withheld` messages.
+    ///
+    /// Each time an `m.room_key.withheld` is received and stored, an update
+    /// will be sent to the stream. Updates that happen at the same time are
+    /// batched into a [`Vec`].
+    ///
+    /// If the reader of the stream lags too far behind, a warning will be
+    /// logged and items will be dropped.
+    pub fn room_keys_withheld_received_stream(
+        &self,
+    ) -> impl Stream<Item = Vec<RoomKeyWithheldInfo>> {
+        self.inner.store.room_keys_withheld_received_stream()
+    }
+
     /// Returns a stream of user identity updates, allowing users to listen for
     /// notifications about new or changed user identities.
     ///
@@ -1503,7 +1581,7 @@ impl Store {
             let map_identity = |(user_id, identity)| {
                 (
                     user_id,
-                    UserIdentities::new(
+                    UserIdentity::new(
                         this.clone(),
                         identity,
                         verification_machine.to_owned(),
@@ -1717,8 +1795,8 @@ impl Store {
     /// # Arguments
     ///
     /// * `exported_keys` - A list of previously exported keys that should be
-    /// imported into our store. If we already have a better version of a key
-    /// the key will *not* be imported.
+    ///   imported into our store. If we already have a better version of a key
+    ///   the key will *not* be imported.
     ///
     /// Returns a tuple of numbers that represent the number of sessions that
     /// were imported and the total number of sessions that were found in the
@@ -1755,9 +1833,9 @@ impl Store {
     /// # Arguments
     ///
     /// * `predicate` - A closure that will be called for every known
-    /// `InboundGroupSession`, which represents a room key. If the closure
-    /// returns `true` the `InboundGroupSession` will be included in the export,
-    /// if the closure returns `false` it will not be included.
+    ///   `InboundGroupSession`, which represents a room key. If the closure
+    ///   returns `true` the `InboundGroupSession` will be included in the
+    ///   export, if the closure returns `false` it will not be included.
     ///
     /// # Examples
     ///
@@ -1795,9 +1873,9 @@ impl Store {
     /// # Arguments
     ///
     /// * `predicate` - A closure that will be called for every known
-    /// `InboundGroupSession`, which represents a room key. If the closure
-    /// returns `true` the `InboundGroupSession` will be included in the export,
-    /// if the closure returns `false` it will not be included.
+    ///   `InboundGroupSession`, which represents a room key. If the closure
+    ///   returns `true` the `InboundGroupSession` will be included in the
+    ///   export, if the closure returns `false` it will not be included.
     ///
     /// # Examples
     ///
@@ -1847,14 +1925,14 @@ pub struct LockableCryptoStore(Arc<dyn CryptoStore<Error = CryptoStoreError>>);
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl matrix_sdk_common::store_locks::BackingStore for LockableCryptoStore {
-    type Error = CryptoStoreError;
+    type LockError = CryptoStoreError;
 
     async fn try_lock(
         &self,
         lease_duration_ms: u32,
         key: &str,
         holder: &str,
-    ) -> std::result::Result<bool, Self::Error> {
+    ) -> std::result::Result<bool, Self::LockError> {
         self.0.try_take_leased_lock(lease_duration_ms, key, holder).await
     }
 }
@@ -1867,10 +1945,10 @@ mod tests {
     use matrix_sdk_test::async_test;
     use ruma::{room_id, user_id};
 
-    use crate::{machine::tests::get_machine_pair, types::EventEncryptionAlgorithm};
+    use crate::{machine::test_helpers::get_machine_pair, types::EventEncryptionAlgorithm};
 
     #[async_test]
-    async fn import_room_keys_notifies_stream() {
+    async fn test_import_room_keys_notifies_stream() {
         use futures_util::FutureExt;
 
         let (alice, bob, _) =
@@ -1893,7 +1971,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn export_room_keys_provides_selected_keys() {
+    async fn test_export_room_keys_provides_selected_keys() {
         // Given an OlmMachine with room keys in it
         let (alice, _, _) = get_machine_pair(user_id!("@a:s.co"), user_id!("@b:s.co"), false).await;
         let room1_id = room_id!("!room1:localhost");
@@ -1921,7 +1999,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn export_room_keys_stream_can_provide_all_keys() {
+    async fn test_export_room_keys_stream_can_provide_all_keys() {
         // Given an OlmMachine with room keys in it
         let (alice, _, _) = get_machine_pair(user_id!("@a:s.co"), user_id!("@b:s.co"), false).await;
         let room1_id = room_id!("!room1:localhost");
@@ -1949,7 +2027,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn export_room_keys_stream_can_provide_a_subset_of_keys() {
+    async fn test_export_room_keys_stream_can_provide_a_subset_of_keys() {
         // Given an OlmMachine with room keys in it
         let (alice, _, _) = get_machine_pair(user_id!("@a:s.co"), user_id!("@b:s.co"), false).await;
         let room1_id = room_id!("!room1:localhost");
@@ -1975,7 +2053,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn export_secrets_bundle() {
+    async fn test_export_secrets_bundle() {
         let user_id = user_id!("@alice:example.com");
         let (first, second, _) = get_machine_pair(user_id, user_id, false).await;
 

@@ -111,8 +111,10 @@ impl RoomInfoV1 {
         } = self;
 
         RoomInfo {
+            version: 0,
             room_id,
             room_state: room_type,
+            prev_room_state: None,
             notification_counts,
             summary,
             members_synced,
@@ -125,6 +127,9 @@ impl RoomInfoV1 {
             base_info: base_info.migrate(create),
             warned_about_unknown_room_version: Arc::new(false.into()),
             cached_display_name: None,
+            cached_user_defined_notification_mode: None,
+            #[cfg(feature = "experimental-sliding-sync")]
+            recency_stamp: None,
         }
     }
 }
@@ -197,6 +202,7 @@ impl BaseRoomInfoV1 {
 
         Box::new(BaseRoomInfo {
             avatar,
+            beacons: BTreeMap::new(),
             canonical_alias,
             create,
             dm_targets,
@@ -208,9 +214,10 @@ impl BaseRoomInfoV1 {
             name,
             tombstone,
             topic,
-            rtc_member: BTreeMap::new(),
+            rtc_member_events: BTreeMap::new(),
             is_marked_unread: false,
             notable_tags: RoomNotableTags::empty(),
+            pinned_events: None,
         })
     }
 }

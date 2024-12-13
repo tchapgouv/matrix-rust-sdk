@@ -1,10 +1,15 @@
-use std::sync::Arc;
+use std::{collections::HashMap, pin::pin, sync::Arc};
 
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use matrix_sdk::{
+    crypto::LocalTrust,
     event_cache::paginator::PaginatorError,
-    room::{power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole},
-    ComposerDraft, RoomHero as SdkRoomHero, RoomMemberships, RoomState,
+    room::{
+        edit::EditedContent, power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole,
+    },
+    ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType,
+    RoomHero as SdkRoomHero, RoomMemberships, RoomState,
 };
 use matrix_sdk_ui::timeline::{PaginationError, RoomExt, TimelineFocus};
 use mime::Mime;
@@ -15,11 +20,13 @@ use ruma::{
         call::notify,
         room::{
             avatar::ImageInfo as RumaAvatarImageInfo,
+            message::RoomMessageEventContentWithoutRelation,
             power_levels::RoomPowerLevels as RumaPowerLevels, MediaSource,
         },
         TimelineEventType,
     },
-    EventId, Int, RoomAliasId, UserId,
+    EventId, Int, OwnedDeviceId, OwnedTransactionId, OwnedUserId, RoomAliasId, TransactionId,
+    UserId,
 };
 use tokio::sync::RwLock;
 use tracing::error;
@@ -29,6 +36,7 @@ use crate::{
     chunk_iterator::ChunkIterator,
     error::{ClientError, MediaInfoError, RoomError},
     event::{MessageLikeEventType, StateEventType},
+    identity_status_change::IdentityStatusChange,
     room_info::RoomInfo,
     room_member::RoomMember,
     ruma::{ImageInfo, Mentions, NotifyType},
@@ -37,11 +45,12 @@ use crate::{
     TaskHandle,
 };
 
-#[derive(uniffi::Enum)]
+#[derive(Debug, Clone, uniffi::Enum)]
 pub enum Membership {
     Invited,
     Joined,
     Left,
+    Knocked,
 }
 
 impl From<RoomState> for Membership {
@@ -50,6 +59,7 @@ impl From<RoomState> for Membership {
             RoomState::Invited => Membership::Invited,
             RoomState::Joined => Membership::Joined,
             RoomState::Left => Membership::Left,
+            RoomState::Knocked => Membership::Knocked,
         }
     }
 }
@@ -72,7 +82,7 @@ impl Room {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl Room {
     pub fn id(&self) -> String {
         self.inner.room_id().to_string()
@@ -153,7 +163,12 @@ impl Room {
     /// the user who invited the logged-in user to a room.
     pub async fn inviter(&self) -> Option<RoomMember> {
         if self.inner.state() == RoomState::Invited {
-            self.inner.invite_details().await.ok().and_then(|a| a.inviter).map(|m| m.into())
+            self.inner
+                .invite_details()
+                .await
+                .ok()
+                .and_then(|a| a.inviter)
+                .and_then(|m| m.try_into().ok())
         } else {
             None
         }
@@ -224,6 +239,28 @@ impl Room {
         Ok(Timeline::new(timeline))
     }
 
+    pub async fn pinned_events_timeline(
+        &self,
+        internal_id_prefix: Option<String>,
+        max_events_to_load: u16,
+        max_concurrent_requests: u16,
+    ) -> Result<Arc<Timeline>, ClientError> {
+        let room = &self.inner;
+
+        let mut builder = matrix_sdk_ui::timeline::Timeline::builder(room);
+
+        if let Some(internal_id_prefix) = internal_id_prefix {
+            builder = builder.with_internal_id_prefix(internal_id_prefix);
+        }
+
+        let timeline = builder
+            .with_focus(TimelineFocus::PinnedEvents { max_events_to_load, max_concurrent_requests })
+            .build()
+            .await?;
+
+        Ok(Timeline::new(timeline))
+    }
+
     pub fn is_encrypted(&self) -> Result<bool, ClientError> {
         Ok(RUNTIME.block_on(self.inner.is_encrypted())?)
     }
@@ -241,7 +278,7 @@ impl Room {
     pub async fn member(&self, user_id: String) -> Result<RoomMember, ClientError> {
         let user_id = UserId::parse(&*user_id).context("Invalid user id.")?;
         let member = self.inner.get_member(&user_id).await?.context("User not found")?;
-        Ok(member.into())
+        Ok(member.try_into().context("Unknown state membership")?)
     }
 
     pub async fn member_avatar_url(&self, user_id: String) -> Result<Option<String>, ClientError> {
@@ -306,8 +343,8 @@ impl Room {
     ///
     /// * `event_id` - The ID of the event to redact
     ///
-    /// * `reason` - The reason for the event being redacted (optional).
-    /// its transaction ID (optional). If not given one is created.
+    /// * `reason` - The reason for the event being redacted (optional). its
+    ///   transaction ID (optional). If not given one is created.
     pub async fn redact(
         &self,
         event_id: String,
@@ -518,6 +555,11 @@ impl Room {
         Ok(self.inner.can_user_send_message(&user_id, message.into()).await?)
     }
 
+    pub async fn can_user_pin_unpin(&self, user_id: String) -> Result<bool, ClientError> {
+        let user_id = UserId::parse(&user_id)?;
+        Ok(self.inner.can_user_pin_unpin(&user_id).await?)
+    }
+
     pub async fn can_user_trigger_room_notification(
         &self,
         user_id: String,
@@ -549,6 +591,31 @@ impl Room {
         })))
     }
 
+    pub fn subscribe_to_identity_status_changes(
+        &self,
+        listener: Box<dyn IdentityStatusChangeListener>,
+    ) -> Arc<TaskHandle> {
+        let room = self.inner.clone();
+        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+            let status_changes = room.subscribe_to_identity_status_changes().await;
+            if let Ok(status_changes) = status_changes {
+                // TODO: what to do with failures?
+                let mut status_changes = pin!(status_changes);
+                while let Some(identity_status_changes) = status_changes.next().await {
+                    listener.call(
+                        identity_status_changes
+                            .into_iter()
+                            .map(|change| {
+                                let user_id = change.user_id.to_string();
+                                IdentityStatusChange { user_id, changed_to: change.changed_to }
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        })))
+    }
+
     /// Set (or unset) a flag on the room to indicate that the user has
     /// explicitly marked it as unread.
     pub async fn set_unread_flag(&self, new_value: bool) -> Result<(), ClientError> {
@@ -567,7 +634,7 @@ impl Room {
     }
 
     pub async fn get_power_levels(&self) -> Result<RoomPowerLevels, ClientError> {
-        let power_levels = self.inner.room_power_levels().await?;
+        let power_levels = self.inner.power_levels().await.map_err(matrix_sdk::Error::from)?;
         Ok(RoomPowerLevels::from(power_levels))
     }
 
@@ -625,6 +692,7 @@ impl Room {
     /// This function is supposed to be called whenever the user creates a room
     /// call. It will send a `m.call.notify` event if:
     ///  - there is not yet a running call.
+    ///
     /// It will configure the notify type: ring or notify based on:
     ///  - is this a DM room -> ring
     ///  - is this a group with more than one other member -> notify
@@ -676,22 +744,129 @@ impl Room {
     /// Store the given `ComposerDraft` in the state store using the current
     /// room id, as identifier.
     pub async fn save_composer_draft(&self, draft: ComposerDraft) -> Result<(), ClientError> {
-        Ok(self.inner.save_composer_draft(draft).await?)
+        Ok(self.inner.save_composer_draft(draft.try_into()?).await?)
     }
 
     /// Retrieve the `ComposerDraft` stored in the state store for this room.
     pub async fn load_composer_draft(&self) -> Result<Option<ComposerDraft>, ClientError> {
-        Ok(self.inner.load_composer_draft().await?)
+        Ok(self.inner.load_composer_draft().await?.map(Into::into))
     }
 
     /// Remove the `ComposerDraft` stored in the state store for this room.
     pub async fn clear_composer_draft(&self) -> Result<(), ClientError> {
         Ok(self.inner.clear_composer_draft().await?)
     }
+
+    /// Edit an event given its event id.
+    ///
+    /// Useful outside the context of a timeline, or when a timeline doesn't
+    /// have the full content of an event.
+    pub async fn edit(
+        &self,
+        event_id: String,
+        new_content: Arc<RoomMessageEventContentWithoutRelation>,
+    ) -> Result<(), ClientError> {
+        let event_id = EventId::parse(event_id)?;
+
+        let replacement_event = self
+            .inner
+            .make_edit_event(&event_id, EditedContent::RoomMessage((*new_content).clone()))
+            .await?;
+
+        self.inner.send_queue().send(replacement_event).await?;
+        Ok(())
+    }
+
+    /// Remove verification requirements for the given users and
+    /// resend messages that failed to send because their identities were no
+    /// longer verified (in response to
+    /// `SessionRecipientCollectionError::VerifiedUserChangedIdentity`)
+    ///
+    /// # Arguments
+    ///
+    /// * `user_ids` - The list of users identifiers received in the error
+    /// * `transaction_id` - The send queue transaction identifier of the local
+    ///   echo the send error applies to
+    pub async fn withdraw_verification_and_resend(
+        &self,
+        user_ids: Vec<String>,
+        transaction_id: String,
+    ) -> Result<(), ClientError> {
+        let transaction_id: OwnedTransactionId = transaction_id.into();
+
+        let user_ids: Vec<OwnedUserId> =
+            user_ids.iter().map(UserId::parse).collect::<Result<_, _>>()?;
+
+        let encryption = self.inner.client().encryption();
+
+        for user_id in user_ids {
+            if let Some(user_identity) = encryption.get_user_identity(&user_id).await? {
+                user_identity.withdraw_verification().await?;
+            }
+        }
+
+        self.inner.send_queue().unwedge(&transaction_id).await?;
+
+        Ok(())
+    }
+
+    /// Set the local trust for the given devices to `LocalTrust::Ignored`
+    /// and resend messages that failed to send because said devices are
+    /// unverified (in response to
+    /// `SessionRecipientCollectionError::VerifiedUserHasUnsignedDevice`).
+    /// # Arguments
+    ///
+    /// * `devices` - The map of users identifiers to device identifiers
+    ///   received in the error
+    /// * `transaction_id` - The send queue transaction identifier of the local
+    ///   echo the send error applies to
+    pub async fn ignore_device_trust_and_resend(
+        &self,
+        devices: HashMap<String, Vec<String>>,
+        transaction_id: String,
+    ) -> Result<(), ClientError> {
+        let transaction_id: OwnedTransactionId = transaction_id.into();
+
+        let encryption = self.inner.client().encryption();
+
+        for (user_id, device_ids) in devices.iter() {
+            let user_id = UserId::parse(user_id)?;
+
+            for device_id in device_ids {
+                let device_id: OwnedDeviceId = device_id.as_str().into();
+
+                if let Some(device) = encryption.get_device(&user_id, &device_id).await? {
+                    device.set_local_trust(LocalTrust::Ignored).await?;
+                }
+            }
+        }
+
+        self.inner.send_queue().unwedge(&transaction_id).await?;
+
+        Ok(())
+    }
+
+    /// Attempt to manually resend messages that failed to send due to issues
+    /// that should now have been fixed.
+    ///
+    /// This is useful for example, when there's a
+    /// `SessionRecipientCollectionError::VerifiedUserChangedIdentity` error;
+    /// the user may have re-verified on a different device and would now
+    /// like to send the failed message that's waiting on this device.
+    ///
+    /// # Arguments
+    ///
+    /// * `transaction_id` - The send queue transaction identifier of the local
+    ///   echo that should be unwedged.
+    pub async fn try_resend(&self, transaction_id: String) -> Result<(), ClientError> {
+        let transaction_id: &TransactionId = transaction_id.as_str().into();
+        self.inner.send_queue().unwedge(transaction_id).await?;
+        Ok(())
+    }
 }
 
 /// Generates a `matrix.to` permalink to the given room alias.
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 pub fn matrix_to_room_alias_permalink(
     room_alias: String,
 ) -> std::result::Result<String, ClientError> {
@@ -747,14 +922,19 @@ impl From<RumaPowerLevels> for RoomPowerLevels {
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomInfoListener: Sync + Send {
     fn call(&self, room_info: RoomInfo);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait TypingNotificationsListener: Sync + Send {
     fn call(&self, typing_user_ids: Vec<String>);
+}
+
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait IdentityStatusChangeListener: Sync + Send {
+    fn call(&self, identity_status_change: Vec<IdentityStatusChange>);
 }
 
 #[derive(uniffi::Object)]
@@ -768,7 +948,7 @@ impl RoomMembersIterator {
     }
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl RoomMembersIterator {
     fn len(&self) -> u32 {
         self.chunk_iterator.len()
@@ -777,7 +957,7 @@ impl RoomMembersIterator {
     fn next_chunk(&self, chunk_size: u32) -> Option<Vec<RoomMember>> {
         self.chunk_iterator
             .next(chunk_size)
-            .map(|members| members.into_iter().map(|m| m.into()).collect())
+            .map(|members| members.into_iter().filter_map(|m| m.try_into().ok()).collect())
     }
 }
 
@@ -845,5 +1025,74 @@ impl From<RtcApplicationType> for notify::ApplicationType {
         match value {
             RtcApplicationType::Call => notify::ApplicationType::Call,
         }
+    }
+}
+
+/// Current draft of the composer for the room.
+#[derive(uniffi::Record)]
+pub struct ComposerDraft {
+    /// The draft content in plain text.
+    pub plain_text: String,
+    /// If the message is formatted in HTML, the HTML representation of the
+    /// message.
+    pub html_text: Option<String>,
+    /// The type of draft.
+    pub draft_type: ComposerDraftType,
+}
+
+impl From<SdkComposerDraft> for ComposerDraft {
+    fn from(value: SdkComposerDraft) -> Self {
+        let SdkComposerDraft { plain_text, html_text, draft_type } = value;
+        Self { plain_text, html_text, draft_type: draft_type.into() }
+    }
+}
+
+impl TryFrom<ComposerDraft> for SdkComposerDraft {
+    type Error = ruma::IdParseError;
+
+    fn try_from(value: ComposerDraft) -> std::result::Result<Self, Self::Error> {
+        let ComposerDraft { plain_text, html_text, draft_type } = value;
+        Ok(Self { plain_text, html_text, draft_type: draft_type.try_into()? })
+    }
+}
+
+/// The type of draft of the composer.
+#[derive(uniffi::Enum)]
+pub enum ComposerDraftType {
+    /// The draft is a new message.
+    NewMessage,
+    /// The draft is a reply to an event.
+    Reply {
+        /// The ID of the event being replied to.
+        event_id: String,
+    },
+    /// The draft is an edit of an event.
+    Edit {
+        /// The ID of the event being edited.
+        event_id: String,
+    },
+}
+
+impl From<SdkComposerDraftType> for ComposerDraftType {
+    fn from(value: SdkComposerDraftType) -> Self {
+        match value {
+            SdkComposerDraftType::NewMessage => Self::NewMessage,
+            SdkComposerDraftType::Reply { event_id } => Self::Reply { event_id: event_id.into() },
+            SdkComposerDraftType::Edit { event_id } => Self::Edit { event_id: event_id.into() },
+        }
+    }
+}
+
+impl TryFrom<ComposerDraftType> for SdkComposerDraftType {
+    type Error = ruma::IdParseError;
+
+    fn try_from(value: ComposerDraftType) -> std::result::Result<Self, Self::Error> {
+        let draft_type = match value {
+            ComposerDraftType::NewMessage => Self::NewMessage,
+            ComposerDraftType::Reply { event_id } => Self::Reply { event_id: event_id.try_into()? },
+            ComposerDraftType::Edit { event_id } => Self::Edit { event_id: event_id.try_into()? },
+        };
+
+        Ok(draft_type)
     }
 }

@@ -224,19 +224,19 @@ impl BackupMachine {
                 if device_key_id.algorithm() == DeviceKeyAlgorithm::Ed25519 {
                     // No need to check our own device here, we're doing that using
                     // the check_own_device_signature().
-                    if device_key_id.device_id() == self.store.static_account().device_id {
+                    if device_key_id.key_name() == self.store.static_account().device_id {
                         continue;
                     }
 
                     let state = self
                         .test_ed25519_device_signature(
-                            device_key_id.device_id(),
+                            device_key_id.key_name(),
                             signatures,
                             auth_data,
                         )
                         .await?;
 
-                    result.insert(device_key_id.device_id().to_owned(), state);
+                    result.insert(device_key_id.key_name().to_owned(), state);
 
                     // Abort the loop if we found a trusted and valid signature,
                     // unless we should check all of them.
@@ -312,8 +312,8 @@ impl BackupMachine {
     ///
     /// # Arguments
     ///
-    /// * `backup_info`: The backup info that should be verified. Should
-    /// be fetched from the server using the [`/room_keys/version`] endpoint.
+    /// * `backup_info`: The backup info that should be verified. Should be
+    ///   fetched from the server using the [`/room_keys/version`] endpoint.
     ///
     /// * `compute_all_signatures`: *Useful for debugging only*. If this
     ///   parameter is `true`, the internal machinery will compute the trust
@@ -341,9 +341,9 @@ impl BackupMachine {
     ///
     /// # Arguments
     ///
-    /// * `backup_info`: The backup version that should be verified. Should
-    /// be created from the [`BackupDecryptionKey`] using the
-    /// [`BackupDecryptionKey::to_backup_info()`] method.
+    /// * `backup_info`: The backup version that should be verified. Should be
+    ///   created from the [`BackupDecryptionKey`] using the
+    ///   [`BackupDecryptionKey::to_backup_info()`] method.
     pub async fn sign_backup(
         &self,
         backup_info: &mut RoomKeyBackupInfo,
@@ -595,8 +595,8 @@ impl BackupMachine {
     /// # Arguments
     ///
     /// * `room_keys` - A list of previously exported keys that should be
-    /// imported into our store. If we already have a better version of a key
-    /// the key will *not* be imported.
+    ///   imported into our store. If we already have a better version of a key
+    ///   the key will *not* be imported.
     ///
     /// Returns a [`RoomKeyImportResult`] containing information about room keys
     /// which were imported.
@@ -745,7 +745,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn memory_store_backups() -> Result<(), OlmError> {
+    async fn test_memory_store_backups() -> Result<(), OlmError> {
         let machine = OlmMachine::new(alice_id(), alice_device_id()).await;
 
         backup_flow(machine).await
@@ -831,7 +831,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn import_backed_up_room_keys() {
+    async fn test_import_backed_up_room_keys() {
         let machine = OlmMachine::new(alice_id(), alice_device_id()).await;
         let backup_machine = machine.backup_machine();
 
@@ -880,7 +880,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn sign_backup_info() {
+    async fn test_sign_backup_info() {
         let machine = OlmMachine::new(alice_id(), alice_device_id()).await;
         let backup_machine = machine.backup_machine();
 

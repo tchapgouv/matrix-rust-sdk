@@ -1,3 +1,17 @@
+// Copyright 2024 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for that specific language governing permissions and
+// limitations under the License.
+
 //! High-level push notification settings API
 
 use std::sync::Arc;
@@ -23,21 +37,12 @@ mod command;
 mod rule_commands;
 mod rules;
 
+pub use matrix_sdk_base::notification_settings::RoomNotificationMode;
+
 use crate::{
     config::RequestConfig, error::NotificationSettingsError, event_handler::EventHandlerDropGuard,
     Client, Result,
 };
-
-/// Enum representing the push notification modes for a room.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoomNotificationMode {
-    /// Receive notifications for all messages.
-    AllMessages,
-    /// Receive notifications for mentions and keywords only.
-    MentionsAndKeywordsOnly,
-    /// Do not receive any notifications.
-    Mute,
-}
 
 /// Whether or not a room is encrypted
 #[derive(Debug, Clone, Copy)]
@@ -446,44 +451,39 @@ impl NotificationSettings {
         let request_config = Some(RequestConfig::short_retry());
         for command in &rule_commands.commands {
             match command {
-                Command::DeletePushRule { scope, kind, rule_id } => {
-                    let request = delete_pushrule::v3::Request::new(
-                        scope.clone(),
-                        kind.clone(),
-                        rule_id.clone(),
-                    );
+                Command::DeletePushRule { kind, rule_id } => {
+                    let request = delete_pushrule::v3::Request::new(kind.clone(), rule_id.clone());
                     self.client.send(request, request_config).await.map_err(|error| {
                         error!("Unable to delete {kind} push rule `{rule_id}`: {error}");
                         NotificationSettingsError::UnableToRemovePushRule
                     })?;
                 }
-                Command::SetRoomPushRule { scope, room_id, notify: _ } => {
+                Command::SetRoomPushRule { room_id, notify: _ } => {
                     let push_rule = command.to_push_rule()?;
-                    let request = set_pushrule::v3::Request::new(scope.clone(), push_rule);
+                    let request = set_pushrule::v3::Request::new(push_rule);
                     self.client.send(request, request_config).await.map_err(|error| {
                         error!("Unable to set room push rule `{room_id}`: {error}");
                         NotificationSettingsError::UnableToAddPushRule
                     })?;
                 }
-                Command::SetOverridePushRule { scope, rule_id, room_id: _, notify: _ } => {
+                Command::SetOverridePushRule { rule_id, room_id: _, notify: _ } => {
                     let push_rule = command.to_push_rule()?;
-                    let request = set_pushrule::v3::Request::new(scope.clone(), push_rule);
+                    let request = set_pushrule::v3::Request::new(push_rule);
                     self.client.send(request, request_config).await.map_err(|error| {
                         error!("Unable to set override push rule `{rule_id}`: {error}");
                         NotificationSettingsError::UnableToAddPushRule
                     })?;
                 }
-                Command::SetKeywordPushRule { scope, keyword: _ } => {
+                Command::SetKeywordPushRule { keyword: _ } => {
                     let push_rule = command.to_push_rule()?;
-                    let request = set_pushrule::v3::Request::new(scope.clone(), push_rule);
+                    let request = set_pushrule::v3::Request::new(push_rule);
                     self.client
                         .send(request, request_config)
                         .await
                         .map_err(|_| NotificationSettingsError::UnableToAddPushRule)?;
                 }
-                Command::SetPushRuleEnabled { scope, kind, rule_id, enabled } => {
+                Command::SetPushRuleEnabled { kind, rule_id, enabled } => {
                     let request = set_pushrule_enabled::v3::Request::new(
-                        scope.clone(),
                         kind.clone(),
                         rule_id.clone(),
                         *enabled,
@@ -493,9 +493,8 @@ impl NotificationSettings {
                         NotificationSettingsError::UnableToUpdatePushRule
                     })?;
                 }
-                Command::SetPushRuleActions { scope, kind, rule_id, actions } => {
+                Command::SetPushRuleActions { kind, rule_id, actions } => {
                     let request = set_pushrule_actions::v3::Request::new(
-                        scope.clone(),
                         kind.clone(),
                         rule_id.clone(),
                         actions.clone(),
@@ -570,7 +569,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn subscribe_to_changes() {
+    async fn test_subscribe_to_changes() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
         let settings = client.notification_settings().await;
@@ -1276,7 +1275,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn list_keywords() {
+    async fn test_list_keywords() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
@@ -1334,7 +1333,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn add_keyword_missing() {
+    async fn test_add_keyword_missing() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
         let settings = client.notification_settings().await;
@@ -1360,7 +1359,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn add_keyword_disabled() {
+    async fn test_add_keyword_disabled() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
@@ -1416,7 +1415,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn add_keyword_noop() {
+    async fn test_add_keyword_noop() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
@@ -1463,7 +1462,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn remove_keyword_all() {
+    async fn test_remove_keyword_all() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
 
@@ -1523,7 +1522,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn remove_keyword_noop() {
+    async fn test_remove_keyword_noop() {
         let server = MockServer::start().await;
         let client = logged_in_client(Some(server.uri())).await;
         let settings = client.notification_settings().await;

@@ -2,12 +2,13 @@ use std::collections::btree_map::Iter;
 
 use ruma::{encryption::KeyUsage, OwnedDeviceKeyId, UserId};
 use serde::{Deserialize, Serialize};
+use vodozemac::Ed25519PublicKey;
 
 use super::{CrossSigningKey, SigningKey};
 use crate::{
     olm::VerifyJson,
     types::{DeviceKeys, SigningKeys},
-    ReadOnlyDevice, SignatureError,
+    DeviceData, SignatureError,
 };
 
 /// Wrapper for a cross signing key marking it as a self signing key.
@@ -33,6 +34,14 @@ impl SelfSigningPubkey {
         &self.0.usage
     }
 
+    /// Get the first available self signing key.
+    ///
+    /// There's usually only a single key so this will usually fetch the
+    /// only key.
+    pub fn get_first_key(&self) -> Option<Ed25519PublicKey> {
+        self.0.get_first_key_and_id().map(|(_, k)| k)
+    }
+
     /// Verify that the [`DeviceKeys`] have a valid signature from this
     /// self-signing key.
     pub fn verify_device_keys(&self, device_keys: &DeviceKeys) -> Result<(), SignatureError> {
@@ -51,7 +60,7 @@ impl SelfSigningPubkey {
     ///
     /// Returns an empty result if the signature check succeeded, otherwise a
     /// SignatureError indicating why the check failed.
-    pub(crate) fn verify_device(&self, device: &ReadOnlyDevice) -> Result<(), SignatureError> {
+    pub(crate) fn verify_device(&self, device: &DeviceData) -> Result<(), SignatureError> {
         self.verify_device_keys(device.as_device_keys())
     }
 }

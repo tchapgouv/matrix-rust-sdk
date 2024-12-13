@@ -6,18 +6,21 @@ use matrix_sdk_test::{test_json, SyncResponseBuilder};
 use ruma::RoomId;
 use serde::Serialize;
 use wiremock::{
-    matchers::{header, method, path, path_regex, query_param, query_param_is_missing},
+    matchers::{header, method, path, query_param, query_param_is_missing},
     Mock, MockGuard, MockServer, ResponseTemplate,
 };
 
+mod account;
 mod client;
 #[cfg(feature = "e2e-encryption")]
 mod encryption;
 mod event_cache;
 mod matrix_auth;
+mod media;
 mod notification;
 mod refresh_token;
 mod room;
+mod room_preview;
 mod send_queue;
 #[cfg(feature = "experimental-widgets")]
 mod widget;
@@ -75,30 +78,6 @@ async fn mock_sync_scoped(
         .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
         .mount_as_scoped(server)
         .await
-}
-
-/// Mount a Mock on the given server to handle the `GET
-/// /rooms/.../state/m.room.encryption` endpoint with an option whether it
-/// should return an encryption event or not.
-async fn mock_encryption_state(server: &MockServer, is_encrypted: bool) {
-    let builder = Mock::given(method("GET"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/state/m.*room.*encryption.?"))
-        .and(header("authorization", "Bearer 1234"));
-
-    if is_encrypted {
-        builder
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(&*test_json::sync_events::ENCRYPTION_CONTENT),
-            )
-            .mount(server)
-            .await;
-    } else {
-        builder
-            .respond_with(ResponseTemplate::new(404).set_body_json(&*test_json::NOT_FOUND))
-            .mount(server)
-            .await;
-    }
 }
 
 /// Does a sync for a given room, and returns its `Room` object.

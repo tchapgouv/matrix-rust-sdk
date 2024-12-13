@@ -23,40 +23,30 @@
 //!
 //! As such, the `RoomListService` works as an opinionated state machine. The
 //! states are defined by [`State`]. Actions are attached to the each state
-//! transition. Apart from that, one can apply [`Input`]s on the state machine,
-//! like notifying that the client app viewport of the room list has changed (if
-//! the user of the client app has scrolled in the room list for example) etc.
+//! transition.
 //!
 //! The API is purposely small. Sliding Sync is versatile. `RoomListService` is
 //! _one_ specific usage of Sliding Sync.
 //!
 //! # Basic principle
 //!
-//! `RoomListService` works with 2 Sliding Sync List:
+//! `RoomListService` works with 1 Sliding Sync List:
 //!
-//! * `all_rooms` (referred by the constant [`ALL_ROOMS_LIST_NAME`]) is the main
+//! * `all_rooms` (referred by the constant [`ALL_ROOMS_LIST_NAME`]) is the only
 //!   list. Its goal is to load all the user' rooms. It starts with a
 //!   [`SlidingSyncMode::Selective`] sync-mode with a small range (i.e. a small
 //!   set of rooms) to load the first rooms quickly, and then updates to a
 //!   [`SlidingSyncMode::Growing`] sync-mode to load the remaining rooms “in the
 //!   background”: it will sync the existing rooms and will fetch new rooms, by
 //!   a certain batch size.
-//! * `visible_rooms` (referred by the constant [`VISIBLE_ROOMS_LIST_NAME`]) is
-//!   the “reactive” list. Its goal is to react to the client app user actions.
-//!   If the user scrolls in the room list, the `visible_rooms` will be
-//!   configured to sync for the particular range of rooms the user is actually
-//!   seeing (the rooms in the current viewport). `visible_rooms` has a
-//!   different configuration than `all_rooms` as it loads more timeline events:
-//!   it means that the room will already have a “history”, a timeline, ready to
-//!   be presented when the user enters the room.
 //!
 //! This behavior has proven to be empirically satisfying to provide a fast and
 //! fluid user experience for a Matrix client.
 //!
 //! [`RoomListService::all_rooms`] provides a way to get a [`RoomList`] for all
-//! the rooms. From that, calling [`RoomList::entries`] provides a way to get a
-//! stream of room list entry. This stream can be filtered, and the filter can
-//! be changed over time.
+//! the rooms. From that, calling [`RoomList::entries_with_dynamic_adapters`]
+//! provides a way to get a stream of rooms. This stream is sorted, can be
+//! filtered, and the filter can be changed over time.
 //!
 //! [`RoomListService::state`] provides a way to get a stream of the state
 //! machine's state, which can be pretty helpful for the client app.
@@ -64,40 +54,49 @@
 pub mod filters;
 mod room;
 mod room_list;
+pub mod sorters;
 mod state;
 
-use std::{
-    future::ready,
-    num::NonZeroUsize,
-    sync::{Arc, Mutex as StdMutex},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use async_stream::stream;
-use eyeball::{SharedObservable, Subscriber};
+use eyeball::Subscriber;
 use futures_util::{pin_mut, Stream, StreamExt};
-pub use matrix_sdk::RoomListEntry;
 use matrix_sdk::{
-    event_cache::EventCacheError, sliding_sync::Ranges, Client, Error as SlidingSyncError,
-    SlidingSync, SlidingSyncList, SlidingSyncListBuilder, SlidingSyncMode,
+    event_cache::EventCacheError, Client, Error as SlidingSyncError, SlidingSync, SlidingSyncList,
+    SlidingSyncMode,
 };
-use matrix_sdk_base::ring_buffer::RingBuffer;
+use matrix_sdk_base::sliding_sync::http;
 pub use room::*;
 pub use room_list::*;
-use ruma::{
-    api::client::sync::sync_events::v4::{
-        AccountDataConfig, E2EEConfig, ReceiptsConfig, RoomReceiptConfig, SyncRequestListFilters,
-        ToDeviceConfig, TypingConfig,
-    },
-    assign,
-    events::{StateEventType, TimelineEventType},
-    OwnedRoomId, RoomId,
-};
+use ruma::{assign, directory::RoomTypeFilter, events::StateEventType, OwnedRoomId, RoomId, UInt};
 pub use state::*;
 use thiserror::Error;
-use tokio::{sync::Mutex, time::timeout};
+use tokio::time::timeout;
+use tracing::debug;
 
 use crate::timeline;
+
+/// The default `required_state` constant value for sliding sync lists and
+/// sliding sync room subscriptions.
+const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
+    (StateEventType::RoomName, ""),
+    (StateEventType::RoomEncryption, ""),
+    (StateEventType::RoomMember, "$LAZY"),
+    (StateEventType::RoomMember, "$ME"),
+    (StateEventType::RoomTopic, ""),
+    (StateEventType::RoomCanonicalAlias, ""),
+    (StateEventType::RoomPowerLevels, ""),
+    (StateEventType::CallMember, "*"),
+];
+
+/// The default `required_state` constant value for sliding sync room
+/// subscriptions that must be added to `DEFAULT_REQUIRED_STATE`.
+const DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE: &[(StateEventType, &str)] =
+    &[(StateEventType::RoomCreate, ""), (StateEventType::RoomPinnedEvents, "")];
+
+/// The default `timeline_limit` value when used with room subscriptions.
+const DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT: u32 = 20;
 
 /// The [`RoomListService`] type. See the module's documentation to learn more.
 #[derive(Debug)]
@@ -111,85 +110,58 @@ pub struct RoomListService {
     /// The current state of the `RoomListService`.
     ///
     /// `RoomListService` is a simple state-machine.
-    state: SharedObservable<State>,
-
-    /// Room cache, to avoid recreating `Room`s every time users fetch them.
-    rooms: Arc<StdMutex<RingBuffer<Room>>>,
-
-    /// The current viewport ranges.
-    ///
-    /// This is useful to avoid resetting the ranges to the same value,
-    /// which would cancel the current in-flight sync request.
-    viewport_ranges: Mutex<Ranges>,
+    state_machine: StateMachine,
 }
 
 impl RoomListService {
-    /// Size of the room's ring buffer.
-    ///
-    /// This number should be high enough so that navigating to a room
-    /// previously visited is almost instant, but also not too high so as to
-    /// avoid exhausting memory.
-    // SAFETY: `new_unchecked` is safe because 128 is not zero.
-    const ROOM_OBJECT_CACHE_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(128) };
-
     /// Create a new `RoomList`.
     ///
     /// A [`matrix_sdk::SlidingSync`] client will be created, with a cached list
     /// already pre-configured.
     ///
     /// This won't start an encryption sync, and it's the user's responsibility
-    /// to create one in this case using `EncryptionSync`.
+    /// to create one in this case using
+    /// [`EncryptionSyncService`][crate::encryption_sync_service::EncryptionSyncService].
     pub async fn new(client: Client) -> Result<Self, Error> {
-        Self::new_internal(client, false).await
-    }
-
-    /// Create a new `RoomList` that enables encryption.
-    ///
-    /// This will include syncing the encryption information, so there must not
-    /// be any instance of `EncryptionSync` running in the background.
-    pub async fn new_with_encryption(client: Client) -> Result<Self, Error> {
-        Self::new_internal(client, true).await
-    }
-
-    async fn new_internal(client: Client, with_encryption: bool) -> Result<Self, Error> {
-        let mut builder = client
+        let builder = client
             .sliding_sync("room-list")
             .map_err(Error::SlidingSync)?
             .with_account_data_extension(
-                assign!(AccountDataConfig::default(), { enabled: Some(true) }),
+                assign!(http::request::AccountData::default(), { enabled: Some(true) }),
             )
-            .with_receipt_extension(assign!(ReceiptsConfig::default(), {
+            .with_receipt_extension(assign!(http::request::Receipts::default(), {
                 enabled: Some(true),
-                rooms: Some(vec![RoomReceiptConfig::AllSubscribed])
+                rooms: Some(vec![http::request::ReceiptsRoom::AllSubscribed])
             }))
-            .with_typing_extension(assign!(TypingConfig::default(), {
+            .with_typing_extension(assign!(http::request::Typing::default(), {
                 enabled: Some(true),
-            }));
-
-        if with_encryption {
-            builder = builder
-                .with_e2ee_extension(assign!(E2EEConfig::default(), { enabled: Some(true) }))
-                .with_to_device_extension(
-                    assign!(ToDeviceConfig::default(), { enabled: Some(true) }),
-                );
-        }
+            }))
+            // We don't deal with encryption device messages here so this is safe
+            .share_pos();
 
         let sliding_sync = builder
-            .add_cached_list(configure_all_or_visible_rooms_list(
+            .add_cached_list(
                 SlidingSyncList::builder(ALL_ROOMS_LIST_NAME)
                     .sync_mode(
                         SlidingSyncMode::new_selective()
                             .add_range(ALL_ROOMS_DEFAULT_SELECTIVE_RANGE),
                     )
                     .timeline_limit(1)
-                    .required_state(vec![
-                        (StateEventType::RoomEncryption, "".to_owned()),
-                        (StateEventType::RoomMember, "$LAZY".to_owned()),
-                        (StateEventType::RoomMember, "$ME".to_owned()),
-                        (StateEventType::RoomName, "".to_owned()),
-                        (StateEventType::RoomPowerLevels, "".to_owned()),
-                    ]),
-            ))
+                    .required_state(
+                        DEFAULT_REQUIRED_STATE
+                            .iter()
+                            .map(|(state_event, value)| (state_event.clone(), (*value).to_owned()))
+                            .collect(),
+                    )
+                    .include_heroes(Some(true))
+                    .filters(Some(assign!(http::request::ListFilters::default(), {
+                        // As defined in the [SlidingSync MSC](https://github.com/matrix-org/matrix-spec-proposals/blob/9450ced7fb9cf5ea9077d029b3adf36aebfa8709/proposals/3575-sync.md?plain=1#L444)
+                        // If unset, both invited and joined rooms are returned. If false, no invited rooms are
+                        // returned. If true, only invited rooms are returned.
+                        is_invite: None,
+                        not_room_types: vec![RoomTypeFilter::Space],
+                    }))),
+            )
             .await
             .map_err(Error::SlidingSync)?
             .build()
@@ -200,13 +172,7 @@ impl RoomListService {
         // Eagerly subscribe the event cache to sync responses.
         client.event_cache().subscribe()?;
 
-        Ok(Self {
-            client,
-            sliding_sync,
-            state: SharedObservable::new(State::Init),
-            rooms: Arc::new(StdMutex::new(RingBuffer::new(Self::ROOM_OBJECT_CACHE_SIZE))),
-            viewport_ranges: Mutex::new(vec![VISIBLE_ROOMS_DEFAULT_RANGE]),
-        })
+        Ok(Self { client, sliding_sync, state_machine: StateMachine::new() })
     }
 
     /// Start to sync the room list.
@@ -239,23 +205,29 @@ impl RoomListService {
             // 3. A sync is done,
             // 4. The next state is stored.
             loop {
+                debug!("Run a sync iteration");
+
                 // Calculate the next state, and run the associated actions.
-                let next_state = self.state.get().next(&self.sliding_sync).await?;
+                let next_state = self.state_machine.next(&self.sliding_sync).await?;
 
                 // Do the sync.
                 match sync.next().await {
                     // Got a successful result while syncing.
                     Some(Ok(_update_summary)) => {
+                        debug!(state = ?next_state, "New state");
+
                         // Update the state.
-                        self.state.set(next_state);
+                        self.state_machine.set(next_state);
 
                         yield Ok(());
                     }
 
                     // Got an error while syncing.
                     Some(Err(error)) => {
+                        debug!(expected_state = ?next_state, "New state is an error");
+
                         let next_state = State::Error { from: Box::new(next_state) };
-                        self.state.set(next_state);
+                        self.state_machine.set(next_state);
 
                         yield Err(Error::SlidingSync(error));
 
@@ -264,8 +236,10 @@ impl RoomListService {
 
                     // Sync loop has terminated.
                     None => {
+                        debug!(expected_state = ?next_state, "New state is a termination");
+
                         let next_state = State::Terminated { from: Box::new(next_state) };
-                        self.state.set(next_state);
+                        self.state_machine.set(next_state);
 
                         break;
                     }
@@ -312,8 +286,8 @@ impl RoomListService {
         // when the session is forced to expire, the state remains `Terminated`, thus
         // the actions aren't executed as expected. Consequently, let's update the
         // state.
-        if let State::Terminated { from } = self.state.get() {
-            self.state.set(State::Error { from });
+        if let State::Terminated { from } = self.state_machine.get() {
+            self.state_machine.set(State::Error { from });
         }
     }
 
@@ -337,11 +311,11 @@ impl RoomListService {
 
             loop {
                 let (sync_indicator, yield_delay) = match current_state {
-                    State::Init | State::Recovering | State::Error { .. } => {
+                    State::Init | State::Error { .. } => {
                         (SyncIndicator::Show, delay_before_showing)
                     }
 
-                    State::SettingUp | State::Running | State::Terminated { .. } => {
+                    State::SettingUp | State::Recovering | State::Running | State::Terminated { .. } => {
                         (SyncIndicator::Hide, delay_before_hiding)
                     }
                 };
@@ -367,7 +341,7 @@ impl RoomListService {
                     // Update the `current_state`.
                     current_state = next_state;
                 } else {
-                    // Something is broken with `self.state`. Let's stop this stream too.
+                    // Something is broken with the state. Let's stop this stream too.
                     break;
                 }
             }
@@ -381,11 +355,11 @@ impl RoomListService {
 
     /// Get a subscriber to the state.
     pub fn state(&self) -> Subscriber<State> {
-        self.state.subscribe()
+        self.state_machine.subscribe()
     }
 
     async fn list_for(&self, sliding_sync_list_name: &str) -> Result<RoomList, Error> {
-        RoomList::new(&self.sliding_sync, sliding_sync_list_name, self.state()).await
+        RoomList::new(&self.client, &self.sliding_sync, sliding_sync_list_name, self.state()).await
     }
 
     /// Get a [`RoomList`] for all rooms.
@@ -393,52 +367,40 @@ impl RoomListService {
         self.list_for(ALL_ROOMS_LIST_NAME).await
     }
 
-    /// Pass an [`Input`] onto the state machine.
-    pub async fn apply_input(&self, input: Input) -> Result<InputResult, Error> {
-        use Input::*;
-
-        match input {
-            Viewport(ranges) => self.update_viewport(ranges).await,
-        }
-    }
-
-    async fn update_viewport(&self, ranges: Ranges) -> Result<InputResult, Error> {
-        let mut viewport_ranges = self.viewport_ranges.lock().await;
-
-        // Is it worth updating the viewport?
-        // The viewport has the same ranges. Don't update it.
-        if *viewport_ranges == ranges {
-            return Ok(InputResult::Ignored);
-        }
-
-        self.sliding_sync
-            .on_list(VISIBLE_ROOMS_LIST_NAME, |list| {
-                list.set_sync_mode(SlidingSyncMode::new_selective().add_ranges(ranges.clone()));
-
-                ready(())
-            })
-            .await
-            .ok_or_else(|| Error::InputCannotBeApplied(Input::Viewport(ranges.clone())))?;
-
-        *viewport_ranges = ranges;
-
-        Ok(InputResult::Applied)
-    }
-
     /// Get a [`Room`] if it exists.
     pub fn room(&self, room_id: &RoomId) -> Result<Room, Error> {
-        let mut rooms = self.rooms.lock().unwrap();
+        Ok(Room::new(
+            self.client.get_room(room_id).ok_or_else(|| Error::RoomNotFound(room_id.to_owned()))?,
+            &self.sliding_sync,
+        ))
+    }
 
-        if let Some(room) = rooms.iter().rfind(|room| room.id() == room_id) {
-            return Ok(room.clone());
-        }
+    /// Subscribe to rooms.
+    ///
+    /// It means that all events from these rooms will be received every time,
+    /// no matter how the `RoomList` is configured.
+    pub fn subscribe_to_rooms(&self, room_ids: &[&RoomId]) {
+        let settings = assign!(http::request::RoomSubscription::default(), {
+            required_state: DEFAULT_REQUIRED_STATE.iter().map(|(state_event, value)| {
+                (state_event.clone(), (*value).to_owned())
+            })
+            .chain(
+                DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE.iter().map(|(state_event, value)| {
+                    (state_event.clone(), (*value).to_owned())
+                })
+            )
+            .collect(),
+            timeline_limit: UInt::from(DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT),
+        });
 
-        let room = Room::new(&self.client, room_id, &self.sliding_sync)?;
+        let cancel_in_flight_request = match self.state_machine.get() {
+            State::Init | State::Recovering | State::Error { .. } | State::Terminated { .. } => {
+                false
+            }
+            State::SettingUp | State::Running => true,
+        };
 
-        // Save for later.
-        rooms.push(room.clone());
-
-        Ok(room)
+        self.sliding_sync.subscribe_to_rooms(room_ids, Some(settings), cancel_in_flight_request)
     }
 
     #[cfg(test)]
@@ -447,46 +409,16 @@ impl RoomListService {
     }
 }
 
-/// Configure the Sliding Sync list for `ALL_ROOMS_LIST_NAME` and
-/// `VISIBLE_ROOMS_LIST_NAME`.
-///
-/// This function configures the `sort`, the `filters` and the`bump_event_types`
-/// properties, so that they are exactly the same.
-fn configure_all_or_visible_rooms_list(
-    list_builder: SlidingSyncListBuilder,
-) -> SlidingSyncListBuilder {
-    list_builder
-        .sort(vec!["by_recency".to_owned(), "by_name".to_owned()])
-        .include_heroes(Some(true))
-        .filters(Some(assign!(SyncRequestListFilters::default(), {
-            // As defined in the [SlidingSync MSC](https://github.com/matrix-org/matrix-spec-proposals/blob/9450ced7fb9cf5ea9077d029b3adf36aebfa8709/proposals/3575-sync.md?plain=1#L444)
-            // If unset, both invited and joined rooms are returned. If false, no invited rooms are
-            // returned. If true, only invited rooms are returned.
-            is_invite: None,
-            is_tombstoned: Some(false),
-            not_room_types: vec!["m.space".to_owned()],
-        })))
-        .bump_event_types(&[
-            TimelineEventType::RoomMessage,
-            TimelineEventType::RoomEncrypted,
-            TimelineEventType::Sticker,
-        ])
-}
-
 /// [`RoomList`]'s errors.
 #[derive(Debug, Error)]
 pub enum Error {
     /// Error from [`matrix_sdk::SlidingSync`].
-    #[error("SlidingSync failed: {0}")]
+    #[error(transparent)]
     SlidingSync(SlidingSyncError),
 
     /// An operation has been requested on an unknown list.
     #[error("Unknown list `{0}`")]
     UnknownList(String),
-
-    /// An input was asked to be applied but it wasn't possible to apply it.
-    #[error("The input cannot be applied: {0:?}")]
-    InputCannotBeApplied(Input),
 
     /// The requested room doesn't exist.
     #[error("Room `{0}` not found")]
@@ -495,37 +427,11 @@ pub enum Error {
     #[error("A timeline instance already exists for room {0}")]
     TimelineAlreadyExists(OwnedRoomId),
 
-    #[error("An error occurred while initializing the timeline")]
-    InitializingTimeline(#[source] timeline::Error),
+    #[error(transparent)]
+    InitializingTimeline(#[from] timeline::Error),
 
-    #[error("The attached event cache ran into an error")]
+    #[error(transparent)]
     EventCache(#[from] EventCacheError),
-}
-
-/// An input for the [`RoomList`]' state machine.
-///
-/// An input is something that has happened or is happening or is requested by
-/// the client app using this [`RoomList`].
-#[derive(Debug)]
-pub enum Input {
-    /// The client app's viewport of the room list has changed.
-    ///
-    /// Use this input when the user of the client app is scrolling inside the
-    /// room list, and the viewport has changed. The viewport is defined as the
-    /// range of visible rooms in the room list.
-    Viewport(Ranges),
-}
-
-/// An [`Input`] Ok result: whether it's been applied, or ignored.
-#[derive(Debug, Eq, PartialEq)]
-pub enum InputResult {
-    /// The input has been applied.
-    Applied,
-
-    /// The input has been ignored.
-    ///
-    /// Note that this is not an error. The input was valid, but simply ignored.
-    Ignored,
 }
 
 /// An hint whether a _sync spinner/loader/toaster_ should be prompted to the
@@ -554,11 +460,13 @@ pub enum SyncIndicator {
 mod tests {
     use std::future::ready;
 
+    use assert_matches::assert_matches;
     use futures_util::{pin_mut, StreamExt};
     use matrix_sdk::{
         config::RequestConfig,
         matrix_auth::{MatrixSession, MatrixSessionTokens},
         reqwest::Url,
+        sliding_sync::Version as SlidingSyncVersion,
         Client, SlidingSyncMode,
     };
     use matrix_sdk_base::SessionMeta;
@@ -583,6 +491,9 @@ mod tests {
             .homeserver_url(server.uri())
             .server_versions([MatrixVersion::V1_0])
             .request_config(RequestConfig::new().disable_retry())
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -601,7 +512,7 @@ mod tests {
 
     impl Match for SlidingSyncMatcher {
         fn matches(&self, request: &Request) -> bool {
-            request.url.path() == "/_matrix/client/unstable/org.matrix.msc3575/sync"
+            request.url.path() == "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync"
                 && request.method == Method::POST
         }
     }
@@ -612,17 +523,20 @@ mod tests {
 
         {
             let room_list = RoomListService::new(client.clone()).await?;
-
-            assert!(room_list.sliding_sync().sliding_sync_proxy().is_none());
+            assert_matches!(room_list.sliding_sync().version(), SlidingSyncVersion::Native);
         }
 
         {
             let url = Url::parse("https://foo.matrix/").unwrap();
-            client.set_sliding_sync_proxy(Some(url.clone()));
+            client.set_sliding_sync_version(SlidingSyncVersion::Proxy { url: url.clone() });
 
             let room_list = RoomListService::new(client.clone()).await?;
-
-            assert_eq!(room_list.sliding_sync().sliding_sync_proxy(), Some(url));
+            assert_matches!(
+                room_list.sliding_sync().version(),
+                SlidingSyncVersion::Proxy { url: given_url } => {
+                    assert_eq!(&url, given_url);
+                }
+            );
         }
 
         Ok(())
@@ -643,23 +557,6 @@ mod tests {
                 .await,
             Some(true)
         );
-
-        Ok(())
-    }
-
-    #[async_test]
-    async fn test_no_to_device_and_e2ee_if_not_explicitly_set() -> Result<(), Error> {
-        let (client, _) = new_client().await;
-
-        let no_encryption = RoomListService::new(client.clone()).await?;
-        let extensions = no_encryption.sliding_sync.extensions_config();
-        assert_eq!(extensions.e2ee.enabled, None);
-        assert_eq!(extensions.to_device.enabled, None);
-
-        let with_encryption = RoomListService::new_with_encryption(client).await?;
-        let extensions = with_encryption.sliding_sync.extensions_config();
-        assert_eq!(extensions.e2ee.enabled, Some(true));
-        assert_eq!(extensions.to_device.enabled, Some(true));
 
         Ok(())
     }
@@ -703,13 +600,16 @@ mod tests {
         let _ = sync.next().await;
 
         // State is `Terminated`, as expected!
-        assert_eq!(room_list.state.get(), State::Terminated { from: Box::new(State::Running) });
+        assert_eq!(
+            room_list.state_machine.get(),
+            State::Terminated { from: Box::new(State::Running) }
+        );
 
         // Now, let's make the sliding sync session to expire.
         room_list.expire_sync_session().await;
 
         // State is `Error`, as a regular session expiration would generate!
-        assert_eq!(room_list.state.get(), State::Error { from: Box::new(State::Running) });
+        assert_eq!(room_list.state_machine.get(), State::Error { from: Box::new(State::Running) });
 
         Ok(())
     }

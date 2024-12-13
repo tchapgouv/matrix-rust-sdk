@@ -32,7 +32,7 @@ use crate::helpers::TestClientBuilder;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_room_directory_search_filter() -> Result<()> {
-    let alice = TestClientBuilder::new("alice".to_owned()).use_sqlite().build().await?;
+    let alice = TestClientBuilder::new("alice").use_sqlite().build().await?;
     let search_string = random_string(32);
     for index in 0..25 {
         let mut request: CreateRoomRequest = CreateRoomRequest::new();
@@ -46,11 +46,11 @@ async fn test_room_directory_search_filter() -> Result<()> {
     let mut room_directory_search = RoomDirectorySearch::new(alice);
     let (values, mut stream) = room_directory_search.results();
     assert!(values.is_empty());
-    room_directory_search.search(Some(search_string), 10).await?;
+    room_directory_search.search(Some(search_string), 10, None).await?;
     let results_batch: Vec<VectorDiff<matrix_sdk::room_directory_search::RoomDescription>> =
         stream.next().await.unwrap();
-    assert_matches!(&results_batch[0], VectorDiff::Clear);
-    assert_matches!(&results_batch[1], VectorDiff::Append { values } => { assert_eq!(values.len(), 10); });
+    assert_eq!(results_batch.len(), 1);
+    assert_matches!(&results_batch[0], VectorDiff::Append { values } => { assert_eq!(values.len(), 10); });
 
     room_directory_search.next_page().await?;
     room_directory_search.next_page().await?;
@@ -63,7 +63,7 @@ async fn test_room_directory_search_filter() -> Result<()> {
     assert_pending!(stream);
 
     // This should reset the state completely
-    room_directory_search.search(None, 25).await?;
+    room_directory_search.search(None, 25, None).await?;
     let results_batch = stream.next().await.unwrap();
     assert_matches!(&results_batch[0], VectorDiff::Clear);
     assert_matches!(&results_batch[1], VectorDiff::Append { values } => { assert_eq!(values.len(), 25); });

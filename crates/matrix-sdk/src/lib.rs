@@ -12,8 +12,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 #![doc = include_str!("../README.md")]
 #![warn(missing_debug_implementations, missing_docs)]
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 pub use async_trait::async_trait;
@@ -22,10 +24,10 @@ pub use bytes;
 pub use matrix_sdk_base::crypto;
 pub use matrix_sdk_base::{
     deserialized_responses,
-    store::{ComposerDraft, DynStateStore, MemoryStore, StateStoreExt},
-    DisplayName, Room as BaseRoom, RoomCreateWithCreatorEventContent, RoomHero, RoomInfo,
-    RoomMember as BaseRoomMember, RoomMemberships, RoomState, SessionMeta, StateChanges,
-    StateStore, StoreError,
+    store::{DynStateStore, MemoryStore, StateStoreExt},
+    ComposerDraft, ComposerDraftType, DisplayName, QueueWedgeError, Room as BaseRoom,
+    RoomCreateWithCreatorEventContent, RoomHero, RoomInfo, RoomMember as BaseRoomMember,
+    RoomMemberships, RoomState, SessionMeta, StateChanges, StateStore, StoreError,
 };
 pub use matrix_sdk_common::*;
 pub use reqwest;
@@ -33,6 +35,9 @@ pub use reqwest;
 mod account;
 pub mod attachment;
 pub mod authentication;
+
+/// BWI content scanner api
+pub mod bwi_content_scanner_api;
 mod client;
 pub mod config;
 mod deduplicating_handler;
@@ -69,8 +74,6 @@ pub use authentication::{AuthApi, AuthSession, SessionTokens};
 pub use client::{
     sanitize_server_name, Client, ClientBuildError, ClientBuilder, LoopCtrl, SessionChange,
 };
-#[cfg(feature = "image-proc")]
-pub use error::ImageError;
 pub use error::{
     Error, HttpError, HttpResult, NotificationSettingsError, RefreshTokenError, Result,
     RumaApiError,
@@ -86,7 +89,7 @@ pub use room::Room;
 pub use ruma::{IdParseError, OwnedServerName, ServerName};
 #[cfg(feature = "experimental-sliding-sync")]
 pub use sliding_sync::{
-    RoomListEntry, SlidingSync, SlidingSyncBuilder, SlidingSyncList, SlidingSyncListBuilder,
+    SlidingSync, SlidingSyncBuilder, SlidingSyncList, SlidingSyncListBuilder,
     SlidingSyncListLoadingState, SlidingSyncMode, SlidingSyncRoom, UpdateSummary,
 };
 

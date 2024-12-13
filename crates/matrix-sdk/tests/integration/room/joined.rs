@@ -6,17 +6,25 @@ use std::{
 use futures_util::future::join_all;
 use matrix_sdk::{
     config::SyncSettings,
-    room::{Receipts, ReportedContentScore, RoomMemberRole},
+    room::{edit::EditedContent, Receipts, ReportedContentScore, RoomMemberRole},
+    test_utils::events::EventFactory,
 };
 use matrix_sdk_base::RoomState;
 use matrix_sdk_test::{
-    async_test, test_json, test_json::sync::CUSTOM_ROOM_POWER_LEVELS, EphemeralTestEvent,
-    GlobalAccountDataTestEvent, JoinedRoomBuilder, SyncResponseBuilder, DEFAULT_TEST_ROOM_ID,
+    async_test,
+    mocks::{mock_encryption_state, mock_redaction},
+    test_json::{self, sync::CUSTOM_ROOM_POWER_LEVELS},
+    EphemeralTestEvent, GlobalAccountDataTestEvent, JoinedRoomBuilder, SyncResponseBuilder,
+    DEFAULT_TEST_ROOM_ID,
 };
 use ruma::{
     api::client::{membership::Invite3pidInit, receipt::create_receipt::v3::ReceiptType},
     assign, event_id,
-    events::{receipt::ReceiptThread, room::message::RoomMessageEventContent, TimelineEventType},
+    events::{
+        receipt::ReceiptThread,
+        room::message::{RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
+        TimelineEventType,
+    },
     int, mxc_uri, owned_event_id, room_id, thirdparty, user_id, OwnedUserId, TransactionId,
 };
 use serde_json::{json, Value};
@@ -25,8 +33,7 @@ use wiremock::{
     Mock, ResponseTemplate,
 };
 
-use crate::{logged_in_client_with_server, mock_encryption_state, mock_sync, synced_client};
-
+use crate::{logged_in_client_with_server, mock_sync, mock_sync_with_new_room, synced_client};
 #[async_test]
 async fn test_invite_user_by_id() {
     let (client, server) = logged_in_client_with_server().await;
@@ -324,7 +331,7 @@ async fn test_room_message_send() {
 
     let content = RoomMessageEventContent::text_plain("Hello world");
     let txn_id = TransactionId::new();
-    let response = room.send(content).with_transaction_id(&txn_id).await.unwrap();
+    let response = room.send(content).with_transaction_id(txn_id).await.unwrap();
 
     assert_eq!(event_id!("$h29iv0s8:example.com"), response.event_id)
 }
@@ -333,22 +340,17 @@ async fn test_room_message_send() {
 async fn test_room_redact() {
     let (client, server) = synced_client().await;
 
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/redact/.*?/.*?"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::EVENT_ID))
-        .mount(&server)
-        .await;
+    let event_id = event_id!("$h29iv0s8:example.com");
+    mock_redaction(event_id).mount(&server).await;
 
     let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
 
-    let event_id = event_id!("$xxxxxxxx:example.com");
-
     let txn_id = TransactionId::new();
     let reason = Some("Indecent material");
-    let response = room.redact(event_id, reason, Some(txn_id)).await.unwrap();
+    let response =
+        room.redact(event_id!("$xxxxxxxx:example.com"), reason, Some(txn_id)).await.unwrap();
 
-    assert_eq!(event_id!("$h29iv0s8:example.com"), response.event_id)
+    assert_eq!(response.event_id, event_id);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -366,8 +368,7 @@ async fn test_fetch_members_deduplication() {
         .and(path_regex(r"^/_matrix/client/r0/rooms/.*/members"))
         .and(header("authorization", "Bearer 1234"))
         .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
-        // Expect that we're only going to send the request out once.
-        .expect(1..=1)
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -623,7 +624,7 @@ async fn test_reset_power_levels() {
         .mount(&server)
         .await;
 
-    let initial_power_levels = room.room_power_levels().await.unwrap();
+    let initial_power_levels = room.power_levels().await.unwrap();
     assert_eq!(initial_power_levels.events[&TimelineEventType::RoomAvatar], int!(100));
 
     room.reset_power_levels().await.unwrap();
@@ -712,4 +713,85 @@ async fn test_call_notifications_notify_for_rooms() {
         .await;
 
     room.send_call_notification_if_needed().await.unwrap();
+}
+
+#[async_test]
+async fn test_make_reply_event_doesnt_require_event_cache() {
+    // Even if we don't have enabled the event cache, we'll resort to using the
+    // /event query to get details on an event.
+
+    let (client, server) = logged_in_client_with_server().await;
+
+    let event_id = event_id!("$1");
+    let resp_event_id = event_id!("$resp");
+    let room_id = room_id!("!galette:saucisse.bzh");
+
+    let f = EventFactory::new();
+
+    let raw_original_event = f
+        .text_msg("hi")
+        .event_id(event_id)
+        .sender(client.user_id().unwrap())
+        .room(room_id)
+        .into_raw_timeline();
+
+    mock_sync_with_new_room(
+        |builder| {
+            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+        },
+        &client,
+        &server,
+        room_id,
+    )
+    .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/event/"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(raw_original_event.json()))
+        .expect(1)
+        .named("/event")
+        .mount(&server)
+        .await;
+
+    let new_content = RoomMessageEventContentWithoutRelation::text_plain("uh i mean bonjour");
+
+    let room = client.get_room(room_id).unwrap();
+
+    // make_edit_event works, even if the event cache hasn't been enabled.
+    room.make_edit_event(resp_event_id, EditedContent::RoomMessage(new_content)).await.unwrap();
+}
+
+#[async_test]
+async fn test_enable_encryption_doesnt_stay_unencrypted() {
+    let (client, server) = logged_in_client_with_server().await;
+
+    mock_encryption_state(&server, false).await;
+
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/state/m.*room.*encryption.?"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$1"})))
+        .mount(&server)
+        .await;
+
+    let room_id = room_id!("!a:b.c");
+    let room = mock_sync_with_new_room(
+        |builder| {
+            builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+        },
+        &client,
+        &server,
+        room_id,
+    )
+    .await;
+
+    assert!(!room.is_encrypted().await.unwrap());
+
+    room.enable_encryption().await.expect("enabling encryption should work");
+
+    server.reset().await;
+    mock_encryption_state(&server, true).await;
+
+    assert!(room.is_encrypted().await.unwrap());
 }

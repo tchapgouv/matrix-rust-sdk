@@ -2,36 +2,24 @@
 
 #![allow(unused_qualifications, clippy::new_without_default)]
 
-macro_rules! unwrap_or_clone_arc_into_variant {
-    (
-        $arc:ident $(, .$field:tt)?, $pat:pat => $body:expr
-    ) => {
-        #[allow(unused_variables)]
-        match &(*$arc)$(.$field)? {
-            $pat => {
-                #[warn(unused_variables)]
-                match crate::helpers::unwrap_or_clone_arc($arc)$(.$field)? {
-                    $pat => Some($body),
-                    _ => unreachable!(),
-                }
-            },
-            _ => None,
-        }
-    };
-}
-
-mod authentication_service;
+mod authentication;
+/// BWI extension for exposing api calls
+mod bwi_bindings;
+/// BWI end
 mod chunk_iterator;
 mod client;
 mod client_builder;
+mod element;
 mod encryption;
 mod error;
 mod event;
 mod helpers;
+mod identity_status_change;
 mod notification;
 mod notification_settings;
 mod platform;
 mod room;
+mod room_alias;
 mod room_directory_search;
 mod room_info;
 mod room_list;
@@ -60,7 +48,7 @@ use self::{
 
 uniffi::include_scaffolding!("api");
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 fn sdk_git_sha() -> String {
     env!("VERGEN_GIT_SHA").to_owned()
 }

@@ -1,0 +1,22 @@
+[package]
+name = "matrix-sdk-base-bwi"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+
+[dependencies]
+regex = "1.10.5"
+serde = { version = "1.0.151" }
+serde_json = "1.0.91"
+tokio = { workspace = true, features = ["macros"] }
+url = "2.5.4"
+reqwest = { workspace = true }
+jsonwebtoken = "9.3.0"
+log = "0.4.22"
+matrix-sdk-bwi-test = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true
+

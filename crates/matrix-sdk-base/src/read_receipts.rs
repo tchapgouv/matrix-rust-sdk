@@ -203,7 +203,7 @@ impl RoomReadReceipts {
     /// Returns whether a new event triggered a new unread/notification/mention.
     #[inline(always)]
     fn process_event(&mut self, event: &SyncTimelineEvent, user_id: &UserId) {
-        if marks_as_unread(&event.event, user_id) {
+        if marks_as_unread(event.raw(), user_id) {
             self.num_unread += 1;
         }
 
@@ -408,7 +408,7 @@ impl ReceiptSelector {
     fn try_match_implicit(&mut self, user_id: &UserId, new_events: &[SyncTimelineEvent]) {
         for ev in new_events {
             // Get the `sender` field, if any, or skip this event.
-            let Ok(Some(sender)) = ev.event.get_field::<OwnedUserId>("sender") else { continue };
+            let Ok(Some(sender)) = ev.raw().get_field::<OwnedUserId>("sender") else { continue };
             if sender == user_id {
                 // Get the event id, if any, or skip this event.
                 let Some(event_id) = ev.event_id() else { continue };
@@ -449,8 +449,6 @@ fn events_intersects<'a>(
 /// that has been just received for an event that came in a previous sync.
 ///
 /// See this module's documentation for more information.
-///
-/// Returns a boolean indicating if a field changed value in the read receipts.
 #[instrument(skip_all, fields(room_id = %room_id))]
 pub(crate) fn compute_unread_counts(
     user_id: &UserId,
@@ -762,17 +760,16 @@ mod tests {
     #[test]
     fn test_count_unread_and_mentions() {
         fn make_event(user_id: &UserId, push_actions: Vec<Action>) -> SyncTimelineEvent {
-            SyncTimelineEvent {
-                event: sync_timeline_event!({
+            SyncTimelineEvent::new_with_push_actions(
+                sync_timeline_event!({
                     "sender": user_id,
                     "type": "m.room.message",
                     "event_id": "$ida",
                     "origin_server_ts": 12344446,
                     "content": { "body":"A", "msgtype": "m.text" },
                 }),
-                encryption_info: None,
                 push_actions,
-            }
+            )
         }
 
         let user_id = user_id!("@alice:example.org");
@@ -847,17 +844,13 @@ mod tests {
         // When provided with one event, that's not the receipt event, we don't count
         // it.
         fn make_event(event_id: &EventId) -> SyncTimelineEvent {
-            SyncTimelineEvent {
-                event: sync_timeline_event!({
-                    "sender": "@bob:example.org",
-                    "type": "m.room.message",
-                    "event_id": event_id,
-                    "origin_server_ts": 12344446,
-                    "content": { "body":"A", "msgtype": "m.text" },
-                }),
-                encryption_info: None,
-                push_actions: Vec::new(),
-            }
+            SyncTimelineEvent::new(sync_timeline_event!({
+                "sender": "@bob:example.org",
+                "type": "m.room.message",
+                "event_id": event_id,
+                "origin_server_ts": 12344446,
+                "content": { "body":"A", "msgtype": "m.text" },
+            }))
         }
 
         let mut receipts = RoomReadReceipts {

@@ -14,10 +14,12 @@
 
 use std::{
     fmt::{self, Debug},
+    num::NonZeroUsize,
     time::Duration,
 };
 
 use matrix_sdk_common::debug::DebugStructExt;
+use ruma::api::MatrixVersion;
 
 use crate::http_client::DEFAULT_REQUEST_TIMEOUT;
 
@@ -44,18 +46,29 @@ pub struct RequestConfig {
     pub(crate) timeout: Duration,
     pub(crate) retry_limit: Option<u64>,
     pub(crate) retry_timeout: Option<Duration>,
+    pub(crate) max_concurrent_requests: Option<NonZeroUsize>,
     pub(crate) force_auth: bool,
+    pub(crate) force_matrix_version: Option<MatrixVersion>,
 }
 
 #[cfg(not(tarpaulin_include))]
 impl Debug for RequestConfig {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { timeout, retry_limit, retry_timeout, force_auth } = self;
+        let Self {
+            timeout,
+            retry_limit,
+            retry_timeout,
+            force_auth,
+            max_concurrent_requests,
+            force_matrix_version,
+        } = self;
 
         let mut res = fmt.debug_struct("RequestConfig");
         res.field("timeout", timeout)
             .maybe_field("retry_limit", retry_limit)
-            .maybe_field("retry_timeout", retry_timeout);
+            .maybe_field("retry_timeout", retry_timeout)
+            .maybe_field("max_concurrent_requests", max_concurrent_requests)
+            .maybe_field("force_matrix_version", force_matrix_version);
 
         if *force_auth {
             res.field("force_auth", &true);
@@ -71,7 +84,9 @@ impl Default for RequestConfig {
             timeout: DEFAULT_REQUEST_TIMEOUT,
             retry_limit: Default::default(),
             retry_timeout: Default::default(),
+            max_concurrent_requests: Default::default(),
             force_auth: false,
+            force_matrix_version: Default::default(),
         }
     }
 }
@@ -106,6 +121,15 @@ impl RequestConfig {
         self
     }
 
+    /// The total limit of request that are pending or run concurrently.
+    /// Any additional request beyond that number will be waiting until another
+    /// concurrent requests finished. Requests are queued fairly.
+    #[must_use]
+    pub fn max_concurrent_requests(mut self, limit: Option<NonZeroUsize>) -> Self {
+        self.max_concurrent_requests = limit;
+        self
+    }
+
     /// Set the timeout duration for all HTTP requests.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
@@ -126,6 +150,17 @@ impl RequestConfig {
     #[must_use]
     pub fn force_auth(mut self) -> Self {
         self.force_auth = true;
+        self
+    }
+
+    /// Force the Matrix version used to select which version of the endpoint to
+    /// use.
+    ///
+    /// Can be used to force the use of a stable endpoint when the versions
+    /// advertised by the homeserver do not support it.
+    #[must_use]
+    pub(crate) fn force_matrix_version(mut self, version: MatrixVersion) -> Self {
+        self.force_matrix_version = Some(version);
         self
     }
 }

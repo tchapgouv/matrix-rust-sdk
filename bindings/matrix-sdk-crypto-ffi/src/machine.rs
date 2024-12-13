@@ -17,7 +17,8 @@ use matrix_sdk_crypto::{
     decrypt_room_key_export, encrypt_room_key_export,
     olm::ExportedRoomKey,
     store::{BackupDecryptionKey, Changes},
-    LocalTrust, OlmMachine as InnerMachine, ToDeviceRequest, UserIdentities,
+    DecryptionSettings, LocalTrust, OlmMachine as InnerMachine, ToDeviceRequest,
+    UserIdentity as SdkUserIdentity,
 };
 use ruma::{
     api::{
@@ -37,11 +38,12 @@ use ruma::{
     },
     events::{
         key::verification::VerificationMethod, room::message::MessageType, AnyMessageLikeEvent,
-        AnySyncMessageLikeEvent, AnyTimelineEvent, MessageLikeEvent,
+        AnySyncMessageLikeEvent, MessageLikeEvent,
     },
     serde::Raw,
     to_device::DeviceIdOrAllDevices,
-    DeviceKeyAlgorithm, EventId, OwnedTransactionId, OwnedUserId, RoomId, UserId,
+    DeviceKeyAlgorithm, EventId, OneTimeKeyAlgorithm, OwnedTransactionId, OwnedUserId, RoomId,
+    UserId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{value::RawValue, Value};
@@ -177,7 +179,7 @@ impl From<RustSignatureCheckResult> for SignatureVerification {
     }
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl OlmMachine {
     /// Create a new `OlmMachine`
     ///
@@ -251,12 +253,12 @@ impl OlmMachine {
     ///
     /// * `user_id` - The unique id of the user that the identity belongs to
     ///
-    /// * `timeout` - The time in seconds we should wait before returning if
-    /// the user's device list has been marked as stale. Passing a 0 as the
-    /// timeout means that we won't wait at all. **Note**, this assumes that
-    /// the requests from [`OlmMachine::outgoing_requests`] are being processed
-    /// and sent out. Namely, this waits for a `/keys/query` response to be
-    /// received.
+    /// * `timeout` - The time in seconds we should wait before returning if the
+    ///   user's device list has been marked as stale. Passing a 0 as the
+    ///   timeout means that we won't wait at all. **Note**, this assumes that
+    ///   the requests from [`OlmMachine::outgoing_requests`] are being
+    ///   processed and sent out. Namely, this waits for a `/keys/query`
+    ///   response to be received.
     pub fn get_identity(
         &self,
         user_id: String,
@@ -285,10 +287,7 @@ impl OlmMachine {
             if let Some(identity) =
                 self.runtime.block_on(self.inner.get_identity(&user_id, None))?
             {
-                match identity {
-                    UserIdentities::Own(i) => i.is_verified(),
-                    UserIdentities::Other(i) => i.is_verified(),
-                }
+                identity.is_verified()
             } else {
                 false
             },
@@ -316,8 +315,8 @@ impl OlmMachine {
 
         if let Some(user_identity) = user_identity {
             Ok(match user_identity {
-                UserIdentities::Own(i) => self.runtime.block_on(i.verify())?,
-                UserIdentities::Other(i) => self.runtime.block_on(i.verify())?,
+                SdkUserIdentity::Own(i) => self.runtime.block_on(i.verify())?,
+                SdkUserIdentity::Other(i) => self.runtime.block_on(i.verify())?,
             }
             .into())
         } else {
@@ -333,12 +332,12 @@ impl OlmMachine {
     ///
     /// * `device_id` - The id of the device itself.
     ///
-    /// * `timeout` - The time in seconds we should wait before returning if
-    /// the user's device list has been marked as stale. Passing a 0 as the
-    /// timeout means that we won't wait at all. **Note**, this assumes that
-    /// the requests from [`OlmMachine::outgoing_requests`] are being processed
-    /// and sent out. Namely, this waits for a `/keys/query` response to be
-    /// received.
+    /// * `timeout` - The time in seconds we should wait before returning if the
+    ///   user's device list has been marked as stale. Passing a 0 as the
+    ///   timeout means that we won't wait at all. **Note**, this assumes that
+    ///   the requests from [`OlmMachine::outgoing_requests`] are being
+    ///   processed and sent out. Namely, this waits for a `/keys/query`
+    ///   response to be received.
     pub fn get_device(
         &self,
         user_id: String,
@@ -416,12 +415,12 @@ impl OlmMachine {
     ///
     /// * `user_id` - The id of the device owner.
     ///
-    /// * `timeout` - The time in seconds we should wait before returning if
-    /// the user's device list has been marked as stale. Passing a 0 as the
-    /// timeout means that we won't wait at all. **Note**, this assumes that
-    /// the requests from [`OlmMachine::outgoing_requests`] are being processed
-    /// and sent out. Namely, this waits for a `/keys/query` response to be
-    /// received.
+    /// * `timeout` - The time in seconds we should wait before returning if the
+    ///   user's device list has been marked as stale. Passing a 0 as the
+    ///   timeout means that we won't wait at all. **Note**, this assumes that
+    ///   the requests from [`OlmMachine::outgoing_requests`] are being
+    ///   processed and sent out. Namely, this waits for a `/keys/query`
+    ///   response to be received.
     pub fn get_user_devices(
         &self,
         user_id: String,
@@ -517,7 +516,7 @@ impl OlmMachine {
     ///   current sync response.
     ///
     /// * `device_changes` - The list of devices that have changed in some way
-    /// since the previous sync.
+    ///   since the previous sync.
     ///
     /// * `key_counts` - The map of uploaded one-time key types and counts.
     pub fn receive_sync_changes(
@@ -530,11 +529,11 @@ impl OlmMachine {
     ) -> Result<SyncChangesResult, CryptoStoreError> {
         let to_device: ToDevice = serde_json::from_str(&events)?;
         let device_changes: RumaDeviceLists = device_changes.into();
-        let key_counts: BTreeMap<DeviceKeyAlgorithm, UInt> = key_counts
+        let key_counts: BTreeMap<OneTimeKeyAlgorithm, UInt> = key_counts
             .into_iter()
             .map(|(k, v)| {
                 (
-                    DeviceKeyAlgorithm::from(k),
+                    OneTimeKeyAlgorithm::from(k),
                     v.clamp(0, i32::MAX)
                         .try_into()
                         .expect("Couldn't convert key counts into an UInt"),
@@ -542,8 +541,8 @@ impl OlmMachine {
             })
             .collect();
 
-        let unused_fallback_keys: Option<Vec<DeviceKeyAlgorithm>> =
-            unused_fallback_keys.map(|u| u.into_iter().map(DeviceKeyAlgorithm::from).collect());
+        let unused_fallback_keys: Option<Vec<OneTimeKeyAlgorithm>> =
+            unused_fallback_keys.map(|u| u.into_iter().map(OneTimeKeyAlgorithm::from).collect());
 
         let (to_device_events, room_key_infos) = self.runtime.block_on(
             self.inner.receive_sync_changes(matrix_sdk_crypto::EncryptionSyncChanges {
@@ -608,7 +607,7 @@ impl OlmMachine {
     /// # Arguments
     ///
     /// * `users` - The list of users for which we would like to establish 1:1
-    /// Olm sessions for.
+    ///   Olm sessions for.
     pub fn get_missing_sessions(
         &self,
         users: Vec<String>,
@@ -729,11 +728,11 @@ impl OlmMachine {
     /// # Arguments
     ///
     /// * `room_id` - The unique id of the room, note that this doesn't strictly
-    /// need to be a Matrix room, it just needs to be an unique identifier for
-    /// the group that will participate in the conversation.
+    ///   need to be a Matrix room, it just needs to be an unique identifier for
+    ///   the group that will participate in the conversation.
     ///
     /// * `users` - The list of users which are considered to be members of the
-    /// room and should receive the room key.
+    ///   room and should receive the room key.
     ///
     /// * `settings` - The settings that should be used for the room key.
     pub fn share_room_key(
@@ -863,12 +862,14 @@ impl OlmMachine {
     /// * `strict_shields` - If `true`, messages will be decorated with strict
     ///   warnings (use `false` to match legacy behaviour where unsafe keys have
     ///   lower severity warnings and unverified identities are not decorated).
+    /// * `decryption_settings` - The setting for decrypting messages.
     pub fn decrypt_room_event(
         &self,
         event: String,
         room_id: String,
         handle_verification_events: bool,
         strict_shields: bool,
+        decryption_settings: DecryptionSettings,
     ) -> Result<DecryptedEvent, DecryptionError> {
         // Element Android wants only the content and the type and will create a
         // decrypted event with those two itself, this struct makes sure we
@@ -884,10 +885,14 @@ impl OlmMachine {
         let event: Raw<_> = serde_json::from_str(&event)?;
         let room_id = RoomId::parse(room_id)?;
 
-        let decrypted = self.runtime.block_on(self.inner.decrypt_room_event(&event, &room_id))?;
+        let decrypted = self.runtime.block_on(self.inner.decrypt_room_event(
+            &event,
+            &room_id,
+            &decryption_settings,
+        ))?;
 
         if handle_verification_events {
-            if let Ok(AnyTimelineEvent::MessageLike(e)) = decrypted.event.deserialize() {
+            if let Ok(e) = decrypted.event.deserialize() {
                 match &e {
                     AnyMessageLikeEvent::RoomMessage(MessageLikeEvent::Original(
                         original_event,
@@ -905,8 +910,7 @@ impl OlmMachine {
             }
         }
 
-        let encryption_info =
-            decrypted.encryption_info.expect("Decrypted event didn't contain any encryption info");
+        let encryption_info = decrypted.encryption_info;
 
         let event_json: Event<'_> = serde_json::from_str(decrypted.event.json().get())?;
 
@@ -935,7 +939,7 @@ impl OlmMachine {
     /// # Arguments
     ///
     /// * `event` - The undecryptable event that we would wish to request a room
-    /// key for.
+    ///   key for.
     ///
     /// * `room_id` - The id of the room the event was sent to.
     pub fn request_room_key(
@@ -960,10 +964,10 @@ impl OlmMachine {
     /// # Arguments
     ///
     /// * `passphrase` - The passphrase that should be used to encrypt the key
-    /// export.
+    ///   export.
     ///
     /// * `rounds` - The number of rounds that should be used when expanding the
-    /// passphrase into an key.
+    ///   passphrase into an key.
     pub fn export_room_keys(
         &self,
         passphrase: String,
@@ -986,7 +990,7 @@ impl OlmMachine {
     /// * `passphrase` - The passphrase that was used to encrypt the key export.
     ///
     /// * `progress_listener` - A callback that can be used to introspect the
-    /// progress of the key import.
+    ///   progress of the key import.
     pub fn import_room_keys(
         &self,
         keys: String,
@@ -1013,7 +1017,7 @@ impl OlmMachine {
     /// * `keys` - The serialized version of the unencrypted key export.
     ///
     /// * `progress_listener` - A callback that can be used to introspect the
-    /// progress of the key import.
+    ///   progress of the key import.
     pub fn import_decrypted_room_keys(
         &self,
         keys: String,
@@ -1038,10 +1042,10 @@ impl OlmMachine {
     /// * `keys` - The serialized version of the unencrypted key export.
     ///
     /// * `backup_version` - The version of the backup that these keys came
-    /// from.
+    ///   from.
     ///
     /// * `progress_listener` - A callback that can be used to introspect the
-    /// progress of the key import.
+    ///   progress of the key import.
     pub fn import_room_keys_from_backup(
         &self,
         keys: String,
@@ -1101,7 +1105,7 @@ impl OlmMachine {
     /// # Arguments
     ///
     /// * `user_id` - The ID of the user for which we would like to fetch the
-    /// verification requests.
+    ///   verification requests.
     pub fn get_verification_requests(&self, user_id: String) -> Vec<Arc<VerificationRequest>> {
         let Ok(user_id) = UserId::parse(user_id) else {
             return vec![];
@@ -1122,7 +1126,7 @@ impl OlmMachine {
     /// # Arguments
     ///
     /// * `user_id` - The ID of the user for which we would like to fetch the
-    /// verification requests.
+    ///   verification requests.
     ///
     /// * `flow_id` - The ID that uniquely identifies the verification flow.
     pub fn get_verification_request(
@@ -1142,10 +1146,10 @@ impl OlmMachine {
     /// # Arguments
     ///
     /// * `user_id` - The ID of the user which we would like to request to
-    /// verify.
+    ///   verify.
     ///
     /// * `methods` - The list of verification methods we want to advertise to
-    /// support.
+    ///   support.
     pub fn verification_request_content(
         &self,
         user_id: String,
@@ -1171,18 +1175,18 @@ impl OlmMachine {
     /// # Arguments
     ///
     /// * `user_id` - The ID of the user which we would like to request to
-    /// verify.
+    ///   verify.
     ///
     /// * `room_id` - The ID of the room that represents a DM with the given
-    /// user.
+    ///   user.
     ///
     /// * `event_id` - The event ID of the `m.key.verification.request` event
-    /// that we sent out to request the verification to begin. The content for
-    /// this request can be created using the [verification_request_content()]
-    /// method.
+    ///   that we sent out to request the verification to begin. The content for
+    ///   this request can be created using the [verification_request_content()]
+    ///   method.
     ///
     /// * `methods` - The list of verification methods we advertised as
-    /// supported in the `m.key.verification.request` event.
+    ///   supported in the `m.key.verification.request` event.
     ///
     /// [verification_request_content()]: Self::verification_request_content
     pub fn request_verification(
@@ -1217,12 +1221,12 @@ impl OlmMachine {
     /// # Arguments
     ///
     /// * `user_id` - The ID of the user which we would like to request to
-    /// verify.
+    ///   verify.
     ///
     /// * `device_id` - The ID of the device that we wish to verify.
     ///
     /// * `methods` - The list of verification methods we advertised as
-    /// supported in the `m.key.verification.request` event.
+    ///   supported in the `m.key.verification.request` event.
     pub fn request_verification_with_device(
         &self,
         user_id: String,
@@ -1291,7 +1295,7 @@ impl OlmMachine {
     /// # Arguments
     ///
     /// * `user_id` - The ID of the user for which we would like to fetch the
-    /// verification.
+    ///   verification.
     ///
     /// * `flow_id` - The ID that uniquely identifies the verification flow.
     pub fn get_verification(&self, user_id: String, flow_id: String) -> Option<Arc<Verification>> {
@@ -1311,7 +1315,7 @@ impl OlmMachine {
     /// # Arguments
     ///
     /// * `user_id` - The ID of the user for which we would like to start the
-    /// SAS verification.
+    ///   SAS verification.
     ///
     /// * `device_id` - The ID of device we would like to verify.
     ///
@@ -1527,17 +1531,6 @@ impl OlmMachine {
             runtime: self.runtime.handle().to_owned(),
         }
         .into()
-    }
-
-    /// Clear any in-memory caches because they may be out of sync with the
-    /// underlying data store.
-    ///
-    /// The crypto store layer is caching olm sessions for a given device.
-    /// When used in a multi-process context this cache will get outdated.
-    /// If the machine is used by another process, the cache must be
-    /// invalidating when the main process is resumed.
-    pub async fn clear_crypto_cache(&self) {
-        self.inner.clear_crypto_cache().await
     }
 }
 

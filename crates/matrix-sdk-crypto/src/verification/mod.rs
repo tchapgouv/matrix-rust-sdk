@@ -47,16 +47,16 @@ use ruma::{
 };
 pub use sas::{AcceptSettings, AcceptedProtocols, EmojiShortAuthString, Sas, SasState};
 use tokio::sync::Mutex;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     error::SignatureError,
     gossiping::{GossipMachine, GossipRequest},
-    olm::{PrivateCrossSigningIdentity, Session, StaticAccountData},
+    olm::{PrivateCrossSigningIdentity, StaticAccountData},
     store::{Changes, CryptoStoreWrapper},
     types::Signatures,
-    CryptoStoreError, LocalTrust, OutgoingVerificationRequest, ReadOnlyDevice,
-    ReadOnlyOwnUserIdentity, ReadOnlyUserIdentities,
+    CryptoStoreError, DeviceData, LocalTrust, OutgoingVerificationRequest, OwnUserIdentityData,
+    UserIdentityData,
 };
 
 #[derive(Clone, Debug)]
@@ -123,7 +123,7 @@ impl VerificationStore {
         &self,
         user_id: &UserId,
         device_id: &DeviceId,
-    ) -> Result<Option<ReadOnlyDevice>, CryptoStoreError> {
+    ) -> Result<Option<DeviceData>, CryptoStoreError> {
         Ok(self.inner.get_device(user_id, device_id).await?.filter(|d| {
             !(d.user_id() == self.account.user_id && d.device_id() == self.account.device_id)
         }))
@@ -132,13 +132,13 @@ impl VerificationStore {
     pub async fn get_user_identity(
         &self,
         user_id: &UserId,
-    ) -> Result<Option<ReadOnlyUserIdentities>, CryptoStoreError> {
+    ) -> Result<Option<UserIdentityData>, CryptoStoreError> {
         self.inner.get_user_identity(user_id).await
     }
 
     pub async fn get_identities(
         &self,
-        device_being_verified: ReadOnlyDevice,
+        device_being_verified: DeviceData,
     ) -> Result<IdentitiesBeingVerified, CryptoStoreError> {
         let identity_being_verified =
             self.get_user_identity(device_being_verified.user_id()).await?;
@@ -162,15 +162,8 @@ impl VerificationStore {
     pub async fn get_user_devices(
         &self,
         user_id: &UserId,
-    ) -> Result<HashMap<OwnedDeviceId, ReadOnlyDevice>, CryptoStoreError> {
+    ) -> Result<HashMap<OwnedDeviceId, DeviceData>, CryptoStoreError> {
         self.inner.get_user_devices(user_id).await
-    }
-
-    pub async fn get_sessions(
-        &self,
-        sender_key: &str,
-    ) -> Result<Option<Arc<Mutex<Vec<Session>>>>, CryptoStoreError> {
-        self.inner.get_sessions(sender_key).await
     }
 
     /// Get the signatures that have signed our own device.
@@ -294,8 +287,8 @@ impl From<QrVerification> for Verification {
 #[cfg(feature = "qrcode")]
 #[derive(Clone, Debug)]
 pub struct Done {
-    verified_devices: Arc<[ReadOnlyDevice]>,
-    verified_master_keys: Arc<[ReadOnlyUserIdentities]>,
+    verified_devices: Arc<[DeviceData]>,
+    verified_master_keys: Arc<[UserIdentityData]>,
 }
 
 #[cfg(feature = "qrcode")]
@@ -468,9 +461,9 @@ pub enum VerificationResult {
 pub struct IdentitiesBeingVerified {
     private_identity: PrivateCrossSigningIdentity,
     store: VerificationStore,
-    device_being_verified: ReadOnlyDevice,
-    own_identity: Option<ReadOnlyOwnUserIdentity>,
-    identity_being_verified: Option<ReadOnlyUserIdentities>,
+    device_being_verified: DeviceData,
+    own_identity: Option<OwnUserIdentityData>,
+    identity_being_verified: Option<UserIdentityData>,
 }
 
 impl IdentitiesBeingVerified {
@@ -495,21 +488,21 @@ impl IdentitiesBeingVerified {
         self.device_being_verified.device_id()
     }
 
-    fn other_device(&self) -> &ReadOnlyDevice {
+    fn other_device(&self) -> &DeviceData {
         &self.device_being_verified
     }
 
     pub async fn mark_as_done(
         &self,
-        verified_devices: Option<&[ReadOnlyDevice]>,
-        verified_identities: Option<&[ReadOnlyUserIdentities]>,
+        verified_devices: Option<&[DeviceData]>,
+        verified_identities: Option<&[UserIdentityData]>,
     ) -> Result<VerificationResult, CryptoStoreError> {
         let device = self.mark_device_as_verified(verified_devices).await?;
         let (identity, should_request_secrets) =
             self.mark_identity_as_verified(verified_identities).await?;
 
         if device.is_none() && identity.is_none() {
-            // Something wen't wrong if nothing was verified, we use key
+            // Something went wrong if nothing was verified. We use key
             // mismatch here, since it's the closest to nothing was verified
             return Ok(VerificationResult::Cancel(CancelCode::KeyMismatch));
         }
@@ -622,8 +615,8 @@ impl IdentitiesBeingVerified {
 
     async fn mark_identity_as_verified(
         &self,
-        verified_identities: Option<&[ReadOnlyUserIdentities]>,
-    ) -> Result<(Option<ReadOnlyUserIdentities>, bool), CryptoStoreError> {
+        verified_identities: Option<&[UserIdentityData]>,
+    ) -> Result<(Option<UserIdentityData>, bool), CryptoStoreError> {
         // If there wasn't an identity available during the verification flow
         // return early as there's nothing to do.
         if self.identity_being_verified.is_none() {
@@ -641,12 +634,13 @@ impl IdentitiesBeingVerified {
                 if verified_identities.is_some_and(|i| {
                     i.iter().any(|verified| verified.user_id() == identity.user_id())
                 }) {
-                    trace!(
+                    info!(
                         user_id = ?self.other_user_id(),
-                        "Marking the user identity of as verified."
+                        "The interactive verification process verified the identity of \
+                        the remote user: marking as verified."
                     );
 
-                    let should_request_secrets = if let ReadOnlyUserIdentities::Own(i) = &identity {
+                    let should_request_secrets = if let UserIdentityData::Own(i) = &identity {
                         i.mark_as_verified();
                         true
                     } else {
@@ -655,7 +649,10 @@ impl IdentitiesBeingVerified {
 
                     (Some(identity), should_request_secrets)
                 } else {
-                    info!(
+                    // Note, this is normal. For example, if we're an existing device in a device
+                    // verification, we don't need to verify our identity: instead the verification
+                    // process should verify the new device.
+                    debug!(
                         user_id = ?self.other_user_id(),
                         "The interactive verification process didn't verify \
                          the user identity of the user that participated in \
@@ -685,8 +682,8 @@ impl IdentitiesBeingVerified {
 
     async fn mark_device_as_verified(
         &self,
-        verified_devices: Option<&[ReadOnlyDevice]>,
-    ) -> Result<Option<ReadOnlyDevice>, CryptoStoreError> {
+        verified_devices: Option<&[DeviceData]>,
+    ) -> Result<Option<DeviceData>, CryptoStoreError> {
         let device = self.store.get_device(self.other_user_id(), self.other_device_id()).await?;
 
         let Some(device) = device else {
@@ -710,20 +707,24 @@ impl IdentitiesBeingVerified {
         }
 
         if verified_devices.is_some_and(|v| v.contains(&device)) {
-            trace!(
+            info!(
                 user_id = ?device.user_id(),
                 device_id = ?device.device_id(),
-                "Marking device as verified.",
+                "The interactive verification process verified the remote device: marking as verified.",
             );
 
             device.set_trust_state(LocalTrust::Verified);
 
             Ok(Some(device))
         } else {
-            info!(
+            // Note, this is normal. For example, if we're a new device in a QR code device
+            // verification, we'll verify the master key but not (directly) the
+            // remote device. Likewise, in a QR code identity verification, we'll verify the
+            // master key of the remote user but not (directly) their device.
+            debug!(
                 user_id = ?device.user_id(),
                 device_id = ?device.device_id(),
-                "The interactive verification process didn't verify the device",
+                "The interactive verification process didn't verify the remote device",
             );
 
             Ok(None)
@@ -748,8 +749,8 @@ pub(crate) mod tests {
         requests::{OutgoingRequest, OutgoingRequests},
         store::{Changes, CryptoStore, CryptoStoreWrapper, IdentityChanges, MemoryStore},
         types::events::ToDeviceEvents,
-        Account, OutgoingVerificationRequest, ReadOnlyDevice, ReadOnlyOwnUserIdentity,
-        ReadOnlyUserIdentity,
+        Account, DeviceData, OtherUserIdentityData, OutgoingVerificationRequest,
+        OwnUserIdentityData,
     };
 
     pub(crate) fn request_to_event(
@@ -818,7 +819,7 @@ pub(crate) mod tests {
     }
 
     pub fn bob_device_id() -> &'static DeviceId {
-        device_id!("BOBDEVCIE")
+        device_id!("BOBDEVICE")
     }
 
     pub(crate) async fn setup_stores() -> (Account, VerificationStore, Account, VerificationStore) {
@@ -834,20 +835,20 @@ pub(crate) mod tests {
         let bob_private_identity = Mutex::new(bob_private_identity);
 
         let alice_public_identity =
-            ReadOnlyUserIdentity::from_private(&*alice_private_identity.lock().await).await;
-        let alice_readonly_identity =
-            ReadOnlyOwnUserIdentity::from_private(&*alice_private_identity.lock().await).await;
+            OtherUserIdentityData::from_private(&*alice_private_identity.lock().await).await;
+        let alice_identity_data =
+            OwnUserIdentityData::from_private(&*alice_private_identity.lock().await).await;
         let bob_public_identity =
-            ReadOnlyUserIdentity::from_private(&*bob_private_identity.lock().await).await;
-        let bob_readonly_identity =
-            ReadOnlyOwnUserIdentity::from_private(&*bob_private_identity.lock().await).await;
+            OtherUserIdentityData::from_private(&*bob_private_identity.lock().await).await;
+        let bob_identity_data =
+            OwnUserIdentityData::from_private(&*bob_private_identity.lock().await).await;
 
-        let alice_device = ReadOnlyDevice::from_account(&alice);
-        let bob_device = ReadOnlyDevice::from_account(&bob);
+        let alice_device = DeviceData::from_account(&alice);
+        let bob_device = DeviceData::from_account(&bob);
 
         let alice_changes = Changes {
             identities: IdentityChanges {
-                new: vec![alice_readonly_identity.into(), bob_public_identity.into()],
+                new: vec![alice_identity_data.into(), bob_public_identity.into()],
                 changed: vec![],
                 unchanged: vec![],
             },
@@ -858,7 +859,7 @@ pub(crate) mod tests {
 
         let bob_changes = Changes {
             identities: IdentityChanges {
-                new: vec![bob_readonly_identity.into(), alice_public_identity.into()],
+                new: vec![bob_identity_data.into(), alice_public_identity.into()],
                 changed: vec![],
                 unchanged: vec![],
             },
@@ -868,14 +869,18 @@ pub(crate) mod tests {
         bob_store.save_devices(vec![alice_device]);
 
         let alice_store = VerificationStore {
-            inner: Arc::new(CryptoStoreWrapper::new(alice.user_id(), alice_store)),
+            inner: Arc::new(CryptoStoreWrapper::new(
+                alice.user_id(),
+                alice.device_id(),
+                alice_store,
+            )),
             account: alice.static_data.clone(),
             private_identity: alice_private_identity.into(),
         };
 
         let bob_store = VerificationStore {
             account: bob.static_data.clone(),
-            inner: Arc::new(CryptoStoreWrapper::new(bob.user_id(), bob_store)),
+            inner: Arc::new(CryptoStoreWrapper::new(bob.user_id(), bob.device_id(), bob_store)),
             private_identity: bob_private_identity.into(),
         };
 

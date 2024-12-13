@@ -14,11 +14,13 @@
 
 //! The `Room` type.
 
+use core::fmt;
 use std::{ops::Deref, sync::Arc};
 
 use async_once_cell::OnceCell as AsyncOnceCell;
-use matrix_sdk::{Client, SlidingSync};
-use ruma::{api::client::sync::sync_events::v4::RoomSubscription, events::StateEventType, RoomId};
+use matrix_sdk::SlidingSync;
+use ruma::RoomId;
+use tracing::info;
 
 use super::Error;
 use crate::{
@@ -29,12 +31,17 @@ use crate::{
 /// A room in the room list.
 ///
 /// It's cheap to clone this type.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Room {
     inner: Arc<RoomInner>,
 }
 
-#[derive(Debug)]
+impl fmt::Debug for Room {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("Room").field(&self.id().to_owned()).finish()
+    }
+}
+
 struct RoomInner {
     /// The Sliding Sync where everything comes from.
     sliding_sync: Arc<SlidingSync>,
@@ -56,21 +63,14 @@ impl Deref for Room {
 
 impl Room {
     /// Create a new `Room`.
-    pub(super) fn new(
-        client: &Client,
-        room_id: &RoomId,
-        sliding_sync: &Arc<SlidingSync>,
-    ) -> Result<Self, Error> {
-        let room =
-            client.get_room(room_id).ok_or_else(|| Error::RoomNotFound(room_id.to_owned()))?;
-
-        Ok(Self {
+    pub(super) fn new(room: matrix_sdk::Room, sliding_sync: &Arc<SlidingSync>) -> Self {
+        Self {
             inner: Arc::new(RoomInner {
                 sliding_sync: sliding_sync.clone(),
                 room,
                 timeline: AsyncOnceCell::new(),
             }),
-        })
+        }
     }
 
     /// Get the room ID.
@@ -86,35 +86,6 @@ impl Room {
     /// Get the underlying [`matrix_sdk::Room`].
     pub fn inner_room(&self) -> &matrix_sdk::Room {
         &self.inner.room
-    }
-
-    /// Subscribe to this room.
-    ///
-    /// It means that all events from this room will be received every time, no
-    /// matter how the `RoomList` is configured.
-    pub fn subscribe(&self, settings: Option<RoomSubscription>) {
-        let mut settings = settings.unwrap_or_default();
-
-        // Make sure to always include the room creation event in the required state
-        // events, to know what the room version is.
-        if !settings
-            .required_state
-            .iter()
-            .any(|(event_type, _state_key)| *event_type == StateEventType::RoomCreate)
-        {
-            settings.required_state.push((StateEventType::RoomCreate, "".to_owned()));
-        }
-
-        self.inner
-            .sliding_sync
-            .subscribe_to_room(self.inner.room.room_id().to_owned(), Some(settings))
-    }
-
-    /// Unsubscribe to this room.
-    ///
-    /// It's the opposite method of [Self::subscribe`].
-    pub fn unsubscribe(&self) {
-        self.inner.sliding_sync.unsubscribe_from_room(self.inner.room.room_id().to_owned())
     }
 
     /// Get the timeline of the room if one exists.
@@ -180,27 +151,32 @@ impl Room {
     }
 
     /// Create a new [`TimelineBuilder`] with the default configuration.
+    ///
+    /// If the room was synced before some initial events will be added to the
+    /// [`TimelineBuilder`].
     pub async fn default_room_timeline_builder(&self) -> Result<TimelineBuilder, Error> {
         // TODO we can remove this once the event cache handles his own cache.
 
-        let sliding_sync_room =
-            self.inner
-                .sliding_sync
-                .get_room(self.inner.room.room_id())
-                .await
-                .ok_or_else(|| Error::RoomNotFound(self.inner.room.room_id().to_owned()))?;
+        let sliding_sync_room = self.inner.sliding_sync.get_room(self.inner.room.room_id()).await;
 
-        self.inner
-            .room
-            .client()
-            .event_cache()
-            .add_initial_events(
-                self.inner.room.room_id(),
-                sliding_sync_room.timeline_queue().iter().cloned().collect(),
-                sliding_sync_room.prev_batch(),
-            )
-            .await
-            .map_err(Error::EventCache)?;
+        if let Some(sliding_sync_room) = sliding_sync_room {
+            self.inner
+                .room
+                .client()
+                .event_cache()
+                .add_initial_events(
+                    self.inner.room.room_id(),
+                    sliding_sync_room.timeline_queue().iter().cloned().collect(),
+                    sliding_sync_room.prev_batch(),
+                )
+                .await
+                .map_err(Error::EventCache)?;
+        } else {
+            info!(
+                "No cached sliding sync room found for `{}`, the timeline will be empty.",
+                self.room_id()
+            );
+        }
 
         Ok(Timeline::builder(&self.inner.room).track_read_marker_and_receipts())
     }

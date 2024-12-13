@@ -34,7 +34,7 @@ use ruma::{
     events::secret::request::{
         RequestAction, SecretName, ToDeviceSecretRequestEvent as SecretRequestEvent,
     },
-    DeviceId, DeviceKeyAlgorithm, OwnedDeviceId, OwnedTransactionId, OwnedUserId, RoomId,
+    DeviceId, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedTransactionId, OwnedUserId, RoomId,
     TransactionId, UserId,
 };
 use tracing::{debug, field::debug, info, instrument, trace, warn, Span};
@@ -178,7 +178,7 @@ impl GossipMachine {
             .map(|(key, value)| {
                 let device_map = value
                     .iter()
-                    .map(|d| (d.to_owned(), DeviceKeyAlgorithm::SignedCurve25519))
+                    .map(|d| (d.to_owned(), OneTimeKeyAlgorithm::SignedCurve25519))
                     .collect();
 
                 (key.to_owned(), device_map)
@@ -268,7 +268,7 @@ impl GossipMachine {
     /// # Arguments
     ///
     /// * `user_id` - The user id of the device that we created the Olm session
-    /// with.
+    ///   with.
     ///
     /// * `device_id` - The device ID of the device that got the Olm session.
     pub fn retry_keyshare(&self, user_id: &UserId, device_id: &DeviceId) {
@@ -510,7 +510,8 @@ impl GossipMachine {
                     }
                     #[cfg(feature = "experimental-algorithms")]
                     RequestedKeyInfo::MegolmV2AesSha2(i) => {
-                        self.handle_supported_key_request(event, &i.room_id, &i.session_id).await
+                        self.handle_supported_key_request(cache, event, &i.room_id, &i.session_id)
+                            .await
                     }
                     RequestedKeyInfo::Unknown(i) => {
                         debug!(
@@ -588,14 +589,14 @@ impl GossipMachine {
     /// The logic for this is currently as follows:
     ///
     /// * Share the session in full, starting from the earliest known index, if
-    /// the requesting device is our own, trusted (verified) device.
+    ///   the requesting device is our own, trusted (verified) device.
     ///
     /// * For other requesting devices, share only a limited session and only if
-    /// we originally shared with that device because it was present when the
-    /// message was initially sent. By limited, we mean that the session will
-    /// not be shared in full, but only from the message index at that moment.
-    /// Since this information is recorded in the outbound session, we need to
-    /// have it for this to work.
+    ///   we originally shared with that device because it was present when the
+    ///   message was initially sent. By limited, we mean that the session will
+    ///   not be shared in full, but only from the message index at that moment.
+    ///   Since this information is recorded in the outbound session, we need to
+    ///   have it for this to work.
     ///
     /// * In all other cases, refuse to share the session.
     ///
@@ -642,7 +643,9 @@ impl GossipMachine {
         // information is recorded there.
         } else if let Some(outbound) = outbound_session {
             match outbound.is_shared_with(&device.inner) {
-                ShareState::Shared(message_index) => Ok(Some(message_index)),
+                ShareState::Shared { message_index, olm_wedging_index: _ } => {
+                    Ok(Some(message_index))
+                }
                 ShareState::SharedButChangedSenderKey => Err(KeyForwardDecision::ChangedSenderKey),
                 ShareState::NotShared => Err(KeyForwardDecision::OutboundSessionNotShared),
             }
@@ -661,7 +664,7 @@ impl GossipMachine {
     /// # Arguments
     ///
     /// * `key_info` - The info of our key request containing information about
-    /// the key we wish to request.
+    ///   the key we wish to request.
     #[cfg(feature = "automatic-room-key-forwarding")]
     async fn should_request_key(&self, key_info: &SecretInfo) -> Result<bool, CryptoStoreError> {
         if self.inner.room_key_requests_enabled.load(Ordering::SeqCst) {
@@ -1123,7 +1126,7 @@ mod tests {
         EncryptionSettings, OutgoingRequests,
     };
     use crate::{
-        identities::{IdentityManager, LocalTrust, ReadOnlyDevice},
+        identities::{DeviceData, IdentityManager, LocalTrust},
         olm::{Account, PrivateCrossSigningIdentity},
         session_manager::GroupSessionCache,
         store::{Changes, CryptoStoreWrapper, MemoryStore, PendingChanges, Store},
@@ -1175,7 +1178,7 @@ mod tests {
         let device_id = DeviceId::new();
 
         let account = Account::with_device_id(&user_id, &device_id);
-        let store = Arc::new(CryptoStoreWrapper::new(&user_id, MemoryStore::new()));
+        let store = Arc::new(CryptoStoreWrapper::new(&user_id, &device_id, MemoryStore::new()));
         let identity = Arc::new(Mutex::new(PrivateCrossSigningIdentity::empty(alice_id())));
         let verification =
             VerificationMachine::new(account.static_data.clone(), identity.clone(), store.clone());
@@ -1191,17 +1194,18 @@ mod tests {
     async fn get_machine_test_helper() -> GossipMachine {
         let user_id = alice_id().to_owned();
         let account = Account::with_device_id(&user_id, alice_device_id());
-        let device = ReadOnlyDevice::from_account(&account);
+        let device = DeviceData::from_account(&account);
         let another_device =
-            ReadOnlyDevice::from_account(&Account::with_device_id(&user_id, alice2_device_id()));
+            DeviceData::from_account(&Account::with_device_id(&user_id, alice2_device_id()));
 
-        let store = Arc::new(CryptoStoreWrapper::new(&user_id, MemoryStore::new()));
+        let store =
+            Arc::new(CryptoStoreWrapper::new(&user_id, account.device_id(), MemoryStore::new()));
         let identity = Arc::new(Mutex::new(PrivateCrossSigningIdentity::empty(alice_id())));
         let verification =
             VerificationMachine::new(account.static_data.clone(), identity.clone(), store.clone());
 
         let store = Store::new(account.static_data().clone(), identity, store, verification);
-        store.save_devices(&[device, another_device]).await.unwrap();
+        store.save_device_data(&[device, another_device]).await.unwrap();
         store.save_pending_changes(PendingChanges { account: Some(account) }).await.unwrap();
         let session_cache = GroupSessionCache::new(store.clone());
 
@@ -1216,24 +1220,26 @@ mod tests {
         create_sessions: bool,
         algorithm: EventEncryptionAlgorithm,
     ) -> (GossipMachine, OutboundGroupSession, GossipMachine) {
+        use crate::olm::SenderData;
+
         let alice_machine = get_machine_test_helper().await;
-        let alice_device = ReadOnlyDevice::from_account(
+        let alice_device = DeviceData::from_account(
             &alice_machine.inner.store.cache().await.unwrap().account().await.unwrap(),
         );
 
         let bob_machine = gossip_machine_test_helper(other_machine_owner).await;
 
-        let bob_device = ReadOnlyDevice::from_account(
+        let bob_device = DeviceData::from_account(
             #[allow(clippy::explicit_auto_deref)] // clippy's wrong
             &*bob_machine.inner.store.cache().await.unwrap().account().await.unwrap(),
         );
 
         // We need a trusted device, otherwise we won't request keys
-        let second_device = ReadOnlyDevice::from_account(&alice_2_account());
+        let second_device = DeviceData::from_account(&alice_2_account());
         second_device.set_trust_state(LocalTrust::Verified);
         bob_device.set_trust_state(LocalTrust::Verified);
-        alice_machine.inner.store.save_devices(&[bob_device, second_device]).await.unwrap();
-        bob_machine.inner.store.save_devices(&[alice_device.clone()]).await.unwrap();
+        alice_machine.inner.store.save_device_data(&[bob_device, second_device]).await.unwrap();
+        bob_machine.inner.store.save_device_data(&[alice_device.clone()]).await.unwrap();
 
         if create_sessions {
             // Create Olm sessions for our two accounts.
@@ -1268,7 +1274,7 @@ mod tests {
             .inner
             .store
             .static_account()
-            .create_group_session_pair(room_id(), settings)
+            .create_group_session_pair(room_id(), settings, SenderData::unknown())
             .await
             .unwrap();
 
@@ -1354,14 +1360,14 @@ mod tests {
     }
 
     #[async_test]
-    async fn create_machine() {
+    async fn test_create_machine() {
         let machine = get_machine_test_helper().await;
 
         assert!(machine.outgoing_to_device_requests().await.unwrap().is_empty());
     }
 
     #[async_test]
-    async fn re_request_keys() {
+    async fn test_re_request_keys() {
         let machine = get_machine_test_helper().await;
         let account = account();
 
@@ -1384,15 +1390,15 @@ mod tests {
 
     #[async_test]
     #[cfg(feature = "automatic-room-key-forwarding")]
-    async fn create_key_request() {
+    async fn test_create_key_request() {
         let machine = get_machine_test_helper().await;
         let account = account();
         let second_account = alice_2_account();
-        let alice_device = ReadOnlyDevice::from_account(&second_account);
+        let alice_device = DeviceData::from_account(&second_account);
 
         // We need a trusted device, otherwise we won't request keys
         alice_device.set_trust_state(LocalTrust::Verified);
-        machine.inner.store.save_devices(&[alice_device]).await.unwrap();
+        machine.inner.store.save_device_data(&[alice_device]).await.unwrap();
 
         let (outbound, session) = account.create_group_session_pair_with_defaults(room_id()).await;
         let content = outbound.encrypt("m.dummy", &message_like_event_content!({})).await;
@@ -1417,15 +1423,15 @@ mod tests {
     /// We should *not* request keys if that has been disabled
     #[async_test]
     #[cfg(feature = "automatic-room-key-forwarding")]
-    async fn create_key_request_requests_disabled() {
+    async fn test_create_key_request_requests_disabled() {
         let machine = get_machine_test_helper().await;
         let account = account();
         let second_account = alice_2_account();
-        let alice_device = ReadOnlyDevice::from_account(&second_account);
+        let alice_device = DeviceData::from_account(&second_account);
 
         // We need a trusted device, otherwise we won't request keys
         alice_device.set_trust_state(LocalTrust::Verified);
-        machine.inner.store.save_devices(&[alice_device]).await.unwrap();
+        machine.inner.store.save_device_data(&[alice_device]).await.unwrap();
 
         // Disable key requests
         assert!(machine.are_room_key_requests_enabled());
@@ -1445,16 +1451,16 @@ mod tests {
 
     #[async_test]
     #[cfg(feature = "automatic-room-key-forwarding")]
-    async fn receive_forwarded_key() {
+    async fn test_receive_forwarded_key() {
         let machine = get_machine_test_helper().await;
         let account = account();
 
         let second_account = alice_2_account();
-        let alice_device = ReadOnlyDevice::from_account(&second_account);
+        let alice_device = DeviceData::from_account(&second_account);
 
         // We need a trusted device, otherwise we won't request keys
         alice_device.set_trust_state(LocalTrust::Verified);
-        machine.inner.store.save_devices(&[alice_device.clone()]).await.unwrap();
+        machine.inner.store.save_device_data(&[alice_device.clone()]).await.unwrap();
 
         let (outbound, session) = account.create_group_session_pair_with_defaults(room_id()).await;
         let content = outbound.encrypt("m.dummy", &message_like_event_content!({})).await;
@@ -1476,6 +1482,7 @@ mod tests {
             alice_id(),
             alice_id(),
             alice_device.ed25519_key().unwrap(),
+            None,
             content,
         );
 
@@ -1523,6 +1530,7 @@ mod tests {
             alice_id(),
             alice_id(),
             alice_device.ed25519_key().unwrap(),
+            None,
             content,
         );
 
@@ -1541,6 +1549,7 @@ mod tests {
             alice_id(),
             alice_id(),
             alice_device.ed25519_key().unwrap(),
+            None,
             content,
         );
 
@@ -1572,8 +1581,8 @@ mod tests {
         // Now we do want to share the keys.
         machine.should_share_key(&own_device, &inbound).await.unwrap();
 
-        let bob_device = ReadOnlyDevice::from_account(&bob_account());
-        machine.inner.store.save_devices(&[bob_device]).await.unwrap();
+        let bob_device = DeviceData::from_account(&bob_account());
+        machine.inner.store.save_device_data(&[bob_device]).await.unwrap();
 
         let bob_device =
             machine.inner.store.get_device(bob_id(), bob_device_id()).await.unwrap().unwrap();
@@ -1630,8 +1639,8 @@ mod tests {
 
         // Finally, let's ensure we don't share the session with a device that rotated
         // its curve25519 key.
-        let bob_device = ReadOnlyDevice::from_account(&bob_account());
-        machine.inner.store.save_devices(&[bob_device]).await.unwrap();
+        let bob_device = DeviceData::from_account(&bob_account());
+        machine.inner.store.save_device_data(&[bob_device]).await.unwrap();
 
         let bob_device =
             machine.inner.store.get_device(bob_id(), bob_device_id()).await.unwrap().unwrap();
@@ -1832,12 +1841,12 @@ mod tests {
         let alice_machine = get_machine_test_helper().await;
 
         let mut second_account = alice_2_account();
-        let alice_device = ReadOnlyDevice::from_account(&second_account);
+        let alice_device = DeviceData::from_account(&second_account);
 
         let bob_account = bob_account();
-        let bob_device = ReadOnlyDevice::from_account(&bob_account);
+        let bob_device = DeviceData::from_account(&bob_account);
 
-        alice_machine.inner.store.save_devices(&[alice_device.clone()]).await.unwrap();
+        alice_machine.inner.store.save_device_data(&[alice_device.clone()]).await.unwrap();
 
         // Create Olm sessions for our two accounts.
         let alice_session = alice_machine
@@ -1881,7 +1890,7 @@ mod tests {
         }
         assert!(alice_machine.inner.outgoing_requests.read().unwrap().is_empty());
 
-        alice_machine.inner.store.save_devices(&[bob_device]).await.unwrap();
+        alice_machine.inner.store.save_device_data(&[bob_device]).await.unwrap();
 
         // The device doesn't belong to us
         alice_machine.inner.store.reset_cross_signing_identity().await;
@@ -1911,7 +1920,7 @@ mod tests {
 
         // We need a trusted device, otherwise we won't serve secrets
         alice_device.set_trust_state(LocalTrust::Verified);
-        alice_machine.inner.store.save_devices(&[alice_device.clone()]).await.unwrap();
+        alice_machine.inner.store.save_device_data(&[alice_device.clone()]).await.unwrap();
 
         alice_machine.receive_incoming_secret_request(&event);
         {
@@ -1929,7 +1938,8 @@ mod tests {
         use tokio_stream::StreamExt;
 
         use crate::{
-            machine::tests::get_machine_pair_with_setup_sessions_test_helper, EncryptionSyncChanges,
+            machine::test_helpers::get_machine_pair_with_setup_sessions_test_helper,
+            EncryptionSyncChanges,
         };
 
         let alice_id = user_id!("@alice:localhost");
@@ -1975,8 +1985,8 @@ mod tests {
         // We need a trusted device, otherwise we won't serve nor accept secrets.
         bob_device.set_trust_state(LocalTrust::Verified);
         alice_device.set_trust_state(LocalTrust::Verified);
-        alice_machine.store().save_devices(&[bob_device.inner]).await.unwrap();
-        bob_machine.store().save_devices(&[alice_device.inner]).await.unwrap();
+        alice_machine.store().save_device_data(&[bob_device.inner]).await.unwrap();
+        bob_machine.store().save_device_data(&[alice_device.inner]).await.unwrap();
 
         let decryption_key = crate::store::BackupDecryptionKey::new().unwrap();
         alice_machine
