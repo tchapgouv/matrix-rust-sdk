@@ -21,6 +21,7 @@ Build 🧱:
 - Add build profiles for iOS
 - MESSENGER-6548 improve build performance
 - MESSENGER-6350 update timeout for the android build job
+- MESSENGER-6082 integration of the matrix-rust-components-kotlin in our rust-sdk
 
 Other changes:
 
