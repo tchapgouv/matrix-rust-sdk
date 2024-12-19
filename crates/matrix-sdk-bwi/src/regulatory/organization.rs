@@ -124,7 +124,8 @@ mod url_helper {
                 BWIUrlHelper::with_base_url(valid_url).unwrap().for_well_known_file().get_url();
 
             // Assert
-            Ok(assert_eq!(built_url, parsed_url))
+            assert_eq!(built_url, parsed_url);
+            Ok(())
         }
     }
 }

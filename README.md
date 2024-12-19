@@ -36,10 +36,19 @@ Daneben enthält dieses Rust-SDK noch weitere Crates:
 
 ## Für Entwickler
 
+### Commit-Hooks
+
+Durch das erstmalige ausführen von `cargo test` werden die Git-Hooks automatisch initialisiert.
+Ob die Initialisierung erfolgreich war, kann mit `less .git/hooks/pre-commit` überprüft werden.
+
+Wenn der Output `.git/hooks/pre-commit: No such file or directory` lautet, so muss zuerst ein _.git/hooks_-Verzeichnis
+mittels `mkdir .git/hooks` erzeugt werden.
+Anschließend können mittels `rusty-hook init` die hooks initialisiert werden.
+
 ### Für Android
 
 Das Rust-SDK wird mittels eines *.aar Archives in den Android Messenger X eingebunden.
-Zur Erstellung dieses Archives wird folgender Befehlt im root dieses Projektes ausgeführt:
+Zur Erstellung dieses Archives wird folgender Befehl im root dieses Projektes ausgeführt:
 
 ```./android-scripts/build.sh -p . -t $TARGET_ARCHITECTURE $PROFILE```
 

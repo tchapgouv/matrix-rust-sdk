@@ -1,0 +1,6 @@
+[hooks]
+pre-commit = "cargo fmt -- --check"
+pre-push = "cargo clippy -p matrix-sdk-bwi -p matrix-sdk-base-bwi --no-deps -- -Dwarnings"
+
+[logging]
+verbose = true
