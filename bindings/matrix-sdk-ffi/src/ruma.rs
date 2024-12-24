@@ -21,6 +21,7 @@ use ruma::{
     events::{
         call::notify::NotifyType as RumaNotifyType,
         location::AssetType as RumaAssetType,
+        macros::EventContent,
         poll::start::PollKind as RumaPollKind,
         room::{
             message::{
@@ -43,11 +44,13 @@ use ruma::{
             ImageInfo as RumaImageInfo, MediaSource as RumaMediaSource,
             ThumbnailInfo as RumaThumbnailInfo,
         },
+        EmptyStateKey,
     },
     matrix_uri::MatrixId as RumaMatrixId,
     serde::JsonObject,
     MatrixToUri, MatrixUri as RumaMatrixUri, OwnedUserId, UInt, UserId,
 };
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::{
@@ -192,6 +195,17 @@ pub fn message_event_content_from_html_as_emote(
     Arc::new(RoomMessageEventContentWithoutRelation::new(RumaMessageType::emote_html(
         body, html_body,
     )))
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, EventContent, uniffi::Object)]
+#[ruma_event(type = "im.vector.room.access_rules", kind = State, state_key_type = EmptyStateKey)]
+pub struct AccessRuleEventContent {
+    pub rule: String,
+}
+
+#[matrix_sdk_ffi_macros::export]
+pub fn access_rule_event_content(rule: String) -> Arc<AccessRuleEventContent> {
+    Arc::new(AccessRuleEventContent { rule })
 }
 
 #[derive(Clone, uniffi::Object)]
