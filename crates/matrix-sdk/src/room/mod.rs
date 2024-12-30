@@ -74,6 +74,7 @@ use ruma::{
         beacon_info::BeaconInfoEventContent,
         call::notify::{ApplicationType, CallNotifyEventContent, NotifyType},
         direct::DirectEventContent,
+        macros::EventContent,
         marked_unread::{MarkedUnreadEventContent, UnstableMarkedUnreadEventContent},
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
@@ -117,6 +118,7 @@ use ruma::{
     MilliSecondsSinceUnixEpoch,
 };
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tracing::{debug, info, instrument, warn};
@@ -2233,6 +2235,11 @@ impl Room {
         user_power_levels
     }
 
+    /// Sets the access rules for this room.
+    pub async fn set_access_rules(&self, rule: String) -> Result<send_state_event::v3::Response> {
+        self.send_state_event(RoomAccessRulesEventContent::new(rule)).await
+    }
+
     /// Sets the name of this room.
     pub async fn set_name(&self, name: String) -> Result<send_state_event::v3::Response> {
         self.send_state_event(RoomNameEventContent::new(name)).await
@@ -3473,6 +3480,24 @@ impl TryFrom<Int> for ReportedContentScore {
 #[derive(Debug, Clone, Error)]
 #[error("out of range conversion attempted")]
 pub struct TryFromReportedContentScoreError(());
+
+/// RoomAccessRules custom StateEvent:
+#[derive(Clone, Debug, Deserialize, Serialize, EventContent)]
+#[ruma_event(
+    type = "im.vector.room.access_rules",
+    kind = State,
+    state_key_type = EmptyStateKey,
+)]
+pub struct RoomAccessRulesEventContent {
+    /// The rule value.
+    pub rule: String,
+}
+impl RoomAccessRulesEventContent {
+    /// Creates a new `RoomAccessRulesEventContent` with the given rule.
+    pub fn new(rule: String) -> Self {
+        Self { rule }
+    }
+}
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
