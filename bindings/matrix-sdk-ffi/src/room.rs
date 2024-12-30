@@ -488,6 +488,12 @@ impl Room {
         Ok(())
     }
 
+    /// Sets the room access rules.
+    pub async fn set_access_rules(&self, rule: String) -> Result<(), ClientError> {
+        self.inner.set_access_rules(rule).await?;
+        Ok(())
+    }
+
     /// Sets a new name to the room.
     pub async fn set_name(&self, name: String) -> Result<(), ClientError> {
         self.inner.set_name(name).await?;
