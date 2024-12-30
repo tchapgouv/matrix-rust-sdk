@@ -85,6 +85,7 @@ use ruma::{
         beacon_info::BeaconInfoEventContent,
         call::notify::{ApplicationType, CallNotifyEventContent, NotifyType},
         direct::DirectEventContent,
+        macros::EventContent,
         marked_unread::{MarkedUnreadEventContent, UnstableMarkedUnreadEventContent},
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
@@ -121,6 +122,7 @@ use ruma::{
     OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
@@ -3790,6 +3792,24 @@ impl TryFrom<Int> for ReportedContentScore {
 #[derive(Debug, Clone, Error)]
 #[error("out of range conversion attempted")]
 pub struct TryFromReportedContentScoreError(());
+
+/// RoomAccessRules custom StateEvent:
+#[derive(Clone, Debug, Deserialize, Serialize, EventContent)]
+#[ruma_event(
+    type = "im.vector.room.access_rules",
+    kind = State,
+    state_key_type = EmptyStateKey,
+)]
+pub struct RoomAccessRulesEventContent {
+    /// The rule value.
+    pub rule: String,
+}
+impl RoomAccessRulesEventContent {
+    /// Creates a new `RoomAccessRulesEventContent` with the given rule.
+    pub fn new(rule: String) -> Self {
+        Self { rule }
+    }
+}
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
