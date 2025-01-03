@@ -18,6 +18,7 @@ use matrix_sdk::{
         MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequestParameters,
         MediaRetentionPolicy, MediaThumbnailSettings,
     },
+    room::RoomAccessRulesEventContent,
     ruma::{
         api::client::{
             push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
@@ -1399,6 +1400,8 @@ impl From<PowerLevels> for RoomPowerLevelsEventContent {
 
 #[derive(uniffi::Record)]
 pub struct CreateRoomParameters {
+    #[uniffi(default = None)]
+    pub access_rules: Option<String>,
     pub name: Option<String>,
     #[uniffi(default = None)]
     pub topic: Option<String>,
@@ -1447,6 +1450,11 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
         };
 
         let mut initial_state: Vec<Raw<AnyInitialStateEvent>> = vec![];
+
+        if let Some(rule) = value.access_rules {
+            let content = RoomAccessRulesEventContent::new(rule);
+            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+        }
 
         if value.is_encrypted {
             let content =
