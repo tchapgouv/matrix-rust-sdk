@@ -18,6 +18,7 @@ use matrix_sdk::{
         MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequestParameters,
         MediaRetentionPolicy, MediaThumbnailSettings,
     },
+    reqwest::StatusCode,
     room::RoomAccessRulesEventContent,
     ruma::{
         api::client::{
