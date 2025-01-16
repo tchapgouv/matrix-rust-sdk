@@ -1345,41 +1345,13 @@ impl QueueStorage {
                         None
                     }
 
-                DependentQueuedRequestKind::ReactEvent { key } => Some(LocalEcho {
-                    transaction_id: dep.own_transaction_id.clone().into(),
-                    content: LocalEchoContent::React {
-                        key,
-                        send_handle: SendReactionHandle {
-                            room: room.clone(),
-                            transaction_id: dep.own_transaction_id,
-                        },
-                        applies_to: dep.parent_transaction_id,
-                    },
-                }),
-
-                DependentQueuedRequestKind::UploadFileWithThumbnail { .. } => {
-                    // Don't reflect these: only the associated event is interesting to observers.
-                    None
-                }
-
-                DependentQueuedRequestKind::FinishUpload {
-                    local_echo,
-                    file_upload,
-                    thumbnail_info,
-                } => {
-                    // Materialize as an event local echo.
-                    Some(LocalEcho {
+                    DependentQueuedRequestKind::ReactEvent { key } => Some(LocalEcho {
                         transaction_id: dep.own_transaction_id.clone().into(),
-                        content: LocalEchoContent::Event {
-                            serialized_event: SerializableEventContent::new(&local_echo.into())
-                                .ok()?,
-                            send_handle: SendHandle {
+                        content: LocalEchoContent::React {
+                            key,
+                            send_handle: SendReactionHandle {
                                 room: room.clone(),
-                                transaction_id: dep.own_transaction_id.into(),
-                                media_handles: Some(MediaHandles {
-                                    upload_thumbnail_txn: thumbnail_info.map(|info| info.txn),
-                                    upload_file_txn: file_upload,
-                                }),
+                                transaction_id: dep.own_transaction_id,
                             },
                             applies_to: dep.parent_transaction_id,
                         },
@@ -1392,8 +1364,8 @@ impl QueueStorage {
 
                     DependentQueuedRequestKind::FinishUpload {
                         local_echo,
-                        file_upload: _,
-                        thumbnail_info: _,
+                        file_upload,
+                        thumbnail_info,
                     } => {
                         // Materialize as an event local echo.
                         Some(LocalEcho {
@@ -1401,11 +1373,13 @@ impl QueueStorage {
                             content: LocalEchoContent::Event {
                                 serialized_event: SerializableEventContent::new(&local_echo.into())
                                     .ok()?,
-                                // TODO this should be a `SendAttachmentHandle`!
                                 send_handle: SendHandle {
                                     room: room.clone(),
                                     transaction_id: dep.own_transaction_id.into(),
-                                    is_upload: true,
+                                    media_handles: Some(MediaHandles {
+                                        upload_thumbnail_txn: thumbnail_info.map(|info| info.txn),
+                                        upload_file_txn: file_upload,
+                                    }),
                                 },
                                 send_error: None,
                             },

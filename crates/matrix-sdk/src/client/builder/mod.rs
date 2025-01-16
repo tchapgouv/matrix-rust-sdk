@@ -1250,8 +1250,14 @@ pub(crate) mod tests {
     async fn test_cross_process_store_locks_holder_name() {
         {
             let homeserver = make_mock_homeserver().await;
-            let client =
-                ClientBuilder::new().homeserver_url(homeserver.uri()).build().await.unwrap();
+            let client = ClientBuilder::new()
+                .homeserver_url(homeserver.uri())
+                // BWI-specific
+                .without_server_jwt_token_validation()
+                // end BWI-specific
+                .build()
+                .await
+                .unwrap();
 
             assert_eq!(client.cross_process_store_locks_holder_name(), "main");
         }
@@ -1261,6 +1267,9 @@ pub(crate) mod tests {
             let client = ClientBuilder::new()
                 .homeserver_url(homeserver.uri())
                 .cross_process_store_locks_holder_name("foo".to_owned())
+                // BWI-specific
+                .without_server_jwt_token_validation()
+                // end BWI-specific
                 .build()
                 .await
                 .unwrap();

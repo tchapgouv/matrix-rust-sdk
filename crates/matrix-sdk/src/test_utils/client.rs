@@ -38,7 +38,11 @@ impl MockClientBuilder {
         let default_builder = Client::builder()
             .homeserver_url(homeserver)
             .server_versions([MatrixVersion::V1_12])
-            .request_config(RequestConfig::new().disable_retry());
+            .request_config(RequestConfig::new().disable_retry())
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
+        ;
 
         Self { builder: default_builder, logged_in: true }
     }

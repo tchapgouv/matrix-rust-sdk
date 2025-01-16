@@ -1570,7 +1570,7 @@ async fn test_reloading_rooms_with_unsent_events() {
     let room_id2 = room_id!("!d:e.f");
 
     let server = wiremock::MockServer::start().await;
-   let mock = MatrixMockServer::from_server(server);
+    let mock = MatrixMockServer::from_server(server);
 
     let client = mock
         .client_builder()
@@ -1578,9 +1578,6 @@ async fn test_reloading_rooms_with_unsent_events() {
             StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
                 .state_store(store.clone()),
         )
-        // BWI-specific
-        .without_server_jwt_token_validation()
-        // end BWI-specific
         .build()
         .await;
 
@@ -1632,12 +1629,8 @@ async fn test_reloading_rooms_with_unsent_events() {
         .store_config(
             StoreConfig::new("cross-process-store-locks-holder-name".to_owned()).state_store(store),
         )
-        // BWI-specific
-        .without_server_jwt_token_validation()
-        // end BWI-specific
         .build()
         .await;
-
 
     new_client.send_queue().respawn_tasks_for_rooms_with_unsent_requests().await;
 
