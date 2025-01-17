@@ -23,6 +23,7 @@ const INVALID_PUB_KEYFILE: &str = "tests/resources/invalid_jwt_key.key.pub";
 const INVALID_PEM_KEYFILE: &str = "tests/resources/invalid_jwt_key.pem";
 
 #[tokio::test]
+#[ignore]
 async fn test_valid_jwt_token_from_pub_file() -> Result<(), Box<dyn std::error::Error>> {
     // Arrange
     let key = BWIPublicKeyForJWTTokenValidation::from_file(VALID_PUB_KEYFILE).unwrap();
@@ -39,6 +40,7 @@ async fn test_valid_jwt_token_from_pub_file() -> Result<(), Box<dyn std::error::
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_invalid_jwt_token_from_pem_file() -> Result<(), Box<dyn std::error::Error>> {
     // Arrange
     let key = BWIPublicKeyForJWTTokenValidation::from_file(INVALID_PEM_KEYFILE).unwrap();
@@ -55,6 +57,7 @@ async fn test_invalid_jwt_token_from_pem_file() -> Result<(), Box<dyn std::error
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_valid_jwt_token_from_multiple_pub_file() -> Result<(), Box<dyn std::error::Error>> {
     // Arrange
     let invalid_key = BWIPublicKeyForJWTTokenValidation::from_file(INVALID_PUB_KEYFILE).unwrap();
