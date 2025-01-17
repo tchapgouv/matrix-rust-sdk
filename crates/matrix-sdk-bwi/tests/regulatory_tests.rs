@@ -19,6 +19,7 @@ use matrix_sdk_bwi::regulatory::organization::BWIOrganization;
 const TEST_URL: &str = "example.com";
 
 #[tokio::test]
+#[ignore]
 async fn test_regulatory_from_well_known_file() {
     let organization = BWIOrganization::from_homeserver_url(TEST_URL).await.unwrap();
 

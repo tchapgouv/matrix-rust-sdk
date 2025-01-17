@@ -1378,6 +1378,7 @@ impl CryptoStore for SqliteCryptoStore {
 mod tests {
     use std::path::PathBuf;
 
+    use super::SqliteCryptoStore;
     use matrix_sdk_crypto::{
         cryptostore_integration_tests, cryptostore_integration_tests_time, store::CryptoStore,
     };
@@ -1386,8 +1387,6 @@ mod tests {
     use similar_asserts::assert_eq;
     use tempfile::{tempdir, TempDir};
     use tokio::fs;
-
-    use super::SqliteCryptoStore;
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
 

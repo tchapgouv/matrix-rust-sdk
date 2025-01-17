@@ -231,6 +231,8 @@ impl ClientBuilder {
         Ok(self)
     }
 
+    /// By default, the jwt-token validation is enabled.
+    /// To disable it, call this method when creating the client
     pub fn without_server_jwt_token_validation(mut self) -> Self {
         self.public_keys_for_jwt_validation = None;
         self

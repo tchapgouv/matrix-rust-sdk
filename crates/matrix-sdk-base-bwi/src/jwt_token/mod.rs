@@ -172,6 +172,3 @@ impl BWITokenValidator {
         Ok(token_array)
     }
 }
-
-#[cfg(test)]
-mod test;

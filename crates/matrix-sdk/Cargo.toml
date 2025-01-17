@@ -109,7 +109,7 @@ mime = { workspace = true }
 mime2ext = "0.1.53"
 once_cell = { workspace = true }
 pin-project-lite = { workspace = true }
-rand = { workspace = true , optional = true }
+rand = { workspace = true, optional = true }
 ruma = { workspace = true, features = ["rand", "unstable-msc2448", "unstable-msc2965", "unstable-msc3930", "unstable-msc3245-v1-compat", "unstable-msc2867"] }
 ruma-common = { git = "https://github.com/ruma/ruma", rev = "79289381444e886c454302e1e8f5b5f62f249a57", features = ["api"] }
 serde = { workspace = true }

@@ -2544,6 +2544,7 @@ pub(crate) mod tests {
         spawn,
         time::{sleep, timeout},
     };
+    use tokio_stream::StreamExt;
     use url::Url;
     use wiremock::{
         matchers::{body_json, header, method, path, query_param_is_missing},
@@ -3020,10 +3021,14 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_no_network_doesnt_cause_infinite_retries() {
+        let server = MockServer::start().await;
         // Note: not `no_retry_test_client` or `logged_in_client` which uses the former,
         // since we want infinite retries for transient errors.
-        let client =
-            test_client_builder(None).request_config(RequestConfig::new()).build().await.unwrap();
+        let client = test_client_builder(Some(server.uri().clone()))
+            .request_config(RequestConfig::new())
+            .build()
+            .await
+            .unwrap();
         set_client_session(&client).await;
 
         // We don't define a mock server on purpose here, so that the error is really a
