@@ -19,14 +19,13 @@ use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{
-    assert_let_timeout, config::SyncSettings, test_utils::logged_in_client_with_server,
+    assert_let_timeout,
+    config::SyncSettings,
+    test_utils::{logged_in_client_with_server, mocks::MatrixMockServer},
 };
 use matrix_sdk_test::{
-    async_test,
-    event_factory::EventFactory,
-    mocks::{mock_encryption_state, mock_redaction},
-    sync_timeline_event, JoinedRoomBuilder, RoomAccountDataTestEvent, StateTestEvent,
-    SyncResponseBuilder, BOB,
+    async_test, event_factory::EventFactory, mocks::mock_encryption_state, sync_timeline_event,
+    JoinedRoomBuilder, RoomAccountDataTestEvent, StateTestEvent, SyncResponseBuilder, BOB,
 };
 use matrix_sdk_ui::{
     timeline::{
@@ -115,15 +114,15 @@ async fn test_reaction() {
     server.reset().await;
 
     // The new message starts with their author's read receipt.
-    assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
+    assert_let_timeout!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next());
     let event_item = message.as_event().unwrap();
     assert_matches!(event_item.content(), TimelineItemContent::Message(_));
     assert_eq!(event_item.read_receipts().len(), 1);
 
     // The new message is getting the reaction, which implies an implicit read
     // receipt that's obtained first.
-    assert_let!(
-        Some(VectorDiff::Set { index: 0, value: updated_message }) = timeline_stream.next().await
+    assert_let_timeout!(
+        Some(VectorDiff::Set { index: 0, value: updated_message }) = timeline_stream.next()
     );
     let event_item = updated_message.as_event().unwrap();
     assert_let!(TimelineItemContent::Message(msg) = event_item.content());
@@ -132,8 +131,8 @@ async fn test_reaction() {
     assert_eq!(event_item.reactions().len(), 0);
 
     // Then the reaction is taken into account.
-    assert_let!(
-        Some(VectorDiff::Set { index: 0, value: updated_message }) = timeline_stream.next().await
+    assert_let_timeout!(
+        Some(VectorDiff::Set { index: 0, value: updated_message }) = timeline_stream.next()
     );
     let event_item = updated_message.as_event().unwrap();
     assert_let!(TimelineItemContent::Message(msg) = event_item.content());
@@ -145,9 +144,11 @@ async fn test_reaction() {
     let senders: Vec<_> = group.keys().collect();
     assert_eq!(senders.as_slice(), [user_id!("@bob:example.org")]);
 
-    // The day divider.
-    assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
-    assert!(day_divider.is_day_divider());
+    // The date divider.
+    assert_let_timeout!(
+        Some(VectorDiff::PushFront { value: date_divider }) = timeline_stream.next()
+    );
+    assert!(date_divider.is_date_divider());
 
     sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
         sync_timeline_event!({
@@ -164,8 +165,8 @@ async fn test_reaction() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
-    assert_let!(
-        Some(VectorDiff::Set { index: 1, value: updated_message }) = timeline_stream.next().await
+    assert_let_timeout!(
+        Some(VectorDiff::Set { index: 1, value: updated_message }) = timeline_stream.next()
     );
     let event_item = updated_message.as_event().unwrap();
     assert_let!(TimelineItemContent::Message(msg) = event_item.content());
@@ -228,41 +229,34 @@ async fn test_redacted_message() {
     assert_let!(Some(VectorDiff::PushBack { value: first }) = timeline_stream.next().await);
     assert_matches!(first.as_event().unwrap().content(), TimelineItemContent::RedactedMessage);
 
-    assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
-    assert!(day_divider.is_day_divider());
+    assert_let!(Some(VectorDiff::PushFront { value: date_divider }) = timeline_stream.next().await);
+    assert!(date_divider.is_date_divider());
 }
 
 #[async_test]
 async fn test_redact_message() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let room = server.sync_joined_room(&client, room_id).await;
 
-    let mut sync_builder = SyncResponseBuilder::new();
-    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    server.mock_room_state_encryption().plain().mount().await;
 
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    mock_encryption_state(&server, false).await;
-
-    let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
     let factory = EventFactory::new();
     factory.set_next_ts(MilliSecondsSinceUnixEpoch::now().get().into());
 
-    sync_builder.add_joined_room(
-        JoinedRoomBuilder::new(room_id).add_timeline_event(
-            factory.sender(user_id!("@a:b.com")).text_msg("buy my bitcoins bro"),
-        ),
-    );
-
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                factory.sender(user_id!("@a:b.com")).text_msg("buy my bitcoins bro"),
+            ),
+        )
+        .await;
 
     assert_let!(Some(VectorDiff::PushBack { value: first }) = timeline_stream.next().await);
     assert_eq!(
@@ -270,11 +264,11 @@ async fn test_redact_message() {
         "buy my bitcoins bro"
     );
 
-    assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
-    assert!(day_divider.is_day_divider());
+    assert_let!(Some(VectorDiff::PushFront { value: date_divider }) = timeline_stream.next().await);
+    assert!(date_divider.is_date_divider());
 
     // Redacting a remote event works.
-    mock_redaction(event_id!("$42")).mount(&server).await;
+    server.mock_room_redact().ok(event_id!("$42")).mock_once().mount().await;
 
     timeline.redact(&first.as_event().unwrap().identifier(), Some("inapprops")).await.unwrap();
 
@@ -306,34 +300,19 @@ async fn test_redact_message() {
 
 #[async_test]
 async fn test_redact_local_sent_message() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let room = server.sync_joined_room(&client, room_id).await;
 
-    let mut sync_builder = SyncResponseBuilder::new();
-    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    server.mock_room_state_encryption().plain().mount().await;
 
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    mock_encryption_state(&server, false).await;
-
-    let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
     // Mock event sending.
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({ "event_id": "$wWgymRfo7ri1uQx0NXO40vLJ" })),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
+    server.mock_room_send().ok(event_id!("$wWgymRfo7ri1uQx0NXO40vLJ")).mock_once().mount().await;
 
     // Send the event so it's added to the send queue as a local event.
     timeline
@@ -347,11 +326,11 @@ async fn test_redact_local_sent_message() {
     assert!(event.is_local_echo());
     assert_matches!(event.send_state(), Some(EventSendState::NotSentYet));
 
-    // As well as a day divider.
+    // As well as a date divider.
     assert_let_timeout!(
-        Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next()
+        Some(VectorDiff::PushFront { value: date_divider }) = timeline_stream.next()
     );
-    assert!(day_divider.is_day_divider());
+    assert!(date_divider.is_date_divider());
 
     // We receive an update in the timeline from the send queue.
     assert_let_timeout!(Some(VectorDiff::Set { index, value: item }) = timeline_stream.next());
@@ -364,7 +343,7 @@ async fn test_redact_local_sent_message() {
 
     // Mock the redaction response for the event we just sent. Ensure it's called
     // once.
-    mock_redaction(event.event_id().unwrap()).expect(1).mount(&server).await;
+    server.mock_room_redact().ok(event_id!("$redaction_event_id")).mock_once().mount().await;
 
     // Let's redact the local echo with the remote handle.
     timeline.redact(&event.identifier(), None).await.unwrap();
@@ -439,8 +418,8 @@ async fn test_read_marker() {
     assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
     assert_matches!(message.as_event().unwrap().content(), TimelineItemContent::Message(_));
 
-    assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
-    assert!(day_divider.is_day_divider());
+    assert_let!(Some(VectorDiff::PushFront { value: date_divider }) = timeline_stream.next().await);
+    assert!(date_divider.is_date_divider());
 
     sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id).add_account_data(RoomAccountDataTestEvent::FullyRead),
@@ -525,8 +504,8 @@ async fn test_sync_highlighted() {
     // Own events don't trigger push rules.
     assert!(!remote_event.is_highlighted());
 
-    assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
-    assert!(day_divider.is_day_divider());
+    assert_let!(Some(VectorDiff::PushFront { value: date_divider }) = timeline_stream.next().await);
+    assert!(date_divider.is_date_divider());
 
     sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(
         sync_timeline_event!({
@@ -589,7 +568,7 @@ async fn test_duplicate_maintains_correct_order() {
     let items = timeline.items().await;
     assert_eq!(items.len(), 2);
 
-    assert!(items[0].is_day_divider());
+    assert!(items[0].is_date_divider());
     let content = items[1].as_event().unwrap().content().as_message().unwrap().body();
     assert_eq!(content, "C");
 
@@ -609,7 +588,7 @@ async fn test_duplicate_maintains_correct_order() {
     let items = timeline.items().await;
     assert_eq!(items.len(), 4, "{items:?}");
 
-    assert!(items[0].is_day_divider());
+    assert!(items[0].is_date_divider());
     let content = items[1].as_event().unwrap().content().as_message().unwrap().body();
     assert_eq!(content, "A");
     let content = items[2].as_event().unwrap().content().as_message().unwrap().body();

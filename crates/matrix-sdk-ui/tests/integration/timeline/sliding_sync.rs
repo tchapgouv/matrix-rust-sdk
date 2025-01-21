@@ -20,8 +20,8 @@ use assert_matches2::assert_let;
 use eyeball_im::{Vector, VectorDiff};
 use futures_util::{pin_mut, FutureExt, Stream, StreamExt};
 use matrix_sdk::{
-    test_utils::logged_in_client_with_server, SlidingSync, SlidingSyncList, SlidingSyncListBuilder,
-    SlidingSyncMode, UpdateSummary,
+    test_utils::logged_in_client_with_server, Client, SlidingSync, SlidingSyncList,
+    SlidingSyncListBuilder, SlidingSyncMode, UpdateSummary,
 };
 use matrix_sdk_test::{async_test, mocks::mock_encryption_state};
 use matrix_sdk_ui::{
@@ -70,8 +70,8 @@ macro_rules! timeline_event {
 pub(crate) use timeline_event;
 
 macro_rules! assert_timeline_stream {
-    // `--- day divider ---`
-    ( @_ [ $stream:ident ] [ --- day divider --- ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+    // `--- date divider ---`
+    ( @_ [ $stream:ident ] [ --- date divider --- ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
         assert_timeline_stream!(
             @_
             [ $stream ]
@@ -85,7 +85,7 @@ macro_rules! assert_timeline_stream {
                             assert_matches!(
                                 **value,
                                 TimelineItemKind::Virtual(
-                                    VirtualTimelineItem::DayDivider(_)
+                                    VirtualTimelineItem::DateDivider(_)
                                 )
                             );
                         }
@@ -120,8 +120,8 @@ macro_rules! assert_timeline_stream {
         )
     };
 
-    // `prepend --- day divider ---`
-    ( @_ [ $stream:ident ] [ prepend --- day divider --- ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
+    // `prepend --- date divider ---`
+    ( @_ [ $stream:ident ] [ prepend --- date divider --- ; $( $rest:tt )* ] [ $( $accumulator:tt )* ] ) => {
         assert_timeline_stream!(
             @_
             [ $stream ]
@@ -134,7 +134,7 @@ macro_rules! assert_timeline_stream {
                         Some(Some(VectorDiff::PushFront { value })) => {
                             assert_matches!(
                                 &**value,
-                                TimelineItemKind::Virtual(VirtualTimelineItem::DayDivider(_)) => {}
+                                TimelineItemKind::Virtual(VirtualTimelineItem::DateDivider(_)) => {}
                             );
                         }
                     );
@@ -223,7 +223,9 @@ macro_rules! assert_timeline_stream {
 
 pub(crate) use assert_timeline_stream;
 
-async fn new_sliding_sync(lists: Vec<SlidingSyncListBuilder>) -> Result<(MockServer, SlidingSync)> {
+async fn new_sliding_sync(
+    lists: Vec<SlidingSyncListBuilder>,
+) -> Result<(Client, MockServer, SlidingSync)> {
     let (client, server) = logged_in_client_with_server().await;
 
     let mut sliding_sync_builder = client.sliding_sync("integration-test")?;
@@ -234,7 +236,7 @@ async fn new_sliding_sync(lists: Vec<SlidingSyncListBuilder>) -> Result<(MockSer
 
     let sliding_sync = sliding_sync_builder.build().await?;
 
-    Ok((server, sliding_sync))
+    Ok((client, server, sliding_sync))
 }
 
 async fn create_one_room(
@@ -268,26 +270,16 @@ async fn create_one_room(
 }
 
 async fn timeline_test_helper(
+    client: &Client,
     sliding_sync: &SlidingSync,
     room_id: &RoomId,
 ) -> Result<(Vector<Arc<TimelineItem>>, impl Stream<Item = VectorDiff<Arc<TimelineItem>>>)> {
     let sliding_sync_room = sliding_sync.get_room(room_id).await.unwrap();
 
     let room_id = sliding_sync_room.room_id();
-    let client = sliding_sync_room.client();
     let sdk_room = client.get_room(room_id).ok_or_else(|| {
         anyhow::anyhow!("Room {room_id} not found in client. Can't provide a timeline for it")
     })?;
-
-    // TODO: when the event cache handles its own cache, we can remove this.
-    client
-        .event_cache()
-        .add_initial_events(
-            room_id,
-            sliding_sync_room.timeline_queue().iter().cloned().collect(),
-            sliding_sync_room.prev_batch(),
-        )
-        .await?;
 
     let timeline = Timeline::builder(&sdk_room).track_read_marker_and_receipts().build().await?;
 
@@ -305,7 +297,7 @@ impl Match for SlidingSyncMatcher {
 
 #[async_test]
 async fn test_timeline_basic() -> Result<()> {
-    let (server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
+    let (client, server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
         .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
     .await?;
 
@@ -319,7 +311,7 @@ async fn test_timeline_basic() -> Result<()> {
     mock_encryption_state(&server, false).await;
 
     let (timeline_items, mut timeline_stream) =
-        timeline_test_helper(&sliding_sync, room_id).await?;
+        timeline_test_helper(&client, &sliding_sync, room_id).await?;
     assert!(timeline_items.is_empty());
 
     // Receiving a bunch of events.
@@ -345,7 +337,7 @@ async fn test_timeline_basic() -> Result<()> {
             append    "$x1:bar.org";
             update[0] "$x1:bar.org";
             append    "$x2:bar.org";
-            prepend   --- day divider ---;
+            prepend   --- date divider ---;
         };
     }
 
@@ -354,7 +346,7 @@ async fn test_timeline_basic() -> Result<()> {
 
 #[async_test]
 async fn test_timeline_duplicated_events() -> Result<()> {
-    let (server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
+    let (client, server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
         .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
     .await?;
 
@@ -367,7 +359,7 @@ async fn test_timeline_duplicated_events() -> Result<()> {
 
     mock_encryption_state(&server, false).await;
 
-    let (_, mut timeline_stream) = timeline_test_helper(&sliding_sync, room_id).await?;
+    let (_, mut timeline_stream) = timeline_test_helper(&client, &sliding_sync, room_id).await?;
 
     // Receiving events.
     {
@@ -395,7 +387,7 @@ async fn test_timeline_duplicated_events() -> Result<()> {
             append    "$x2:bar.org";
             update[1] "$x2:bar.org";
             append    "$x3:bar.org";
-            prepend    --- day divider ---;
+            prepend    --- date divider ---;
         };
     }
 
@@ -419,9 +411,8 @@ async fn test_timeline_duplicated_events() -> Result<()> {
 
         assert_timeline_stream! {
             [timeline_stream]
-            update[3] "$x3:bar.org";
-            update[1] "$x1:bar.org";
             remove[1];
+            update[2] "$x3:bar.org";
             append    "$x1:bar.org";
             update[3] "$x1:bar.org";
             append    "$x4:bar.org";
@@ -433,7 +424,7 @@ async fn test_timeline_duplicated_events() -> Result<()> {
 
 #[async_test]
 async fn test_timeline_read_receipts_are_updated_live() -> Result<()> {
-    let (server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
+    let (client, server, sliding_sync) = new_sliding_sync(vec![SlidingSyncList::builder("foo")
         .sync_mode(SlidingSyncMode::new_selective().add_range(0..=10))])
     .await?;
 
@@ -447,7 +438,7 @@ async fn test_timeline_read_receipts_are_updated_live() -> Result<()> {
     mock_encryption_state(&server, false).await;
 
     let (timeline_items, mut timeline_stream) =
-        timeline_test_helper(&sliding_sync, room_id).await?;
+        timeline_test_helper(&client, &sliding_sync, room_id).await?;
     assert!(timeline_items.is_empty());
 
     // Receiving initial events.
@@ -473,7 +464,7 @@ async fn test_timeline_read_receipts_are_updated_live() -> Result<()> {
             append    "$x1:bar.org";
             update[0] "$x1:bar.org";
             append    "$x2:bar.org";
-            prepend   --- day divider ---;
+            prepend   --- date divider ---;
         };
     }
 

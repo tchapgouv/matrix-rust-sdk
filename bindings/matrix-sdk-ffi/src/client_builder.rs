@@ -1,4 +1,4 @@
-use std::{fs, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
+use std::{fs, num::NonZeroUsize, path::Path, sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use matrix_sdk::{
@@ -8,6 +8,7 @@ use matrix_sdk::{
         CollectStrategy, TrustRequirement,
     },
     encryption::{BackupDownloadStrategy, EncryptionSettings},
+    event_cache::EventCacheError,
     reqwest::Certificate,
     ruma::{ServerName, UserId},
     sliding_sync::{
@@ -202,6 +203,8 @@ pub enum ClientBuildError {
     SlidingSyncVersion(VersionBuilderError),
     #[error(transparent)]
     Sdk(MatrixClientBuildError),
+    #[error(transparent)]
+    EventCache(#[from] EventCacheError),
     #[error("Failed to build the client: {message}")]
     Generic { message: String },
 }
@@ -269,6 +272,10 @@ pub struct ClientBuilder {
     room_key_recipient_strategy: CollectStrategy,
     decryption_trust_requirement: TrustRequirement,
     request_config: Option<RequestConfig>,
+
+    /// Whether to enable use of the event cache store, for reloading events
+    /// when building timelines et al.
+    use_event_cache_persistent_storage: bool,
 }
 
 #[matrix_sdk_ffi_macros::export]
@@ -299,7 +306,25 @@ impl ClientBuilder {
             room_key_recipient_strategy: Default::default(),
             decryption_trust_requirement: TrustRequirement::Untrusted,
             request_config: Default::default(),
+            use_event_cache_persistent_storage: false,
         })
+    }
+
+    /// Whether to use the event cache persistent storage or not.
+    ///
+    /// This is a temporary feature flag, for testing the event cache's
+    /// persistent storage. Follow new developments in https://github.com/matrix-org/matrix-rust-sdk/issues/3280.
+    ///
+    /// This is disabled by default. When disabled, a one-time cleanup is
+    /// performed when creating the client, and it will clear all the events
+    /// previously stored in the event cache.
+    ///
+    /// When enabled, it will attempt to store events in the event cache as
+    /// they're received, and reuse them when reconstructing timelines.
+    pub fn use_event_cache_persistent_storage(self: Arc<Self>, value: bool) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.use_event_cache_persistent_storage = value;
+        Arc::new(builder)
     }
 
     pub fn cross_process_store_locks_holder_name(
@@ -484,8 +509,8 @@ impl ClientBuilder {
         }
 
         if let Some(session_paths) = &builder.session_paths {
-            let data_path = PathBuf::from(&session_paths.data_path);
-            let cache_path = PathBuf::from(&session_paths.cache_path);
+            let data_path = Path::new(&session_paths.data_path);
+            let cache_path = Path::new(&session_paths.cache_path);
 
             debug!(
                 data_path = %data_path.to_string_lossy(),
@@ -493,12 +518,12 @@ impl ClientBuilder {
                 "Creating directories for data and cache stores.",
             );
 
-            fs::create_dir_all(&data_path)?;
-            fs::create_dir_all(&cache_path)?;
+            fs::create_dir_all(data_path)?;
+            fs::create_dir_all(cache_path)?;
 
             inner_builder = inner_builder.sqlite_store_with_cache_path(
-                &data_path,
-                &cache_path,
+                data_path,
+                cache_path,
                 builder.passphrase.as_deref(),
             );
         } else {
@@ -623,6 +648,19 @@ impl ClientBuilder {
         }
 
         let sdk_client = inner_builder.build().await?;
+
+        if builder.use_event_cache_persistent_storage {
+            // Enable the persistent storage \o/
+            sdk_client.event_cache().enable_storage()?;
+        } else {
+            // Get rid of all the previous events, if any.
+            let store = sdk_client
+                .event_cache_store()
+                .lock()
+                .await
+                .map_err(EventCacheError::LockingStorage)?;
+            store.clear_all_rooms_chunks().await.map_err(EventCacheError::Storage)?;
+        }
 
         Ok(Arc::new(
             Client::new(sdk_client, builder.enable_oidc_refresh_lock, builder.session_delegate)

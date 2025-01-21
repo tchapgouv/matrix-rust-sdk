@@ -17,7 +17,10 @@ use std::{collections::BTreeMap, fmt};
 use ruma::{
     events::{AnyMessageLikeEvent, AnySyncTimelineEvent, AnyTimelineEvent},
     push::Action,
-    serde::{JsonObject, Raw},
+    serde::{
+        AsRefStr, AsStrAsRefStr, DebugAsRefStr, DeserializeFromCowStr, FromString, JsonObject, Raw,
+        SerializeAsRefStr,
+    },
     DeviceKeyAlgorithm, OwnedDeviceId, OwnedEventId, OwnedUserId,
 };
 use serde::{Deserialize, Serialize};
@@ -176,6 +179,7 @@ pub enum VerificationLevel {
 
     /// The message was sent by a user identity we have not verified, but the
     /// user was previously verified.
+    #[serde(alias = "PreviouslyVerified")]
     VerificationViolation,
 
     /// The message was sent by a device not linked to (signed by) any user
@@ -259,6 +263,7 @@ pub enum ShieldStateCode {
     /// An unencrypted event in an encrypted room.
     SentInClear,
     /// The sender was previously verified but changed their identity.
+    #[serde(alias = "PreviouslyVerified")]
     VerificationViolation,
 }
 
@@ -303,6 +308,22 @@ pub struct EncryptionInfo {
 /// Previously, this differed from [`TimelineEvent`] by wrapping an
 /// [`AnySyncTimelineEvent`] instead of an [`AnyTimelineEvent`], but nowadays
 /// they are essentially identical, and one of them should probably be removed.
+//
+// 🚨 Note about this type, please read! 🚨
+//
+// `SyncTimelineEvent` is heavily used across the SDK crates. In some cases, we
+// are reaching a [`recursion_limit`] when the compiler is trying to figure out
+// if `SyncTimelineEvent` implements `Sync` when it's embedded in other types.
+//
+// We want to help the compiler so that one doesn't need to increase the
+// `recursion_limit`. We stop the recursive check by (un)safely implement `Sync`
+// and `Send` on `SyncTimelineEvent` directly.
+//
+// See
+// https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823
+// which has addressed this issue first
+//
+// [`recursion_limit`]: https://doc.rust-lang.org/reference/attributes/limits.html#the-recursion_limit-attribute
 #[derive(Clone, Debug, Serialize)]
 pub struct SyncTimelineEvent {
     /// The event itself, together with any information on decryption.
@@ -311,6 +332,23 @@ pub struct SyncTimelineEvent {
     /// The push actions associated with this event.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub push_actions: Vec<Action>,
+}
+
+// See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
+#[cfg(not(feature = "test-send-sync"))]
+unsafe impl Send for SyncTimelineEvent {}
+
+// See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
+#[cfg(not(feature = "test-send-sync"))]
+unsafe impl Sync for SyncTimelineEvent {}
+
+#[cfg(feature = "test-send-sync")]
+#[test]
+// See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
+fn test_send_sync_for_sync_timeline_event() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<SyncTimelineEvent>();
 }
 
 impl SyncTimelineEvent {
@@ -350,6 +388,19 @@ impl SyncTimelineEvent {
     /// this `TimelineEvent`.
     pub fn raw(&self) -> &Raw<AnySyncTimelineEvent> {
         self.kind.raw()
+    }
+
+    /// Replace the raw event included in this item by another one.
+    pub fn replace_raw(&mut self, replacement: Raw<AnyMessageLikeEvent>) {
+        match &mut self.kind {
+            TimelineEventKind::Decrypted(decrypted) => decrypted.event = replacement,
+            TimelineEventKind::UnableToDecrypt { event, .. }
+            | TimelineEventKind::PlainText { event } => {
+                // It's safe to cast `AnyMessageLikeEvent` into `AnySyncMessageLikeEvent`,
+                // because the former contains a superset of the fields included in the latter.
+                *event = replacement.cast();
+            }
+        }
     }
 
     /// If the event was a decrypted event that was successfully decrypted, get
@@ -666,12 +717,30 @@ pub struct UnableToDecryptInfo {
     pub session_id: Option<String>,
 
     /// Reason code for the decryption failure
-    #[serde(default = "unknown_utd_reason")]
+    #[serde(default = "unknown_utd_reason", deserialize_with = "deserialize_utd_reason")]
     pub reason: UnableToDecryptReason,
 }
 
 fn unknown_utd_reason() -> UnableToDecryptReason {
     UnableToDecryptReason::Unknown
+}
+
+/// Provides basic backward compatibility for deserializing older serialized
+/// `UnableToDecryptReason` values.
+pub fn deserialize_utd_reason<'de, D>(d: D) -> Result<UnableToDecryptReason, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Start by deserializing as to an untyped JSON value.
+    let v: serde_json::Value = Deserialize::deserialize(d)?;
+    // Backwards compatibility: `MissingMegolmSession` used to be stored without the
+    // withheld code.
+    if v.as_str().is_some_and(|s| s == "MissingMegolmSession") {
+        return Ok(UnableToDecryptReason::MissingMegolmSession { withheld_code: None });
+    }
+    // Otherwise, use the derived deserialize impl to turn the JSON into a
+    // UnableToDecryptReason
+    serde_json::from_value::<UnableToDecryptReason>(v).map_err(serde::de::Error::custom)
 }
 
 /// Reason code for a decryption failure
@@ -689,9 +758,11 @@ pub enum UnableToDecryptReason {
 
     /// Decryption failed because we're missing the megolm session that was used
     /// to encrypt the event.
-    ///
-    /// TODO: support withheld codes?
-    MissingMegolmSession,
+    MissingMegolmSession {
+        /// If the key was withheld on purpose, the associated code. `None`
+        /// means no withheld code was received.
+        withheld_code: Option<WithheldCode>,
+    },
 
     /// Decryption failed because, while we have the megolm session that was
     /// used to encrypt the message, it is ratcheted too far forward.
@@ -723,7 +794,86 @@ impl UnableToDecryptReason {
     /// Returns true if this UTD is due to a missing room key (and hence might
     /// resolve itself if we wait a bit.)
     pub fn is_missing_room_key(&self) -> bool {
-        matches!(self, Self::MissingMegolmSession | Self::UnknownMegolmMessageIndex)
+        // In case of MissingMegolmSession with a withheld code we return false here
+        // given that this API is used to decide if waiting a bit will help.
+        matches!(
+            self,
+            Self::MissingMegolmSession { withheld_code: None } | Self::UnknownMegolmMessageIndex
+        )
+    }
+}
+
+/// A machine-readable code for why a Megolm key was not sent.
+///
+/// Normally sent as the payload of an [`m.room_key.withheld`](https://spec.matrix.org/v1.12/client-server-api/#mroom_keywithheld) to-device message.
+#[derive(
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    AsStrAsRefStr,
+    AsRefStr,
+    FromString,
+    DebugAsRefStr,
+    SerializeAsRefStr,
+    DeserializeFromCowStr,
+)]
+pub enum WithheldCode {
+    /// the user/device was blacklisted.
+    #[ruma_enum(rename = "m.blacklisted")]
+    Blacklisted,
+
+    /// the user/devices is unverified.
+    #[ruma_enum(rename = "m.unverified")]
+    Unverified,
+
+    /// The user/device is not allowed have the key. For example, this would
+    /// usually be sent in response to a key request if the user was not in
+    /// the room when the message was sent.
+    #[ruma_enum(rename = "m.unauthorised")]
+    Unauthorised,
+
+    /// Sent in reply to a key request if the device that the key is requested
+    /// from does not have the requested key.
+    #[ruma_enum(rename = "m.unavailable")]
+    Unavailable,
+
+    /// An olm session could not be established.
+    /// This may happen, for example, if the sender was unable to obtain a
+    /// one-time key from the recipient.
+    #[ruma_enum(rename = "m.no_olm")]
+    NoOlm,
+
+    #[doc(hidden)]
+    _Custom(PrivOwnedStr),
+}
+
+impl fmt::Display for WithheldCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        let string = match self {
+            WithheldCode::Blacklisted => "The sender has blocked you.",
+            WithheldCode::Unverified => "The sender has disabled encrypting to unverified devices.",
+            WithheldCode::Unauthorised => "You are not authorised to read the message.",
+            WithheldCode::Unavailable => "The requested key was not found.",
+            WithheldCode::NoOlm => "Unable to establish a secure channel.",
+            _ => self.as_str(),
+        };
+
+        f.write_str(string)
+    }
+}
+
+// The Ruma macro expects the type to have this name.
+// The payload is counter intuitively made public in order to avoid having
+// multiple copies of this struct.
+#[doc(hidden)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PrivOwnedStr(pub Box<str>);
+
+#[cfg(not(tarpaulin_include))]
+impl fmt::Debug for PrivOwnedStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -805,21 +955,22 @@ mod tests {
     use std::collections::BTreeMap;
 
     use assert_matches::assert_matches;
+    use insta::{assert_json_snapshot, with_settings};
     use ruma::{
-        event_id,
+        device_id, event_id,
         events::{room::message::RoomMessageEventContent, AnySyncTimelineEvent},
         serde::Raw,
-        user_id,
+        user_id, DeviceKeyAlgorithm,
     };
     use serde::Deserialize;
     use serde_json::json;
 
     use super::{
-        AlgorithmInfo, DecryptedRoomEvent, EncryptionInfo, SyncTimelineEvent, TimelineEvent,
-        TimelineEventKind, UnableToDecryptInfo, UnableToDecryptReason, UnsignedDecryptionResult,
-        UnsignedEventLocation, VerificationState,
+        AlgorithmInfo, DecryptedRoomEvent, DeviceLinkProblem, EncryptionInfo, ShieldState,
+        ShieldStateCode, SyncTimelineEvent, TimelineEvent, TimelineEventKind, UnableToDecryptInfo,
+        UnableToDecryptReason, UnsignedDecryptionResult, UnsignedEventLocation, VerificationLevel,
+        VerificationState, WithheldCode,
     };
-    use crate::deserialized_responses::{DeviceLinkProblem, VerificationLevel};
 
     fn example_event() -> serde_json::Value {
         json!({
@@ -892,6 +1043,74 @@ mod tests {
             deserialized.state,
             VerificationState::Unverified(VerificationLevel::UnsignedDevice)
         );
+    }
+
+    #[test]
+    fn test_verification_level_deserializes() {
+        // Given a JSON VerificationLevel
+        #[derive(Deserialize)]
+        struct Container {
+            verification_level: VerificationLevel,
+        }
+        let container = json!({ "verification_level": "VerificationViolation" });
+
+        // When we deserialize it
+        let deserialized: Container = serde_json::from_value(container)
+            .expect("We can deserialize the old PreviouslyVerified value");
+
+        // Then it is populated correctly
+        assert_eq!(deserialized.verification_level, VerificationLevel::VerificationViolation);
+    }
+
+    #[test]
+    fn test_verification_level_deserializes_from_old_previously_verified_value() {
+        // Given a JSON VerificationLevel with the old value PreviouslyVerified
+        #[derive(Deserialize)]
+        struct Container {
+            verification_level: VerificationLevel,
+        }
+        let container = json!({ "verification_level": "PreviouslyVerified" });
+
+        // When we deserialize it
+        let deserialized: Container = serde_json::from_value(container)
+            .expect("We can deserialize the old PreviouslyVerified value");
+
+        // Then it is migrated to the new value
+        assert_eq!(deserialized.verification_level, VerificationLevel::VerificationViolation);
+    }
+
+    #[test]
+    fn test_shield_state_code_deserializes() {
+        // Given a JSON ShieldStateCode with value VerificationViolation
+        #[derive(Deserialize)]
+        struct Container {
+            shield_state_code: ShieldStateCode,
+        }
+        let container = json!({ "shield_state_code": "VerificationViolation" });
+
+        // When we deserialize it
+        let deserialized: Container = serde_json::from_value(container)
+            .expect("We can deserialize the old PreviouslyVerified value");
+
+        // Then it is populated correctly
+        assert_eq!(deserialized.shield_state_code, ShieldStateCode::VerificationViolation);
+    }
+
+    #[test]
+    fn test_shield_state_code_deserializes_from_old_previously_verified_value() {
+        // Given a JSON ShieldStateCode with the old value PreviouslyVerified
+        #[derive(Deserialize)]
+        struct Container {
+            shield_state_code: ShieldStateCode,
+        }
+        let container = json!({ "shield_state_code": "PreviouslyVerified" });
+
+        // When we deserialize it
+        let deserialized: Container = serde_json::from_value(container)
+            .expect("We can deserialize the old PreviouslyVerified value");
+
+        // Then it is migrated to the new value
+        assert_eq!(deserialized.shield_state_code, ShieldStateCode::VerificationViolation);
     }
 
     #[test]
@@ -1036,6 +1255,238 @@ mod tests {
                     assert_eq!(utd_info.reason, UnableToDecryptReason::Unknown);
                 })
             });
+        });
+    }
+
+    #[test]
+    fn sync_timeline_event_deserialisation_migration_for_withheld() {
+        // Old serialized version was
+        //    "utd_info": {
+        //         "reason": "MissingMegolmSession",
+        //         "session_id": "session000"
+        //       }
+
+        // The new version would be
+        //      "utd_info": {
+        //         "reason": {
+        //           "MissingMegolmSession": {
+        //              "withheld_code": null
+        //           }
+        //         },
+        //         "session_id": "session000"
+        //       }
+
+        let serialized = json!({
+             "kind": {
+                "UnableToDecrypt": {
+                  "event": {
+                    "content": {
+                      "algorithm": "m.megolm.v1.aes-sha2",
+                      "ciphertext": "AwgAEoABzL1JYhqhjW9jXrlT3M6H8mJ4qffYtOQOnPuAPNxsuG20oiD/Fnpv6jnQGhU6YbV9pNM+1mRnTvxW3CbWOPjLKqCWTJTc7Q0vDEVtYePg38ncXNcwMmfhgnNAoW9S7vNs8C003x3yUl6NeZ8bH+ci870BZL+kWM/lMl10tn6U7snNmSjnE3ckvRdO+11/R4//5VzFQpZdf4j036lNSls/WIiI67Fk9iFpinz9xdRVWJFVdrAiPFwb8L5xRZ8aX+e2JDMlc1eW8gk",
+                      "device_id": "SKCGPNUWAU",
+                      "sender_key": "Gim/c7uQdSXyrrUbmUOrBT6sMC0gO7QSLmOK6B7NOm0",
+                      "session_id": "hgLyeSqXfb8vc5AjQLsg6TSHVu0HJ7HZ4B6jgMvxkrs"
+                    },
+                    "event_id": "$xxxxx:example.org",
+                    "origin_server_ts": 2189,
+                    "room_id": "!someroom:example.com",
+                    "sender": "@carl:example.com",
+                    "type": "m.room.message"
+                  },
+                  "utd_info": {
+                    "reason": "MissingMegolmSession",
+                    "session_id": "session000"
+                  }
+                }
+              }
+        });
+
+        let result = serde_json::from_value(serialized);
+        assert!(result.is_ok());
+
+        // should have migrated to the new format
+        let event: SyncTimelineEvent = result.unwrap();
+        assert_matches!(
+            event.kind,
+            TimelineEventKind::UnableToDecrypt { utd_info, .. }=> {
+                assert_matches!(
+                    utd_info.reason,
+                    UnableToDecryptReason::MissingMegolmSession { withheld_code: None }
+                );
+            }
+        )
+    }
+
+    #[test]
+    fn unable_to_decrypt_info_migration_for_withheld() {
+        let old_format = json!({
+            "reason": "MissingMegolmSession",
+            "session_id": "session000"
+        });
+
+        let deserialized = serde_json::from_value::<UnableToDecryptInfo>(old_format).unwrap();
+        let session_id = Some("session000".to_owned());
+
+        assert_eq!(deserialized.session_id, session_id);
+        assert_eq!(
+            deserialized.reason,
+            UnableToDecryptReason::MissingMegolmSession { withheld_code: None },
+        );
+
+        let new_format = json!({
+             "session_id": "session000",
+              "reason": {
+                "MissingMegolmSession": {
+                  "withheld_code": null
+                }
+              }
+        });
+
+        let deserialized = serde_json::from_value::<UnableToDecryptInfo>(new_format).unwrap();
+
+        assert_eq!(
+            deserialized.reason,
+            UnableToDecryptReason::MissingMegolmSession { withheld_code: None },
+        );
+        assert_eq!(deserialized.session_id, session_id);
+    }
+
+    #[test]
+    fn unable_to_decrypt_reason_is_missing_room_key() {
+        let reason = UnableToDecryptReason::MissingMegolmSession { withheld_code: None };
+        assert!(reason.is_missing_room_key());
+
+        let reason = UnableToDecryptReason::MissingMegolmSession {
+            withheld_code: Some(WithheldCode::Blacklisted),
+        };
+        assert!(!reason.is_missing_room_key());
+
+        let reason = UnableToDecryptReason::UnknownMegolmMessageIndex;
+        assert!(reason.is_missing_room_key());
+    }
+
+    #[test]
+    fn snapshot_test_verification_level() {
+        assert_json_snapshot!(VerificationLevel::VerificationViolation);
+        assert_json_snapshot!(VerificationLevel::UnsignedDevice);
+        assert_json_snapshot!(VerificationLevel::None(DeviceLinkProblem::InsecureSource));
+        assert_json_snapshot!(VerificationLevel::None(DeviceLinkProblem::MissingDevice));
+        assert_json_snapshot!(VerificationLevel::UnverifiedIdentity);
+    }
+
+    #[test]
+    fn snapshot_test_verification_states() {
+        assert_json_snapshot!(VerificationState::Unverified(VerificationLevel::UnsignedDevice));
+        assert_json_snapshot!(VerificationState::Unverified(
+            VerificationLevel::VerificationViolation
+        ));
+        assert_json_snapshot!(VerificationState::Unverified(VerificationLevel::None(
+            DeviceLinkProblem::InsecureSource,
+        )));
+        assert_json_snapshot!(VerificationState::Unverified(VerificationLevel::None(
+            DeviceLinkProblem::MissingDevice,
+        )));
+        assert_json_snapshot!(VerificationState::Verified);
+    }
+
+    #[test]
+    fn snapshot_test_shield_states() {
+        assert_json_snapshot!(ShieldState::None);
+        assert_json_snapshot!(ShieldState::Red {
+            code: ShieldStateCode::UnverifiedIdentity,
+            message: "a message"
+        });
+        assert_json_snapshot!(ShieldState::Grey {
+            code: ShieldStateCode::AuthenticityNotGuaranteed,
+            message: "authenticity of this message cannot be guaranteed",
+        });
+    }
+
+    #[test]
+    fn snapshot_test_shield_codes() {
+        assert_json_snapshot!(ShieldStateCode::AuthenticityNotGuaranteed);
+        assert_json_snapshot!(ShieldStateCode::UnknownDevice);
+        assert_json_snapshot!(ShieldStateCode::UnsignedDevice);
+        assert_json_snapshot!(ShieldStateCode::UnverifiedIdentity);
+        assert_json_snapshot!(ShieldStateCode::SentInClear);
+        assert_json_snapshot!(ShieldStateCode::VerificationViolation);
+    }
+
+    #[test]
+    fn snapshot_test_algorithm_info() {
+        let mut map = BTreeMap::new();
+        map.insert(DeviceKeyAlgorithm::Curve25519, "claimedclaimedcurve25519".to_owned());
+        map.insert(DeviceKeyAlgorithm::Ed25519, "claimedclaimeded25519".to_owned());
+        let info = AlgorithmInfo::MegolmV1AesSha2 {
+            curve25519_key: "curvecurvecurve".into(),
+            sender_claimed_keys: BTreeMap::from([
+                (DeviceKeyAlgorithm::Curve25519, "claimedclaimedcurve25519".to_owned()),
+                (DeviceKeyAlgorithm::Ed25519, "claimedclaimeded25519".to_owned()),
+            ]),
+        };
+
+        assert_json_snapshot!(info)
+    }
+
+    #[test]
+    fn snapshot_test_encryption_info() {
+        let info = EncryptionInfo {
+            sender: user_id!("@alice:localhost").to_owned(),
+            sender_device: Some(device_id!("ABCDEFGH").to_owned()),
+            algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                curve25519_key: "curvecurvecurve".into(),
+                sender_claimed_keys: Default::default(),
+            },
+            verification_state: VerificationState::Verified,
+        };
+
+        with_settings!({sort_maps =>true}, {
+            assert_json_snapshot!(info)
+        })
+    }
+
+    #[test]
+    fn snapshot_test_sync_timeline_event() {
+        let room_event = SyncTimelineEvent {
+            kind: TimelineEventKind::Decrypted(DecryptedRoomEvent {
+                event: Raw::new(&example_event()).unwrap().cast(),
+                encryption_info: EncryptionInfo {
+                    sender: user_id!("@sender:example.com").to_owned(),
+                    sender_device: Some(device_id!("ABCDEFGHIJ").to_owned()),
+                    algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                        curve25519_key: "xxx".to_owned(),
+                        sender_claimed_keys: BTreeMap::from([
+                            (
+                                DeviceKeyAlgorithm::Ed25519,
+                                "I3YsPwqMZQXHkSQbjFNEs7b529uac2xBpI83eN3LUXo".to_owned(),
+                            ),
+                            (
+                                DeviceKeyAlgorithm::Curve25519,
+                                "qzdW3F5IMPFl0HQgz5w/L5Oi/npKUFn8Um84acIHfPY".to_owned(),
+                            ),
+                        ]),
+                    },
+                    verification_state: VerificationState::Verified,
+                },
+                unsigned_encryption_info: Some(BTreeMap::from([(
+                    UnsignedEventLocation::RelationsThreadLatestEvent,
+                    UnsignedDecryptionResult::UnableToDecrypt(UnableToDecryptInfo {
+                        session_id: Some("xyz".to_owned()),
+                        reason: UnableToDecryptReason::MissingMegolmSession {
+                            withheld_code: Some(WithheldCode::Unverified),
+                        },
+                    }),
+                )])),
+            }),
+            push_actions: Default::default(),
+        };
+
+        with_settings!({sort_maps =>true}, {
+            // We use directly the serde_json formatter here, because of a bug in insta
+            // not serializing custom BTreeMap key enum https://github.com/mitsuhiko/insta/issues/689
+            assert_json_snapshot! {
+                serde_json::to_value(&room_event).unwrap(),
+            }
         });
     }
 }

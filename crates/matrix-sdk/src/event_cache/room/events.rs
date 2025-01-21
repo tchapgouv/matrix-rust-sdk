@@ -16,17 +16,21 @@ use std::cmp::Ordering;
 
 use eyeball_im::VectorDiff;
 pub use matrix_sdk_base::event_cache::{Event, Gap};
-use matrix_sdk_base::{
-    event_cache::store::DEFAULT_CHUNK_CAPACITY,
-    linked_chunk::{AsVector, ObservableUpdates},
-};
+use matrix_sdk_base::{apply_redaction, event_cache::store::DEFAULT_CHUNK_CAPACITY};
 use matrix_sdk_common::linked_chunk::{
-    Chunk, ChunkIdentifier, EmptyChunk, Error, Iter, LinkedChunk, Position,
+    AsVector, Chunk, ChunkIdentifier, EmptyChunk, Error, Iter, IterBackward, LinkedChunk,
+    ObservableUpdates, Position,
 };
-use ruma::OwnedEventId;
-use tracing::{debug, error, warn};
+use ruma::{
+    events::{room::redaction::SyncRoomRedactionEvent, AnySyncTimelineEvent},
+    OwnedEventId, RoomVersionId,
+};
+use tracing::{debug, error, instrument, trace, warn};
 
-use super::super::deduplicator::{Decoration, Deduplicator};
+use super::{
+    super::deduplicator::{Decoration, Deduplicator},
+    chunk_debug_string,
+};
 
 /// This type represents all events of a single room.
 #[derive(Debug)]
@@ -76,6 +80,11 @@ impl RoomEvents {
         Self { chunks, chunks_updates_as_vectordiffs, deduplicator }
     }
 
+    /// Returns whether the room has at least one event.
+    pub fn is_empty(&self) -> bool {
+        self.chunks.num_items() == 0
+    }
+
     /// Clear all events.
     ///
     /// All events, all gaps, everything is dropped, move into the void, into
@@ -84,15 +93,99 @@ impl RoomEvents {
         self.chunks.clear();
     }
 
+    /// If the given event is a redaction, try to retrieve the to-be-redacted
+    /// event in the chunk, and replace it by the redacted form.
+    #[instrument(skip_all)]
+    fn maybe_apply_new_redaction(&mut self, room_version: &RoomVersionId, event: &Event) {
+        let Ok(AnySyncTimelineEvent::MessageLike(
+            ruma::events::AnySyncMessageLikeEvent::RoomRedaction(redaction),
+        )) = event.raw().deserialize()
+        else {
+            return;
+        };
+
+        let Some(event_id) = redaction.redacts(room_version) else {
+            warn!("missing target event id from the redaction event");
+            return;
+        };
+
+        // Replace the redacted event by a redacted form, if we knew about it.
+        let mut items = self.chunks.items();
+
+        if let Some((pos, target_event)) =
+            items.find(|(_, item)| item.event_id().as_deref() == Some(event_id))
+        {
+            // Don't redact already redacted events.
+            if let Ok(deserialized) = target_event.raw().deserialize() {
+                match deserialized {
+                    AnySyncTimelineEvent::MessageLike(ev) => {
+                        if ev.original_content().is_none() {
+                            // Already redacted.
+                            return;
+                        }
+                    }
+                    AnySyncTimelineEvent::State(ev) => {
+                        if ev.original_content().is_none() {
+                            // Already redacted.
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if let Some(redacted_event) = apply_redaction(
+                target_event.raw(),
+                event.raw().cast_ref::<SyncRoomRedactionEvent>(),
+                room_version,
+            ) {
+                let mut copy = target_event.clone();
+
+                // It's safe to cast `redacted_event` here:
+                // - either the event was an `AnyTimelineEvent` cast to `AnySyncTimelineEvent`
+                //   when calling .raw(), so it's still one under the hood.
+                // - or it wasn't, and it's a plain `AnySyncTimelineEvent` in this case.
+                copy.replace_raw(redacted_event.cast());
+
+                // Get rid of the immutable borrow on self.chunks.
+                drop(items);
+
+                self.chunks
+                    .replace_item_at(pos, copy)
+                    .expect("should have been a valid position of an item");
+            }
+        } else {
+            trace!("redacted event is missing from the linked chunk");
+        }
+
+        // TODO: remove all related events too!
+    }
+
+    /// Callback to call whenever we touch events in the database.
+    pub fn on_new_events<'a>(
+        &mut self,
+        room_version: &RoomVersionId,
+        events: impl Iterator<Item = &'a Event>,
+    ) {
+        for ev in events {
+            self.maybe_apply_new_redaction(room_version, ev);
+        }
+    }
+
     /// Push events after all events or gaps.
     ///
     /// The last event in `events` is the most recent one.
-    pub fn push_events<I>(&mut self, events: I)
+    ///
+    /// Returns true if the linked chunk was modified, false otherwise.
+    pub fn push_events<I>(&mut self, events: I) -> bool
     where
         I: IntoIterator<Item = Event>,
     {
-        let (unique_events, duplicated_event_ids) =
-            self.filter_duplicated_events(events.into_iter());
+        let (events, duplicated_event_ids) =
+            self.collect_valid_and_duplicated_events(events.into_iter());
+
+        if deduplicated_all_new_events(events.len(), duplicated_event_ids.len()) {
+            return false;
+        }
 
         // Remove the _old_ duplicated events!
         //
@@ -101,21 +194,29 @@ impl RoomEvents {
         self.remove_events(duplicated_event_ids);
 
         // Push new `events`.
-        self.chunks.push_items_back(unique_events);
+        self.chunks.push_items_back(events);
+
+        true
     }
 
     /// Push a gap after all events or gaps.
     pub fn push_gap(&mut self, gap: Gap) {
-        self.chunks.push_gap_back(gap)
+        self.chunks.push_gap_back(gap);
     }
 
     /// Insert events at a specified position.
-    pub fn insert_events_at<I>(&mut self, events: I, mut position: Position) -> Result<(), Error>
+    ///
+    /// Returns true if the linked chunk was modified.
+    pub fn insert_events_at<I>(&mut self, events: I, mut position: Position) -> Result<bool, Error>
     where
         I: IntoIterator<Item = Event>,
     {
-        let (unique_events, duplicated_event_ids) =
-            self.filter_duplicated_events(events.into_iter());
+        let (events, duplicated_event_ids) =
+            self.collect_valid_and_duplicated_events(events.into_iter());
+
+        if deduplicated_all_new_events(events.len(), duplicated_event_ids.len()) {
+            return Ok(false);
+        }
 
         // Remove the _old_ duplicated events!
         //
@@ -124,7 +225,9 @@ impl RoomEvents {
         // argument value for each removal.
         self.remove_events_and_update_insert_position(duplicated_event_ids, &mut position);
 
-        self.chunks.insert_items_at(unique_events, position)
+        self.chunks.insert_items_at(events, position)?;
+
+        Ok(true)
     }
 
     /// Insert a gap at a specified position.
@@ -137,18 +240,25 @@ impl RoomEvents {
     /// Because the `gap_identifier` can represent non-gap chunk, this method
     /// returns a `Result`.
     ///
-    /// This method returns a reference to the (first if many) newly created
-    /// `Chunk` that contains the `items`.
+    /// This method returns:
+    /// - a boolean indicating if we updated the linked chunk,
+    /// - the position of the (first if many) newly created `Chunk` that
+    ///   contains the `items`.
     pub fn replace_gap_at<I>(
         &mut self,
         events: I,
         gap_identifier: ChunkIdentifier,
-    ) -> Result<&Chunk<DEFAULT_CHUNK_CAPACITY, Event, Gap>, Error>
+    ) -> Result<(bool, Option<Position>), Error>
     where
         I: IntoIterator<Item = Event>,
     {
-        let (unique_events, duplicated_event_ids) =
-            self.filter_duplicated_events(events.into_iter());
+        let (events, duplicated_event_ids) =
+            self.collect_valid_and_duplicated_events(events.into_iter());
+
+        if deduplicated_all_new_events(events.len(), duplicated_event_ids.len()) {
+            let pos = self.chunks.remove_gap_at(gap_identifier)?;
+            return Ok((false, pos));
+        }
 
         // Remove the _old_ duplicated events!
         //
@@ -157,8 +267,16 @@ impl RoomEvents {
         // because of the removals.
         self.remove_events(duplicated_event_ids);
 
-        // Replace the gap by new events.
-        self.chunks.replace_gap_at(unique_events, gap_identifier)
+        let next_pos = if events.is_empty() {
+            // There are no new events, so there's no need to create a new empty items
+            // chunk; instead, remove the gap.
+            self.chunks.remove_gap_at(gap_identifier)?
+        } else {
+            // Replace the gap by new events.
+            Some(self.chunks.replace_gap_at(events, gap_identifier)?.first_position())
+        };
+
+        Ok((true, next_pos))
     }
 
     /// Search for a chunk, and return its identifier.
@@ -174,6 +292,13 @@ impl RoomEvents {
     /// The oldest chunk comes first.
     pub fn chunks(&self) -> Iter<'_, DEFAULT_CHUNK_CAPACITY, Event, Gap> {
         self.chunks.chunks()
+    }
+
+    /// Iterate over the chunks, backward.
+    ///
+    /// The most recent chunk comes first.
+    pub fn rchunks(&self) -> IterBackward<'_, DEFAULT_CHUNK_CAPACITY, Event, Gap> {
+        self.chunks.rchunks()
     }
 
     /// Iterate over the events, backward.
@@ -197,7 +322,6 @@ impl RoomEvents {
     /// See [`AsVector`] to learn more.
     ///
     /// [`Update`]: matrix_sdk_base::linked_chunk::Update
-    #[allow(unused)] // gonna be useful very soon! but we need it now for test purposes
     pub fn updates_as_vector_diffs(&mut self) -> Vec<VectorDiff<Event>> {
         self.chunks_updates_as_vectordiffs.take()
     }
@@ -210,15 +334,18 @@ impl RoomEvents {
 
     /// Deduplicate `events` considering all events in `Self::chunks`.
     ///
-    /// The returned tuple contains (i) the unique events, and (ii) the
+    /// The returned tuple contains (i) all events with an ID, and (ii) the
     /// duplicated events (by ID).
-    fn filter_duplicated_events<'a, I>(&'a mut self, events: I) -> (Vec<Event>, Vec<OwnedEventId>)
+    fn collect_valid_and_duplicated_events<'a, I>(
+        &'a mut self,
+        events: I,
+    ) -> (Vec<Event>, Vec<OwnedEventId>)
     where
         I: Iterator<Item = Event> + 'a,
     {
         let mut duplicated_event_ids = Vec::new();
 
-        let deduplicated_events = self
+        let events = self
             .deduplicator
             .scan_and_learn(events, self)
             .filter_map(|decorated_event| match decorated_event {
@@ -245,8 +372,43 @@ impl RoomEvents {
             })
             .collect();
 
-        (deduplicated_events, duplicated_event_ids)
+        (events, duplicated_event_ids)
     }
+
+    /// Return a nice debug string (a vector of lines) for the linked chunk of
+    /// events for this room.
+    pub fn debug_string(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        for c in self.chunks() {
+            let content = chunk_debug_string(c.content());
+            let line = format!("chunk #{}: {content}", c.identifier().index());
+            result.push(line);
+        }
+        result
+    }
+}
+
+/// Whenever we add new events to the linked chunk, did we *at least add one*,
+/// and all the added events were already known (deduplicated)?
+///
+/// This is useful to know whether we need to store a previous-batch token (gap)
+/// we received from a server-side request (sync or back-pagination), or if we
+/// should *not* store it.
+///
+/// Since there can be empty back-paginations with a previous-batch token (that
+/// is, they don't contain any events), we need to make sure that there is *at
+/// least* one new event that has been added. Otherwise, we might conclude
+/// something wrong because a subsequent back-pagination might
+/// return non-duplicated events.
+///
+/// If we had already seen all the duplicated events that we're trying to add,
+/// then it would be wasteful to store a previous-batch token, or even touch the
+/// linked chunk: we would repeat back-paginations for events that we have
+/// already seen, and possibly misplace them. And we should not be missing
+/// events either: the already-known events would have their own previous-batch
+/// token (it might already be consumed).
+fn deduplicated_all_new_events(num_new_unique: usize, num_duplicated: usize) -> bool {
+    num_new_unique > 0 && num_new_unique == num_duplicated
 }
 
 // Private implementations, implementation specific.
@@ -432,28 +594,30 @@ mod tests {
     fn test_push_events_with_duplicates() {
         let (event_id_0, event_0) = new_event("$ev0");
         let (event_id_1, event_1) = new_event("$ev1");
+        let (event_id_2, event_2) = new_event("$ev1");
 
         let mut room_events = RoomEvents::new();
 
-        room_events.push_events([event_0.clone(), event_1]);
+        room_events.push_events([event_2.clone()]);
 
         assert_events_eq!(
             room_events.events(),
             [
-                (event_id_0 at (0, 0)),
-                (event_id_1 at (0, 1)),
+                (event_id_2 at (0, 0)),
             ]
         );
 
-        // Everything is alright. Now let's push a duplicated event.
-        room_events.push_events([event_0]);
+        // Everything is alright. Now let's push a duplicated event by simulating a
+        // wider sync.
+        room_events.push_events([event_0, event_1, event_2]);
 
         assert_events_eq!(
             room_events.events(),
             [
-                // The first `event_id_0` has been removed.
-                (event_id_1 at (0, 0)),
-                (event_id_0 at (0, 1)),
+                // The first `event_id_2` has been removed.
+                (event_id_0 at (0, 0)),
+                (event_id_1 at (0, 1)),
+                (event_id_2 at (0, 2)),
             ]
         );
     }
@@ -479,12 +643,11 @@ mod tests {
         // Everything is alright. Now let's push a duplicated event.
         room_events.push_events([event_0]);
 
-        // The event has been removed, then the chunk was empty, so removed, and a new
-        // chunk has been created with identifier 3.
+        // Nothing has changed in the linked chunk.
         assert_events_eq!(
             room_events.events(),
             [
-                (event_id_0 at (3, 0)),
+                (event_id_0 at (2, 0)),
             ]
         );
     }
@@ -682,9 +845,8 @@ mod tests {
 
         let chunk_identifier_of_gap = room_events
             .chunks()
-            .find_map(|chunk| chunk.is_gap().then_some(chunk.first_position()))
-            .unwrap()
-            .chunk_identifier();
+            .find_map(|chunk| chunk.is_gap().then_some(chunk.identifier()))
+            .unwrap();
 
         room_events.replace_gap_at([event_1, event_2], chunk_identifier_of_gap).unwrap();
 
@@ -723,9 +885,8 @@ mod tests {
 
         let chunk_identifier_of_gap = room_events
             .chunks()
-            .find_map(|chunk| chunk.is_gap().then_some(chunk.first_position()))
-            .unwrap()
-            .chunk_identifier();
+            .find_map(|chunk| chunk.is_gap().then_some(chunk.identifier()))
+            .unwrap();
 
         assert_events_eq!(
             room_events.events(),
@@ -759,6 +920,42 @@ mod tests {
 
             assert!(chunks.next().is_none());
         }
+    }
+
+    #[test]
+    fn test_replace_gap_at_with_no_new_events() {
+        let (_, event_0) = new_event("$ev0");
+        let (_, event_1) = new_event("$ev1");
+        let (_, event_2) = new_event("$ev2");
+
+        let mut room_events = RoomEvents::new();
+
+        room_events.push_events([event_0, event_1]);
+        room_events.push_gap(Gap { prev_token: "middle".to_owned() });
+        room_events.push_events([event_2]);
+        room_events.push_gap(Gap { prev_token: "end".to_owned() });
+
+        // Remove the first gap.
+        let first_gap_id = room_events
+            .chunks()
+            .find_map(|chunk| chunk.is_gap().then_some(chunk.identifier()))
+            .unwrap();
+
+        // The next insert position is the next chunk's start.
+        let (touched_linked_chunk, pos) = room_events.replace_gap_at([], first_gap_id).unwrap();
+        assert_eq!(pos, Some(Position::new(ChunkIdentifier::new(2), 0)));
+        assert!(touched_linked_chunk);
+
+        // Remove the second gap.
+        let second_gap_id = room_events
+            .chunks()
+            .find_map(|chunk| chunk.is_gap().then_some(chunk.identifier()))
+            .unwrap();
+
+        // No next insert position.
+        let (touched_linked_chunk, pos) = room_events.replace_gap_at([], second_gap_id).unwrap();
+        assert!(pos.is_none());
+        assert!(touched_linked_chunk);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use std::{
 };
 
 use itertools::{Either, Itertools};
+use matrix_sdk_common::deserialized_responses::WithheldCode;
 use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, trace};
@@ -27,7 +28,6 @@ use super::OutboundGroupSession;
 use crate::{
     error::{OlmResult, SessionRecipientCollectionError},
     store::Store,
-    types::events::room_key_withheld::WithheldCode,
     DeviceData, EncryptionSettings, LocalTrust, OlmError, OwnUserIdentityData, UserIdentityData,
 };
 #[cfg(doc)]
@@ -125,7 +125,7 @@ pub(crate) async fn collect_session_recipients(
     trace!(?users, ?settings, "Calculating group session recipients");
 
     let users_shared_with: BTreeSet<OwnedUserId> =
-        outbound.shared_with_set.read().unwrap().keys().cloned().collect();
+        outbound.shared_with_set.read().keys().cloned().collect();
 
     let users_shared_with: BTreeSet<&UserId> = users_shared_with.iter().map(Deref::deref).collect();
 
@@ -339,7 +339,7 @@ fn is_session_overshared_for_user(
     let recipient_device_ids: BTreeSet<&DeviceId> =
         recipient_devices.iter().map(|d| d.device_id()).collect();
 
-    let guard = outbound_session.shared_with_set.read().unwrap();
+    let guard = outbound_session.shared_with_set.read();
 
     let Some(shared) = guard.get(user_id) else {
         return false;
@@ -517,6 +517,7 @@ mod tests {
 
     use assert_matches::assert_matches;
     use assert_matches2::assert_let;
+    use matrix_sdk_common::deserialized_responses::WithheldCode;
     use matrix_sdk_test::{
         async_test, test_json,
         test_json::keys_query_sets::{
@@ -536,7 +537,6 @@ mod tests {
             group_sessions::share_strategy::collect_session_recipients, CollectStrategy,
         },
         testing::simulate_key_query_response_for_verification,
-        types::events::room_key_withheld::WithheldCode,
         CrossSigningKeyExport, EncryptionSettings, LocalTrust, OlmError, OlmMachine,
     };
 

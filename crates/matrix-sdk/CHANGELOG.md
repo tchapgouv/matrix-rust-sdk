@@ -2,6 +2,77 @@
 
 All notable changes to this project will be documented in this file.
 
+<!-- next-header -->
+
+## [Unreleased] - ReleaseDate
+
+### Features
+
+- Allow to set and check whether an image is animated via its `ImageInfo`.
+  ([#4503](https://github.com/matrix-org/matrix-rust-sdk/pull/4503))
+
+- Implement `Default` for `BaseImageInfo`, `BaseVideoInfo`, `BaseAudioInfo` and
+  `BaseFileInfo`.
+  ([#4503](https://github.com/matrix-org/matrix-rust-sdk/pull/4503))
+
+- Expose `Client::server_versions()` publicly to allow users of the library to
+  get the versions of Matrix supported by the homeserver.
+  ([#4519](https://github.com/matrix-org/matrix-rust-sdk/pull/4519))
+
+- Create `RoomPrivacySettings` helper to group room settings functionality
+  related to room access and visibility.
+  ([#4401](https://github.com/matrix-org/matrix-rust-sdk/pull/4401))
+
+### Refactor
+
+- [**breaking**] Move the optional `RequestConfig` argument of the
+  `Client::send()` method to the `with_request_config()` builder method. You
+  should call `Client::send(request).with_request_config(request_config).await`
+  now instead.
+  ([#4443](https://github.com/matrix-org/matrix-rust-sdk/pull/4443))
+
+- [**breaking**] Remove the `AttachmentConfig::with_thumbnail()` constructor and
+  replace it with the `AttachmentConfig::thumbnail()` builder method. You should
+  call `AttachmentConfig::new().thumbnail(thumbnail)` now instead.
+  ([#4452](https://github.com/matrix-org/matrix-rust-sdk/pull/4452))
+
+- [**breaking**] `Room::send_attachment()` and `RoomSendQueue::send_attachment()`
+  now take any type that implements `Into<String>` for the filename.
+  ([#4451](https://github.com/matrix-org/matrix-rust-sdk/pull/4451))
+
+- [**breaking**] `Recovery::are_we_the_last_man_standing()` has been renamed to `is_last_device()`.
+  ([#4522](https://github.com/matrix-org/matrix-rust-sdk/pull/4522))
+
+## [0.9.0] - 2024-12-18
+
+### Bug Fixes
+
+- Use the inviter's server name and the server name from the room alias as
+  fallback values for the via parameter when requesting the room summary from
+  the homeserver. This ensures requests succeed even when the room being
+  previewed is hosted on a federated server.
+  ([#4357](https://github.com/matrix-org/matrix-rust-sdk/pull/4357))
+
+- Do not use the encrypted original file's content type as the encrypted
+  thumbnail's content type.
+  ([#ecf4434](https://github.com/matrix-org/matrix-rust-sdk/commit/ecf44348cf6a872b843fb7d7af1a88f724c58c3e))
+
+### Features
+
+- Enable persistent storage for the `EventCache`. This allows events received
+  through the `/sync` endpoint or backpagination to be stored persistently,
+  enabling client applications to restore a room's view, including events,
+  without requiring server communication.
+  ([#4347](https://github.com/matrix-org/matrix-rust-sdk/pull/4347))
+
+- [**breaking**] Make all fields of Thumbnail required
+  ([#4324](https://github.com/matrix-org/matrix-rust-sdk/pull/4324))
+
+- `Backups::exists_on_server`, which always fetches up-to-date information from the
+  server about whether a key storage backup exists, was renamed to
+  `fetch_exists_on_the_server`, and a new implementation of `exists_on_server`
+  which caches the most recent answer is now provided.
+
 ## [0.8.0] - 2024-11-19
 
 ### Bug Fixes

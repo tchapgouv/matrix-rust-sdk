@@ -1,8 +1,9 @@
 #![allow(missing_docs)]
 
 use matrix_sdk_crypto::{
-    store::CryptoStoreError as InnerStoreError, KeyExportError, MegolmError, OlmError,
-    SecretImportError as RustSecretImportError, SignatureError as InnerSignatureError,
+    store::{CryptoStoreError as InnerStoreError, DehydrationError as InnerDehydrationError},
+    KeyExportError, MegolmError, OlmError, SecretImportError as RustSecretImportError,
+    SignatureError as InnerSignatureError,
 };
 use matrix_sdk_sqlite::OpenStoreError;
 use ruma::{IdParseError, OwnedUserId};
@@ -57,6 +58,8 @@ pub enum CryptoStoreError {
     InvalidUserId(String, IdParseError),
     #[error(transparent)]
     Identifier(#[from] IdParseError),
+    #[error(transparent)]
+    DehydrationError(#[from] InnerDehydrationError),
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -112,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_withheld_error_mapping() {
-        use matrix_sdk_crypto::types::events::room_key_withheld::WithheldCode;
+        use matrix_sdk_common::deserialized_responses::WithheldCode;
 
         let inner_error = MegolmError::MissingRoomKey(Some(WithheldCode::Unverified));
 

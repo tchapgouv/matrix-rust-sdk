@@ -61,7 +61,6 @@ pub mod futures {
 
     pub use super::client::futures::SendRequest;
 }
-#[cfg(feature = "experimental-sliding-sync")]
 pub mod sliding_sync;
 pub mod sync;
 #[cfg(feature = "experimental-widgets")]
@@ -85,7 +84,6 @@ pub use media::Media;
 pub use pusher::Pusher;
 pub use room::Room;
 pub use ruma::{IdParseError, OwnedServerName, ServerName};
-#[cfg(feature = "experimental-sliding-sync")]
 pub use sliding_sync::{
     SlidingSync, SlidingSyncBuilder, SlidingSyncList, SlidingSyncListBuilder,
     SlidingSyncListLoadingState, SlidingSyncMode, SlidingSyncRoom, UpdateSummary,
@@ -94,6 +92,7 @@ pub use sliding_sync::{
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
+pub mod live_location_share;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
 

@@ -21,7 +21,7 @@ use tracing::error;
 
 use super::{
     Chunk, ChunkContent, ChunkIdentifier, ChunkIdentifierGenerator, Ends, LinkedChunk,
-    ObservableUpdates,
+    ObservableUpdates, RawChunk,
 };
 
 /// A temporary chunk representation in the [`LinkedChunkBuilder`].
@@ -31,7 +31,6 @@ use super::{
 /// which will get resolved later when re-building the full data structure. This
 /// allows using chunks that references other chunks that aren't known yet.
 struct TemporaryChunk<Item, Gap> {
-    id: ChunkIdentifier,
     previous: Option<ChunkIdentifier>,
     next: Option<ChunkIdentifier>,
     content: ChunkContent<Item, Gap>,
@@ -79,7 +78,7 @@ impl<const CAP: usize, Item, Gap> LinkedChunkBuilder<CAP, Item, Gap> {
         next: Option<ChunkIdentifier>,
         content: Gap,
     ) {
-        let chunk = TemporaryChunk { id, previous, next, content: ChunkContent::Gap(content) };
+        let chunk = TemporaryChunk { previous, next, content: ChunkContent::Gap(content) };
         self.chunks.insert(id, chunk);
     }
 
@@ -96,7 +95,6 @@ impl<const CAP: usize, Item, Gap> LinkedChunkBuilder<CAP, Item, Gap> {
         items: impl IntoIterator<Item = Item>,
     ) {
         let chunk = TemporaryChunk {
-            id,
             previous,
             next,
             content: ChunkContent::Items(items.into_iter().collect()),
@@ -260,6 +258,22 @@ impl<const CAP: usize, Item, Gap> LinkedChunkBuilder<CAP, Item, Gap> {
 
         Ok(Some(LinkedChunk { links, chunk_identifier_generator, updates, marker: PhantomData }))
     }
+
+    /// Fills a linked chunk builder from all the given raw parts.
+    pub fn from_raw_parts(raws: Vec<RawChunk<Item, Gap>>) -> Self {
+        let mut this = Self::new();
+        for raw in raws {
+            match raw.content {
+                ChunkContent::Gap(gap) => {
+                    this.push_gap(raw.previous, raw.identifier, raw.next, gap);
+                }
+                ChunkContent::Items(vec) => {
+                    this.push_items(raw.previous, raw.identifier, raw.next, vec);
+                }
+            }
+        }
+        this
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -356,7 +370,7 @@ mod tests {
         assert!(chunks.next().is_none());
 
         // The linked chunk had 5 items.
-        assert_eq!(lc.len(), 5);
+        assert_eq!(lc.num_items(), 5);
 
         // Now, if we add a new chunk, its identifier should be the previous one we used
         // + 1.

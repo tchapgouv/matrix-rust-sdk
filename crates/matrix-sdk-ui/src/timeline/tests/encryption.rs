@@ -127,7 +127,7 @@ async fn test_retry_message_decryption() {
     assert_eq!(session_id, SESSION_ID);
 
     assert_next_matches!(stream, VectorDiff::PushFront { value } => {
-        assert!(value.is_day_divider());
+        assert!(value.is_date_divider());
     });
 
     {
@@ -348,6 +348,7 @@ async fn test_retry_edit_decryption() {
     let item = items[1].as_event().unwrap();
 
     assert_matches!(item.encryption_info(), Some(_));
+    assert_matches!(item.latest_edit_json(), Some(_));
     assert_let!(TimelineItemContent::Message(msg) = item.content());
     assert!(msg.is_edited());
     assert_eq!(msg.body(), "This is Error");
@@ -451,11 +452,10 @@ async fn test_retry_edit_and_more() {
 
     let timeline_items = timeline.controller.items().await;
     assert_eq!(timeline_items.len(), 3);
-    assert!(timeline_items[0].is_day_divider());
-    assert_eq!(
-        timeline_items[1].as_event().unwrap().content().as_message().unwrap().body(),
-        "edited"
-    );
+    assert!(timeline_items[0].is_date_divider());
+    let timeline_event = timeline_items[1].as_event().unwrap();
+    assert!(timeline_event.latest_edit_json().is_some());
+    assert_eq!(timeline_event.content().as_message().unwrap().body(), "edited");
     assert_eq!(
         timeline_items[2].as_event().unwrap().content().as_message().unwrap().body(),
         "Another message"
@@ -520,8 +520,8 @@ async fn test_retry_message_decryption_highlighted() {
     );
     assert_eq!(session_id, SESSION_ID);
 
-    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
-    assert!(day_divider.is_day_divider());
+    let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(date_divider.is_date_divider());
 
     let own_user_id = user_id!("@example:matrix.org");
     let exported_keys = decrypt_room_key_export(Cursor::new(SESSION_KEY), "1234").unwrap();
@@ -774,7 +774,7 @@ fn utd_event_with_unsigned(unsigned: serde_json::Value) -> SyncTimelineEvent {
         raw,
         matrix_sdk::deserialized_responses::UnableToDecryptInfo {
             session_id: Some("SESSION_ID".into()),
-            reason: UnableToDecryptReason::MissingMegolmSession,
+            reason: UnableToDecryptReason::MissingMegolmSession { withheld_code: None },
         },
     )
 }

@@ -15,15 +15,15 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
-    sync::RwLock as StdRwLock,
-    time::Instant,
 };
 
 use async_trait::async_trait;
-use matrix_sdk_common::store_locks::memory_store_helper::try_take_leased_lock;
+use matrix_sdk_common::{
+    locks::RwLock as StdRwLock, store_locks::memory_store_helper::try_take_leased_lock,
+};
 use ruma::{
-    events::secret::request::SecretName, DeviceId, OwnedDeviceId, OwnedRoomId, OwnedTransactionId,
-    OwnedUserId, RoomId, TransactionId, UserId,
+    events::secret::request::SecretName, time::Instant, DeviceId, OwnedDeviceId, OwnedRoomId,
+    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
 };
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -31,8 +31,8 @@ use vodozemac::Curve25519PublicKey;
 
 use super::{
     caches::{DeviceStore, GroupSessionStore},
-    Account, BackupKeys, Changes, CryptoStore, InboundGroupSession, PendingChanges, RoomKeyCounts,
-    RoomSettings, Session,
+    Account, BackupKeys, Changes, CryptoStore, DehydratedDeviceKey, InboundGroupSession,
+    PendingChanges, RoomKeyCounts, RoomSettings, Session,
 };
 use crate::{
     gossiping::{GossipRequest, GossippedSecret, SecretInfo},
@@ -93,6 +93,7 @@ pub struct MemoryStore {
     leases: StdRwLock<HashMap<String, (String, Instant)>>,
     secret_inbox: StdRwLock<HashMap<String, Vec<GossippedSecret>>>,
     backup_keys: RwLock<BackupKeys>,
+    dehydrated_device_pickle_key: RwLock<Option<DehydratedDeviceKey>>,
     next_batch_token: RwLock<Option<String>>,
     room_settings: StdRwLock<HashMap<OwnedRoomId, RoomSettings>>,
 }
@@ -116,6 +117,7 @@ impl Default for MemoryStore {
             custom_values: Default::default(),
             leases: Default::default(),
             backup_keys: Default::default(),
+            dehydrated_device_pickle_key: Default::default(),
             secret_inbox: Default::default(),
             next_batch_token: Default::default(),
             room_settings: Default::default(),
@@ -142,7 +144,7 @@ impl MemoryStore {
     }
 
     fn save_sessions(&self, sessions: Vec<Session>) {
-        let mut session_store = self.sessions.write().unwrap();
+        let mut session_store = self.sessions.write();
 
         for session in sessions {
             let entry = session_store.entry(session.sender_key().to_base64()).or_default();
@@ -158,12 +160,11 @@ impl MemoryStore {
     fn save_outbound_group_sessions(&self, sessions: Vec<OutboundGroupSession>) {
         self.outbound_group_sessions
             .write()
-            .unwrap()
             .extend(sessions.into_iter().map(|s| (s.room_id().to_owned(), s)));
     }
 
     fn save_private_identity(&self, private_identity: Option<PrivateCrossSigningIdentity>) {
-        *self.private_identity.write().unwrap() = private_identity;
+        *self.private_identity.write() = private_identity;
     }
 
     /// Return all the [`InboundGroupSession`]s we have, paired with the
@@ -175,7 +176,6 @@ impl MemoryStore {
         let lookup = |s: &InboundGroupSession| {
             self.inbound_group_sessions_backed_up_to
                 .read()
-                .unwrap()
                 .get(&s.room_id)?
                 .get(s.session_id())
                 .cloned()
@@ -201,11 +201,11 @@ impl CryptoStore for MemoryStore {
     type Error = Infallible;
 
     async fn load_account(&self) -> Result<Option<Account>> {
-        Ok(self.account.read().unwrap().as_ref().map(|acc| acc.deep_clone()))
+        Ok(self.account.read().as_ref().map(|acc| acc.deep_clone()))
     }
 
     async fn load_identity(&self) -> Result<Option<PrivateCrossSigningIdentity>> {
-        Ok(self.private_identity.read().unwrap().clone())
+        Ok(self.private_identity.read().clone())
     }
 
     async fn next_batch_token(&self) -> Result<Option<String>> {
@@ -214,7 +214,7 @@ impl CryptoStore for MemoryStore {
 
     async fn save_pending_changes(&self, changes: PendingChanges) -> Result<()> {
         if let Some(account) = changes.account {
-            *self.account.write().unwrap() = Some(account);
+            *self.account.write() = Some(account);
         }
 
         Ok(())
@@ -231,7 +231,7 @@ impl CryptoStore for MemoryStore {
         self.delete_devices(changes.devices.deleted);
 
         {
-            let mut identities = self.identities.write().unwrap();
+            let mut identities = self.identities.write();
             for identity in changes.identities.new.into_iter().chain(changes.identities.changed) {
                 identities.insert(
                     identity.user_id().to_owned(),
@@ -241,15 +241,15 @@ impl CryptoStore for MemoryStore {
         }
 
         {
-            let mut olm_hashes = self.olm_hashes.write().unwrap();
+            let mut olm_hashes = self.olm_hashes.write();
             for hash in changes.message_hashes {
                 olm_hashes.entry(hash.sender_key.to_owned()).or_default().insert(hash.hash.clone());
             }
         }
 
         {
-            let mut outgoing_key_requests = self.outgoing_key_requests.write().unwrap();
-            let mut key_requests_by_info = self.key_requests_by_info.write().unwrap();
+            let mut outgoing_key_requests = self.outgoing_key_requests.write();
+            let mut key_requests_by_info = self.key_requests_by_info.write();
 
             for key_request in changes.key_requests {
                 let id = key_request.request_id.clone();
@@ -268,15 +268,20 @@ impl CryptoStore for MemoryStore {
             self.backup_keys.write().await.backup_version = Some(version);
         }
 
+        if let Some(pickle_key) = changes.dehydrated_device_pickle_key {
+            let mut lock = self.dehydrated_device_pickle_key.write().await;
+            *lock = Some(pickle_key);
+        }
+
         {
-            let mut secret_inbox = self.secret_inbox.write().unwrap();
+            let mut secret_inbox = self.secret_inbox.write();
             for secret in changes.secrets {
                 secret_inbox.entry(secret.secret_name.to_string()).or_default().push(secret);
             }
         }
 
         {
-            let mut direct_withheld_info = self.direct_withheld_info.write().unwrap();
+            let mut direct_withheld_info = self.direct_withheld_info.write();
             for (room_id, data) in changes.withheld_session_info {
                 for (session_id, event) in data {
                     direct_withheld_info
@@ -292,7 +297,7 @@ impl CryptoStore for MemoryStore {
         }
 
         if !changes.room_settings.is_empty() {
-            let mut settings = self.room_settings.write().unwrap();
+            let mut settings = self.room_settings.write();
             settings.extend(changes.room_settings);
         }
 
@@ -305,7 +310,7 @@ impl CryptoStore for MemoryStore {
         backed_up_to_version: Option<&str>,
     ) -> Result<()> {
         let mut inbound_group_sessions_backed_up_to =
-            self.inbound_group_sessions_backed_up_to.write().unwrap();
+            self.inbound_group_sessions_backed_up_to.write();
 
         for session in sessions {
             let room_id = session.room_id();
@@ -333,7 +338,7 @@ impl CryptoStore for MemoryStore {
     }
 
     async fn get_sessions(&self, sender_key: &str) -> Result<Option<Vec<Session>>> {
-        Ok(self.sessions.read().unwrap().get(sender_key).cloned())
+        Ok(self.sessions.read().get(sender_key).cloned())
     }
 
     async fn get_inbound_group_session(
@@ -352,7 +357,6 @@ impl CryptoStore for MemoryStore {
         Ok(self
             .direct_withheld_info
             .read()
-            .unwrap()
             .get(room_id)
             .and_then(|e| Some(e.get(session_id)?.to_owned())))
     }
@@ -452,7 +456,7 @@ impl CryptoStore for MemoryStore {
         room_and_session_ids: &[(&RoomId, &str)],
     ) -> Result<()> {
         let mut inbound_group_sessions_backed_up_to =
-            self.inbound_group_sessions_backed_up_to.write().unwrap();
+            self.inbound_group_sessions_backed_up_to.write();
 
         for &(room_id, session_id) in room_and_session_ids {
             let session = self.inbound_group_sessions.get(room_id, session_id);
@@ -486,19 +490,29 @@ impl CryptoStore for MemoryStore {
         Ok(self.backup_keys.read().await.to_owned())
     }
 
+    async fn load_dehydrated_device_pickle_key(&self) -> Result<Option<DehydratedDeviceKey>> {
+        Ok(self.dehydrated_device_pickle_key.read().await.to_owned())
+    }
+
+    async fn delete_dehydrated_device_pickle_key(&self) -> Result<()> {
+        let mut lock = self.dehydrated_device_pickle_key.write().await;
+        *lock = None;
+        Ok(())
+    }
+
     async fn get_outbound_group_session(
         &self,
         room_id: &RoomId,
     ) -> Result<Option<OutboundGroupSession>> {
-        Ok(self.outbound_group_sessions.read().unwrap().get(room_id).cloned())
+        Ok(self.outbound_group_sessions.read().get(room_id).cloned())
     }
 
     async fn load_tracked_users(&self) -> Result<Vec<TrackedUser>> {
-        Ok(self.tracked_users.read().unwrap().values().cloned().collect())
+        Ok(self.tracked_users.read().values().cloned().collect())
     }
 
     async fn save_tracked_users(&self, tracked_users: &[(&UserId, bool)]) -> Result<()> {
-        self.tracked_users.write().unwrap().extend(tracked_users.iter().map(|(user_id, dirty)| {
+        self.tracked_users.write().extend(tracked_users.iter().map(|(user_id, dirty)| {
             let user_id: OwnedUserId = user_id.to_owned().into();
             (user_id.clone(), TrackedUser { user_id, dirty: *dirty })
         }));
@@ -527,7 +541,7 @@ impl CryptoStore for MemoryStore {
     }
 
     async fn get_user_identity(&self, user_id: &UserId) -> Result<Option<UserIdentityData>> {
-        let serialized = self.identities.read().unwrap().get(user_id).cloned();
+        let serialized = self.identities.read().get(user_id).cloned();
         match serialized {
             None => Ok(None),
             Some(serialized) => {
@@ -541,7 +555,6 @@ impl CryptoStore for MemoryStore {
         Ok(self
             .olm_hashes
             .write()
-            .unwrap()
             .entry(message_hash.sender_key.to_owned())
             .or_default()
             .contains(&message_hash.hash))
@@ -551,7 +564,7 @@ impl CryptoStore for MemoryStore {
         &self,
         request_id: &TransactionId,
     ) -> Result<Option<GossipRequest>> {
-        Ok(self.outgoing_key_requests.read().unwrap().get(request_id).cloned())
+        Ok(self.outgoing_key_requests.read().get(request_id).cloned())
     }
 
     async fn get_secret_request_by_info(
@@ -563,16 +576,14 @@ impl CryptoStore for MemoryStore {
         Ok(self
             .key_requests_by_info
             .read()
-            .unwrap()
             .get(&key_info_string)
-            .and_then(|i| self.outgoing_key_requests.read().unwrap().get(i).cloned()))
+            .and_then(|i| self.outgoing_key_requests.read().get(i).cloned()))
     }
 
     async fn get_unsent_secret_requests(&self) -> Result<Vec<GossipRequest>> {
         Ok(self
             .outgoing_key_requests
             .read()
-            .unwrap()
             .values()
             .filter(|req| !req.sent_out)
             .cloned()
@@ -580,10 +591,10 @@ impl CryptoStore for MemoryStore {
     }
 
     async fn delete_outgoing_secret_requests(&self, request_id: &TransactionId) -> Result<()> {
-        let req = self.outgoing_key_requests.write().unwrap().remove(request_id);
+        let req = self.outgoing_key_requests.write().remove(request_id);
         if let Some(i) = req {
             let key_info_string = encode_key_info(&i.info);
-            self.key_requests_by_info.write().unwrap().remove(&key_info_string);
+            self.key_requests_by_info.write().remove(&key_info_string);
         }
 
         Ok(())
@@ -593,36 +604,30 @@ impl CryptoStore for MemoryStore {
         &self,
         secret_name: &SecretName,
     ) -> Result<Vec<GossippedSecret>> {
-        Ok(self
-            .secret_inbox
-            .write()
-            .unwrap()
-            .entry(secret_name.to_string())
-            .or_default()
-            .to_owned())
+        Ok(self.secret_inbox.write().entry(secret_name.to_string()).or_default().to_owned())
     }
 
     async fn delete_secrets_from_inbox(&self, secret_name: &SecretName) -> Result<()> {
-        self.secret_inbox.write().unwrap().remove(secret_name.as_str());
+        self.secret_inbox.write().remove(secret_name.as_str());
 
         Ok(())
     }
 
     async fn get_room_settings(&self, room_id: &RoomId) -> Result<Option<RoomSettings>> {
-        Ok(self.room_settings.read().unwrap().get(room_id).cloned())
+        Ok(self.room_settings.read().get(room_id).cloned())
     }
 
     async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.custom_values.read().unwrap().get(key).cloned())
+        Ok(self.custom_values.read().get(key).cloned())
     }
 
     async fn set_custom_value(&self, key: &str, value: Vec<u8>) -> Result<()> {
-        self.custom_values.write().unwrap().insert(key.to_owned(), value);
+        self.custom_values.write().insert(key.to_owned(), value);
         Ok(())
     }
 
     async fn remove_custom_value(&self, key: &str) -> Result<()> {
-        self.custom_values.write().unwrap().remove(key);
+        self.custom_values.write().remove(key);
         Ok(())
     }
 
@@ -632,7 +637,7 @@ impl CryptoStore for MemoryStore {
         key: &str,
         holder: &str,
     ) -> Result<bool> {
-        Ok(try_take_leased_lock(&mut self.leases.write().unwrap(), lease_duration_ms, key, holder))
+        Ok(try_take_leased_lock(&mut self.leases.write(), lease_duration_ms, key, holder))
     }
 }
 
@@ -1125,7 +1130,10 @@ mod integration_tests {
             InboundGroupSession, OlmMessageHash, OutboundGroupSession, PrivateCrossSigningIdentity,
             SenderDataType, StaticAccountData,
         },
-        store::{BackupKeys, Changes, CryptoStore, PendingChanges, RoomKeyCounts, RoomSettings},
+        store::{
+            BackupKeys, Changes, CryptoStore, DehydratedDeviceKey, PendingChanges, RoomKeyCounts,
+            RoomSettings,
+        },
         types::events::room_key_withheld::RoomKeyWithheldEvent,
         Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, Session, TrackedUser,
         UserIdentityData,
@@ -1148,7 +1156,7 @@ mod integration_tests {
 
     impl MemoryStore {
         fn get_static_account(&self) -> Option<StaticAccountData> {
-            self.account.read().unwrap().as_ref().map(|acc| acc.static_data().clone())
+            self.account.read().as_ref().map(|acc| acc.static_data().clone())
         }
     }
 
@@ -1286,6 +1294,16 @@ mod integration_tests {
 
         async fn load_backup_keys(&self) -> Result<BackupKeys, Self::Error> {
             self.0.load_backup_keys().await
+        }
+
+        async fn load_dehydrated_device_pickle_key(
+            &self,
+        ) -> Result<Option<DehydratedDeviceKey>, Self::Error> {
+            self.0.load_dehydrated_device_pickle_key().await
+        }
+
+        async fn delete_dehydrated_device_pickle_key(&self) -> Result<(), Self::Error> {
+            self.0.delete_dehydrated_device_pickle_key().await
         }
 
         async fn get_outbound_group_session(

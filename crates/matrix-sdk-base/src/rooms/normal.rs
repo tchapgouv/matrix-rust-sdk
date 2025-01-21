@@ -12,28 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
+#[cfg(feature = "e2e-encryption")]
 use std::sync::RwLock as SyncRwLock;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     mem,
     sync::{atomic::AtomicBool, Arc},
 };
 
+use as_variant::as_variant;
 use bitflags::bitflags;
-use eyeball::{SharedObservable, Subscriber};
+use eyeball::{AsyncLock, ObservableWriteGuard, SharedObservable, Subscriber};
 use futures_util::{Stream, StreamExt};
-#[cfg(feature = "experimental-sliding-sync")]
 use matrix_sdk_common::deserialized_responses::TimelineEventKind;
-#[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
+#[cfg(feature = "e2e-encryption")]
 use matrix_sdk_common::ring_buffer::RingBuffer;
-#[cfg(feature = "experimental-sliding-sync")]
-use ruma::events::AnySyncTimelineEvent;
 use ruma::{
     api::client::sync::sync_events::v3::RoomSummary as RumaSummary,
     events::{
         call::member::{CallMemberStateKey, MembershipData},
+        direct::OwnedDirectUserIdentifier,
         ignored_user_list::IgnoredUserListEventContent,
+        member_hints::MemberHintsEventContent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
             avatar::{self, RoomAvatarEventContent},
@@ -48,8 +48,8 @@ use ruma::{
             tombstone::RoomTombstoneEventContent,
         },
         tag::{TagEventContent, Tags},
-        AnyRoomAccountDataEvent, AnyStrippedStateEvent, AnySyncStateEvent,
-        RoomAccountDataEventType,
+        AnyRoomAccountDataEvent, AnyStrippedStateEvent, AnySyncStateEvent, AnySyncTimelineEvent,
+        RoomAccountDataEventType, StateEventType, SyncStateEvent,
     },
     room::RoomType,
     serde::Raw,
@@ -58,21 +58,23 @@ use ruma::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tracing::{debug, field::debug, info, instrument, warn};
+use tracing::{debug, field::debug, info, instrument, trace, warn};
 
 use super::{
     members::MemberRoomInfo, BaseRoomInfo, RoomCreateWithCreatorEventContent, RoomDisplayName,
     RoomMember, RoomNotableTags,
 };
-#[cfg(feature = "experimental-sliding-sync")]
-use crate::latest_event::LatestEvent;
 use crate::{
-    deserialized_responses::{DisplayName, MemberEvent, RawSyncOrStrippedState},
+    deserialized_responses::{
+        DisplayName, MemberEvent, RawMemberEvent, RawSyncOrStrippedState, SyncOrStrippedState,
+    },
+    latest_event::LatestEvent,
     notification_settings::RoomNotificationMode,
     read_receipts::RoomReadReceipts,
     store::{DynStateStore, Result as StoreResult, StateStoreExt},
     sync::UnreadNotificationsCount,
-    Error, MinimalStateEvent, OriginalMinimalStateEvent, RoomMemberships,
+    Error, MinimalStateEvent, OriginalMinimalStateEvent, RoomMemberships, StateStoreDataKey,
+    StateStoreDataValue, StoreError,
 };
 
 /// Indicates that a notable update of `RoomInfo` has been applied, and why.
@@ -114,6 +116,23 @@ bitflags! {
     }
 }
 
+/// The result of a room summary computation.
+///
+/// If the homeserver does not provide a room summary, we perform a best-effort
+/// computation to generate one ourselves. If the homeserver does provide the
+/// summary, we augment it with additional information about the service members
+/// in the room.
+struct ComputedSummary {
+    /// The list of display names that will be used to calculate the room
+    /// display name.
+    heroes: Vec<String>,
+    /// The number of joined service members in the room.
+    num_service_members: u64,
+    /// The number of joined and invited members, not including any service
+    /// members.
+    num_joined_invited_guess: u64,
+}
+
 impl Default for RoomInfoNotableUpdateReasons {
     fn default() -> Self {
         Self::empty()
@@ -143,8 +162,17 @@ pub struct Room {
     /// not sure whether holding too many of them might make the cache too
     /// slow to load on startup. Keeping them here means they are not cached
     /// to disk but held in memory.
-    #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
+    #[cfg(feature = "e2e-encryption")]
     pub latest_encrypted_events: Arc<SyncRwLock<RingBuffer<Raw<AnySyncTimelineEvent>>>>,
+
+    /// A map for ids of room membership events in the knocking state linked to
+    /// the user id of the user affected by the member event, that the current
+    /// user has marked as seen so they can be ignored.
+    pub seen_knock_request_ids_map:
+        SharedObservable<Option<BTreeMap<OwnedEventId, OwnedUserId>>, AsyncLock>,
+
+    /// A sender that will notify receivers when room member updates happen.
+    pub room_member_updates_sender: broadcast::Sender<RoomMembersUpdate>,
 }
 
 /// The room summary containing member counts and members that should be used to
@@ -196,14 +224,14 @@ pub enum RoomState {
     Invited,
     /// The room is in a knocked state.
     Knocked,
+    /// The room is in a banned state.
+    Banned,
 }
 
 impl From<&MembershipState> for RoomState {
     fn from(membership_state: &MembershipState) -> Self {
-        // We consider Ban, Knock and Leave to be Left, because they all mean we are not
-        // in the room.
         match membership_state {
-            MembershipState::Ban => Self::Left,
+            MembershipState::Ban => Self::Banned,
             MembershipState::Invite => Self::Invited,
             MembershipState::Join => Self::Joined,
             MembershipState::Knock => Self::Knocked,
@@ -221,10 +249,31 @@ impl From<&MembershipState> for RoomState {
 /// try to behave similarly here.
 const NUM_HEROES: usize = 5;
 
+/// A filter to remove our own user and the users specified in the member hints
+/// state event, so called service members, from the list of heroes.
+///
+/// The heroes will then be used to calculate a display name for the room if one
+/// wasn't explicitly defined.
+fn heroes_filter<'a>(
+    own_user_id: &'a UserId,
+    member_hints: &'a MemberHintsEventContent,
+) -> impl Fn(&UserId) -> bool + use<'a> {
+    move |user_id| user_id != own_user_id && !member_hints.service_members.contains(user_id)
+}
+
+/// The kind of room member updates that just happened.
+#[derive(Debug, Clone)]
+pub enum RoomMembersUpdate {
+    /// The whole list room members was reloaded.
+    FullReload,
+    /// A few members were updated, their user ids are included.
+    Partial(BTreeSet<OwnedUserId>),
+}
+
 impl Room {
     /// The size of the latest_encrypted_events RingBuffer
     // SAFETY: `new_unchecked` is safe because 10 is not zero.
-    #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
+    #[cfg(feature = "e2e-encryption")]
     const MAX_ENCRYPTED_EVENTS: std::num::NonZeroUsize =
         unsafe { std::num::NonZeroUsize::new_unchecked(10) };
 
@@ -245,16 +294,19 @@ impl Room {
         room_info: RoomInfo,
         room_info_notable_update_sender: broadcast::Sender<RoomInfoNotableUpdate>,
     ) -> Self {
+        let (room_member_updates_sender, _) = broadcast::channel(10);
         Self {
             own_user_id: own_user_id.into(),
             room_id: room_info.room_id.clone(),
             store,
             inner: SharedObservable::new(room_info),
-            #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
+            #[cfg(feature = "e2e-encryption")]
             latest_encrypted_events: Arc::new(SyncRwLock::new(RingBuffer::new(
                 Self::MAX_ENCRYPTED_EVENTS,
             ))),
             room_info_notable_update_sender,
+            seen_knock_request_ids_map: SharedObservable::new_async(None),
+            room_member_updates_sender,
         }
     }
 
@@ -337,6 +389,17 @@ impl Room {
     /// Returns true if no members are missing, false otherwise.
     pub fn are_members_synced(&self) -> bool {
         self.inner.read().members_synced
+    }
+
+    /// Mark this Room as holding all member information.
+    ///
+    /// Useful in tests if we want to persuade the Room not to sync when asked
+    /// about its members.
+    #[cfg(feature = "testing")]
+    pub fn mark_members_synced(&self) {
+        self.inner.update(|info| {
+            info.members_synced = true;
+        });
     }
 
     /// Mark this Room as still missing member information.
@@ -423,7 +486,7 @@ impl Room {
     #[instrument(skip_all, fields(room_id = ?self.room_id))]
     pub async fn is_direct(&self) -> StoreResult<bool> {
         match self.state() {
-            RoomState::Joined | RoomState::Left => {
+            RoomState::Joined | RoomState::Left | RoomState::Banned => {
                 Ok(!self.inner.read().base_info.dm_targets.is_empty())
             }
 
@@ -460,7 +523,7 @@ impl Room {
     /// only be considered as guidance. We leave members in this list to allow
     /// us to re-find a DM with a user even if they have left, since we may
     /// want to re-invite them.
-    pub fn direct_targets(&self) -> HashSet<OwnedUserId> {
+    pub fn direct_targets(&self) -> HashSet<OwnedDirectUserIdentifier> {
         self.inner.read().base_info.dm_targets.clone()
     }
 
@@ -567,18 +630,40 @@ impl Room {
         self.inner.read().active_room_call_participants()
     }
 
-    /// Return the cached display name of the room if it was provided via sync,
-    /// or otherwise calculate it, taking into account its name, aliases and
-    /// members.
+    /// Calculate a room's display name, or return the cached value, taking into
+    /// account its name, aliases and members.
     ///
     /// The display name is calculated according to [this algorithm][spec].
     ///
-    /// This is automatically recomputed on every successful sync, and the
-    /// cached result can be retrieved in
-    /// [`Self::cached_display_name`].
+    /// While the underlying computation can be slow, the result is cached and
+    /// returned on the following calls. The cache is also filled on every
+    /// successful sync, since a sync may cause a change in the display
+    /// name.
+    ///
+    /// If you need a variant that's sync (but with the drawback that it returns
+    /// an `Option`), consider using [`Room::cached_display_name`].
     ///
     /// [spec]: <https://matrix.org/docs/spec/client_server/latest#calculating-the-display-name-for-a-room>
-    pub async fn compute_display_name(&self) -> StoreResult<RoomDisplayName> {
+    pub async fn display_name(&self) -> StoreResult<RoomDisplayName> {
+        if let Some(name) = self.cached_display_name() {
+            Ok(name)
+        } else {
+            self.compute_display_name().await
+        }
+    }
+
+    /// Force recalculating a room's display name, taking into account its name,
+    /// aliases and members.
+    ///
+    /// The display name is calculated according to [this algorithm][spec].
+    ///
+    /// ⚠ This may be slowish to compute. As such, the result is cached and can
+    /// be retrieved via [`Room::cached_display_name`] (sync, returns an option)
+    /// or [`Room::display_name`] (async, always returns a value), which should
+    /// be preferred in general.
+    ///
+    /// [spec]: <https://matrix.org/docs/spec/client_server/latest#calculating-the-display-name-for-a-room>
+    pub(crate) async fn compute_display_name(&self) -> StoreResult<RoomDisplayName> {
         enum DisplayNameOrSummary {
             Summary(RoomSummary),
             DisplayName(RoomDisplayName),
@@ -629,29 +714,24 @@ impl Room {
         &self,
         summary: RoomSummary,
     ) -> StoreResult<RoomDisplayName> {
-        let summary_member_count = summary.joined_member_count + summary.invited_member_count;
-
-        let (heroes, num_joined_invited_guess) = if !summary.room_heroes.is_empty() {
-            let heroes = self.extract_heroes(&summary.room_heroes).await?;
-            (heroes, None)
+        let computed_summary = if !summary.room_heroes.is_empty() {
+            self.extract_and_augment_summary(&summary).await?
         } else {
-            let (heroes, num_joined_invited) = self.compute_summary().await?;
-            (heroes, Some(num_joined_invited))
+            self.compute_summary().await?
         };
+
+        let ComputedSummary { heroes, num_service_members, num_joined_invited_guess } =
+            computed_summary;
+
+        let summary_member_count = (summary.joined_member_count + summary.invited_member_count)
+            .saturating_sub(num_service_members);
 
         let num_joined_invited = if self.state() == RoomState::Invited {
             // when we were invited we don't have a proper summary, we have to do best
             // guessing
             heroes.len() as u64 + 1
         } else if summary_member_count == 0 {
-            if let Some(num_joined_invited) = num_joined_invited_guess {
-                num_joined_invited
-            } else {
-                self.store
-                    .get_user_ids(self.room_id(), RoomMemberships::JOIN | RoomMemberships::INVITE)
-                    .await?
-                    .len() as u64
-            }
+            num_joined_invited_guess
         } else {
             summary_member_count
         };
@@ -672,17 +752,39 @@ impl Room {
         Ok(display_name)
     }
 
-    /// Extract and collect the display names of the room heroes from a
-    /// [`RoomSummary`].
+    /// Extracts and enhances the [`RoomSummary`] provided by the homeserver.
     ///
-    /// Returns the display names as a list of strings.
-    async fn extract_heroes(&self, heroes: &[RoomHero]) -> StoreResult<Vec<String>> {
-        let own_user_id = self.own_user_id().as_str();
+    /// This method extracts the relevant data from the [`RoomSummary`] and
+    /// augments it with additional information that may not be included in
+    /// the initial response, such as details about service members in the
+    /// room.
+    ///
+    /// Returns a [`ComputedSummary`].
+    async fn extract_and_augment_summary(
+        &self,
+        summary: &RoomSummary,
+    ) -> StoreResult<ComputedSummary> {
+        let heroes = &summary.room_heroes;
 
         let mut names = Vec::with_capacity(heroes.len());
-        let heroes = heroes.iter().filter(|hero| hero.user_id != own_user_id);
+        let own_user_id = self.own_user_id();
+        let member_hints = self.get_member_hints().await?;
 
-        for hero in heroes {
+        // If we have some service members in the heroes, that means that they are also
+        // part of the joined member counts. They shouldn't be so, otherwise
+        // we'll wrongly assume that there are more members in the room than
+        // they are for the "Bob and 2 others" case.
+        let num_service_members = heroes
+            .iter()
+            .filter(|hero| member_hints.service_members.contains(&hero.user_id))
+            .count() as u64;
+
+        // Construct a filter that is specific to this own user id, set of member hints,
+        // and accepts a `RoomHero` type.
+        let heroes_filter = heroes_filter(own_user_id, &member_hints);
+        let heroes_filter = |hero: &&RoomHero| heroes_filter(&hero.user_id);
+
+        for hero in heroes.iter().filter(heroes_filter) {
             if let Some(display_name) = &hero.display_name {
                 names.push(display_name.clone());
             } else {
@@ -700,21 +802,56 @@ impl Room {
             }
         }
 
-        Ok(names)
+        let num_joined_invited_guess = summary.joined_member_count + summary.invited_member_count;
+
+        // If the summary doesn't provide the number of joined/invited members, let's
+        // guess something.
+        let num_joined_invited_guess = if num_joined_invited_guess == 0 {
+            let guess = self
+                .store
+                .get_user_ids(self.room_id(), RoomMemberships::JOIN | RoomMemberships::INVITE)
+                .await?
+                .len() as u64;
+
+            guess.saturating_sub(num_service_members)
+        } else {
+            // Otherwise, accept the numbers provided by the summary as the guess.
+            num_joined_invited_guess
+        };
+
+        Ok(ComputedSummary { heroes: names, num_service_members, num_joined_invited_guess })
     }
 
     /// Compute the room summary with the data present in the store.
     ///
     /// The summary might be incorrect if the database info is outdated.
     ///
-    /// Returns a `(heroes_names, num_joined_invited)` tuple.
-    async fn compute_summary(&self) -> StoreResult<(Vec<String>, u64)> {
+    /// Returns the [`ComputedSummary`].
+    async fn compute_summary(&self) -> StoreResult<ComputedSummary> {
+        let member_hints = self.get_member_hints().await?;
+
+        // Construct a filter that is specific to this own user id, set of member hints,
+        // and accepts a `RoomMember` type.
+        let heroes_filter = heroes_filter(&self.own_user_id, &member_hints);
+        let heroes_filter = |u: &RoomMember| heroes_filter(u.user_id());
+
         let mut members = self.members(RoomMemberships::JOIN | RoomMemberships::INVITE).await?;
+
+        // If we have some service members, they shouldn't count to the number of
+        // joined/invited members, otherwise we'll wrongly assume that there are more
+        // members in the room than they are for the "Bob and 2 others" case.
+        let num_service_members = members
+            .iter()
+            .filter(|member| member_hints.service_members.contains(member.user_id()))
+            .count();
 
         // We can make a good prediction of the total number of joined and invited
         // members here. This might be incorrect if the database info is
         // outdated.
-        let num_joined_invited = members.len() as u64;
+        //
+        // Note: Subtracting here is fine because `num_service_members` is a subset of
+        // `members.len()` due to the above filter operation.
+        let num_joined_invited = members.len() - num_service_members;
 
         if num_joined_invited == 0
             || (num_joined_invited == 1 && members[0].user_id() == self.own_user_id)
@@ -728,18 +865,42 @@ impl Room {
 
         let heroes = members
             .into_iter()
-            .filter(|u| u.user_id() != self.own_user_id)
+            .filter(heroes_filter)
             .take(NUM_HEROES)
             .map(|u| u.name().to_owned())
             .collect();
 
-        Ok((heroes, num_joined_invited))
+        trace!(
+            ?heroes,
+            num_joined_invited,
+            num_service_members,
+            "Computed a room summary since we didn't receive one."
+        );
+
+        let num_service_members = num_service_members as u64;
+        let num_joined_invited_guess = num_joined_invited as u64;
+
+        Ok(ComputedSummary { heroes, num_service_members, num_joined_invited_guess })
+    }
+
+    async fn get_member_hints(&self) -> StoreResult<MemberHintsEventContent> {
+        Ok(self
+            .store
+            .get_state_event_static::<MemberHintsEventContent>(self.room_id())
+            .await?
+            .and_then(|event| {
+                event
+                    .deserialize()
+                    .inspect_err(|e| warn!("Couldn't deserialize the member hints event: {e}"))
+                    .ok()
+            })
+            .and_then(|event| as_variant!(event, SyncOrStrippedState::Sync(SyncStateEvent::Original(e)) => e.content))
+            .unwrap_or_default())
     }
 
     /// Returns the cached computed display name, if available.
     ///
-    /// This cache is refilled every time we call
-    /// [`Self::compute_display_name`].
+    /// This cache is refilled every time we call [`Self::display_name`].
     pub fn cached_display_name(&self) -> Option<RoomDisplayName> {
         self.inner.read().cached_display_name.clone()
     }
@@ -771,7 +932,6 @@ impl Room {
 
     /// Return the last event in this room, if one has been cached during
     /// sliding sync.
-    #[cfg(feature = "experimental-sliding-sync")]
     pub fn latest_event(&self) -> Option<LatestEvent> {
         self.inner.read().latest_event.as_deref().cloned()
     }
@@ -780,7 +940,7 @@ impl Room {
     /// to decrypt these, the most recent relevant one will replace
     /// latest_event. (We can't tell which one is relevant until
     /// they are decrypted.)
-    #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
+    #[cfg(feature = "e2e-encryption")]
     pub(crate) fn latest_encrypted_events(&self) -> Vec<Raw<AnySyncTimelineEvent>> {
         self.latest_encrypted_events.read().unwrap().iter().cloned().collect()
     }
@@ -795,7 +955,7 @@ impl Room {
     ///
     /// It is the responsibility of the caller to apply the changes into the
     /// state store after calling this function.
-    #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
+    #[cfg(feature = "e2e-encryption")]
     pub(crate) fn on_latest_event_decrypted(
         &self,
         latest_event: Box<LatestEvent>,
@@ -1041,7 +1201,6 @@ impl Room {
     /// Returns the recency stamp of the room.
     ///
     /// Please read `RoomInfo::recency_stamp` to learn more.
-    #[cfg(feature = "experimental-sliding-sync")]
     pub fn recency_stamp(&self) -> Option<u64> {
         self.inner.read().recency_stamp
     }
@@ -1057,6 +1216,140 @@ impl Room {
     /// Returns the current pinned event ids for this room.
     pub fn pinned_event_ids(&self) -> Option<Vec<OwnedEventId>> {
         self.inner.read().pinned_event_ids()
+    }
+
+    /// Mark a list of requests to join the room as seen, given their state
+    /// event ids.
+    pub async fn mark_knock_requests_as_seen(&self, user_ids: &[OwnedUserId]) -> StoreResult<()> {
+        let raw_user_ids: Vec<&str> = user_ids.iter().map(|id| id.as_str()).collect();
+        let member_raw_events = self
+            .store
+            .get_state_events_for_keys(self.room_id(), StateEventType::RoomMember, &raw_user_ids)
+            .await?;
+        let mut event_to_user_ids = Vec::with_capacity(member_raw_events.len());
+
+        // Map the list of events ids to their user ids, if they are event ids for knock
+        // membership events. Log an error and continue otherwise.
+        for raw_event in member_raw_events {
+            let event = raw_event.cast::<RoomMemberEventContent>().deserialize()?;
+            match event {
+                SyncOrStrippedState::Sync(SyncStateEvent::Original(event)) => {
+                    if event.content.membership == MembershipState::Knock {
+                        event_to_user_ids.push((event.event_id, event.state_key))
+                    } else {
+                        warn!("Could not mark knock event as seen: event {} for user {} is not in Knock membership state.", event.event_id, event.state_key);
+                    }
+                }
+                _ => warn!(
+                    "Could not mark knock event as seen: event for user {} is not valid.",
+                    event.state_key()
+                ),
+            }
+        }
+
+        let current_seen_events_guard = self.get_write_guarded_current_knock_request_ids().await?;
+        let mut current_seen_events = current_seen_events_guard.clone().unwrap_or_default();
+
+        current_seen_events.extend(event_to_user_ids);
+
+        self.update_seen_knock_request_ids(current_seen_events_guard, current_seen_events).await?;
+
+        Ok(())
+    }
+
+    /// Removes the seen knock request ids that are no longer valid given the
+    /// current room members.
+    pub async fn remove_outdated_seen_knock_requests_ids(&self) -> StoreResult<()> {
+        let current_seen_events_guard = self.get_write_guarded_current_knock_request_ids().await?;
+        let mut current_seen_events = current_seen_events_guard.clone().unwrap_or_default();
+
+        // Get and deserialize the member events for the seen knock requests
+        let keys: Vec<OwnedUserId> = current_seen_events.values().map(|id| id.to_owned()).collect();
+        let raw_member_events: Vec<RawMemberEvent> =
+            self.store.get_state_events_for_keys_static(self.room_id(), &keys).await?;
+        let member_events = raw_member_events
+            .into_iter()
+            .map(|raw| raw.deserialize())
+            .collect::<Result<Vec<MemberEvent>, _>>()?;
+
+        let mut ids_to_remove = Vec::new();
+
+        for (event_id, user_id) in current_seen_events.iter() {
+            // Check the seen knock request ids against the current room member events for
+            // the room members associated to them
+            let matching_member = member_events.iter().find(|event| event.user_id() == user_id);
+
+            if let Some(member) = matching_member {
+                let member_event_id = member.event_id();
+                // If the member event is not a knock or it's different knock, it's outdated
+                if *member.membership() != MembershipState::Knock
+                    || member_event_id.is_some_and(|id| id != event_id)
+                {
+                    ids_to_remove.push(event_id.to_owned());
+                }
+            } else {
+                ids_to_remove.push(event_id.to_owned());
+            }
+        }
+
+        // If there are no ids to remove, do nothing
+        if ids_to_remove.is_empty() {
+            return Ok(());
+        }
+
+        for event_id in ids_to_remove {
+            current_seen_events.remove(&event_id);
+        }
+
+        self.update_seen_knock_request_ids(current_seen_events_guard, current_seen_events).await?;
+
+        Ok(())
+    }
+
+    /// Get the list of seen knock request event ids in this room.
+    pub async fn get_seen_knock_request_ids(
+        &self,
+    ) -> Result<BTreeMap<OwnedEventId, OwnedUserId>, StoreError> {
+        Ok(self.get_write_guarded_current_knock_request_ids().await?.clone().unwrap_or_default())
+    }
+
+    async fn get_write_guarded_current_knock_request_ids(
+        &self,
+    ) -> StoreResult<ObservableWriteGuard<'_, Option<BTreeMap<OwnedEventId, OwnedUserId>>, AsyncLock>>
+    {
+        let mut guard = self.seen_knock_request_ids_map.write().await;
+        // If there are no loaded request ids yet
+        if guard.is_none() {
+            // Load the values from the store and update the shared observable contents
+            let updated_seen_ids = self
+                .store
+                .get_kv_data(StateStoreDataKey::SeenKnockRequests(self.room_id()))
+                .await?
+                .and_then(|v| v.into_seen_knock_requests())
+                .unwrap_or_default();
+
+            ObservableWriteGuard::set(&mut guard, Some(updated_seen_ids));
+        }
+        Ok(guard)
+    }
+
+    async fn update_seen_knock_request_ids(
+        &self,
+        mut guard: ObservableWriteGuard<'_, Option<BTreeMap<OwnedEventId, OwnedUserId>>, AsyncLock>,
+        new_value: BTreeMap<OwnedEventId, OwnedUserId>,
+    ) -> StoreResult<()> {
+        // Save the new values to the shared observable
+        ObservableWriteGuard::set(&mut guard, Some(new_value.clone()));
+
+        // Save them into the store too
+        self.store
+            .set_kv_data(
+                StateStoreDataKey::SeenKnockRequests(self.room_id()),
+                StateStoreDataValue::SeenKnockRequests(new_value),
+            )
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -1117,7 +1410,6 @@ pub struct RoomInfo {
     pub(crate) encryption_state_synced: bool,
 
     /// The last event send by sliding sync
-    #[cfg(feature = "experimental-sliding-sync")]
     pub(crate) latest_event: Option<Box<LatestEvent>>,
 
     /// Information about read receipts for this room.
@@ -1151,7 +1443,6 @@ pub struct RoomInfo {
     /// Sliding Sync might "ignore” some events when computing the recency
     /// stamp of the room. Thus, using this `recency_stamp` value is
     /// more accurate than relying on the latest event.
-    #[cfg(feature = "experimental-sliding-sync")]
     #[serde(default)]
     pub(crate) recency_stamp: Option<u64>,
 }
@@ -1187,14 +1478,12 @@ impl RoomInfo {
             last_prev_batch: None,
             sync_info: SyncInfo::NoState,
             encryption_state_synced: false,
-            #[cfg(feature = "experimental-sliding-sync")]
             latest_event: None,
             read_receipts: Default::default(),
             base_info: Box::new(BaseRoomInfo::new()),
             warned_about_unknown_room_version: Arc::new(false.into()),
             cached_display_name: None,
             cached_user_defined_notification_mode: None,
-            #[cfg(feature = "experimental-sliding-sync")]
             recency_stamp: None,
         }
     }
@@ -1219,6 +1508,11 @@ impl RoomInfo {
         self.set_state(RoomState::Knocked);
     }
 
+    /// Mark this Room as banned.
+    pub fn mark_as_banned(&mut self) {
+        self.set_state(RoomState::Banned);
+    }
+
     /// Set the membership RoomState of this Room
     pub fn set_state(&mut self, room_state: RoomState) {
         if room_state != self.room_state {
@@ -1235,6 +1529,11 @@ impl RoomInfo {
     /// Mark this Room as still missing member information.
     pub fn mark_members_missing(&mut self) {
         self.members_synced = false;
+    }
+
+    /// Returns whether the room members are synced.
+    pub fn are_members_synced(&self) -> bool {
+        self.members_synced
     }
 
     /// Mark this Room as still missing some state information.
@@ -1329,7 +1628,6 @@ impl RoomInfo {
         };
         tracing::Span::current().record("redacts", debug(redacts));
 
-        #[cfg(feature = "experimental-sliding-sync")]
         if let Some(latest_event) = &mut self.latest_event {
             tracing::trace!("Checking if redaction applies to latest event");
             if latest_event.event_id().as_deref() == Some(redacts) {
@@ -1419,19 +1717,16 @@ impl RoomInfo {
     }
 
     /// Updates the joined member count.
-    #[cfg(feature = "experimental-sliding-sync")]
     pub(crate) fn update_joined_member_count(&mut self, count: u64) {
         self.summary.joined_member_count = count;
     }
 
     /// Updates the invited member count.
-    #[cfg(feature = "experimental-sliding-sync")]
     pub(crate) fn update_invited_member_count(&mut self, count: u64) {
         self.summary.invited_member_count = count;
     }
 
     /// Updates the room heroes.
-    #[cfg(feature = "experimental-sliding-sync")]
     pub(crate) fn update_heroes(&mut self, heroes: Vec<RoomHero>) {
         self.summary.room_heroes = heroes;
     }
@@ -1631,7 +1926,6 @@ impl RoomInfo {
     }
 
     /// Returns the latest (decrypted) event recorded for this room.
-    #[cfg(feature = "experimental-sliding-sync")]
     pub fn latest_event(&self) -> Option<&LatestEvent> {
         self.latest_event.as_deref()
     }
@@ -1639,7 +1933,6 @@ impl RoomInfo {
     /// Updates the recency stamp of this room.
     ///
     /// Please read [`Self::recency_stamp`] to learn more.
-    #[cfg(feature = "experimental-sliding-sync")]
     pub(crate) fn update_recency_stamp(&mut self, stamp: u64) {
         self.recency_stamp = Some(stamp);
     }
@@ -1725,8 +2018,9 @@ impl RoomInfo {
     }
 }
 
-#[cfg(feature = "experimental-sliding-sync")]
-fn apply_redaction(
+/// Apply a redaction to the given target `event`, given the raw redaction event
+/// and the room version.
+pub fn apply_redaction(
     event: &Raw<AnySyncTimelineEvent>,
     raw_redaction: &Raw<SyncRoomRedactionEvent>,
     room_version: &RoomVersionId,
@@ -1752,7 +2046,7 @@ fn apply_redaction(
     let redact_result = redact_in_place(&mut event_json, room_version, Some(redacted_because));
 
     if let Err(e) = redact_result {
-        warn!("Failed to redact latest event: {e}");
+        warn!("Failed to redact event: {e}");
         return None;
     }
 
@@ -1775,6 +2069,8 @@ bitflags! {
         const LEFT     = 0b00000100;
         /// The room is in a knocked state.
         const KNOCKED  = 0b00001000;
+        /// The room is in a banned state.
+        const BANNED   = 0b00010000;
     }
 }
 
@@ -1790,6 +2086,7 @@ impl RoomStateFilter {
             RoomState::Left => Self::LEFT,
             RoomState::Invited => Self::INVITED,
             RoomState::Knocked => Self::KNOCKED,
+            RoomState::Banned => Self::BANNED,
         };
 
         self.contains(bit_state)
@@ -1807,6 +2104,12 @@ impl RoomStateFilter {
         }
         if self.contains(Self::INVITED) {
             states.push(RoomState::Invited);
+        }
+        if self.contains(Self::KNOCKED) {
+            states.push(RoomState::Knocked);
+        }
+        if self.contains(Self::BANNED) {
+            states.push(RoomState::Banned);
         }
 
         states
@@ -1853,6 +2156,7 @@ fn compute_display_name_from_heroes(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         ops::{Not, Sub},
         str::FromStr,
         sync::Arc,
@@ -1860,7 +2164,6 @@ mod tests {
     };
 
     use assign::assign;
-    #[cfg(feature = "experimental-sliding-sync")]
     use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
     use matrix_sdk_test::{
         async_test,
@@ -1886,27 +2189,27 @@ mod tests {
             },
             AnySyncStateEvent, EmptyStateKey, StateEventType, StateUnsigned, SyncStateEvent,
         },
-        owned_event_id, owned_user_id, room_alias_id, room_id,
+        owned_event_id, owned_room_id, owned_user_id, room_alias_id, room_id,
         serde::Raw,
         time::SystemTime,
         user_id, DeviceId, EventEncryptionAlgorithm, EventId, MilliSecondsSinceUnixEpoch,
         OwnedEventId, OwnedUserId, UserId,
     };
     use serde_json::json;
+    use similar_asserts::assert_eq;
     use stream_assert::{assert_pending, assert_ready};
 
     use super::{compute_display_name_from_heroes, Room, RoomHero, RoomInfo, RoomState, SyncInfo};
-    #[cfg(any(feature = "experimental-sliding-sync", feature = "e2e-encryption"))]
-    use crate::latest_event::LatestEvent;
     use crate::{
+        latest_event::LatestEvent,
         rooms::RoomNotableTags,
         store::{IntoStateStore, MemoryStore, StateChanges, StateStore, StoreConfig},
+        test_utils::logged_in_base_client,
         BaseClient, MinimalStateEvent, OriginalMinimalStateEvent, RoomDisplayName,
-        RoomInfoNotableUpdateReasons, SessionMeta,
+        RoomInfoNotableUpdateReasons, RoomStateFilter, SessionMeta,
     };
 
     #[test]
-    #[cfg(feature = "experimental-sliding-sync")]
     fn test_room_info_serialization() {
         // This test exists to make sure we don't accidentally change the
         // serialized format for `RoomInfo`.
@@ -2093,7 +2396,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "experimental-sliding-sync")]
     fn test_room_info_deserialization() {
         use ruma::{owned_mxc_uri, owned_user_id};
 
@@ -2546,6 +2848,95 @@ mod tests {
     }
 
     #[async_test]
+    async fn test_display_name_dm_joined_service_members() {
+        let (store, room) = make_room_test_helper(RoomState::Joined);
+        let room_id = room_id!("!test:localhost");
+
+        let matthew = user_id!("@sahasrhala:example.org");
+        let me = user_id!("@me:example.org");
+        let bot = user_id!("@bot:example.org");
+
+        let mut changes = StateChanges::new("".to_owned());
+        let summary = assign!(RumaSummary::new(), {
+            joined_member_count: Some(3u32.into()),
+            heroes: vec![me.to_owned(), matthew.to_owned(), bot.to_owned()],
+        });
+
+        let f = EventFactory::new().room(room_id!("!test:localhost"));
+
+        let members = changes
+            .state
+            .entry(room_id.to_owned())
+            .or_default()
+            .entry(StateEventType::RoomMember)
+            .or_default();
+        members.insert(matthew.into(), f.member(matthew).display_name("Matthew").into_raw());
+        members.insert(me.into(), f.member(me).display_name("Me").into_raw());
+        members.insert(bot.into(), f.member(bot).display_name("Bot").into_raw());
+
+        let member_hints_content =
+            f.member_hints(BTreeSet::from([bot.to_owned()])).sender(me).into_raw();
+        changes
+            .state
+            .entry(room_id.to_owned())
+            .or_default()
+            .entry(StateEventType::MemberHints)
+            .or_default()
+            .insert("".to_owned(), member_hints_content);
+
+        store.save_changes(&changes).await.unwrap();
+
+        room.inner.update_if(|info| info.update_from_ruma_summary(&summary));
+        // Bot should not contribute to the display name.
+        assert_eq!(
+            room.compute_display_name().await.unwrap(),
+            RoomDisplayName::Calculated("Matthew".to_owned())
+        );
+    }
+
+    #[async_test]
+    async fn test_display_name_dm_joined_alone_with_service_members() {
+        let (store, room) = make_room_test_helper(RoomState::Joined);
+        let room_id = room_id!("!test:localhost");
+
+        let me = user_id!("@me:example.org");
+        let bot = user_id!("@bot:example.org");
+
+        let mut changes = StateChanges::new("".to_owned());
+        let summary = assign!(RumaSummary::new(), {
+            joined_member_count: Some(2u32.into()),
+            heroes: vec![me.to_owned(), bot.to_owned()],
+        });
+
+        let f = EventFactory::new().room(room_id!("!test:localhost"));
+
+        let members = changes
+            .state
+            .entry(room_id.to_owned())
+            .or_default()
+            .entry(StateEventType::RoomMember)
+            .or_default();
+        members.insert(me.into(), f.member(me).display_name("Me").into_raw());
+        members.insert(bot.into(), f.member(bot).display_name("Bot").into_raw());
+
+        let member_hints_content =
+            f.member_hints(BTreeSet::from([bot.to_owned()])).sender(me).into_raw();
+        changes
+            .state
+            .entry(room_id.to_owned())
+            .or_default()
+            .entry(StateEventType::MemberHints)
+            .or_default()
+            .insert("".to_owned(), member_hints_content);
+
+        store.save_changes(&changes).await.unwrap();
+
+        room.inner.update_if(|info| info.update_from_ruma_summary(&summary));
+        // Bot should not contribute to the display name.
+        assert_eq!(room.compute_display_name().await.unwrap(), RoomDisplayName::Empty);
+    }
+
+    #[async_test]
     async fn test_display_name_dm_joined_no_heroes() {
         let (store, room) = make_room_test_helper(RoomState::Joined);
         let room_id = room_id!("!test:localhost");
@@ -2563,6 +2954,47 @@ mod tests {
             .or_default();
         members.insert(matthew.into(), f.member(matthew).display_name("Matthew").into_raw());
         members.insert(me.into(), f.member(me).display_name("Me").into_raw());
+
+        store.save_changes(&changes).await.unwrap();
+
+        assert_eq!(
+            room.compute_display_name().await.unwrap(),
+            RoomDisplayName::Calculated("Matthew".to_owned())
+        );
+    }
+
+    #[async_test]
+    async fn test_display_name_dm_joined_no_heroes_service_members() {
+        let (store, room) = make_room_test_helper(RoomState::Joined);
+        let room_id = room_id!("!test:localhost");
+
+        let matthew = user_id!("@matthew:example.org");
+        let me = user_id!("@me:example.org");
+        let bot = user_id!("@bot:example.org");
+
+        let mut changes = StateChanges::new("".to_owned());
+
+        let f = EventFactory::new().room(room_id!("!test:localhost"));
+
+        let members = changes
+            .state
+            .entry(room_id.to_owned())
+            .or_default()
+            .entry(StateEventType::RoomMember)
+            .or_default();
+        members.insert(matthew.into(), f.member(matthew).display_name("Matthew").into_raw());
+        members.insert(me.into(), f.member(me).display_name("Me").into_raw());
+        members.insert(bot.into(), f.member(bot).display_name("Bot").into_raw());
+
+        let member_hints_content =
+            f.member_hints(BTreeSet::from([bot.to_owned()])).sender(me).into_raw();
+        changes
+            .state
+            .entry(room_id.to_owned())
+            .or_default()
+            .entry(StateEventType::MemberHints)
+            .or_default()
+            .insert("".to_owned(), member_hints_content);
 
         store.save_changes(&changes).await.unwrap();
 
@@ -2713,8 +3145,8 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[async_test]
-    #[cfg(feature = "experimental-sliding-sync")]
     async fn test_setting_the_latest_event_doesnt_cause_a_room_info_notable_update() {
         use std::collections::BTreeMap;
 
@@ -2733,7 +3165,6 @@ mod tests {
                     user_id: user_id!("@alice:example.org").into(),
                     device_id: ruma::device_id!("AYEAYEAYE").into(),
                 },
-                #[cfg(feature = "e2e-encryption")]
                 None,
             )
             .await
@@ -2781,8 +3212,8 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[async_test]
-    #[cfg(feature = "experimental-sliding-sync")]
     async fn test_when_we_provide_a_newly_decrypted_event_it_replaces_latest_event() {
         use std::collections::BTreeMap;
 
@@ -2811,8 +3242,8 @@ mod tests {
         assert_eq!(room.latest_event().unwrap().event_id(), event.event_id());
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[async_test]
-    #[cfg(feature = "experimental-sliding-sync")]
     async fn test_when_a_newly_decrypted_event_appears_we_delete_all_older_encrypted_events() {
         use std::collections::BTreeMap;
 
@@ -2850,8 +3281,8 @@ mod tests {
         assert_eq!(room.latest_event().unwrap().event_id(), new_event.event_id());
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[async_test]
-    #[cfg(feature = "experimental-sliding-sync")]
     async fn test_replacing_the_newest_event_leaves_none_left() {
         use std::collections::BTreeMap;
 
@@ -2883,7 +3314,7 @@ mod tests {
         assert_eq!(enc_evs.len(), 0);
     }
 
-    #[cfg(feature = "experimental-sliding-sync")]
+    #[cfg(feature = "e2e-encryption")]
     fn add_encrypted_event(room: &Room, event_id: &str) {
         room.latest_encrypted_events
             .write()
@@ -2891,7 +3322,7 @@ mod tests {
             .push(Raw::from_json_string(json!({ "event_id": event_id }).to_string()).unwrap());
     }
 
-    #[cfg(feature = "experimental-sliding-sync")]
+    #[cfg(feature = "e2e-encryption")]
     fn make_latest_event(event_id: &str) -> Box<LatestEvent> {
         Box::new(LatestEvent::new(SyncTimelineEvent::new(
             Raw::from_json_string(json!({ "event_id": event_id }).to_string()).unwrap(),
@@ -3291,5 +3722,78 @@ mod tests {
         room.set_room_info(room_info, RoomInfoNotableUpdateReasons::MEMBERSHIP);
         assert_eq!(room.prev_state(), Some(RoomState::Joined));
         assert_eq!(room.state(), RoomState::Left);
+
+        // Left -> Banned
+        let mut room_info = room.clone_info();
+        room_info.mark_as_banned();
+        room.set_room_info(room_info, RoomInfoNotableUpdateReasons::MEMBERSHIP);
+        assert_eq!(room.prev_state(), Some(RoomState::Left));
+        assert_eq!(room.state(), RoomState::Banned);
+    }
+
+    #[async_test]
+    async fn test_room_state_filters() {
+        let client = logged_in_base_client(None).await;
+
+        let joined_room_id = owned_room_id!("!joined:example.org");
+        client.get_or_create_room(&joined_room_id, RoomState::Joined);
+
+        let invited_room_id = owned_room_id!("!invited:example.org");
+        client.get_or_create_room(&invited_room_id, RoomState::Invited);
+
+        let left_room_id = owned_room_id!("!left:example.org");
+        client.get_or_create_room(&left_room_id, RoomState::Left);
+
+        let knocked_room_id = owned_room_id!("!knocked:example.org");
+        client.get_or_create_room(&knocked_room_id, RoomState::Knocked);
+
+        let banned_room_id = owned_room_id!("!banned:example.org");
+        client.get_or_create_room(&banned_room_id, RoomState::Banned);
+
+        let joined_rooms = client.rooms_filtered(RoomStateFilter::JOINED);
+        assert_eq!(joined_rooms.len(), 1);
+        assert_eq!(joined_rooms[0].state(), RoomState::Joined);
+        assert_eq!(joined_rooms[0].room_id, joined_room_id);
+
+        let invited_rooms = client.rooms_filtered(RoomStateFilter::INVITED);
+        assert_eq!(invited_rooms.len(), 1);
+        assert_eq!(invited_rooms[0].state(), RoomState::Invited);
+        assert_eq!(invited_rooms[0].room_id, invited_room_id);
+
+        let left_rooms = client.rooms_filtered(RoomStateFilter::LEFT);
+        assert_eq!(left_rooms.len(), 1);
+        assert_eq!(left_rooms[0].state(), RoomState::Left);
+        assert_eq!(left_rooms[0].room_id, left_room_id);
+
+        let knocked_rooms = client.rooms_filtered(RoomStateFilter::KNOCKED);
+        assert_eq!(knocked_rooms.len(), 1);
+        assert_eq!(knocked_rooms[0].state(), RoomState::Knocked);
+        assert_eq!(knocked_rooms[0].room_id, knocked_room_id);
+
+        let banned_rooms = client.rooms_filtered(RoomStateFilter::BANNED);
+        assert_eq!(banned_rooms.len(), 1);
+        assert_eq!(banned_rooms[0].state(), RoomState::Banned);
+        assert_eq!(banned_rooms[0].room_id, banned_room_id);
+    }
+
+    #[test]
+    fn test_room_state_filters_as_vec() {
+        assert_eq!(RoomStateFilter::JOINED.as_vec(), vec![RoomState::Joined]);
+        assert_eq!(RoomStateFilter::LEFT.as_vec(), vec![RoomState::Left]);
+        assert_eq!(RoomStateFilter::INVITED.as_vec(), vec![RoomState::Invited]);
+        assert_eq!(RoomStateFilter::KNOCKED.as_vec(), vec![RoomState::Knocked]);
+        assert_eq!(RoomStateFilter::BANNED.as_vec(), vec![RoomState::Banned]);
+
+        // Check all filters are taken into account
+        assert_eq!(
+            RoomStateFilter::all().as_vec(),
+            vec![
+                RoomState::Joined,
+                RoomState::Left,
+                RoomState::Invited,
+                RoomState::Knocked,
+                RoomState::Banned
+            ]
+        );
     }
 }

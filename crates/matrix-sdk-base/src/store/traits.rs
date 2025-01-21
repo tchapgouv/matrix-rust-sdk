@@ -35,8 +35,8 @@ use ruma::{
     },
     serde::Raw,
     time::SystemTime,
-    EventId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId,
-    TransactionId, UserId,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedRoomId,
+    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -359,6 +359,7 @@ pub trait StateStore: AsyncTraitDeps {
         &self,
         room_id: &RoomId,
         transaction_id: OwnedTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
         request: QueuedRequestKind,
         priority: usize,
     ) -> Result<(), Self::Error>;
@@ -421,6 +422,7 @@ pub trait StateStore: AsyncTraitDeps {
         room_id: &RoomId,
         parent_txn_id: &TransactionId,
         own_txn_id: ChildTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
         content: DependentQueuedRequestKind,
     ) -> Result<(), Self::Error>;
 
@@ -657,11 +659,12 @@ impl<T: StateStore> StateStore for EraseStateStoreError<T> {
         &self,
         room_id: &RoomId,
         transaction_id: OwnedTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
         content: QueuedRequestKind,
         priority: usize,
     ) -> Result<(), Self::Error> {
         self.0
-            .save_send_queue_request(room_id, transaction_id, content, priority)
+            .save_send_queue_request(room_id, transaction_id, created_at, content, priority)
             .await
             .map_err(Into::into)
     }
@@ -711,10 +714,11 @@ impl<T: StateStore> StateStore for EraseStateStoreError<T> {
         room_id: &RoomId,
         parent_txn_id: &TransactionId,
         own_txn_id: ChildTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
         content: DependentQueuedRequestKind,
     ) -> Result<(), Self::Error> {
         self.0
-            .save_dependent_queued_request(room_id, parent_txn_id, own_txn_id, content)
+            .save_dependent_queued_request(room_id, parent_txn_id, own_txn_id, created_at, content)
             .await
             .map_err(Into::into)
     }
@@ -1022,6 +1026,9 @@ pub enum StateStoreDataValue {
     ///
     /// [`ComposerDraft`]: Self::ComposerDraft
     ComposerDraft(ComposerDraft),
+
+    /// A list of knock request ids marked as seen in a room.
+    SeenKnockRequests(BTreeMap<OwnedEventId, OwnedUserId>),
 }
 
 /// Current draft of the composer for the room.
@@ -1088,6 +1095,11 @@ impl StateStoreDataValue {
     pub fn into_server_capabilities(self) -> Option<ServerCapabilities> {
         as_variant!(self, Self::ServerCapabilities)
     }
+
+    /// Get this value if it is the data for the ignored join requests.
+    pub fn into_seen_knock_requests(self) -> Option<BTreeMap<OwnedEventId, OwnedUserId>> {
+        as_variant!(self, Self::SeenKnockRequests)
+    }
 }
 
 /// A key for key-value data.
@@ -1117,6 +1129,9 @@ pub enum StateStoreDataKey<'a> {
     ///
     /// [`ComposerDraft`]: Self::ComposerDraft
     ComposerDraft(&'a RoomId),
+
+    /// A list of knock request ids marked as seen in a room.
+    SeenKnockRequests(&'a RoomId),
 }
 
 impl StateStoreDataKey<'_> {
@@ -1142,6 +1157,10 @@ impl StateStoreDataKey<'_> {
     /// Key prefix to use for the [`ComposerDraft`][Self::ComposerDraft]
     /// variant.
     pub const COMPOSER_DRAFT: &'static str = "composer_draft";
+
+    /// Key prefix to use for the
+    /// [`SeenKnockRequests`][Self::SeenKnockRequests] variant.
+    pub const SEEN_KNOCK_REQUESTS: &'static str = "seen_knock_requests";
 }
 
 #[cfg(test)]

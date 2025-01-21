@@ -17,12 +17,14 @@ mod share_strategy;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Debug,
-    sync::{Arc, RwLock as StdRwLock},
+    sync::Arc,
 };
 
 use futures_util::future::join_all;
 use itertools::Itertools;
-use matrix_sdk_common::executor::spawn;
+use matrix_sdk_common::{
+    deserialized_responses::WithheldCode, executor::spawn, locks::RwLock as StdRwLock,
+};
 use ruma::{
     events::{AnyMessageLikeEventContent, ToDeviceEventType},
     serde::Raw,
@@ -41,10 +43,7 @@ use crate::{
         ShareInfo, ShareState,
     },
     store::{Changes, CryptoStoreWrapper, Result as StoreResult, Store},
-    types::{
-        events::{room::encrypted::RoomEncryptedEventContent, room_key_withheld::WithheldCode},
-        requests::ToDeviceRequest,
-    },
+    types::{events::room::encrypted::RoomEncryptedEventContent, requests::ToDeviceRequest},
     Device, DeviceData, EncryptionSettings, OlmError,
 };
 
@@ -63,7 +62,7 @@ impl GroupSessionCache {
     }
 
     pub(crate) fn insert(&self, session: OutboundGroupSession) {
-        self.sessions.write().unwrap().insert(session.room_id().to_owned(), session);
+        self.sessions.write().insert(session.room_id().to_owned(), session);
     }
 
     /// Either get a session for the given room from the cache or load it from
@@ -75,20 +74,20 @@ impl GroupSessionCache {
     pub async fn get_or_load(&self, room_id: &RoomId) -> Option<OutboundGroupSession> {
         // Get the cached session, if there isn't one load one from the store
         // and put it in the cache.
-        if let Some(s) = self.sessions.read().unwrap().get(room_id) {
+        if let Some(s) = self.sessions.read().get(room_id) {
             return Some(s.clone());
         }
 
         match self.store.get_outbound_group_session(room_id).await {
             Ok(Some(s)) => {
                 {
-                    let mut sessions_being_shared = self.sessions_being_shared.write().unwrap();
+                    let mut sessions_being_shared = self.sessions_being_shared.write();
                     for request_id in s.pending_request_ids() {
                         sessions_being_shared.insert(request_id, s.clone());
                     }
                 }
 
-                self.sessions.write().unwrap().insert(room_id.to_owned(), s.clone());
+                self.sessions.write().insert(room_id.to_owned(), s.clone());
 
                 Some(s)
             }
@@ -107,20 +106,20 @@ impl GroupSessionCache {
     /// * `room_id` - The id of the room for which we should get the outbound
     ///   group session.
     fn get(&self, room_id: &RoomId) -> Option<OutboundGroupSession> {
-        self.sessions.read().unwrap().get(room_id).cloned()
+        self.sessions.read().get(room_id).cloned()
     }
 
     /// Returns whether any session is withheld with the given device and code.
     fn has_session_withheld_to(&self, device: &DeviceData, code: &WithheldCode) -> bool {
-        self.sessions.read().unwrap().values().any(|s| s.is_withheld_to(device, code))
+        self.sessions.read().values().any(|s| s.is_withheld_to(device, code))
     }
 
     fn remove_from_being_shared(&self, id: &TransactionId) -> Option<OutboundGroupSession> {
-        self.sessions_being_shared.write().unwrap().remove(id)
+        self.sessions_being_shared.write().remove(id)
     }
 
     fn mark_as_being_shared(&self, id: OwnedTransactionId, session: OutboundGroupSession) {
-        self.sessions_being_shared.write().unwrap().insert(id, session);
+        self.sessions_being_shared.write().insert(id, session);
     }
 }
 
@@ -782,6 +781,7 @@ mod tests {
     };
 
     use assert_matches2::assert_let;
+    use matrix_sdk_common::deserialized_responses::WithheldCode;
     use matrix_sdk_test::{async_test, ruma_response_from_json};
     use ruma::{
         api::client::{
@@ -804,10 +804,7 @@ mod tests {
         types::{
             events::{
                 room::encrypted::EncryptedToDeviceEvent,
-                room_key_withheld::{
-                    RoomKeyWithheldContent::{self, MegolmV1AesSha2},
-                    WithheldCode,
-                },
+                room_key_withheld::RoomKeyWithheldContent::{self, MegolmV1AesSha2},
             },
             requests::ToDeviceRequest,
             DeviceKeys, EventEncryptionAlgorithm,

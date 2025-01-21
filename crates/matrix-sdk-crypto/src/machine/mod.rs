@@ -14,7 +14,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::{Arc, RwLock as StdRwLock},
+    sync::Arc,
     time::Duration,
 };
 
@@ -25,6 +25,7 @@ use matrix_sdk_common::{
         UnableToDecryptReason, UnsignedDecryptionResult, UnsignedEventLocation, VerificationLevel,
         VerificationState,
     },
+    locks::RwLock as StdRwLock,
     BoxFuture,
 };
 use ruma::{
@@ -2582,7 +2583,9 @@ fn megolm_error_to_utd_info(
     let reason = match error {
         EventError(_) => UnableToDecryptReason::MalformedEncryptedEvent,
         Decode(_) => UnableToDecryptReason::MalformedEncryptedEvent,
-        MissingRoomKey(_) => UnableToDecryptReason::MissingMegolmSession,
+        MissingRoomKey(maybe_withheld) => {
+            UnableToDecryptReason::MissingMegolmSession { withheld_code: maybe_withheld }
+        }
         Decryption(DecryptionError::UnknownMessageIndex(_, _)) => {
             UnableToDecryptReason::UnknownMegolmMessageIndex
         }

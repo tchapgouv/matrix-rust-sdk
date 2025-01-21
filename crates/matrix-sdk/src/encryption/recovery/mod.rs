@@ -243,7 +243,7 @@ impl Recovery {
     /// ```
     #[instrument(skip_all)]
     pub async fn enable_backup(&self) -> Result<()> {
-        if !self.client.encryption().backups().exists_on_server().await? {
+        if !self.client.encryption().backups().fetch_exists_on_server().await? {
             self.mark_backup_as_enabled().await?;
 
             self.client.encryption().backups().create().await?;
@@ -462,7 +462,7 @@ impl Recovery {
     /// If the user does not enable recovery before logging out of their last
     /// device, they will not be able to decrypt historic messages once they
     /// create a new device.
-    pub async fn are_we_the_last_man_standing(&self) -> Result<bool> {
+    pub async fn is_last_device(&self) -> Result<bool> {
         let olm_machine = self.client.olm_machine().await;
         let olm_machine = olm_machine.as_ref().ok_or(crate::Error::NoOlmMachine)?;
         let user_id = olm_machine.user_id();
@@ -503,7 +503,7 @@ impl Recovery {
         // disabled, then we can automatically enable them.
         Ok(self.client.inner.e2ee.encryption_settings.auto_enable_backups
             && !self.client.encryption().backups().are_enabled().await
-            && !self.client.encryption().backups().exists_on_server().await?
+            && !self.client.encryption().backups().fetch_exists_on_server().await?
             && !self.are_backups_marked_as_disabled().await?)
     }
 

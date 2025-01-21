@@ -34,6 +34,7 @@ use std::{
 };
 
 use as_variant::as_variant;
+use matrix_sdk_common::deserialized_responses::PrivOwnedStr;
 use ruma::{
     serde::StringEnum, DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceKeyId, OwnedUserId, UserId,
 };
@@ -425,20 +426,6 @@ impl Algorithm for DeviceKeyAlgorithm {
     }
 }
 
-// Wrapper around `Box<str>` that cannot be used in a meaningful way outside of
-// this crate. Used for string enums because their `_Custom` variant can't be
-// truly private (only `#[doc(hidden)]`).
-#[doc(hidden)]
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PrivOwnedStr(Box<str>);
-
-#[cfg(not(tarpaulin_include))]
-impl std::fmt::Debug for PrivOwnedStr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 /// An encryption algorithm to be used to encrypt messages sent to a room.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, StringEnum)]
 #[non_exhaustive]
@@ -532,6 +519,8 @@ where
 
 #[cfg(test)]
 mod test {
+    use insta::{assert_debug_snapshot, assert_json_snapshot, with_settings};
+    use ruma::{device_id, user_id};
     use serde_json::json;
     use similar_asserts::assert_eq;
 
@@ -559,5 +548,80 @@ mod test {
             .expect("We should be able to serialize a secrets bundle");
 
         assert_eq!(json, serialized, "A serialization cycle should yield the same result");
+    }
+
+    #[test]
+    fn snapshot_backup_decryption_key() {
+        let decryption_key = BackupDecryptionKey { inner: Box::new([1u8; 32]) };
+        assert_json_snapshot!(decryption_key);
+
+        // should not log the key !
+        assert_debug_snapshot!(decryption_key);
+    }
+
+    #[test]
+    fn snapshot_signatures() {
+        let signatures = Signatures(BTreeMap::from([
+            (
+                user_id!("@alice:localhost").to_owned(),
+                BTreeMap::from([
+                    (
+                        DeviceKeyId::from_parts(
+                            DeviceKeyAlgorithm::Ed25519,
+                            device_id!("ABCDEFGH"),
+                        ),
+                        Ok(Signature::from(Ed25519Signature::from_slice(&[0u8; 64]).unwrap())),
+                    ),
+                    (
+                        DeviceKeyId::from_parts(
+                            DeviceKeyAlgorithm::Curve25519,
+                            device_id!("IJKLMNOP"),
+                        ),
+                        Ok(Signature::from(Ed25519Signature::from_slice(&[1u8; 64]).unwrap())),
+                    ),
+                ]),
+            ),
+            (
+                user_id!("@bob:localhost").to_owned(),
+                BTreeMap::from([(
+                    DeviceKeyId::from_parts(DeviceKeyAlgorithm::Ed25519, device_id!("ABCDEFGH")),
+                    Err(InvalidSignature { source: "SOME+B64+SOME+B64+SOME+B64+==".to_owned() }),
+                )]),
+            ),
+        ]));
+
+        with_settings!({sort_maps =>true}, {
+            assert_json_snapshot!(signatures)
+        });
+    }
+
+    #[test]
+    fn snapshot_secret_bundle() {
+        let secret_bundle = SecretsBundle {
+            cross_signing: CrossSigningSecrets {
+                master_key: "MSKMSKMSKMSKMSKMSKMSKMSKMSKMSKMSKMSK".to_owned(),
+                user_signing_key: "USKUSKUSKUSKUSKUSKUSKUSKUSKUSKUSKUSK".to_owned(),
+                self_signing_key: "SSKSSKSSKSSKSSKSSKSSKSSKSSKSSKSSK".to_owned(),
+            },
+            backup: Some(BackupSecrets::MegolmBackupV1Curve25519AesSha2(
+                MegolmBackupV1Curve25519AesSha2Secrets {
+                    key: BackupDecryptionKey::from_bytes(&[0u8; 32]),
+                    backup_version: "v1.1".to_owned(),
+                },
+            )),
+        };
+
+        assert_json_snapshot!(secret_bundle);
+
+        let secret_bundle = SecretsBundle {
+            cross_signing: CrossSigningSecrets {
+                master_key: "MSKMSKMSKMSKMSKMSKMSKMSKMSKMSKMSKMSK".to_owned(),
+                user_signing_key: "USKUSKUSKUSKUSKUSKUSKUSKUSKUSKUSKUSK".to_owned(),
+                self_signing_key: "SSKSSKSSKSSKSSKSSKSSKSSKSSKSSKSSK".to_owned(),
+            },
+            backup: None,
+        };
+
+        assert_json_snapshot!(secret_bundle);
     }
 }
