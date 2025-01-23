@@ -154,7 +154,7 @@ pub mod v3 {
             }
             let body = response.body().as_ref();
             let json = std::str::from_utf8(body)?;
-            let res: Response = serde_json::from_str(&json)?;
+            let res: Response = serde_json::from_str(json)?;
             Ok(res)
         }
     }
@@ -162,12 +162,10 @@ pub mod v3 {
     #[cfg(test)]
     mod test {
         use bytes::BytesMut;
-        use ruma_common::api::error::DeserializationError::*;
+
         use ruma_common::api::{IncomingResponse, MatrixVersion, OutgoingRequest, SendAccessToken};
 
         use crate::bwi_content_scanner_api::scan_file;
-
-        use super::*;
 
         #[test]
         fn create_request() {
@@ -196,7 +194,7 @@ pub mod v3 {
             let result = scan_file::v3::Response::try_from_http_response(response);
             assert!(result.is_ok());
             let res = result.unwrap();
-            assert_eq!(res.clean, true);
+            assert!(res.clean);
             assert_eq!(res.info, None);
         }
     }

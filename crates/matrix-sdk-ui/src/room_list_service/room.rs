@@ -17,16 +17,15 @@
 use core::fmt;
 use std::{ops::Deref, sync::Arc};
 
-use async_once_cell::OnceCell as AsyncOnceCell;
-use matrix_sdk::SlidingSync;
-use ruma::RoomId;
-use tracing::info;
-
 use super::Error;
 use crate::{
     timeline::{EventTimelineItem, TimelineBuilder},
     Timeline,
 };
+use async_once_cell::OnceCell as AsyncOnceCell;
+use matrix_sdk::SlidingSync;
+use ruma::RoomId;
+use tracing::info;
 
 /// A room in the room list.
 ///
