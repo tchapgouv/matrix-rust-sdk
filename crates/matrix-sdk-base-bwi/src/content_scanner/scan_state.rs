@@ -13,6 +13,26 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-pub mod content_scanner;
-pub mod jwt_token;
-pub mod room_alias;
+
+/// The State that is indicated by the BWI Content Scanner
+#[derive(Clone, Debug)]
+pub enum BWIScanState {
+    /// The Content is marked as safe
+    Trusted,
+
+    /// The content is marked as infected and must not be loaded
+    Infected,
+
+    /**
+    The content can not be scanned.
+    That could happen because the ContentScanner is not available
+    or the content can not be uploaded.
+    */
+    Error,
+
+    /// The scan process is triggered bug not finished
+    InProgress,
+
+    /// The file can no longer be found and can therefore not be scanned
+    NotFound,
+}

@@ -71,7 +71,7 @@ use tracing::{debug, error};
 use url::Url;
 
 use super::{room::Room, session_verification::SessionVerificationController, RUNTIME};
-use crate::client::ScanState::Infected;
+use crate::client::BWIScanState::Infected;
 use crate::{
     authentication::{HomeserverLoginDetails, OidcConfiguration, OidcError, SsoError, SsoHandler},
     client,
@@ -86,6 +86,7 @@ use crate::{
     utils::AsyncRuntimeDropped,
     ClientError,
 };
+use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState as SDKScanState;
 
 #[derive(Clone, uniffi::Record)]
 pub struct PusherIdentifiers {
@@ -112,13 +113,39 @@ pub enum PusherKind {
     Email,
 }
 
+/// The State that is indicated by the BWI Content Scanner
 #[derive(Clone, uniffi::Enum)]
-pub enum ScanState {
+pub enum BWIScanState {
+    /// The Content is marked as safe
     Trusted,
+
+    /// The content is marked as infected and must not be loaded
     Infected,
+
+    /**
+    The content can not be scanned.
+    That could happen because the ContentScanner is not available
+    or the content can not be uploaded.
+    */
     Error,
+
+    /// The scan process is triggered bug not finished
     InProgress,
+
+    /// The file can no longer be found and can therefore not be scanned
     NotFound,
+}
+
+impl From<SDKScanState> for BWIScanState {
+    fn from(value: SDKScanState) -> Self {
+        match value {
+            SDKScanState::Trusted => BWIScanState::Trusted,
+            SDKScanState::Infected => BWIScanState::Infected,
+            SDKScanState::Error => BWIScanState::Error,
+            SDKScanState::InProgress => BWIScanState::InProgress,
+            SDKScanState::NotFound => BWIScanState::NotFound,
+        }
+    }
 }
 
 impl TryFrom<PusherKind> for RumaPusherKind {
@@ -776,7 +803,7 @@ impl Client {
     pub async fn get_content_scanner_result_for_attachment(
         &self,
         _media_source: Arc<MediaSource>,
-    ) -> Result<ScanState, ClientError> {
+    ) -> Result<BWIScanState, ClientError> {
         Ok(Infected)
     }
 

@@ -36,7 +36,9 @@ imbl = { workspace = true, features = ["serde"] }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 matrix-sdk = { workspace = true, features = ["experimental-sliding-sync", "e2e-encryption"] }
+matrix-sdk-bwi = { workspace = true }
 matrix-sdk-base = { workspace = true }
+matrix-sdk-base-bwi = { workspace = true }
 mime = { workspace = true }
 once_cell = { workspace = true }
 pin-project-lite = { workspace = true }
@@ -49,6 +51,7 @@ tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true, features = ["attributes"] }
 unicode-normalization = { workspace = true }
 uniffi = { workspace = true, optional = true }
+url = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

@@ -760,16 +760,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b6a852b24ab71dffc585bcb46eaf7959d175cb865a7152e35b348d1b2960422"
 
 [[package]]
-name = "colored"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
-dependencies = [
- "lazy_static",
- "windows-sys 0.52.0",
-]
-
-[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2946,12 +2936,10 @@ version = "0.1.0"
 dependencies = [
  "jsonwebtoken",
  "log",
- "matrix-sdk-bwi-test",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
- "simple_logger",
  "tokio",
  "url",
  "wiremock",
@@ -3317,6 +3305,8 @@ dependencies = [
  "itertools 0.13.0",
  "matrix-sdk",
  "matrix-sdk-base",
+ "matrix-sdk-base-bwi",
+ "matrix-sdk-bwi",
  "matrix-sdk-test",
  "mime",
  "once_cell",
@@ -3332,6 +3322,7 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uniffi",
+ "url",
  "wiremock",
 ]
 
@@ -5098,18 +5089,6 @@ dependencies = [
  "num-traits",
  "thiserror 2.0.3",
  "time",
-]
-
-[[package]]
-name = "simple_logger"
-version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8c5dfa5e08767553704aa0ffd9d9794d527103c736aba9854773851fd7497eb"
-dependencies = [
- "colored",
- "log",
- "time",
- "windows-sys 0.48.0",
 ]
 
 [[package]]
