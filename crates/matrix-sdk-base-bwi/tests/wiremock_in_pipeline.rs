@@ -15,15 +15,11 @@
  */
 #![cfg(test)]
 mod pipeline_tests {
-    use log::LevelFilter;
-    use simple_logger::SimpleLogger;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn test_mock() {
-        SimpleLogger::new().with_level(LevelFilter::Trace).init().unwrap();
-
         // Start a background HTTP server on a random local port
         let mock_server = MockServer::start().await;
 

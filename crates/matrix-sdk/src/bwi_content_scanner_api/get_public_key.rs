@@ -43,10 +43,16 @@ pub mod v3 {
 
     /// Response type for the `public_key` endpoint.
     #[response(error = ruma_client_api::Error)]
-    #[derive(Deserialize)]
+    #[derive(Deserialize, PartialEq)]
     pub struct Response {
         #[serde(default)]
         pub public_key: String,
+    }
+
+    impl Default for Request {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl Request {
@@ -149,11 +155,7 @@ pub mod v3 {
 
             let result = get_public_key::v3::Response::try_from_http_response(response);
             assert!(result.is_err());
-            if let Err(Deserialization(Utf8(error))) = result {
-                assert!(true);
-            } else {
-                assert!(false);
-            }
+            assert!(matches!(result, Err(Deserialization(Utf8(_)))));
         }
 
         #[test]
@@ -163,11 +165,7 @@ pub mod v3 {
 
             let result = get_public_key::v3::Response::try_from_http_response(response);
             assert!(result.is_err());
-            if let Err(Deserialization(Json(error))) = result {
-                assert!(true);
-            } else {
-                assert!(false);
-            }
+            assert!(matches!(result, Err(Deserialization(Json(_)))));
         }
 
         #[test]
