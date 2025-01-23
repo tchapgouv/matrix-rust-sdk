@@ -5,17 +5,15 @@ edition = "2021"
 rust-version.workspace = true
 
 [dependencies]
-regex = "1.10.5"
-serde = { version = "1.0.151" }
-serde_json = "1.0.91"
-tokio = { workspace = true, features = ["macros"] }
-url = "2.5.4"
-reqwest = { workspace = true }
 jsonwebtoken = "9.3.0"
 log = "0.4.22"
-matrix-sdk-bwi-test = { workspace = true }
-wiremock = "0.6.2"
-simple_logger = "5.0.0"
+regex = "1.11.1"
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
+url = { workspace = true }
+wiremock = { workspace = true }
 
 [dev-dependencies]
 

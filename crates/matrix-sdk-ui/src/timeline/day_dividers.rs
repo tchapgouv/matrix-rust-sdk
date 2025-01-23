@@ -130,7 +130,9 @@ impl DayDividerAdjuster {
                     latest_event_ts = Some(ts);
                 }
 
-                TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker) => {
+                TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker)
+                // BWI-specific code
+                | TimelineItemKind::Virtual(VirtualTimelineItem::ScanStateChanged(_, _)) => {
                     // Nothing to do.
                 }
             }
@@ -219,7 +221,8 @@ impl DayDividerAdjuster {
                 return true;
             }
 
-            TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker) => {
+            TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker)
+            | TimelineItemKind::Virtual(VirtualTimelineItem::ScanStateChanged(_, _)) => {
                 // Nothing to do for read markers.
             }
         }
@@ -278,7 +281,8 @@ impl DayDividerAdjuster {
                 }
             }
 
-            TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker) => {
+            TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker)
+            | TimelineItemKind::Virtual(VirtualTimelineItem::ScanStateChanged(_, _)) => {
                 // Nothing to do.
             }
         }
