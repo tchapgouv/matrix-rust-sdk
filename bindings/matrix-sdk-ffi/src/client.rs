@@ -713,8 +713,8 @@ impl Client {
         Ok(device_id.to_string())
     }
 
-    pub async fn create_room(&self, request: CreateRoomParameters) -> Result<String, ClientError> {
-        let response = self.inner.create_room(request.try_into()?).await?;
+    pub async fn create_room(&self, request: CreateRoomParameters, is_federated: bool) -> Result<String, ClientError> {
+        let response = self.inner.create_room(request.try_into()?, is_federated).await?;
         Ok(String::from(response.room_id()))
     }
 

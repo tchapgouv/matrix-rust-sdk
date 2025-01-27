@@ -73,6 +73,8 @@ use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use ruma::events::room::history_visibility::{
     HistoryVisibility, RoomHistoryVisibilityEventContent,
 };
+use ruma::events::room::server_acl::RoomServerAclEventContent;
+use matrix_sdk_base_bwi::federation::{BWIFederationHandler,};
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{room::encryption::RoomEncryptionEventContent, InitialStateEvent};
 use ruma::{
@@ -109,6 +111,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, Mutex, OnceCell, RwLock, RwLockReadGuard};
 use tracing::{debug, error, instrument, trace, warn, Instrument, Span};
 use url::Url;
+use matrix_sdk_base_bwi::jwt_token::BWIJwtToken;
 
 mod builder;
 pub(crate) mod futures;
@@ -1485,10 +1488,10 @@ impl Client {
     /// # let homeserver = Url::parse("http://example.com").unwrap();
     /// let request = CreateRoomRequest::new();
     /// let client = Client::new(homeserver).await.unwrap();
-    /// assert!(client.create_room(request).await.is_ok());
+    /// assert!(client.create_room(request, false).await.is_ok());
     /// # };
     /// ```
-    pub async fn create_room(&self, mut request: create_room::v3::Request) -> Result<Room> {
+    pub async fn create_room(&self, mut request: create_room::v3::Request, is_federated: bool) -> Result<Room> {
         let invite = request.invite.clone();
         let is_direct_room = request.is_direct;
 
@@ -1507,6 +1510,19 @@ impl Client {
             .to_raw_any(),
         );
 
+        if !is_direct_room {
+            let server = self.server().expect("Server should be set").to_owned();
+            let federation_handler = BWIFederationHandler::for_server(server);
+            request.initial_state.push(
+                InitialStateEvent::new(RoomServerAclEventContent::new(
+                    false,
+                    federation_handler.create_server_acl(is_federated),
+                    Vec::new(),
+                ))
+                .to_raw_any()
+            );
+        }
+        // END BWI specific
         let response = self.send(request, None).await?;
         let base_room = self.base_client().get_or_create_room(&response.room_id, RoomState::Joined);
 
@@ -1552,7 +1568,7 @@ impl Client {
             initial_state,
         });
 
-        self.create_room(request).await
+        self.create_room(request, false).await
     }
 
     /// Search the homeserver's directory for public rooms with a filter.
@@ -3150,7 +3166,7 @@ pub(crate) mod tests {
             .create_room(assign!(CreateRoomRequest::new(), {
                 invite: vec![],
                 is_direct: false,
-            }))
+            }), false)
             .await
             .unwrap();
 
