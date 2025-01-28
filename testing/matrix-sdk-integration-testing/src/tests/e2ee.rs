@@ -60,7 +60,7 @@ async fn test_mutual_sas_verification() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room(request, false).await?;
     alice_room.enable_encryption().await?;
     let room_id = alice_room.room_id();
 
@@ -322,7 +322,7 @@ async fn test_mutual_qrcode_verification() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room(request, false).await?;
     alice_room.enable_encryption().await?;
     let room_id = alice_room.room_id();
 
@@ -546,7 +546,7 @@ async fn test_encryption_missing_member_keys() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room(request, false).await?;
     alice_room.enable_encryption().await?;
     alice.sync_once().await?;
 
@@ -664,7 +664,7 @@ async fn test_failed_members_response() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room(request, false).await?;
     alice_room.enable_encryption().await?;
     alice.sync_once().await?;
 

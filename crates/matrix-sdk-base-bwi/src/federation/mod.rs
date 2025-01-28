@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+mod test;
 use url::Url;
 
 pub struct BWIFederationHandler {
@@ -32,7 +33,7 @@ impl BWIFederationHandler {
         let mut is_allowed: Vec<String> = Vec::new();
         if is_federated {
             // Room is federated, allow other user from other servers to join the room
-            is_allowed.push("*".to_string());
+            is_allowed.push("*".to_owned());
         } else {
             // Room is not federated, only user from the same homeserver can join the room
             is_allowed.push(self.server_domain());

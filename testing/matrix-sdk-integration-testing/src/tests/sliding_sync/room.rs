@@ -110,10 +110,13 @@ async fn test_left_room() -> Result<()> {
 
     // Peter creates a room and invites Steven.
     let peter_room = peter
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![steven.user_id().unwrap().to_owned()],
-            is_direct: true,
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![steven.user_id().unwrap().to_owned()],
+                is_direct: true,
+            }),
+            false,
+        )
         .await?;
 
     // Steven joins it.

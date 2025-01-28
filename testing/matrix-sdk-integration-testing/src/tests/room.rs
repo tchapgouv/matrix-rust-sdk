@@ -208,7 +208,7 @@ async fn test_room_account_data() -> Result<()> {
     });
 
     // alice creates a room and invites bob.
-    let room_id = alice.create_room(CreateRoomRequest::new()).await?.room_id().to_owned();
+    let room_id = alice.create_room(CreateRoomRequest::new(), false).await?.room_id().to_owned();
 
     let alice_room = wait_for_room(&alice, &room_id).await;
 
