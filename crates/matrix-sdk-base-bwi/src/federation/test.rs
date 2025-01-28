@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#[cfg(test)]
 mod test_federation_create_server_acl {
     use crate::federation::BWIFederationHandler;
     use url::Url;
