@@ -13,7 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use log::debug;
 use url::Url;
 
 pub struct BWIFederationHandler {
@@ -21,7 +20,6 @@ pub struct BWIFederationHandler {
 }
 
 impl BWIFederationHandler {
-
     pub fn for_server(server_url: Url) -> Self {
         BWIFederationHandler { server_url }
     }

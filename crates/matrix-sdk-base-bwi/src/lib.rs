@@ -15,6 +15,6 @@
  */
 pub mod content_scanner;
 pub mod http_client;
+pub mod federation;
 pub mod jwt_token;
 pub mod room_alias;
-pub mod federation;

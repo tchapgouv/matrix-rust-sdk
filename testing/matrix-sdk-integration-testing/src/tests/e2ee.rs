@@ -801,7 +801,7 @@ async fn test_secret_gossip_after_interactive_verification() -> Result<()> {
     let user_id = first_client.user_id().expect("We should have access to the user id now");
 
     let request = CreateRoomRequest::new();
-    let room_first_client = first_client.create_room(request).await?;
+    let room_first_client = first_client.create_room(request, false).await?;
     room_first_client.enable_encryption().await?;
     first_client.sync_once().await?;
 
