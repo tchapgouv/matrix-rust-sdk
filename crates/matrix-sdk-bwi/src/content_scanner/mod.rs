@@ -22,7 +22,6 @@ use crate::content_scanner::dto::{
 };
 use crate::content_scanner::url::BWIContentScannerUrl;
 use crate::content_scanner::BWIContentScannerError::ScanFailed;
-use ::url::{ParseError, Url};
 use http::StatusCode;
 use matrix_sdk_base::ruma::events::room::MediaSource::{Encrypted, Plain};
 use matrix_sdk_base::ruma::events::room::{EncryptedFile, MediaSource};
@@ -34,6 +33,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error};
+use ::url::{ParseError, Url};
 
 #[derive(Debug)]
 pub enum BWIContentScannerError {
@@ -121,8 +121,8 @@ impl BWIContentScanner {
         match media_source {
             Encrypted(encrypted_file) => self.scan_encrypted_file(encrypted_file).await,
             Plain(attachment) => {
-                error!("###BWI### All media should be encrypted. But we encountered an unencrypted media with uri {:?}", attachment);
-                BWIScanState::Error
+                debug!("###BWI### All media should be encrypted. This should be a local echo with uri {:?}", attachment);
+                BWIScanState::InProgress
             }
         }
     }
