@@ -15,7 +15,7 @@
  */
 
 /// The State that is indicated by the BWI Content Scanner
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BWIScanState {
     /// The Content is marked as safe
     Trusted,

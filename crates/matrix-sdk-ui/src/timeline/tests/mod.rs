@@ -22,6 +22,18 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use super::{
+    controller::{TimelineNewItemPosition, TimelineSettings},
+    event_handler::TimelineEventKind,
+    event_item::RemoteEventOrigin,
+    traits::RoomDataProvider,
+    util::rfind_event_by_item_id,
+    EventTimelineItem, Profile, TimelineController, TimelineEventItemId, TimelineFocus,
+    TimelineItem,
+};
+use crate::{
+    timeline::pinned_events_loader::PinnedEventsRoom, unable_to_decrypt_hook::UtdHookManager,
+};
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
@@ -31,6 +43,7 @@ use matrix_sdk::{
     config::RequestConfig,
     deserialized_responses::{SyncTimelineEvent, TimelineEvent},
     event_cache::paginator::{PaginableRoom, PaginatorError},
+    reqwest,
     room::{EventWithContextResponse, Messages, MessagesOptions},
     send_queue::RoomSendQueueUpdate,
     BoxFuture,
@@ -38,6 +51,7 @@ use matrix_sdk::{
 use matrix_sdk_base::{
     crypto::types::events::CryptoContextInfo, latest_event::LatestEvent, RoomInfo, RoomState,
 };
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use matrix_sdk_test::{
     event_factory::EventFactory, EventBuilder, ALICE, BOB, DEFAULT_TEST_ROOM_ID,
 };
@@ -60,19 +74,6 @@ use ruma::{
 };
 use tokio::sync::RwLock;
 
-use super::{
-    controller::{TimelineNewItemPosition, TimelineSettings},
-    event_handler::TimelineEventKind,
-    event_item::RemoteEventOrigin,
-    traits::RoomDataProvider,
-    util::rfind_event_by_item_id,
-    EventTimelineItem, Profile, TimelineController, TimelineEventItemId, TimelineFocus,
-    TimelineItem,
-};
-use crate::{
-    timeline::pinned_events_loader::PinnedEventsRoom, unable_to_decrypt_hook::UtdHookManager,
-};
-
 mod basic;
 mod echo;
 mod edit;
@@ -85,6 +86,14 @@ mod read_receipts;
 mod redaction;
 mod shields;
 mod virt;
+
+// BWI-specific
+fn create_dummy_content_scanner() -> Arc<BWIContentScanner> {
+    Arc::from(
+        BWIContentScanner::new_with_url_as_str(reqwest::Client::default(), "example.com").unwrap(),
+    )
+}
+// end BWI-specific
 
 struct TestTimeline {
     controller: TimelineController<TestRoomDataProvider>,
@@ -112,6 +121,9 @@ impl TestTimeline {
                 Some(prefix),
                 None,
                 Some(false),
+                // BWI-specific
+                create_dummy_content_scanner(),
+                // end BWI-specific
             ),
             event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
@@ -126,6 +138,9 @@ impl TestTimeline {
                 None,
                 None,
                 Some(false),
+                // BWI-specific
+                create_dummy_content_scanner(),
+                // end BWI-specific
             ),
             event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
@@ -140,6 +155,9 @@ impl TestTimeline {
                 None,
                 Some(hook),
                 Some(true),
+                // BWI-specific
+                create_dummy_content_scanner(),
+                // end BWI-specific
             ),
             event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
@@ -155,6 +173,9 @@ impl TestTimeline {
                 None,
                 None,
                 Some(encrypted),
+                // BWI-specific
+                create_dummy_content_scanner(),
+                // end BWI-specific
             ),
             event_builder: EventBuilder::new(),
             factory: EventFactory::new(),

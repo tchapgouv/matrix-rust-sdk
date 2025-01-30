@@ -34,7 +34,7 @@ async fn test_valid_jwt_token_from_pub_file() -> Result<(), Box<dyn std::error::
     // Assert
     assert_eq!(
         Ok(()),
-        BWITokenValidator::for_homeserver(homeserver_url).validate_with_keys(&vec![key]).await
+        BWITokenValidator::for_homeserver(homeserver_url).validate_with_keys(&[key]).await
     );
     Ok(())
 }

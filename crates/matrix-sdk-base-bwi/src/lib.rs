@@ -14,5 +14,6 @@
  * limitations under the License.
  */
 pub mod content_scanner;
+pub mod http_client;
 pub mod jwt_token;
 pub mod room_alias;

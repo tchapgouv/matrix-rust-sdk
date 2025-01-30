@@ -114,7 +114,6 @@ matrix-sdk-qrcode = { path = "crates/matrix-sdk-qrcode", version = "0.8.0" }
 matrix-sdk-sqlite = { path = "crates/matrix-sdk-sqlite", version = "0.8.0", default-features = false }
 matrix-sdk-store-encryption = { path = "crates/matrix-sdk-store-encryption", version = "0.8.0" }
 matrix-sdk-test = { path = "testing/matrix-sdk-test", version = "0.7.0" }
-matrix-sdk-bwi-test = { path = "testing/matrix-sdk-bwi-test", version = "0.1.0" }
 matrix-sdk-ui = { path = "crates/matrix-sdk-ui", version = "0.8.0", default-features = false }
 
 # Default release profile, select with `--release`

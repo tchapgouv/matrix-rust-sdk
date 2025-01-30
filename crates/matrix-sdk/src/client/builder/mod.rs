@@ -93,6 +93,7 @@ use url::Url;
 pub struct ClientBuilder {
     // BWI specific
     public_keys_for_jwt_validation: Option<Vec<BWIPublicKeyForJWTTokenValidation>>,
+    use_content_scanner: bool,
     // end BWI specific
     homeserver_cfg: Option<HomeserverConfig>,
     #[cfg(feature = "experimental-sliding-sync")]
@@ -120,6 +121,7 @@ impl ClientBuilder {
         Self {
             // BWI specific
             public_keys_for_jwt_validation: Some(Vec::new()),
+            use_content_scanner: true,
             // end BWI specific
             homeserver_cfg: None,
             #[cfg(feature = "experimental-sliding-sync")]
@@ -211,7 +213,7 @@ impl ClientBuilder {
     /// the identity of the server via the jwt token flow
     pub fn public_keys_for_jwt_from_strings(
         mut self,
-        public_keys_for_jwt_as_paths: &Vec<String>,
+        public_keys_for_jwt_as_paths: &[String],
     ) -> Result<Self, BWIPublicKeyForJWTTokenValidationParseError> {
         let public_keys = public_keys_for_jwt_as_paths
             .iter()
@@ -235,6 +237,12 @@ impl ClientBuilder {
     /// To disable it, call this method when creating the client
     pub fn without_server_jwt_token_validation(mut self) -> Self {
         self.public_keys_for_jwt_validation = None;
+        self
+    }
+
+    /// Disable the content scanner extension for a specific client
+    pub fn without_content_scanner(mut self) -> Self {
+        self.use_content_scanner = false;
         self
     }
     // end BWI specific
