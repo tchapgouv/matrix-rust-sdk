@@ -14,6 +14,33 @@
 
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
+pub(super) use self::state::{
+    AllRemoteEvents, FullEventMeta, PendingEdit, PendingEditKind, TimelineMetadata,
+    TimelineNewItemPosition, TimelineState, TimelineStateTransaction,
+};
+use super::{
+    event_handler::TimelineEventKind,
+    event_item::{ReactionStatus, RemoteEventOrigin},
+    item::TimelineUniqueId,
+    traits::{Decryptor, RoomDataProvider},
+    util::{rfind_event_by_id, rfind_event_item, RelativePosition},
+    Error, EventSendState, EventTimelineItem, InReplyToDetails, PaginationError, Profile,
+    ReactionInfo, RepliedToEvent, TimelineDetails, TimelineEventItemId, TimelineFocus,
+    TimelineItem, TimelineItemContent, TimelineItemKind,
+};
+use crate::timeline::TimelineItemKind::Virtual;
+use crate::timeline::VirtualTimelineItem::ScanStateChanged;
+use crate::{
+    timeline::{
+        day_dividers::DayDividerAdjuster,
+        event_item::EventTimelineItemKind,
+        pinned_events_loader::{PinnedEventsLoader, PinnedEventsLoaderError},
+        reactions::FullReactionKey,
+        util::rfind_event_by_item_id,
+        TimelineEventFilterFn,
+    },
+    unable_to_decrypt_hook::UtdHookManager,
+};
 use as_variant::as_variant;
 use eyeball_im::{ObservableVectorEntry, VectorDiff};
 use eyeball_im_util::vector::VectorObserverExt;
@@ -29,6 +56,10 @@ use matrix_sdk::{
     },
     Result, Room,
 };
+use matrix_sdk_base::media::MediaEventContent;
+use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState;
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
+use ruma::events::room::MediaSource;
 use ruma::{
     api::client::receipt::create_receipt::v3::ReceiptType as SendReceiptType,
     events::{
@@ -49,32 +80,6 @@ use ruma::{events::receipt::ReceiptEventContent, RoomId};
 use tokio::sync::{RwLock, RwLockWriteGuard};
 use tracing::{
     debug, error, field, field::debug, info, info_span, instrument, trace, warn, Instrument as _,
-};
-
-pub(super) use self::state::{
-    AllRemoteEvents, FullEventMeta, PendingEdit, PendingEditKind, TimelineMetadata,
-    TimelineNewItemPosition, TimelineState, TimelineStateTransaction,
-};
-use super::{
-    event_handler::TimelineEventKind,
-    event_item::{ReactionStatus, RemoteEventOrigin},
-    item::TimelineUniqueId,
-    traits::{Decryptor, RoomDataProvider},
-    util::{rfind_event_by_id, rfind_event_item, RelativePosition},
-    Error, EventSendState, EventTimelineItem, InReplyToDetails, Message, PaginationError, Profile,
-    ReactionInfo, RepliedToEvent, TimelineDetails, TimelineEventItemId, TimelineFocus,
-    TimelineItem, TimelineItemContent, TimelineItemKind,
-};
-use crate::{
-    timeline::{
-        day_dividers::DayDividerAdjuster,
-        event_item::EventTimelineItemKind,
-        pinned_events_loader::{PinnedEventsLoader, PinnedEventsLoaderError},
-        reactions::FullReactionKey,
-        util::rfind_event_by_item_id,
-        TimelineEventFilterFn,
-    },
-    unable_to_decrypt_hook::UtdHookManager,
 };
 
 mod state;
@@ -116,6 +121,11 @@ pub(super) struct TimelineController<P: RoomDataProvider = Room> {
 
     /// Settings applied to this timeline.
     settings: TimelineSettings,
+
+    // BWI-specific
+    /// the used ContentScanner
+    content_scanner: Arc<BWIContentScanner>,
+    // end BWI-specific
 }
 
 #[derive(Clone)]
@@ -242,6 +252,9 @@ impl<P: RoomDataProvider> TimelineController<P> {
         internal_id_prefix: Option<String>,
         unable_to_decrypt_hook: Option<Arc<UtdHookManager>>,
         is_room_encrypted: Option<bool>,
+        // BWI-specific
+        content_scanner: Arc<BWIContentScanner>,
+        // end BWI-specific
     ) -> Self {
         let (focus_data, focus_kind) = match focus {
             TimelineFocus::Live => (TimelineFocusData::Live, TimelineFocusKind::Live),
@@ -280,6 +293,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
             focus: Arc::new(RwLock::new(focus_data)),
             room_data_provider,
             settings: Default::default(),
+            content_scanner,
         }
     }
 
@@ -1531,6 +1545,54 @@ impl TimelineController {
         let state = self.state.read().await;
         state.meta.all_remote_events.last().map(|event_meta| &event_meta.event_id).cloned()
     }
+
+    // BWI-specific
+    pub(crate) async fn handle_single_timeline_item(&self, diff: &Arc<TimelineItem>) {
+        if let Some(source) = self.filter_for_media_events(diff) {
+            debug!("###BWI###: Stated Scan for Timeline Item with id {}", diff.internal_id.0);
+            let scan_state =
+                self.content_scanner.scan_attachment_with_content_scanner(source).await;
+            debug!("###BWI###: Finished Scan: Scan state is: {:?}", scan_state);
+            self.finish_content_scan_for_item_with_state(diff.internal_id.clone(), scan_state)
+                .await;
+        }
+    }
+
+    fn filter_for_media_events(&self, diff: &Arc<TimelineItem>) -> Option<MediaSource> {
+        if let Some(item) = diff.as_event() {
+            if let TimelineItemContent::Message(message) = item.content() {
+                return match message.msgtype() {
+                    MessageType::Image(content) => content.source(),
+                    MessageType::Video(content) => content.source(),
+                    MessageType::Audio(content) => content.source(),
+                    MessageType::File(content) => content.source(),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
+    async fn finish_content_scan_for_item_with_state(
+        &self,
+        id_of_event_with_attachment: TimelineUniqueId,
+        scan_state_after_scanning: BWIScanState,
+    ) {
+        let mut state = self.state.write().await;
+        state.items.push_back(TimelineItem::new(
+            Virtual(ScanStateChanged(
+                id_of_event_with_attachment.clone(),
+                scan_state_after_scanning.clone(),
+            )),
+            // possible solution: is there an item with this timelineUniqueId
+            TimelineUniqueId(id_of_event_with_attachment.clone().0 + "__scan_state"),
+        ));
+        info!(
+            "###BWI###: virtual Event with state {:?} and id {:?}",
+            scan_state_after_scanning, id_of_event_with_attachment.0
+        );
+    }
+    // end BWI-specific
 }
 
 #[derive(Debug, Default)]
@@ -1550,7 +1612,7 @@ async fn fetch_replied_to_event(
     index: usize,
     item: &EventTimelineItem,
     internal_id: TimelineUniqueId,
-    message: &Message,
+    message: &crate::timeline::event_item::Message,
     in_reply_to: &EventId,
     room: &Room,
 ) -> Result<TimelineDetails<Box<RepliedToEvent>>, Error> {

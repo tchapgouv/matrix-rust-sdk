@@ -14,17 +14,6 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
-use futures_util::{pin_mut, StreamExt};
-use matrix_sdk::{
-    encryption::backups::BackupState,
-    event_cache::{EventsOrigin, RoomEventCacheUpdate},
-    executor::spawn,
-    Room,
-};
-use ruma::{events::AnySyncTimelineEvent, RoomVersionId};
-use tokio::sync::broadcast::error::RecvError;
-use tracing::{info, info_span, trace, warn, Instrument, Span};
-
 use super::{
     controller::{TimelineController, TimelineSettings},
     to_device::{handle_forwarded_room_key_event, handle_room_key_event},
@@ -34,6 +23,17 @@ use crate::{
     timeline::{controller::TimelineNewItemPosition, event_item::RemoteEventOrigin},
     unable_to_decrypt_hook::UtdHookManager,
 };
+use futures_util::{pin_mut, StreamExt};
+use matrix_sdk::{
+    encryption::backups::BackupState,
+    event_cache::{EventsOrigin, RoomEventCacheUpdate},
+    executor::spawn,
+    Room,
+};
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
+use ruma::{events::AnySyncTimelineEvent, RoomVersionId};
+use tokio::sync::broadcast::error::RecvError;
+use tracing::{info, info_span, trace, warn, Instrument, Span};
 
 /// Builder that allows creating and configuring various parts of a
 /// [`Timeline`].
@@ -160,12 +160,22 @@ impl TimelineBuilder {
         let is_pinned_events = matches!(focus, TimelineFocus::PinnedEvents { .. });
         let is_room_encrypted = room.is_encrypted().await.ok();
 
+        // BWI-specific
+        let client = room.client();
+        let homeserver_url = client.homeserver();
+        let content_scanner = Arc::from(BWIContentScanner::new_with_url(
+            client.http_client().clone(),
+            homeserver_url,
+        ));
+        // end BWI-specific
+
         let controller = TimelineController::new(
             room,
             focus.clone(),
             internal_id_prefix.clone(),
             unable_to_decrypt_hook,
             is_room_encrypted,
+            content_scanner,
         )
         .with_settings(settings);
 

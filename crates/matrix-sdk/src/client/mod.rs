@@ -2544,7 +2544,6 @@ pub(crate) mod tests {
         spawn,
         time::{sleep, timeout},
     };
-    use tokio_stream::StreamExt;
     use url::Url;
     use wiremock::{
         matchers::{body_json, header, method, path, query_param_is_missing},

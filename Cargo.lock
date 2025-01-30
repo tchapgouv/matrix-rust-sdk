@@ -760,6 +760,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b6a852b24ab71dffc585bcb46eaf7959d175cb865a7152e35b348d1b2960422"
 
 [[package]]
+name = "colored"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
+dependencies = [
+ "lazy_static",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1452,10 +1462,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "eyeball-im",
  "futures-util",
+ "log",
  "matrix-sdk",
+ "matrix-sdk-base-bwi",
+ "matrix-sdk-bwi",
  "matrix-sdk-ui",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "url",
 ]
@@ -2934,12 +2949,14 @@ dependencies = [
 name = "matrix-sdk-base-bwi"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "jsonwebtoken",
  "log",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror 2.0.3",
  "tokio",
  "url",
  "wiremock",
@@ -2950,12 +2967,20 @@ name = "matrix-sdk-bwi"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "http",
+ "matrix-sdk-base",
+ "matrix-sdk-base-bwi",
  "reqwest",
  "rusty-hook",
  "serde",
  "serde_json",
+ "simple_logger",
  "tokio",
+ "tracing",
+ "tracing-test",
  "url",
+ "wiremock",
  "zxcvbn",
 ]
 
@@ -5091,6 +5116,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "simple_logger"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8c5dfa5e08767553704aa0ffd9d9794d527103c736aba9854773851fd7497eb"
+dependencies = [
+ "colored",
+ "log",
+ "time",
+ "windows-sys 0.48.0",
+]
+
+[[package]]
 name = "siphasher"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5669,6 +5706,27 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "tracing-test"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "557b891436fe0d5e0e363427fc7f217abf9ccd510d5136549847bdcbcd011d68"
+dependencies = [
+ "tracing-core",
+ "tracing-subscriber",
+ "tracing-test-macro",
+]
+
+[[package]]
+name = "tracing-test-macro"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04659ddb06c87d233c566112c1c9c5b9e98256d9af50ec3bc9c8327f873a7568"
+dependencies = [
+ "quote",
+ "syn",
 ]
 
 [[package]]
