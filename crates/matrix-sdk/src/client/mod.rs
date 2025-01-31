@@ -1561,7 +1561,7 @@ impl Client {
         let server = self.server().expect("Server should be set").to_owned();
 
         #[cfg(test)]
-        let server = Url::parse("test.de").unwrap();
+        let server = Url::parse("https://test.de").unwrap();
 
         let federation_handler = BWIFederationHandler::for_server(server);
 
