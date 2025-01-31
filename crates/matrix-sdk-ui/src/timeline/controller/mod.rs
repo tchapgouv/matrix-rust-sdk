@@ -1550,8 +1550,7 @@ impl TimelineController {
     pub(crate) async fn handle_single_timeline_item(&self, diff: &Arc<TimelineItem>) {
         if let Some(source) = self.filter_for_media_events(diff) {
             debug!("###BWI###: Stated Scan for Timeline Item with id {}", diff.internal_id.0);
-            let scan_state =
-                self.content_scanner.scan_attachment_with_content_scanner(source).await;
+            let scan_state = self.content_scanner.scan_attachment(source).await;
             debug!("###BWI###: Finished Scan: Scan state is: {:?}", scan_state);
             self.finish_content_scan_for_item_with_state(diff.internal_id.clone(), scan_state)
                 .await;

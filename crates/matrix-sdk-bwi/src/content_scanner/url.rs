@@ -13,11 +13,45 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+use crate::content_scanner::url::content_scanner_api::Endpoint::{
+    MediaDownloadEndpoint, PublicKeyEndpoint, ScanEndpoint, ThumbnailDownloadEndpoint,
+};
 use url::Url;
 
-mod content_scanner_api {
-    pub(super) const PUBLIC_KEY_ENDPOINT: &str = "/_matrix/media_proxy/unstable/public_key";
-    pub(super) const SCAN_ENDPOINT: &str = "/_matrix/media_proxy/unstable/scan_encrypted";
+pub(crate) mod content_scanner_api {
+    use crate::content_scanner::url::BWIContentScannerUrl;
+    use url::Url;
+
+    pub enum Endpoint {
+        PublicKeyEndpoint,
+        ScanEndpoint,
+        MediaDownloadEndpoint(String, String),
+        ThumbnailDownloadEndpoint(String, String),
+    }
+
+    impl Into<String> for Endpoint {
+        fn into(self) -> String {
+            match self {
+                Endpoint::PublicKeyEndpoint => {
+                    "/_matrix/media_proxy/unstable/public_key".to_owned()
+                }
+                Endpoint::ScanEndpoint => "/_matrix/media_proxy/unstable/scan_encrypted".to_owned(),
+                Endpoint::MediaDownloadEndpoint(server_name, media_id) => {
+                    format!("/_matrix/media_proxy/unstable/download/{server_name}/{media_id}")
+                }
+                Endpoint::ThumbnailDownloadEndpoint(server_name, media_id) => {
+                    format!("/_matrix/media_proxy/unstable/thumbnail/{server_name}/{media_id}")
+                }
+            }
+        }
+    }
+
+    impl BWIContentScannerUrl {
+        pub(crate) fn get_url_for_endpoint(&self, endpoint: Endpoint) -> Url {
+            let endpoint_as_str: String = endpoint.into();
+            self.get_base_url().join(&endpoint_as_str).expect("The url should be valid")
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -52,15 +86,19 @@ impl BWIContentScannerUrl {
     }
 
     pub fn get_public_key_url(&self) -> Url {
-        self.get_base_url()
-            .join(content_scanner_api::PUBLIC_KEY_ENDPOINT)
-            .expect("The url should be valid")
+        self.get_url_for_endpoint(PublicKeyEndpoint)
     }
 
     pub fn get_scan_url(&self) -> Url {
-        self.get_base_url()
-            .join(content_scanner_api::SCAN_ENDPOINT)
-            .expect("The url should be valid")
+        self.get_url_for_endpoint(ScanEndpoint)
+    }
+
+    pub fn get_media_download_link(&self, server_name: &str, media_id: &str) -> Url {
+        self.get_url_for_endpoint(MediaDownloadEndpoint(server_name.into(), media_id.into()))
+    }
+
+    pub fn get_thumbnail_download_link(&self, server_name: &str, media_id: &str) -> Url {
+        self.get_url_for_endpoint(ThumbnailDownloadEndpoint(server_name.into(), media_id.into()))
     }
 }
 

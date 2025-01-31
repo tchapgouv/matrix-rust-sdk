@@ -125,9 +125,7 @@ async fn test_media_scan_trusted() {
     let content_scanner = BWIContentScanner::new_with_url(client, mock_server_url);
 
     // Act
-    let scan_state = content_scanner
-        .scan_attachment_with_content_scanner(Encrypted(Box::from(encrypted_file())))
-        .await;
+    let scan_state = content_scanner.scan_attachment(Encrypted(Box::from(encrypted_file()))).await;
 
     // Assert
     assert_eq!(scan_state, BWIScanState::Trusted);

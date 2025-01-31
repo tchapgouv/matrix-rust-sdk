@@ -77,6 +77,20 @@ impl BWIContentScanner {
         Self { http_client, content_scanner_url, scanned_media }
     }
 
+    pub fn new_with_url_as_str(
+        http_client: reqwest::Client,
+        content_scanner_url: &str,
+    ) -> Result<Self, ParseError> {
+        let content_scanner_url =
+            BWIContentScannerUrl::for_base_url_as_string(content_scanner_url)?;
+        Ok(Self::new(http_client, content_scanner_url, BWIScannedMedia::new()))
+    }
+
+    pub fn new_with_url(http_client: reqwest::Client, content_scanner_url: Url) -> Self {
+        let content_scanner_url = BWIContentScannerUrl::for_base_url(content_scanner_url);
+        Self::new(http_client, content_scanner_url, BWIScannedMedia::new())
+    }
+
     pub async fn get_public_key(
         &self,
     ) -> Result<BWIContentScannerPublicKey, BWIContentScannerError> {
@@ -100,26 +114,9 @@ impl BWIContentScanner {
         )
     }
 
-    pub fn new_with_url_as_str(
-        http_client: reqwest::Client,
-        content_scanner_url: &str,
-    ) -> Result<Self, ParseError> {
-        let content_scanner_url =
-            BWIContentScannerUrl::for_base_url_as_string(content_scanner_url)?;
-        Ok(Self::new(http_client, content_scanner_url, BWIScannedMedia::new()))
-    }
-
-    pub fn new_with_url(http_client: reqwest::Client, content_scanner_url: Url) -> Self {
-        let content_scanner_url = BWIContentScannerUrl::for_base_url(content_scanner_url);
-        Self::new(http_client, content_scanner_url, BWIScannedMedia::new())
-    }
-
-    pub async fn scan_attachment_with_content_scanner(
-        &self,
-        media_source: MediaSource,
-    ) -> BWIScanState {
+    pub async fn scan_attachment(&self, media_source: MediaSource) -> BWIScanState {
         match media_source {
-            Encrypted(encrypted_file) => self.scan_encrypted_file(encrypted_file).await,
+            Encrypted(encrypted_file) => self.get_scan_for_encrypted_media(encrypted_file).await,
             Plain(attachment) => {
                 debug!("###BWI### All media should be encrypted. This should be a local echo with uri {:?}", attachment);
                 BWIScanState::InProgress
@@ -127,7 +124,10 @@ impl BWIContentScanner {
         }
     }
 
-    async fn scan_encrypted_file(&self, encrypted_file: Box<EncryptedFile>) -> BWIScanState {
+    async fn get_scan_for_encrypted_media(
+        &self,
+        encrypted_file: Box<EncryptedFile>,
+    ) -> BWIScanState {
         let mut guard = self.scanned_media.scanned_media.lock().await;
 
         let media_uri = encrypted_file.url.to_string();
@@ -154,6 +154,23 @@ impl BWIContentScanner {
                 Err(ScanFailed)
             }
         }
+    }
+
+    async fn send_scan_request(
+        &self,
+        encrypted_media: Box<EncryptedFile>,
+        public_key: &BWIContentScannerPublicKey,
+    ) -> Result<Result<Response, Error>, BWIContentScannerError> {
+        Ok(self
+            .http_client
+            .post(self.content_scanner_url.get_scan_url())
+            .json(
+                &EncryptedMetadataRequestBuilder::for_encrypted_file(*encrypted_media)
+                    .build_encrypted_request(public_key)
+                    .map_err(|_| ScanFailed)?,
+            )
+            .send()
+            .await)
     }
 
     /// Map the responses to the given semantic used by NV
@@ -186,23 +203,6 @@ impl BWIContentScanner {
             StatusCode::NOT_FOUND => Ok(BWIScanState::NotFound),
             _ => Err(ScanFailed),
         }
-    }
-
-    async fn send_scan_request(
-        &self,
-        encrypted_media: Box<EncryptedFile>,
-        public_key: &BWIContentScannerPublicKey,
-    ) -> Result<Result<Response, Error>, BWIContentScannerError> {
-        Ok(self
-            .http_client
-            .post(self.content_scanner_url.get_scan_url())
-            .json(
-                &EncryptedMetadataRequestBuilder::for_encrypted_file(*encrypted_media)
-                    .build_encrypted_request(public_key)
-                    .map_err(|_| ScanFailed)?,
-            )
-            .send()
-            .await)
     }
 }
 
