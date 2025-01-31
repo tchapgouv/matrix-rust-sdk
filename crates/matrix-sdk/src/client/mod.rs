@@ -1499,34 +1499,20 @@ impl Client {
         let invite = request.invite.clone();
         let is_direct_room = request.is_direct;
 
-        // BWI specific: create room alias
         if !is_direct_room {
-            if let Some(room_name) = &request.name {
-                request.room_alias_name = Some(BWIRoomAlias::alias_for_room_name(room_name));
-            }
+            // BWI specific: create room alias
+            Client::add_room_alias(&mut request);
+            // END BWI specific
+
+            // BWI specific: add acl initial state event
+            self.add_acl_initial_state_event(&mut request, is_federated);
+            // END #6880 BWI specific
         }
 
         // BWI specific: #5991 create room with HistoryVisibility set to invite
-        request.initial_state.push(
-            InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(
-                HistoryVisibility::Invited,
-            ))
-            .to_raw_any(),
-        );
+        Client::add_history_visibility_initial_state_event(&mut request);
+        // END #5991 BWI specific
 
-        if !is_direct_room {
-            let server = self.server().expect("Server should be set").to_owned();
-            let federation_handler = BWIFederationHandler::for_server(server);
-            request.initial_state.push(
-                InitialStateEvent::new(RoomServerAclEventContent::new(
-                    false,
-                    federation_handler.create_server_acl(is_federated),
-                    Vec::new(),
-                ))
-                .to_raw_any(),
-            );
-        }
-        // END BWI specific
         let response = self.send(request, None).await?;
         let base_room = self.base_client().get_or_create_room(&response.room_id, RoomState::Joined);
 
@@ -1543,6 +1529,52 @@ impl Client {
 
         Ok(joined_room)
     }
+
+    // BWI specific: create room alias
+    pub(self) fn add_room_alias(request: &mut create_room::v3::Request) {
+        if let Some(room_name) = &request.name {
+            request.room_alias_name = Some(BWIRoomAlias::alias_for_room_name(room_name));
+        }
+    }
+    // END BWI specific
+
+    // BWI specific: #5991 create room with HistoryVisibility set to invite
+    pub(self) fn add_history_visibility_initial_state_event(
+        request: &mut create_room::v3::Request,
+    ) {
+        request.initial_state.push(
+            InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(
+                HistoryVisibility::Invited,
+            ))
+            .to_raw_any(),
+        );
+    }
+    // END #5991 BWI specific
+
+    // BWI specific: #6880 add acl initial state event
+    pub(self) fn add_acl_initial_state_event(
+        &self,
+        request: &mut create_room::v3::Request,
+        is_federated: bool,
+    ) {
+        #[cfg(not(test))]
+        let server = self.server().expect("Server should be set").to_owned();
+
+        #[cfg(test)]
+        let server = Url::parse("test.de").unwrap();
+
+        let federation_handler = BWIFederationHandler::for_server(server);
+
+        request.initial_state.push(
+            InitialStateEvent::new(RoomServerAclEventContent::new(
+                false,
+                federation_handler.create_server_acl(is_federated),
+                Vec::new(),
+            ))
+            .to_raw_any(),
+        );
+    }
+    // END #6880 BWI specific
 
     /// Create a DM room.
     ///

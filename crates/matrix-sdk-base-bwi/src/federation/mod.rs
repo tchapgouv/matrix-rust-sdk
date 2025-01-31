@@ -30,14 +30,11 @@ impl BWIFederationHandler {
     }
 
     pub fn create_server_acl(&self, is_federated: bool) -> Vec<String> {
-        let mut is_allowed: Vec<String> = Vec::new();
-        if is_federated {
+        match is_federated {
             // Room is federated, allow other user from other servers to join the room
-            is_allowed.push("*".to_owned());
-        } else {
+            true => vec!["*".to_owned()],
             // Room is not federated, only user from the same homeserver can join the room
-            is_allowed.push(self.server_domain());
+            false => vec![self.server_domain()],
         }
-        is_allowed
     }
 }
