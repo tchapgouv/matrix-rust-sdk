@@ -22,7 +22,6 @@ use crate::content_scanner::dto::{
 };
 use crate::content_scanner::url::BWIContentScannerUrl;
 use crate::content_scanner::BWIContentScannerError::ScanFailed;
-use ::url::{ParseError, Url};
 use http::StatusCode;
 use matrix_sdk_base::ruma::events::room::MediaSource::{Encrypted, Plain};
 use matrix_sdk_base::ruma::events::room::{EncryptedFile, MediaSource};
@@ -33,7 +32,8 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
+use ::url::{ParseError, Url};
 
 #[derive(Debug)]
 pub enum BWIContentScannerError {
@@ -169,8 +169,8 @@ impl BWIContentScanner {
         match status {
             StatusCode::OK => {
                 if !body.clean {
-                    error!("###BWI### inconsistent response from the content scanner");
-                    Ok(BWIScanState::Error)
+                    warn!("###BWI### inconsistent response from the content scanner. Maybe an old version of the content scanner ist used");
+                    Ok(BWIScanState::Infected)
                 } else {
                     Ok(BWIScanState::Trusted)
                 }
