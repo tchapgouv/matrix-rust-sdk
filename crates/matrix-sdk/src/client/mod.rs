@@ -1557,10 +1557,10 @@ impl Client {
         request: &mut create_room::v3::Request,
         is_federated: bool,
     ) {
-        #[cfg(not(test))]
+        #[cfg(any(not(feature = "wiremock")))]
         let server = self.server().expect("Server should be set").to_owned();
 
-        #[cfg(test)]
+        #[cfg(feature = "wiremock")]
         let server = Url::parse("https://test.de").unwrap();
 
         let federation_handler = BWIFederationHandler::for_server(server);
