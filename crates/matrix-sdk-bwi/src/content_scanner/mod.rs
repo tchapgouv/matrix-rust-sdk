@@ -22,7 +22,6 @@ use crate::content_scanner::dto::{
 };
 use crate::content_scanner::url::BWIContentScannerUrl;
 use crate::content_scanner::BWIContentScannerError::ScanFailed;
-use ::url::{ParseError, Url};
 use http::StatusCode;
 use matrix_sdk_base::ruma::events::room::MediaSource::{Encrypted, Plain};
 use matrix_sdk_base::ruma::events::room::{EncryptedFile, MediaSource};
@@ -34,6 +33,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, warn};
+use ::url::{ParseError, Url};
 
 #[derive(Debug)]
 pub enum BWIContentScannerError {
@@ -173,6 +173,14 @@ impl BWIContentScanner {
                     Ok(BWIScanState::Infected)
                 } else {
                     Ok(BWIScanState::Trusted)
+                }
+            }
+            StatusCode::FORBIDDEN => {
+                if !body.clean {
+                    Ok(BWIScanState::Infected)
+                } else {
+                    warn!("###BWI### inconsistent response from the content scanner. Is is forbidden but clean");
+                    Ok(BWIScanState::Error)
                 }
             }
             StatusCode::NOT_FOUND => Ok(BWIScanState::NotFound),
