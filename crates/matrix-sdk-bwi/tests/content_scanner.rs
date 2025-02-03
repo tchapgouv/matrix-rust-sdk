@@ -214,3 +214,23 @@ async fn test_media_scan_error_with_403_and_mime_type_forbidden() {
     // Assert
     assert_eq!(scan_state, BWIScanState::Error);
 }
+
+#[tokio::test]
+async fn test_media_scan_media_not_found() {
+    // Arrange
+    let mock_server = MockServer::builder().start().await;
+    mount_public_key_mock(&mock_server).await;
+    mount_scan_mock(
+        &mock_server,
+        ResponseTemplate::new(404).set_body_json(json!({"reason": "M_NOT_FOUND"})),
+    )
+    .await;
+
+    let content_scanner = setup_content_scanner(&mock_server);
+
+    // Act
+    let scan_state = content_scanner.scan_attachment(Encrypted(Box::from(encrypted_file()))).await;
+
+    // Assert
+    assert_eq!(scan_state, BWIScanState::NotFound);
+}
