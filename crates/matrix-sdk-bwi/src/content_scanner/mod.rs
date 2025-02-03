@@ -20,7 +20,7 @@ use crate::content_scanner::dto::{
     BWIContentScannerPublicKey, BWIPublicKeyDto, BWIScanStateResultDto,
     EncryptedMetadataRequestBuilder,
 };
-use crate::content_scanner::url::BWIContentScannerUrl;
+use crate::content_scanner::url::{BWIContentScannerUrl, BearerToken};
 use crate::content_scanner::BWIContentScannerError::ScanFailed;
 use ::url::{ParseError, Url};
 use http::StatusCode;
@@ -104,6 +104,10 @@ impl BWIContentScanner {
             .await
             .map_err(|_| BWIContentScannerError::PublicKeyParseError)?;
         Ok(BWIContentScannerPublicKey(public_key.public_key))
+    }
+
+    pub async fn get_server_domain(&self) -> &str {
+        self.content_scanner_url.get_base_url().domain().expect("server should have domain")
     }
 
     async fn send_get_public_key_request(&self) -> Result<Response, BWIContentScannerError> {

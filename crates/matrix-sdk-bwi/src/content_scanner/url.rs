@@ -81,7 +81,7 @@ impl BWIContentScannerUrl {
         }
     }
 
-    fn get_base_url(&self) -> &Url {
+    pub(crate) fn get_base_url(&self) -> &Url {
         &self.base_url
     }
 
