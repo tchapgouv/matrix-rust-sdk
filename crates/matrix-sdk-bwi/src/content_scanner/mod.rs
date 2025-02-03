@@ -183,32 +183,41 @@ impl BWIContentScanner {
         response: Response,
     ) -> Result<BWIScanState, BWIContentScannerError> {
         let status = response.status();
-        let body = response.json::<BWIScanStateResultDto>().await.map_err(|_| ScanFailed)?;
         debug!("###BWI### Scan finished with status {:?}", &status);
 
         match status {
-            StatusCode::OK => Ok(Self::handle_ok_response(&body)),
-            StatusCode::FORBIDDEN => Ok(Self::handle_forbidden_response(body)),
+            StatusCode::OK => Self::handle_ok_response(response).await,
+            StatusCode::FORBIDDEN => Self::handle_forbidden_response(response).await,
             StatusCode::NOT_FOUND => Ok(BWIScanState::NotFound),
             _ => Err(ScanFailed),
         }
     }
 
-    fn handle_forbidden_response(body: BWIScanStateResultDto) -> BWIScanState {
-        if !body.clean {
-            BWIScanState::Infected
-        } else {
-            warn!("###BWI### inconsistent response from the content scanner. Is is forbidden but clean");
-            BWIScanState::Error
-        }
+    async fn handle_forbidden_response(
+        response: Response,
+    ) -> Result<BWIScanState, BWIContentScannerError> {
+        let body = response.json::<BWIScanStateResultDto>().await.map_err(|_| ScanFailed)?;
+        let scan_result = match body.clean {
+            true => {
+                warn!("###BWI### inconsistent response from the content scanner. Is is forbidden but clean");
+                BWIScanState::Error
+            }
+            false => BWIScanState::Infected,
+        };
+        Ok(scan_result)
     }
 
-    fn handle_ok_response(body: &BWIScanStateResultDto) -> BWIScanState {
-        if !body.clean {
-            warn!("###BWI### inconsistent response from the content scanner. Maybe an old version of the content scanner ist used");
-            BWIScanState::Infected
-        } else {
-            BWIScanState::Trusted
-        }
+    async fn handle_ok_response(
+        response: Response,
+    ) -> Result<BWIScanState, BWIContentScannerError> {
+        let body = response.json::<BWIScanStateResultDto>().await.map_err(|_| ScanFailed)?;
+        let scan_result = match body.clean {
+            true => BWIScanState::Trusted,
+            false => {
+                warn!("###BWI### inconsistent response from the content scanner. Maybe an old version of the content scanner ist used");
+                BWIScanState::Infected
+            }
+        };
+        Ok(scan_result)
     }
 }
