@@ -87,9 +87,10 @@ impl BWIContentScanner {
         Ok(Self::new(http_client, content_scanner_url, BWIScannedMedia::new()))
     }
 
-    pub fn new_with_url(http_client: reqwest::Client, content_scanner_url: Url) -> Self {
-        let content_scanner_url = BWIContentScannerUrl::for_base_url(content_scanner_url);
-        Self::new(http_client, content_scanner_url, BWIScannedMedia::new())
+    pub fn new_with_url(http_client: &reqwest::Client, content_scanner_url: &Url) -> Self {
+        let content_scanner_url =
+            BWIContentScannerUrl::for_base_url(content_scanner_url.to_owned());
+        Self::new(http_client.to_owned(), content_scanner_url, BWIScannedMedia::new())
     }
 
     pub async fn get_public_key(

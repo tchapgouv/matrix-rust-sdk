@@ -2868,6 +2868,7 @@ dependencies = [
  "mas-oidc-client",
  "matrix-sdk-base",
  "matrix-sdk-base-bwi",
+ "matrix-sdk-bwi",
  "matrix-sdk-common",
  "matrix-sdk-ffi-macros",
  "matrix-sdk-indexeddb",

@@ -122,7 +122,7 @@ async fn test_media_scan_trusted() {
 
     let client = reqwest::Client::builder().build().unwrap();
     let mock_server_url = url::Url::parse(&mock_server.uri()).unwrap();
-    let content_scanner = BWIContentScanner::new_with_url(client, mock_server_url);
+    let content_scanner = BWIContentScanner::new_with_url(&client, &mock_server_url);
 
     // Act
     let scan_state = content_scanner.scan_attachment(Encrypted(Box::from(encrypted_file()))).await;

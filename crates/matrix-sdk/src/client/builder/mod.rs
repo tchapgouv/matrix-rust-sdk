@@ -40,6 +40,7 @@ use matrix_sdk_base_bwi::jwt_token::{
     BWIJWTTokenValidationError, BWIPublicKeyForJWTTokenValidation,
     BWIPublicKeyForJWTTokenValidationParseError, BWITokenValidator,
 };
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use ruma::{
     api::{error::FromHttpResponseError, MatrixVersion},
     OwnedServerName, ServerName,
@@ -115,7 +116,7 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
-    const DEFAULT_CROSS_PROCESS_STORE_LOCKS_HOLDER_NAME: &str = "main";
+    const DEFAULT_CROSS_PROCESS_STORE_LOCKS_HOLDER_NAME: &'static str = "main";
 
     pub(crate) fn new() -> Self {
         Self {
@@ -596,6 +597,9 @@ impl ClientBuilder {
             unstable_features: None,
         };
 
+        let content_scanner =
+            Arc::from(BWIContentScanner::new_with_url(&http_client.inner, &homeserver));
+
         let event_cache = OnceCell::new();
         let inner = ClientInner::new(
             auth_ctx,
@@ -604,6 +608,7 @@ impl ClientBuilder {
             #[cfg(feature = "experimental-sliding-sync")]
             sliding_sync_version,
             http_client,
+            content_scanner,
             base_client,
             server_capabilities,
             self.respect_login_well_known,
