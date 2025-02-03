@@ -207,20 +207,3 @@ impl BWIContentScanner {
         }
     }
 }
-
-#[cfg(test)]
-mod test {
-    use serde_json::json;
-
-    #[tokio::test]
-    async fn test_scan() {
-        let response = reqwest::Client::default()
-            .post("https://example.com")
-            .json(&json!({
-                "test": "false",
-            }))
-            .send()
-            .await;
-        println!("{:#?}", response);
-    }
-}
