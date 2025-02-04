@@ -78,7 +78,7 @@ mod helpers {
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 json! ({"public_key": "GdwYYj5Ey9O96FMi4DjIhPhY604RuZg2Om98Kqh+3GE"}),
             ))
-            .mount(&mock_server)
+            .mount(mock_server)
             .await;
     }
 
@@ -86,7 +86,7 @@ mod helpers {
         Mock::given(method("POST"))
             .and(path("/_matrix/media_proxy/unstable/scan_encrypted"))
             .respond_with(response)
-            .mount(&mock_server)
+            .mount(mock_server)
             .await;
     }
 
