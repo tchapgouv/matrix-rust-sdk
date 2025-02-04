@@ -760,16 +760,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b6a852b24ab71dffc585bcb46eaf7959d175cb865a7152e35b348d1b2960422"
 
 [[package]]
-name = "colored"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
-dependencies = [
- "lazy_static",
- "windows-sys 0.52.0",
-]
-
-[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2883,11 +2873,9 @@ dependencies = [
  "rand",
  "reqwest",
  "ruma",
- "ruma-common 0.13.0",
  "serde",
  "serde_html_form",
  "serde_json",
- "serde_urlencoded",
  "sha2",
  "similar-asserts",
  "stream_assert",
@@ -2974,11 +2962,10 @@ dependencies = [
  "matrix-sdk-base-bwi",
  "reqwest",
  "ruma",
- "ruma-common 0.14.1",
+ "ruma-common",
  "rusty-hook",
  "serde",
  "serde_json",
- "simple_logger",
  "tokio",
  "tracing",
  "url",
@@ -3224,7 +3211,7 @@ dependencies = [
  "byteorder",
  "image",
  "qrcode",
- "ruma-common 0.14.1",
+ "ruma-common",
  "thiserror 2.0.3",
  "vodozemac",
 ]
@@ -4437,7 +4424,7 @@ dependencies = [
  "js_int",
  "js_option",
  "ruma-client-api",
- "ruma-common 0.14.1",
+ "ruma-common",
  "ruma-events",
  "ruma-federation-api",
  "ruma-html",
@@ -4459,7 +4446,7 @@ dependencies = [
  "js_int",
  "js_option",
  "maplit",
- "ruma-common 0.14.1",
+ "ruma-common",
  "ruma-events",
  "serde",
  "serde_html_form",
@@ -4467,34 +4454,6 @@ dependencies = [
  "thiserror 1.0.63",
  "url",
  "web-time",
-]
-
-[[package]]
-name = "ruma-common"
-version = "0.13.0"
-source = "git+https://github.com/ruma/ruma?rev=79289381444e886c454302e1e8f5b5f62f249a57#79289381444e886c454302e1e8f5b5f62f249a57"
-dependencies = [
- "as_variant",
- "base64 0.22.1",
- "bytes",
- "form_urlencoded",
- "http",
- "indexmap 2.6.0",
- "js_int",
- "konst",
- "percent-encoding",
- "regex",
- "ruma-identifiers-validation 0.9.5",
- "ruma-macros 0.13.0",
- "serde",
- "serde_html_form",
- "serde_json",
- "thiserror 1.0.63",
- "time",
- "tracing",
- "url",
- "web-time",
- "wildmatch",
 ]
 
 [[package]]
@@ -4516,8 +4475,8 @@ dependencies = [
  "percent-encoding",
  "rand",
  "regex",
- "ruma-identifiers-validation 0.10.0",
- "ruma-macros 0.14.0",
+ "ruma-identifiers-validation",
+ "ruma-macros",
  "serde",
  "serde_html_form",
  "serde_json",
@@ -4543,10 +4502,10 @@ dependencies = [
  "percent-encoding",
  "pulldown-cmark",
  "regex",
- "ruma-common 0.14.1",
+ "ruma-common",
  "ruma-html",
- "ruma-identifiers-validation 0.10.0",
- "ruma-macros 0.14.0",
+ "ruma-identifiers-validation",
+ "ruma-macros",
  "serde",
  "serde_json",
  "thiserror 1.0.63",
@@ -4565,7 +4524,7 @@ dependencies = [
  "http",
  "js_int",
  "mime",
- "ruma-common 0.14.1",
+ "ruma-common",
  "ruma-events",
  "serde",
  "serde_json",
@@ -4586,36 +4545,12 @@ dependencies = [
 
 [[package]]
 name = "ruma-identifiers-validation"
-version = "0.9.5"
-source = "git+https://github.com/ruma/ruma?rev=79289381444e886c454302e1e8f5b5f62f249a57#79289381444e886c454302e1e8f5b5f62f249a57"
-dependencies = [
- "js_int",
- "thiserror 1.0.63",
-]
-
-[[package]]
-name = "ruma-identifiers-validation"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e7f9b534a65698d7db3c08d94bf91de0046fe6c7893a7b360502f65e7011ac4"
 dependencies = [
  "js_int",
  "thiserror 1.0.63",
-]
-
-[[package]]
-name = "ruma-macros"
-version = "0.13.0"
-source = "git+https://github.com/ruma/ruma?rev=79289381444e886c454302e1e8f5b5f62f249a57#79289381444e886c454302e1e8f5b5f62f249a57"
-dependencies = [
- "once_cell",
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "ruma-identifiers-validation 0.9.5",
- "serde",
- "syn",
- "toml 0.8.15",
 ]
 
 [[package]]
@@ -4629,7 +4564,7 @@ dependencies = [
  "proc-macro-crate",
  "proc-macro2",
  "quote",
- "ruma-identifiers-validation 0.10.0",
+ "ruma-identifiers-validation",
  "serde",
  "syn",
  "toml 0.8.15",
@@ -4642,7 +4577,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfced466fbed6277f74ac3887eeb96c185a09f4323dc3c39bcea04870430fe9a"
 dependencies = [
  "js_int",
- "ruma-common 0.14.1",
+ "ruma-common",
  "ruma-events",
  "serde",
  "serde_json",
@@ -5115,18 +5050,6 @@ dependencies = [
  "num-traits",
  "thiserror 2.0.3",
  "time",
-]
-
-[[package]]
-name = "simple_logger"
-version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8c5dfa5e08767553704aa0ffd9d9794d527103c736aba9854773851fd7497eb"
-dependencies = [
- "colored",
- "log",
- "time",
- "windows-sys 0.48.0",
 ]
 
 [[package]]

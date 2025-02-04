@@ -112,7 +112,6 @@ once_cell = { workspace = true }
 pin-project-lite = { workspace = true }
 rand = { workspace = true, optional = true }
 ruma = { workspace = true, features = ["rand", "unstable-msc2448", "unstable-msc2965", "unstable-msc3930", "unstable-msc3245-v1-compat", "unstable-msc2867"] }
-ruma-common = { git = "https://github.com/ruma/ruma", rev = "79289381444e886c454302e1e8f5b5f62f249a57", features = ["api"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_html_form = { workspace = true }
@@ -153,7 +152,6 @@ futures-executor = { workspace = true }
 matrix-sdk-base = { workspace = true, features = ["testing"] }
 matrix-sdk-test = { workspace = true }
 once_cell = { workspace = true }
-serde_urlencoded = "0.7.1"
 similar-asserts = { workspace = true }
 stream_assert = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
