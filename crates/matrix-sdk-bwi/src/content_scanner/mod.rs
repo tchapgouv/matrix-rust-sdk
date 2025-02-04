@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 mod dto;
+mod request;
 mod url;
 
 use crate::content_scanner::dto::{
     BWIContentScannerPublicKey, BWIPublicKeyDto, BWIScanStateResultDto,
     EncryptedMetadataRequestBuilder,
 };
-use crate::content_scanner::url::{BWIContentScannerUrl, BearerToken};
+use crate::content_scanner::url::BWIContentScannerUrl;
 use crate::content_scanner::BWIContentScannerError::ScanFailed;
 use ::url::{ParseError, Url};
 use http::StatusCode;
@@ -34,14 +35,16 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use tracing::{debug, error, warn};
+use crate::content_scanner::request::v1::download_encrypted::Request;
 use ::url::{ParseError, Url};
+use tracing::{debug, error, warn};
 
 #[derive(Debug)]
 pub enum BWIContentScannerError {
     PublicKeyNotAvailable(HttpError),
     PublicKeyParseError,
     ScanFailed,
+    DownloadFailed,
 }
 
 #[derive(Clone)]
@@ -223,5 +226,16 @@ impl BWIContentScanner {
             }
         };
         Ok(scan_result)
+    }
+
+    pub async fn download_authenticated_media_request(
+        &self,
+        file: Box<EncryptedFile>,
+    ) -> Result<Request, BWIContentScannerError> {
+        let public_key = self.get_public_key().await?;
+        let encrypted_metadata = EncryptedMetadataRequestBuilder::for_encrypted_file(*file.clone())
+            .build_encrypted_request(&public_key)
+            .map_err(|_| BWIContentScannerError::DownloadFailed)?;
+        Ok(Request::from_encrypted_metadata(encrypted_metadata))
     }
 }

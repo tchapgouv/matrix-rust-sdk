@@ -25,6 +25,7 @@ use eyeball::SharedObservable;
 use futures_util::future::try_join;
 pub use matrix_sdk_base::media::*;
 use mime::Mime;
+use ruma::events::room::EncryptedFile;
 use ruma::{
     api::{
         client::{authenticated_media, error::ErrorKind, media},
@@ -424,15 +425,13 @@ impl Media {
 
         let content: Vec<u8> = match &request.source {
             MediaSource::Encrypted(file) => {
-                let content = if use_auth {
-                    let request =
-                        authenticated_media::get_content::v1::Request::from_uri(&file.url)?;
-                    self.client.send(request, request_config).await?.file
-                } else {
-                    #[allow(deprecated)]
-                    let request = media::get_content::v3::Request::from_url(&file.url)?;
-                    self.client.send(request, None).await?.file
-                };
+                let content = self
+                    .fetch_encrypted_media_via_content_scanner(
+                        use_auth,
+                        request_config,
+                        file.clone(),
+                    )
+                    .await?;
 
                 #[cfg(feature = "e2e-encryption")]
                 let content = {
@@ -473,6 +472,22 @@ impl Media {
                 .await?;
         }
 
+        Ok(content)
+    }
+
+    async fn fetch_encrypted_media_via_content_scanner(
+        &self,
+        use_auth: bool,
+        request_config: Option<RequestConfig>,
+        file: Box<EncryptedFile>,
+    ) -> Result<Vec<u8>, Error> {
+        let request_config = match use_auth {
+            true => request_config,
+            false => None,
+        };
+        let request =
+            self.client.content_scanner().download_authenticated_media_request(file).await.unwrap();
+        let content = self.client.send(request, request_config).await?.file;
         Ok(content)
     }
 

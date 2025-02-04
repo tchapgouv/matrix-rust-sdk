@@ -2973,6 +2973,8 @@ dependencies = [
  "matrix-sdk-base",
  "matrix-sdk-base-bwi",
  "reqwest",
+ "ruma",
+ "ruma-common 0.14.1",
  "rusty-hook",
  "serde",
  "serde_json",

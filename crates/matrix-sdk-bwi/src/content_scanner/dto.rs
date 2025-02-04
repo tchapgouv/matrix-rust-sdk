@@ -61,7 +61,7 @@ impl BWIEncryptedFileDto {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug)]
 pub struct EncryptedMetadataRequest {
     pub encrypted_body: EncryptedMetadata,
 }
@@ -72,7 +72,7 @@ impl EncryptedMetadataRequest {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug)]
 pub struct EncryptedMetadata {
     pub ciphertext: Base64,
     pub mac: Base64,
