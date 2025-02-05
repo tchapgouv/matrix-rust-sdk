@@ -108,10 +108,6 @@ impl BWIContentScanner {
         Ok(BWIContentScannerPublicKey(public_key.public_key))
     }
 
-    pub async fn get_server_domain(&self) -> &str {
-        self.content_scanner_url.get_base_url().domain().expect("server should have domain")
-    }
-
     async fn send_get_public_key_request(&self) -> Result<Response, BWIContentScannerError> {
         self.http_client.get(self.content_scanner_url.get_public_key_url()).send().await.map_err(
             |e| {
