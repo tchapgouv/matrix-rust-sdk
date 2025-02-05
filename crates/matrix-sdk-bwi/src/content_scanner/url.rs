@@ -13,9 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use crate::content_scanner::url::content_scanner_api::Endpoint::{
-    MediaDownloadEndpoint, PublicKeyEndpoint, ScanEndpoint, ThumbnailDownloadEndpoint,
-};
+use crate::content_scanner::url::content_scanner_api::Endpoint::{PublicKeyEndpoint, ScanEndpoint};
 use url::Url;
 
 pub(crate) mod content_scanner_api {
@@ -25,8 +23,6 @@ pub(crate) mod content_scanner_api {
     pub enum Endpoint {
         PublicKeyEndpoint,
         ScanEndpoint,
-        MediaDownloadEndpoint(String, String),
-        ThumbnailDownloadEndpoint(String, String),
     }
 
     impl Into<String> for Endpoint {
@@ -36,12 +32,6 @@ pub(crate) mod content_scanner_api {
                     "/_matrix/media_proxy/unstable/public_key".to_owned()
                 }
                 Endpoint::ScanEndpoint => "/_matrix/media_proxy/unstable/scan_encrypted".to_owned(),
-                Endpoint::MediaDownloadEndpoint(server_name, media_id) => {
-                    format!("/_matrix/media_proxy/unstable/download/{server_name}/{media_id}")
-                }
-                Endpoint::ThumbnailDownloadEndpoint(server_name, media_id) => {
-                    format!("/_matrix/media_proxy/unstable/thumbnail/{server_name}/{media_id}")
-                }
             }
         }
     }
@@ -91,14 +81,6 @@ impl BWIContentScannerUrl {
 
     pub fn get_scan_url(&self) -> Url {
         self.get_url_for_endpoint(ScanEndpoint)
-    }
-
-    pub fn get_media_download_link(&self, server_name: &str, media_id: &str) -> Url {
-        self.get_url_for_endpoint(MediaDownloadEndpoint(server_name.into(), media_id.into()))
-    }
-
-    pub fn get_thumbnail_download_link(&self, server_name: &str, media_id: &str) -> Url {
-        self.get_url_for_endpoint(ThumbnailDownloadEndpoint(server_name.into(), media_id.into()))
     }
 }
 
