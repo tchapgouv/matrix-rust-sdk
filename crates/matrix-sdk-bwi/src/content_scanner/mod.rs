@@ -23,7 +23,6 @@ use crate::content_scanner::dto::{
 };
 use crate::content_scanner::url::BWIContentScannerUrl;
 use crate::content_scanner::BWIContentScannerError::ScanFailed;
-use ::url::{ParseError, Url};
 use http::StatusCode;
 use matrix_sdk_base::ruma::events::room::MediaSource::{Encrypted, Plain};
 use matrix_sdk_base::ruma::events::room::{EncryptedFile, MediaSource};
@@ -34,9 +33,9 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use ::url::{ParseError, Url};
 
 use crate::content_scanner::request::v1::download_encrypted::Request;
-use ::url::{ParseError, Url};
 use tracing::{debug, error, warn};
 
 #[derive(Debug)]
