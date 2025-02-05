@@ -25,9 +25,9 @@ pub(crate) mod content_scanner_api {
         ScanEndpoint,
     }
 
-    impl Into<String> for Endpoint {
-        fn into(self) -> String {
-            match self {
+    impl From<Endpoint> for String {
+        fn from(value: Endpoint) -> Self {
+            match value {
                 Endpoint::PublicKeyEndpoint => {
                     "/_matrix/media_proxy/unstable/public_key".to_owned()
                 }
