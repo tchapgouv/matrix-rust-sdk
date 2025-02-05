@@ -231,6 +231,11 @@ impl Timeline {
     }
 
     // BWI-specific
+    #[cfg(feature = "enable_external_content_scanner_setup")]
+    pub async fn setup_content_scanner_hook_ext(&self) -> &Self {
+        self.setup_content_scanner_hook().await
+    }
+
     pub(crate) async fn setup_content_scanner_hook(&self) -> &Self {
         info!("###BWI### setup content scanner hook");
         let (timeline_items, timeline_stream) = self.subscribe_batched().await;

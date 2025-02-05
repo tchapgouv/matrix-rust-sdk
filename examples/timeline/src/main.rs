@@ -17,6 +17,7 @@ use matrix_sdk_ui::timeline::TimelineItemKind::Virtual;
 use matrix_sdk_ui::timeline::VirtualTimelineItem::ScanStateChanged;
 use matrix_sdk_ui::timeline::{RoomExt, TimelineUniqueId};
 use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::fmt::time;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
@@ -48,7 +49,7 @@ struct Cli {
 
     /// The room id that we should listen for the,
     #[clap(value_parser)]
-    room_id: OwnedRoomId,
+    room_id: String,
 
     #[clap(long, action)]
     secret_store_key: String,
@@ -143,15 +144,37 @@ async fn main() -> Result<()> {
 
     import_known_secrets(&client, secret_store).await?;
 
-    client.rooms().iter().for_each(|room| {
+    let available_rooms = client.rooms();
+
+    available_rooms.iter().for_each(|room| {
         println!("Room with id {} and name {}", room.room_id(), room.name().unwrap())
     });
+
+    let room_id =
+        {
+            if available_rooms.iter().any(|room| is_room_id_matching(&room_id, room)) {
+                OwnedRoomId::try_from(room_id.as_str())?
+            } else {
+                available_rooms
+                    .iter()
+                    .find(|room| {
+                        if let Some(room_name) = room.name() {
+                            room_name == room_id
+                        } else {
+                            false
+                        }
+                    })
+                    .expect("No room with that name")
+                    .room_id()
+                    .to_owned()
+            }
+        };
 
     // Get the timeline stream and listen to it.
     println!("Try to connect to room with id: {}", &room_id);
     let room = client.get_room(&room_id).unwrap();
     let timeline = room.timeline().await?;
-    // timeline.setup_content_scanner_hook().await;
+    timeline.setup_content_scanner_hook_ext().await;
 
     let (timeline_items, mut timeline_stream) = timeline.subscribe().await;
 
@@ -169,4 +192,8 @@ async fn main() -> Result<()> {
     client.sync(sync_settings).await?;
 
     Ok(())
+}
+
+fn is_room_id_matching(room_id: &String, room: &Room) -> bool {
+    room.room_id().as_str() == room_id
 }
