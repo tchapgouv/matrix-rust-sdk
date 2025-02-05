@@ -1,23 +1,21 @@
 use anyhow::Result;
+use clap::builder::OsStr;
 use clap::Parser;
+use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt};
 use log::{debug, info};
 use matrix_sdk::encryption::backups::BackupState;
 use matrix_sdk::encryption::secret_storage::SecretStore;
-use matrix_sdk::media::MediaEventContent;
-use matrix_sdk::ruma::events::room::message::MessageType::{Image, Text, Video};
-use matrix_sdk::ruma::events::room::message::{SyncRoomMessageEvent, TextMessageEventContent};
+use matrix_sdk::media::{MediaEventContent, MediaFormat, MediaRequestParameters};
+use matrix_sdk::ruma::events::room::message::{
+    ImageMessageEventContent, MessageType, SyncRoomMessageEvent,
+};
 use matrix_sdk::ruma::events::SyncMessageLikeEvent::Original;
-use matrix_sdk::ruma::{OwnedEventId, RoomId};
-use matrix_sdk::{async_trait, config::SyncSettings, ruma::OwnedRoomId, Client, Room};
-use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState;
-use matrix_sdk_bwi::content_scanner::BWIContentScanner;
-use matrix_sdk_ui::timeline::TimelineItemContent::Message;
-use matrix_sdk_ui::timeline::TimelineItemKind::Virtual;
-use matrix_sdk_ui::timeline::VirtualTimelineItem::ScanStateChanged;
-use matrix_sdk_ui::timeline::{RoomExt, TimelineUniqueId};
+use matrix_sdk::{config::SyncSettings, ruma::OwnedRoomId, Client, Room};
+use matrix_sdk_ui::timeline::{RoomExt, TimelineItem, TimelineItemContent, TimelineItemKind};
+use std::path::{absolute, Path};
+use std::sync::Arc;
 use tracing_subscriber::filter::filter_fn;
-use tracing_subscriber::fmt::time;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
@@ -122,6 +120,7 @@ async fn main() -> Result<()> {
                 .with_filter(filter_fn(|meta| meta.target() == BWI_TARGET)),
         )
         .init();
+    // tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
     let room_id = cli.room_id.clone();
@@ -180,11 +179,24 @@ async fn main() -> Result<()> {
 
     let room_id = room.room_id().to_owned();
 
+    let client_copy = client.clone();
+
     println!("Initial timeline items: {timeline_items:#?}");
     tokio::spawn(async move {
         debug!(target: BWI_TARGET, "Timeline handler start for room {room_id:?}");
         while let Some(diff) = timeline_stream.next().await {
             info!(target: BWI_TARGET, "received diff: {diff:?}");
+            match diff {
+                VectorDiff::PushFront { value } => handle_timeline_item(&value, &client_copy).await,
+                VectorDiff::PushBack { value } => handle_timeline_item(&value, &client_copy).await,
+                VectorDiff::Insert { index, value } => {
+                    handle_timeline_item(&value, &client_copy).await
+                }
+                VectorDiff::Set { index, value } => {
+                    handle_timeline_item(&value, &client_copy).await
+                }
+                _ => {}
+            }
         }
     });
 
@@ -192,6 +204,29 @@ async fn main() -> Result<()> {
     client.sync(sync_settings).await?;
 
     Ok(())
+}
+
+async fn handle_timeline_item(item: &Arc<TimelineItem>, client: &Client) {
+    if let TimelineItemKind::Event(e) = item.kind() {
+        if let TimelineItemContent::Message(m) = e.content() {
+            match m.msgtype() {
+                MessageType::Image(content) => handle_image_content(content, client).await,
+                _ => {}
+            }
+        }
+    }
+}
+
+async fn handle_image_content(content: &ImageMessageEventContent, client: &Client) {
+    let request =
+        MediaRequestParameters { source: content.source().unwrap(), format: MediaFormat::File };
+    let file_handle = client
+        .media()
+        .get_media_file(&request, None, &(mime::IMAGE_PNG), false, Some("./".to_string()))
+        .await;
+    let path = Path::new("./foo.png");
+    info!(target: BWI_TARGET, "{:?}", absolute(path));
+    file_handle.unwrap().persist(path).unwrap();
 }
 
 fn is_room_id_matching(room_id: &String, room: &Room) -> bool {

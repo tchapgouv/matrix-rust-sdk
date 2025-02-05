@@ -1,12 +1,12 @@
 [package]
-name = "example-timeline"
+name = "bwi-example"
 version = "0.1.0"
 edition = "2021"
 publish = false
 license = "Apache-2.0"
 
 [[bin]]
-name = "example-timeline"
+name = "bwi-example"
 test = false
 
 [dependencies]
@@ -25,6 +25,7 @@ matrix-sdk-ui = { path = "../../crates/matrix-sdk-ui", features = ["enable_exter
 eyeball-im = "0.5.0"
 log = "0.4.22"
 tracing = "0.1.40"
+mime = "0.3.17"
 
 [lints]
 workspace = true

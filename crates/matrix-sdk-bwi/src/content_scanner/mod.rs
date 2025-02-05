@@ -235,6 +235,7 @@ impl BWIContentScanner {
         let encrypted_metadata = EncryptedMetadataRequestBuilder::for_encrypted_file(*file.clone())
             .build_encrypted_request(&public_key)
             .map_err(|_| BWIContentScannerError::DownloadFailed)?;
+        debug!("###BWI### Downloading authenticated media with url {:?}", file.url);
         Ok(Request::from_encrypted_metadata(encrypted_metadata))
     }
 }
