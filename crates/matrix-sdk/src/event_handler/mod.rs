@@ -50,7 +50,7 @@ use eyeball::{SharedObservable, Subscriber};
 use futures_core::Stream;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use matrix_sdk_base::{
-    deserialized_responses::{EncryptionInfo, SyncTimelineEvent},
+    deserialized_responses::{EncryptionInfo, TimelineEvent},
     SendOutsideWasm, SyncOutsideWasm,
 };
 use pin_project_lite::pin_project;
@@ -380,7 +380,7 @@ impl Client {
     pub(crate) async fn handle_sync_timeline_events(
         &self,
         room: Option<&Room>,
-        timeline_events: &[SyncTimelineEvent],
+        timeline_events: &[TimelineEvent],
     ) -> serde_json::Result<()> {
         #[derive(Deserialize)]
         struct TimelineEventDetails<'a> {
@@ -402,7 +402,7 @@ impl Client {
 
             let raw_event = item.raw().json();
             let encryption_info = item.encryption_info();
-            let push_actions = &item.push_actions;
+            let push_actions = item.push_actions.as_deref().unwrap_or(&[]);
 
             // Event handlers for possibly-redacted timeline events
             self.call_event_handlers(
@@ -672,7 +672,9 @@ where
 #[cfg(test)]
 mod tests {
     use matrix_sdk_test::{
-        async_test, InvitedRoomBuilder, JoinedRoomBuilder, DEFAULT_TEST_ROOM_ID,
+        async_test,
+        event_factory::{EventFactory, PreviousMembership},
+        InvitedRoomBuilder, JoinedRoomBuilder, DEFAULT_TEST_ROOM_ID,
     };
     use stream_assert::{assert_closed, assert_pending, assert_ready};
     #[cfg(target_arch = "wasm32")]
@@ -686,14 +688,14 @@ mod tests {
     };
 
     use matrix_sdk_test::{
-        sync_timeline_event, EphemeralTestEvent, StateTestEvent, StrippedStateTestEvent,
-        SyncResponseBuilder,
+        EphemeralTestEvent, StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder,
     };
     use once_cell::sync::Lazy;
     use ruma::{
+        event_id,
         events::{
             room::{
-                member::{OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
+                member::{MembershipState, OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
                 name::OriginalSyncRoomNameEvent,
                 power_levels::OriginalSyncRoomPowerLevelsEvent,
             },
@@ -702,6 +704,7 @@ mod tests {
         },
         room_id,
         serde::Raw,
+        user_id,
     };
     use serde_json::json;
 
@@ -712,28 +715,13 @@ mod tests {
     };
 
     static MEMBER_EVENT: Lazy<Raw<AnySyncTimelineEvent>> = Lazy::new(|| {
-        sync_timeline_event!({
-            "content": {
-                "avatar_url": null,
-                "displayname": "example",
-                "membership": "join"
-            },
-            "event_id": "$151800140517rfvjc:localhost",
-            "membership": "join",
-            "origin_server_ts": 151800140,
-            "sender": "@example:localhost",
-            "state_key": "@example:localhost",
-            "type": "m.room.member",
-            "prev_content": {
-                "avatar_url": null,
-                "displayname": "example",
-                "membership": "invite"
-            },
-            "unsigned": {
-                "age": 297036,
-                "replaces_state": "$151800111315tsynI:localhost"
-            }
-        })
+        EventFactory::new()
+            .member(user_id!("@example:localhost"))
+            .membership(MembershipState::Join)
+            .display_name("example")
+            .event_id(event_id!("$151800140517rfvjc:localhost"))
+            .previous(PreviousMembership::new(MembershipState::Invite).display_name("example"))
+            .into()
     });
 
     #[async_test]

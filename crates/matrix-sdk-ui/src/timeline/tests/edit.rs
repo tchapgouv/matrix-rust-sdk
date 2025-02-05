@@ -19,7 +19,7 @@ use eyeball_im::VectorDiff;
 use matrix_sdk::deserialized_responses::{
     AlgorithmInfo, EncryptionInfo, VerificationLevel, VerificationState,
 };
-use matrix_sdk_base::deserialized_responses::{DecryptedRoomEvent, SyncTimelineEvent};
+use matrix_sdk_base::deserialized_responses::{DecryptedRoomEvent, TimelineEvent};
 use matrix_sdk_test::{async_test, ALICE};
 use ruma::{
     event_id,
@@ -41,9 +41,7 @@ async fn test_live_redacted() {
 
     let f = &timeline.factory;
 
-    timeline
-        .handle_live_redacted_message_event(*ALICE, RedactedRoomMessageEventContent::new())
-        .await;
+    timeline.handle_live_event(f.redacted(*ALICE, RedactedRoomMessageEventContent::new())).await;
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
 
     let redacted_event_id = item.as_event().unwrap().event_id().unwrap();
@@ -180,7 +178,7 @@ async fn test_edit_updates_encryption_info() {
         verification_state: VerificationState::Verified,
     };
 
-    let original_event: SyncTimelineEvent = DecryptedRoomEvent {
+    let original_event: TimelineEvent = DecryptedRoomEvent {
         event: original_event.cast(),
         encryption_info: encryption_info.clone(),
         unsigned_encryption_info: None,
@@ -209,7 +207,7 @@ async fn test_edit_updates_encryption_info() {
         .into_raw_timeline();
     encryption_info.verification_state =
         VerificationState::Unverified(VerificationLevel::UnverifiedIdentity);
-    let edit_event: SyncTimelineEvent = DecryptedRoomEvent {
+    let edit_event: TimelineEvent = DecryptedRoomEvent {
         event: edit_event.cast(),
         encryption_info: encryption_info.clone(),
         unsigned_encryption_info: None,

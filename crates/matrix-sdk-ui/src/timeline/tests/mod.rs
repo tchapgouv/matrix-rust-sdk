@@ -24,10 +24,11 @@ use std::{
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
+use imbl::vector;
 use indexmap::IndexMap;
 use matrix_sdk::{
     config::RequestConfig,
-    deserialized_responses::{SyncTimelineEvent, TimelineEvent},
+    deserialized_responses::TimelineEvent,
     event_cache::paginator::{PaginableRoom, PaginatorError},
     room::{EventWithContextResponse, Messages, MessagesOptions},
     send_queue::RoomSendQueueUpdate,
@@ -36,17 +37,14 @@ use matrix_sdk::{
 use matrix_sdk_base::{
     crypto::types::events::CryptoContextInfo, latest_event::LatestEvent, RoomInfo, RoomState,
 };
-use matrix_sdk_test::{
-    event_factory::EventFactory, EventBuilder, ALICE, BOB, DEFAULT_TEST_ROOM_ID,
-};
+use matrix_sdk_test::{event_factory::EventFactory, ALICE, BOB, DEFAULT_TEST_ROOM_ID};
 use ruma::{
     event_id,
     events::{
         reaction::ReactionEventContent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
         relation::{Annotation, RelationType},
-        AnyMessageLikeEventContent, AnyTimelineEvent, EmptyStateKey,
-        RedactedMessageLikeEventContent, RedactedStateEventContent, StaticStateEventContent,
+        AnyMessageLikeEventContent, AnyTimelineEvent,
     },
     int,
     power_levels::NotificationPowerLevels,
@@ -59,11 +57,8 @@ use ruma::{
 use tokio::sync::RwLock;
 
 use super::{
-    algorithms::rfind_event_by_item_id,
-    controller::{TimelineNewItemPosition, TimelineSettings},
-    event_handler::TimelineEventKind,
-    event_item::RemoteEventOrigin,
-    traits::RoomDataProvider,
+    algorithms::rfind_event_by_item_id, controller::TimelineSettings,
+    event_handler::TimelineEventKind, event_item::RemoteEventOrigin, traits::RoomDataProvider,
     EventTimelineItem, Profile, TimelineController, TimelineEventItemId, TimelineFocus,
     TimelineItem,
 };
@@ -86,7 +81,6 @@ mod virt;
 
 struct TestTimeline {
     controller: TimelineController<TestRoomDataProvider>,
-    event_builder: EventBuilder,
     /// An [`EventFactory`] that can be used for creating events in this
     /// timeline.
     pub factory: EventFactory,
@@ -111,7 +105,6 @@ impl TestTimeline {
                 None,
                 Some(false),
             ),
-            event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
         }
     }
@@ -125,7 +118,6 @@ impl TestTimeline {
                 None,
                 Some(false),
             ),
-            event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
         }
     }
@@ -139,7 +131,6 @@ impl TestTimeline {
                 Some(hook),
                 Some(true),
             ),
-            event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
         }
     }
@@ -154,7 +145,6 @@ impl TestTimeline {
                 None,
                 Some(encrypted),
             ),
-            event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
         }
     }
@@ -181,67 +171,11 @@ impl TestTimeline {
         self.controller.items().await.len()
     }
 
-    async fn handle_live_redacted_message_event<C>(&self, sender: &UserId, content: C)
-    where
-        C: RedactedMessageLikeEventContent,
-    {
-        let ev = self.event_builder.make_sync_redacted_message_event(sender, content);
-        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
-    }
-
-    async fn handle_live_state_event<C>(&self, sender: &UserId, content: C, prev_content: Option<C>)
-    where
-        C: StaticStateEventContent<StateKey = EmptyStateKey>,
-    {
-        let ev = self.event_builder.make_sync_state_event(sender, "", content, prev_content);
-        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
-    }
-
-    async fn handle_live_state_event_with_state_key<C>(
-        &self,
-        sender: &UserId,
-        state_key: C::StateKey,
-        content: C,
-        prev_content: Option<C>,
-    ) where
-        C: StaticStateEventContent,
-    {
-        let ev = self.event_builder.make_sync_state_event(
-            sender,
-            state_key.as_ref(),
-            content,
-            prev_content,
-        );
-        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
-    }
-
-    async fn handle_live_redacted_state_event<C>(&self, sender: &UserId, content: C)
-    where
-        C: RedactedStateEventContent<StateKey = EmptyStateKey>,
-    {
-        let ev = self.event_builder.make_sync_redacted_state_event(sender, "", content);
-        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
-    }
-
-    async fn handle_live_redacted_state_event_with_state_key<C>(
-        &self,
-        sender: &UserId,
-        state_key: C::StateKey,
-        content: C,
-    ) where
-        C: RedactedStateEventContent,
-    {
-        let ev =
-            self.event_builder.make_sync_redacted_state_event(sender, state_key.as_ref(), content);
-        self.handle_live_event(SyncTimelineEvent::new(ev)).await;
-    }
-
-    async fn handle_live_event(&self, event: impl Into<SyncTimelineEvent>) {
-        let event = event.into();
+    async fn handle_live_event(&self, event: impl Into<TimelineEvent>) {
         self.controller
-            .add_events_at(
-                [event].into_iter(),
-                TimelineNewItemPosition::End { origin: RemoteEventOrigin::Sync },
+            .handle_remote_events_with_diffs(
+                vec![VectorDiff::Append { values: vector![event.into()] }],
+                RemoteEventOrigin::Sync,
             )
             .await;
     }
@@ -261,9 +195,9 @@ impl TestTimeline {
     async fn handle_back_paginated_event(&self, event: Raw<AnyTimelineEvent>) {
         let timeline_event = TimelineEvent::new(event.cast());
         self.controller
-            .add_events_at(
-                [timeline_event].into_iter(),
-                TimelineNewItemPosition::Start { origin: RemoteEventOrigin::Pagination },
+            .handle_remote_events_with_diffs(
+                vec![VectorDiff::PushFront { value: timeline_event }],
+                RemoteEventOrigin::Pagination,
             )
             .await;
     }
@@ -272,7 +206,11 @@ impl TestTimeline {
         &self,
         receipts: impl IntoIterator<Item = (OwnedEventId, ReceiptType, OwnedUserId, ReceiptThread)>,
     ) {
-        let ev_content = self.event_builder.make_receipt_event_content(receipts);
+        let mut read_receipt = self.factory.read_receipts();
+        for (event_id, tyype, user_id, thread) in receipts {
+            read_receipt = read_receipt.add(&event_id, &user_id, tyype, thread);
+        }
+        let ev_content = read_receipt.build();
         self.controller.handle_read_receipts(ev_content).await;
     }
 
@@ -356,7 +294,7 @@ impl PinnedEventsRoom for TestRoomDataProvider {
         _event_id: &'a EventId,
         _request_config: Option<RequestConfig>,
         _related_event_filters: Option<Vec<RelationType>>,
-    ) -> BoxFuture<'a, Result<(SyncTimelineEvent, Vec<SyncTimelineEvent>), PaginatorError>> {
+    ) -> BoxFuture<'a, Result<(TimelineEvent, Vec<TimelineEvent>), PaginatorError>> {
         unimplemented!();
     }
 

@@ -38,8 +38,9 @@ use matrix_sdk_base::crypto::{DecryptionSettings, RoomEventDecryptionResult};
 use matrix_sdk_base::crypto::{IdentityStatusChange, RoomIdentityProvider, UserIdentity};
 use matrix_sdk_base::{
     deserialized_responses::{
-        RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState, TimelineEvent,
+        RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState,
     },
+    event_cache::store::media::IgnoreMediaRetentionPolicy,
     media::MediaThumbnailSettings,
     store::StateStoreExt,
     ComposerDraft, RoomInfoNotableUpdateReasons, RoomMemberships, StateChanges, StateStoreDataKey,
@@ -48,7 +49,7 @@ use matrix_sdk_base::{
 #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
 use matrix_sdk_common::BoxFuture;
 use matrix_sdk_common::{
-    deserialized_responses::SyncTimelineEvent,
+    deserialized_responses::TimelineEvent,
     executor::{spawn, JoinHandle},
     timeout::timeout,
 };
@@ -328,7 +329,11 @@ impl Room {
             start: http_response.start,
             end: http_response.end,
             #[cfg(not(feature = "e2e-encryption"))]
-            chunk: http_response.chunk.into_iter().map(TimelineEvent::new).collect(),
+            chunk: http_response
+                .chunk
+                .into_iter()
+                .map(|raw| TimelineEvent::new(raw.cast()))
+                .collect(),
             #[cfg(feature = "e2e-encryption")]
             chunk: Vec::with_capacity(http_response.chunk.len()),
             state: http_response.state,
@@ -343,10 +348,10 @@ impl Room {
                 if let Ok(event) = self.decrypt_event(event.cast_ref()).await {
                     event
                 } else {
-                    TimelineEvent::new(event)
+                    TimelineEvent::new(event.cast())
                 }
             } else {
-                TimelineEvent::new(event)
+                TimelineEvent::new(event.cast())
             };
             response.chunk.push(decrypted_event);
         }
@@ -460,7 +465,7 @@ impl Room {
             }
         }
 
-        let mut event = TimelineEvent::new(event);
+        let mut event = TimelineEvent::new(event.cast());
         event.push_actions = self.event_push_actions(event.raw()).await?;
 
         Ok(event)
@@ -483,7 +488,7 @@ impl Room {
 
         // Save the event into the event cache, if it's set up.
         if let Ok((cache, _handles)) = self.event_cache().await {
-            cache.save_event(event.clone().into()).await;
+            cache.save_event(event.clone()).await;
         }
 
         Ok(event)
@@ -527,17 +532,17 @@ impl Room {
 
         // Save the loaded events into the event cache, if it's set up.
         if let Ok((cache, _handles)) = self.event_cache().await {
-            let mut events_to_save: Vec<SyncTimelineEvent> = Vec::new();
+            let mut events_to_save: Vec<TimelineEvent> = Vec::new();
             if let Some(event) = &target_event {
-                events_to_save.push(event.clone().into());
+                events_to_save.push(event.clone());
             }
 
             for event in &events_before {
-                events_to_save.push(event.clone().into());
+                events_to_save.push(event.clone());
             }
 
             for event in &events_after {
-                events_to_save.push(event.clone().into());
+                events_to_save.push(event.clone());
             }
 
             cache.save_events(events_to_save).await;
@@ -2036,7 +2041,10 @@ impl Room {
             let request =
                 MediaRequestParameters { source: media_source.clone(), format: MediaFormat::File };
 
-            if let Err(err) = cache_store_lock_guard.add_media_content(&request, data).await {
+            if let Err(err) = cache_store_lock_guard
+                .add_media_content(&request, data, IgnoreMediaRetentionPolicy::No)
+                .await
+            {
                 warn!("unable to cache the media after uploading it: {err}");
             }
 
@@ -2050,7 +2058,10 @@ impl Room {
                     format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(width, height)),
                 };
 
-                if let Err(err) = cache_store_lock_guard.add_media_content(&request, data).await {
+                if let Err(err) = cache_store_lock_guard
+                    .add_media_content(&request, data, IgnoreMediaRetentionPolicy::No)
+                    .await
+                {
                     warn!("unable to cache the media after uploading it: {err}");
                 }
             }
@@ -3719,11 +3730,7 @@ mod tests {
         async_test, event_factory::EventFactory, test_json, JoinedRoomBuilder, StateTestEvent,
         SyncResponseBuilder,
     };
-    use ruma::{
-        device_id, event_id,
-        events::room::member::{MembershipState, RoomMemberEventContent},
-        int, room_id, user_id,
-    };
+    use ruma::{device_id, event_id, events::room::member::MembershipState, int, room_id, user_id};
     use wiremock::{
         matchers::{header, method, path_regex},
         Mock, MockServer, ResponseTemplate,
@@ -3731,8 +3738,8 @@ mod tests {
 
     use super::ReportedContentScore;
     use crate::{
+        authentication::matrix::{MatrixSession, MatrixSessionTokens},
         config::RequestConfig,
-        matrix_auth::{MatrixSession, MatrixSessionTokens},
         test_utils::{logged_in_client, mocks::MatrixMockServer},
         Client,
     };
@@ -3919,10 +3926,9 @@ mod tests {
 
         let f = EventFactory::new().room(room_id);
         let joined_room_builder = JoinedRoomBuilder::new(room_id).add_state_bulk(vec![f
-            .event(RoomMemberEventContent::new(MembershipState::Knock))
+            .member(user_id)
+            .membership(MembershipState::Knock)
             .event_id(event_id)
-            .sender(user_id)
-            .state_key(user_id)
             .into_raw_timeline()
             .cast()]);
         let room = server.sync_room(&client, joined_room_builder).await;

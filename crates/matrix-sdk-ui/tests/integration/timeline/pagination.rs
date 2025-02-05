@@ -22,18 +22,15 @@ use futures_util::{
 };
 use matrix_sdk::{config::SyncSettings, test_utils::logged_in_client_with_server};
 use matrix_sdk_test::{
-    async_test, mocks::mock_encryption_state, EventBuilder, JoinedRoomBuilder, StateTestEvent,
-    SyncResponseBuilder, ALICE, BOB,
+    async_test, event_factory::EventFactory, mocks::mock_encryption_state, JoinedRoomBuilder,
+    StateTestEvent, SyncResponseBuilder, ALICE, BOB,
 };
 use matrix_sdk_ui::timeline::{
     AnyOtherFullStateEventContent, LiveBackPaginationStatus, RoomExt, TimelineItemContent,
 };
 use once_cell::sync::Lazy;
 use ruma::{
-    events::{
-        room::message::{MessageType, RoomMessageEventContent},
-        FullStateEventContent,
-    },
+    events::{room::message::MessageType, FullStateEventContent},
     room_id,
 };
 use serde_json::{json, Value as JsonValue};
@@ -79,7 +76,7 @@ async fn test_back_pagination() {
         .await;
 
     let paginate = async {
-        timeline.live_paginate_backwards(10).await.unwrap();
+        timeline.paginate_backwards(10).await.unwrap();
         server.reset().await;
     };
     let observe_paginating = async {
@@ -87,9 +84,11 @@ async fn test_back_pagination() {
     };
     join(paginate, observe_paginating).await;
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+
     // `m.room.name`
     {
-        assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
+        assert_let!(VectorDiff::PushBack { value: message } = &timeline_updates[0]);
         assert_let!(TimelineItemContent::OtherState(state) = message.as_event().unwrap().content());
         assert_eq!(state.state_key(), "");
         assert_let!(
@@ -104,13 +103,13 @@ async fn test_back_pagination() {
 
     // `m.room.name` receives an update
     {
-        assert_let!(Some(VectorDiff::Set { index, .. }) = timeline_stream.next().await);
-        assert_eq!(index, 0);
+        assert_let!(VectorDiff::Set { index, .. } = &timeline_updates[1]);
+        assert_eq!(*index, 0);
     }
 
     // `m.room.message`: “the world is big”
     {
-        assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
+        assert_let!(VectorDiff::PushBack { value: message } = &timeline_updates[2]);
         assert_let!(TimelineItemContent::Message(msg) = message.as_event().unwrap().content());
         assert_let!(MessageType::Text(text) = msg.msgtype());
         assert_eq!(text.body, "the world is big");
@@ -118,7 +117,7 @@ async fn test_back_pagination() {
 
     // `m.room.message`: “hello world”
     {
-        assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
+        assert_let!(VectorDiff::PushBack { value: message } = &timeline_updates[3]);
         assert_let!(TimelineItemContent::Message(msg) = message.as_event().unwrap().content());
         assert_let!(MessageType::Text(text) = msg.msgtype());
         assert_eq!(text.body, "hello world");
@@ -126,9 +125,7 @@ async fn test_back_pagination() {
 
     // Date divider is updated.
     {
-        assert_let!(
-            Some(VectorDiff::PushFront { value: date_divider }) = timeline_stream.next().await
-        );
+        assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[4]);
         assert!(date_divider.is_date_divider());
     }
 
@@ -148,7 +145,7 @@ async fn test_back_pagination() {
         .mount(&server)
         .await;
 
-    let hit_start = timeline.live_paginate_backwards(10).await.unwrap();
+    let hit_start = timeline.paginate_backwards(10).await.unwrap();
     assert!(hit_start);
     assert_next_eq!(
         back_pagination_status,
@@ -221,12 +218,14 @@ async fn test_back_pagination_highlighted() {
         .mount(&server)
         .await;
 
-    timeline.live_paginate_backwards(10).await.unwrap();
+    timeline.paginate_backwards(10).await.unwrap();
     server.reset().await;
+
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
 
     // `m.room.tombstone`
     {
-        assert_let!(Some(VectorDiff::PushBack { value: second }) = timeline_stream.next().await);
+        assert_let!(VectorDiff::PushBack { value: second } = &timeline_updates[0]);
         let remote_event = second.as_event().unwrap();
         // `m.room.tombstone` should be highlighted by default.
         assert!(remote_event.is_highlighted());
@@ -234,7 +233,7 @@ async fn test_back_pagination_highlighted() {
 
     // `m.room.message`
     {
-        assert_let!(Some(VectorDiff::PushBack { value: first }) = timeline_stream.next().await);
+        assert_let!(VectorDiff::PushBack { value: first } = &timeline_updates[1]);
         let remote_event = first.as_event().unwrap();
         // Own events don't trigger push rules.
         assert!(!remote_event.is_highlighted());
@@ -242,9 +241,7 @@ async fn test_back_pagination_highlighted() {
 
     // Date divider
     {
-        assert_let!(
-            Some(VectorDiff::PushFront { value: date_divider }) = timeline_stream.next().await
-        );
+        assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[2]);
         assert!(date_divider.is_date_divider());
     }
 
@@ -257,7 +254,7 @@ async fn test_wait_for_token() {
     let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
-    let event_builder = EventBuilder::new();
+    let f = EventFactory::new();
     let mut sync_builder = SyncResponseBuilder::new();
     sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
 
@@ -285,17 +282,14 @@ async fn test_wait_for_token() {
 
     sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
-            .add_timeline_event(event_builder.make_sync_message_event(
-                &ALICE,
-                RoomMessageEventContent::text_plain("live event!"),
-            ))
+            .add_timeline_event(f.text_msg("live event!").sender(&ALICE))
             .set_timeline_prev_batch(from.to_owned())
             .set_timeline_limited(),
     );
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
 
     let paginate = async {
-        timeline.live_paginate_backwards(10).await.unwrap();
+        timeline.paginate_backwards(10).await.unwrap();
     };
     let observe_paginating = async {
         assert_eq!(back_pagination_status.next().await, Some(LiveBackPaginationStatus::Paginating));
@@ -321,7 +315,7 @@ async fn test_dedup_pagination() {
     let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
-    let event_builder = EventBuilder::new();
+    let f = EventFactory::new();
     let mut sync_builder = SyncResponseBuilder::new();
     sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
 
@@ -353,20 +347,17 @@ async fn test_dedup_pagination() {
 
     sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
-            .add_timeline_event(event_builder.make_sync_message_event(
-                &ALICE,
-                RoomMessageEventContent::text_plain("live event!"),
-            ))
+            .add_timeline_event(f.text_msg("live event!").sender(&ALICE))
             .set_timeline_prev_batch(from.to_owned()),
     );
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
 
     // If I try to paginate twice at the same time,
     let paginate_1 = async {
-        timeline.live_paginate_backwards(10).await.unwrap();
+        timeline.paginate_backwards(10).await.unwrap();
     };
     let paginate_2 = async {
-        timeline.live_paginate_backwards(10).await.unwrap();
+        timeline.paginate_backwards(10).await.unwrap();
     };
     timeout(Duration::from_secs(5), join(paginate_1, paginate_2)).await.unwrap();
 
@@ -383,7 +374,7 @@ async fn test_timeline_reset_while_paginating() {
     let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
-    let event_builder = EventBuilder::new();
+    let f = EventFactory::new();
     let mut sync_builder = SyncResponseBuilder::new();
 
     sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
@@ -398,10 +389,7 @@ async fn test_timeline_reset_while_paginating() {
 
     sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
-            .add_timeline_event(event_builder.make_sync_message_event(
-                &ALICE,
-                RoomMessageEventContent::text_plain("live event!"),
-            ))
+            .add_timeline_event(f.text_msg("live event!").sender(&ALICE))
             .set_timeline_prev_batch("pagination_1".to_owned())
             .set_timeline_limited(),
     );
@@ -413,10 +401,7 @@ async fn test_timeline_reset_while_paginating() {
     // response, resetting the timeline
     sync_builder.add_joined_room(
         JoinedRoomBuilder::new(room_id)
-            .add_timeline_event(event_builder.make_sync_message_event(
-                &BOB,
-                RoomMessageEventContent::text_plain("new live event."),
-            ))
+            .add_timeline_event(f.text_msg("new live event.").sender(&BOB))
             .set_timeline_prev_batch("pagination_2".to_owned())
             .set_timeline_limited(),
     );
@@ -458,7 +443,7 @@ async fn test_timeline_reset_while_paginating() {
 
     let (_, mut back_pagination_status) = timeline.live_back_pagination_status().await.unwrap();
 
-    let paginate = async { timeline.live_paginate_backwards(10).await.unwrap() };
+    let paginate = async { timeline.paginate_backwards(10).await.unwrap() };
 
     let observe_paginating = async {
         let mut seen_paginating = false;
@@ -623,7 +608,7 @@ async fn test_empty_chunk() {
         .await;
 
     let paginate = async {
-        timeline.live_paginate_backwards(10).await.unwrap();
+        timeline.paginate_backwards(10).await.unwrap();
         server.reset().await;
     };
     let observe_paginating = async {
@@ -631,9 +616,11 @@ async fn test_empty_chunk() {
     };
     join(paginate, observe_paginating).await;
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+
     // `m.room.name`
     {
-        assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
+        assert_let!(VectorDiff::PushBack { value: message } = &timeline_updates[0]);
         assert_let!(TimelineItemContent::OtherState(state) = message.as_event().unwrap().content());
         assert_eq!(state.state_key(), "");
         assert_let!(
@@ -648,13 +635,13 @@ async fn test_empty_chunk() {
 
     // `m.room.name` is updated
     {
-        assert_let!(Some(VectorDiff::Set { index, .. }) = timeline_stream.next().await);
-        assert_eq!(index, 0);
+        assert_let!(VectorDiff::Set { index, .. } = &timeline_updates[1]);
+        assert_eq!(*index, 0);
     }
 
     // `m.room.message`: “the world is big”
     {
-        assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
+        assert_let!(VectorDiff::PushBack { value: message } = &timeline_updates[2]);
         assert_let!(TimelineItemContent::Message(msg) = message.as_event().unwrap().content());
         assert_let!(MessageType::Text(text) = msg.msgtype());
         assert_eq!(text.body, "the world is big");
@@ -662,7 +649,7 @@ async fn test_empty_chunk() {
 
     // `m.room.name`: “hello world”
     {
-        assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
+        assert_let!(VectorDiff::PushBack { value: message } = &timeline_updates[3]);
         assert_let!(TimelineItemContent::Message(msg) = message.as_event().unwrap().content());
         assert_let!(MessageType::Text(text) = msg.msgtype());
         assert_eq!(text.body, "hello world");
@@ -670,9 +657,7 @@ async fn test_empty_chunk() {
 
     // Date divider
     {
-        assert_let!(
-            Some(VectorDiff::PushFront { value: date_divider }) = timeline_stream.next().await
-        );
+        assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[4]);
         assert!(date_divider.is_date_divider());
     }
 
@@ -734,16 +719,18 @@ async fn test_until_num_items_with_empty_chunk() {
         .await;
 
     let paginate = async {
-        timeline.live_paginate_backwards(10).await.unwrap();
+        timeline.paginate_backwards(10).await.unwrap();
     };
     let observe_paginating = async {
         assert_eq!(back_pagination_status.next().await, Some(LiveBackPaginationStatus::Paginating));
     };
     join(paginate, observe_paginating).await;
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+
     // `m.room.name`
     {
-        assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
+        assert_let!(VectorDiff::PushBack { value: message } = &timeline_updates[0]);
         assert_let!(TimelineItemContent::OtherState(state) = message.as_event().unwrap().content());
         assert_eq!(state.state_key(), "");
         assert_let!(
@@ -758,13 +745,13 @@ async fn test_until_num_items_with_empty_chunk() {
 
     // `m.room.name` is updated
     {
-        assert_let!(Some(VectorDiff::Set { index, .. }) = timeline_stream.next().await);
-        assert_eq!(index, 0);
+        assert_let!(VectorDiff::Set { index, .. } = &timeline_updates[1]);
+        assert_eq!(*index, 0);
     }
 
     // `m.room.message`: “the world is big”
     {
-        assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
+        assert_let!(VectorDiff::PushBack { value: message } = &timeline_updates[2]);
         assert_let!(TimelineItemContent::Message(msg) = message.as_event().unwrap().content());
         assert_let!(MessageType::Text(text) = msg.msgtype());
         assert_eq!(text.body, "the world is big");
@@ -772,7 +759,7 @@ async fn test_until_num_items_with_empty_chunk() {
 
     // `m.room.name`: “hello world”
     {
-        assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
+        assert_let!(VectorDiff::PushBack { value: message } = &timeline_updates[3]);
         assert_let!(TimelineItemContent::Message(msg) = message.as_event().unwrap().content());
         assert_let!(MessageType::Text(text) = msg.msgtype());
         assert_eq!(text.body, "hello world");
@@ -780,20 +767,18 @@ async fn test_until_num_items_with_empty_chunk() {
 
     // Date divider
     {
-        assert_let!(
-            Some(VectorDiff::PushFront { value: date_divider }) = timeline_stream.next().await
-        );
+        assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[4]);
         assert!(date_divider.is_date_divider());
     }
 
-    timeline.live_paginate_backwards(10).await.unwrap();
+    timeline.paginate_backwards(10).await.unwrap();
+
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
 
     // `m.room.name`: “hello room then”
     {
-        assert_let!(
-            Some(VectorDiff::Insert { index, value: message }) = timeline_stream.next().await
-        );
-        assert_eq!(index, 1);
+        assert_let!(VectorDiff::Insert { index, value: message } = &timeline_updates[0]);
+        assert_eq!(*index, 1);
         assert_let!(TimelineItemContent::Message(msg) = message.as_event().unwrap().content());
         assert_let!(MessageType::Text(text) = msg.msgtype());
         assert_eq!(text.body, "hello room then");
@@ -836,7 +821,7 @@ async fn test_back_pagination_aborted() {
     let paginate = spawn({
         let timeline = timeline.clone();
         async move {
-            timeline.live_paginate_backwards(10).await.unwrap();
+            timeline.paginate_backwards(10).await.unwrap();
         }
     });
 

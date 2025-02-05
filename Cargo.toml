@@ -34,8 +34,8 @@ base64 = "0.22.1"
 byteorder = "1.5.0"
 chrono = "0.4.38"
 eyeball = { version = "0.8.8", features = ["tracing"] }
-eyeball-im = { version = "0.5.1", features = ["tracing"] }
-eyeball-im-util = "0.7.0"
+eyeball-im = { version = "0.6.0", features = ["tracing"] }
+eyeball-im-util = "0.8.0"
 futures-core = "0.3.31"
 futures-executor = "0.3.21"
 futures-util = "0.3.31"
@@ -44,7 +44,7 @@ growable-bloom-filter = "2.1.1"
 hkdf = "0.12.4"
 hmac = "0.12.1"
 http = "1.1.0"
-imbl = "3.0.0"
+imbl = "4.0.1"
 indexmap = "2.6.0"
 insta = { version = "1.41.1", features = ["json"] }
 itertools = "0.13.0"
@@ -93,7 +93,7 @@ uniffi = { version = "0.28.0" }
 uniffi_bindgen = { version = "0.28.0" }
 url = "2.5.4"
 uuid = "1.11.0"
-vodozemac = { version = "0.8.1", features = ["insecure-pk-encryption"] }
+vodozemac = { git = "https://github.com/matrix-org/vodozemac", rev = "3d655add09992d17fdb2b55c60f532658090487d", features = ["insecure-pk-encryption"] }
 wasm-bindgen = "0.2.84"
 wasm-bindgen-test = "0.3.33"
 web-sys = "0.3.69"

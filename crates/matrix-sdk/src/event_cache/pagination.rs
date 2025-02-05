@@ -17,9 +17,8 @@
 use std::{future::Future, ops::ControlFlow, sync::Arc, time::Duration};
 
 use eyeball::Subscriber;
-use matrix_sdk_base::deserialized_responses::SyncTimelineEvent;
+use matrix_sdk_base::{deserialized_responses::TimelineEvent, timeout::timeout};
 use matrix_sdk_common::linked_chunk::ChunkContent;
-use tokio::time::timeout;
 use tracing::{debug, instrument, trace};
 
 use super::{
@@ -181,7 +180,7 @@ impl RoomPagination {
                     // (backward). The `RoomEvents` API expects the first event to be the oldest.
                     .rev()
                     .cloned()
-                    .map(SyncTimelineEvent::from)
+                    .map(TimelineEvent::from)
                     .collect::<Vec<_>>();
 
                 let first_event_pos = room_events.events().next().map(|(item_pos, _)| item_pos);
@@ -295,7 +294,7 @@ impl RoomPagination {
         // Otherwise, wait for a notification that we received a previous-batch token.
         // Note the state lock is released while doing so, allowing other tasks to write
         // into the linked chunk.
-        let _ = timeout(wait_time, self.inner.pagination_batch_token_notifier.notified()).await;
+        let _ = timeout(self.inner.pagination_batch_token_notifier.notified(), wait_time).await;
 
         let mut state = self.inner.state.write().await;
 
@@ -376,14 +375,11 @@ mod tests {
 
         use assert_matches::assert_matches;
         use matrix_sdk_base::RoomState;
-        use matrix_sdk_test::{
-            async_test, event_factory::EventFactory, sync_timeline_event, ALICE,
-        };
-        use ruma::room_id;
+        use matrix_sdk_test::{async_test, event_factory::EventFactory, ALICE};
+        use ruma::{event_id, room_id, user_id};
         use tokio::{spawn, time::sleep};
 
         use crate::{
-            deserialized_responses::SyncTimelineEvent,
             event_cache::{pagination::PaginationToken, room::events::Gap},
             test_utils::logged_in_client,
         };
@@ -456,8 +452,9 @@ mod tests {
                 .write()
                 .await
                 .with_events_mut(|events| {
-                    events
-                        .push_events([f.text_msg("this is the start of the timeline").into_sync()]);
+                    events.push_events([f
+                        .text_msg("this is the start of the timeline")
+                        .into_event()]);
                 })
                 .await
                 .unwrap();
@@ -501,7 +498,7 @@ mod tests {
                     .with_events_mut(|events| {
                         events.push_events([f
                             .text_msg("this is the start of the timeline")
-                            .into_sync()]);
+                            .into_event()]);
                     })
                     .await
                     .unwrap();
@@ -541,13 +538,11 @@ mod tests {
                     .await
                     .with_events_mut(|room_events| {
                         room_events.push_gap(Gap { prev_token: expected_token.clone() });
-                        room_events.push_events([SyncTimelineEvent::new(sync_timeline_event!({
-                            "sender": "b@z.h",
-                            "type": "m.room.message",
-                            "event_id": "$ida",
-                            "origin_server_ts": 12344446,
-                            "content": { "body":"yolo", "msgtype": "m.text" },
-                        }))]);
+                        room_events.push_events([EventFactory::new()
+                            .text_msg("yolo")
+                            .sender(user_id!("@b:z.h"))
+                            .event_id(event_id!("$ida"))
+                            .into_event()]);
                     })
                     .await
                     .unwrap();

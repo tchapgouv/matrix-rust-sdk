@@ -18,7 +18,8 @@ use assert_matches2::{assert_let, assert_matches};
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
 use futures_util::{FutureExt as _, StreamExt as _};
-use matrix_sdk::deserialized_responses::SyncTimelineEvent;
+use imbl::vector;
+use matrix_sdk::deserialized_responses::TimelineEvent;
 use matrix_sdk_test::{async_test, event_factory::EventFactory, sync_timeline_event, ALICE, BOB};
 use ruma::{
     event_id, events::AnyMessageLikeEventContent, server_name, uint, EventId,
@@ -28,8 +29,8 @@ use stream_assert::assert_next_matches;
 use tokio::time::timeout;
 
 use crate::timeline::{
-    controller::TimelineNewItemPosition, event_item::RemoteEventOrigin, tests::TestTimeline,
-    ReactionStatus, TimelineEventItemId, TimelineItem,
+    event_item::RemoteEventOrigin, tests::TestTimeline, ReactionStatus, TimelineEventItemId,
+    TimelineItem,
 };
 
 const REACTION_KEY: &str = "👍";
@@ -113,7 +114,7 @@ async fn test_add_reaction_success() {
 
     // When the remote echo is received from sync,
     let f = EventFactory::new();
-    timeline.handle_live_event(f.reaction(&event_id, REACTION_KEY.to_owned()).sender(*ALICE)).await;
+    timeline.handle_live_event(f.reaction(&event_id, REACTION_KEY).sender(*ALICE)).await;
 
     // The reaction is still present on the item, as a remote echo.
     assert_reaction_is_updated!(stream, &event_id, item_pos, true);
@@ -132,9 +133,7 @@ async fn test_redact_reaction_success() {
     // A reaction is added by sync.
     let reaction_id = event_id!("$reaction_id");
     timeline
-        .handle_live_event(
-            f.reaction(&event_id, REACTION_KEY.to_owned()).sender(&ALICE).event_id(reaction_id),
-        )
+        .handle_live_event(f.reaction(&event_id, REACTION_KEY).sender(&ALICE).event_id(reaction_id))
         .await;
     assert_reaction_is_updated!(stream, &event_id, item_pos, true);
 
@@ -153,7 +152,7 @@ async fn test_redact_reaction_success() {
 
     // When that redaction is confirmed by the server,
     timeline
-        .handle_live_event(SyncTimelineEvent::new(sync_timeline_event!({
+        .handle_live_event(TimelineEvent::new(sync_timeline_event!({
             "sender": *ALICE,
             "type": "m.room.redaction",
             "event_id": "$idb",
@@ -195,17 +194,18 @@ async fn test_initial_reaction_timestamp_is_stored() {
 
     timeline
         .controller
-        .add_events_at(
-            [
-                // Reaction comes first.
-                f.reaction(&message_event_id, REACTION_KEY.to_owned())
-                    .server_ts(reaction_timestamp)
-                    .into_sync(),
-                // Event comes next.
-                f.text_msg("A").event_id(&message_event_id).into_sync(),
-            ]
-            .into_iter(),
-            TimelineNewItemPosition::End { origin: RemoteEventOrigin::Sync },
+        .handle_remote_events_with_diffs(
+            vec![VectorDiff::Append {
+                values: vector![
+                    // Reaction comes first.
+                    f.reaction(&message_event_id, REACTION_KEY)
+                        .server_ts(reaction_timestamp)
+                        .into_event(),
+                    // Event comes next.
+                    f.text_msg("A").event_id(&message_event_id).into_event(),
+                ],
+            }],
+            RemoteEventOrigin::Sync,
         )
         .await;
 
