@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 #[derive(Debug)]
 pub enum BWIContentScannerError {
@@ -121,8 +121,8 @@ impl BWIContentScanner {
         match media_source {
             Encrypted(encrypted_file) => self.scan_encrypted_file(encrypted_file).await,
             Plain(attachment) => {
-                error!("###BWI### All media should be encrypted. But we encountered an unencrypted media with uri {:?}", attachment);
-                BWIScanState::Error
+                debug!("###BWI### All media should be encrypted. This should be a local echo with uri {:?}", attachment);
+                BWIScanState::InProgress
             }
         }
     }
@@ -169,10 +169,18 @@ impl BWIContentScanner {
         match status {
             StatusCode::OK => {
                 if !body.clean {
-                    error!("###BWI### inconsistent response from the content scanner");
-                    Ok(BWIScanState::Error)
+                    warn!("###BWI### inconsistent response from the content scanner. Maybe an old version of the content scanner ist used");
+                    Ok(BWIScanState::Infected)
                 } else {
                     Ok(BWIScanState::Trusted)
+                }
+            }
+            StatusCode::FORBIDDEN => {
+                if !body.clean {
+                    Ok(BWIScanState::Infected)
+                } else {
+                    warn!("###BWI### inconsistent response from the content scanner. Is is forbidden but clean");
+                    Ok(BWIScanState::Error)
                 }
             }
             StatusCode::NOT_FOUND => Ok(BWIScanState::NotFound),
