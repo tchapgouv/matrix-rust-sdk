@@ -1,5 +1,4 @@
 use anyhow::Result;
-use clap::builder::OsStr;
 use clap::Parser;
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt};
@@ -7,10 +6,7 @@ use log::{debug, info};
 use matrix_sdk::encryption::backups::BackupState;
 use matrix_sdk::encryption::secret_storage::SecretStore;
 use matrix_sdk::media::{MediaEventContent, MediaFormat, MediaRequestParameters};
-use matrix_sdk::ruma::events::room::message::{
-    ImageMessageEventContent, MessageType, SyncRoomMessageEvent,
-};
-use matrix_sdk::ruma::events::SyncMessageLikeEvent::Original;
+use matrix_sdk::ruma::events::room::message::{ImageMessageEventContent, MessageType};
 use matrix_sdk::{config::SyncSettings, ruma::OwnedRoomId, Client, Room};
 use matrix_sdk_ui::timeline::{RoomExt, TimelineItem, TimelineItemContent, TimelineItemKind};
 use std::path::{absolute, Path};
@@ -189,10 +185,10 @@ async fn main() -> Result<()> {
             match diff {
                 VectorDiff::PushFront { value } => handle_timeline_item(&value, &client_copy).await,
                 VectorDiff::PushBack { value } => handle_timeline_item(&value, &client_copy).await,
-                VectorDiff::Insert { index, value } => {
+                VectorDiff::Insert { index: _, value } => {
                     handle_timeline_item(&value, &client_copy).await
                 }
-                VectorDiff::Set { index, value } => {
+                VectorDiff::Set { index: _, value } => {
                     handle_timeline_item(&value, &client_copy).await
                 }
                 _ => {}
