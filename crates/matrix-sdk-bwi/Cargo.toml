@@ -7,6 +7,7 @@ rust-version.workspace = true
 [features]
 client = [] # needed for creating ruma like requests
 server = [] # needed for creating ruma like requests
+unstable-exhaustive-types = [] # needed for creating ruma like requests
 
 [dependencies]
 anyhow = { workspace = true }

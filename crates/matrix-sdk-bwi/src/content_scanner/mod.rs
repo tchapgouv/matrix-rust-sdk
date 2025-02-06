@@ -23,7 +23,6 @@ use crate::content_scanner::dto::{
 };
 use crate::content_scanner::url::BWIContentScannerUrl;
 use crate::content_scanner::BWIContentScannerError::ScanFailed;
-use ::url::{ParseError, Url};
 use http::StatusCode;
 use matrix_sdk_base::ruma::events::room::MediaSource::{Encrypted, Plain};
 use matrix_sdk_base::ruma::events::room::{EncryptedFile, MediaSource};
@@ -84,13 +83,13 @@ impl BWIContentScanner {
     pub fn new_with_url_as_str(
         http_client: reqwest::Client,
         content_scanner_url: &str,
-    ) -> Result<Self, ParseError> {
+    ) -> Result<Self, ::url::ParseError> {
         let content_scanner_url =
             BWIContentScannerUrl::for_base_url_as_string(content_scanner_url)?;
         Ok(Self::new(http_client, content_scanner_url, BWIScannedMedia::new()))
     }
 
-    pub fn new_with_url(http_client: &reqwest::Client, content_scanner_url: &Url) -> Self {
+    pub fn new_with_url(http_client: &reqwest::Client, content_scanner_url: &::url::Url) -> Self {
         let content_scanner_url =
             BWIContentScannerUrl::for_base_url(content_scanner_url.to_owned());
         Self::new(http_client.to_owned(), content_scanner_url, BWIScannedMedia::new())
@@ -121,7 +120,7 @@ impl BWIContentScanner {
 
     pub async fn scan_attachment(&self, media_source: MediaSource) -> BWIScanState {
         match media_source {
-            Encrypted(encrypted_file) => self.get_scan_for_encrypted_media(encrypted_file).await,
+            Encrypted(encrypted_file) => self.scan_encrypted_attachment(encrypted_file).await,
             Plain(attachment) => {
                 debug!("###BWI### All media should be encrypted. This should be a local echo with uri {:?}", attachment);
                 BWIScanState::InProgress
@@ -129,27 +128,33 @@ impl BWIContentScanner {
         }
     }
 
-    async fn get_scan_for_encrypted_media(
-        &self,
-        encrypted_file: Box<EncryptedFile>,
-    ) -> BWIScanState {
+    async fn scan_encrypted_attachment(&self, encrypted_file: Box<EncryptedFile>) -> BWIScanState {
         let mut guard = self.scanned_media.scanned_media.lock().await;
 
         let media_uri = encrypted_file.url.to_string();
-        let media_is_scanned = guard.contains_key(&media_uri);
+        let optional_previous_scan_state = guard.get(&media_uri);
 
-        if !media_is_scanned {
-            let scan_result =
-                self.scan_encrypted_media(encrypted_file).await.unwrap_or(BWIScanState::Error);
-            guard.insert(media_uri.clone(), scan_result);
+        match optional_previous_scan_state {
+            None | Some(BWIScanState::Error) => {
+                let scan_result = self
+                    .trigger_scan_request_for_encrypted_media(encrypted_file)
+                    .await
+                    .unwrap_or(BWIScanState::Error);
+                guard.insert(media_uri.clone(), scan_result.clone());
+                scan_result
+            }
+            Some(previous_scan_state) => previous_scan_state.clone(),
         }
-        guard.get(&media_uri).cloned().expect("entry should always be present")
     }
 
-    async fn scan_encrypted_media(
+    async fn trigger_scan_request_for_encrypted_media(
         &self,
         encrypted_media: Box<EncryptedFile>,
     ) -> Result<BWIScanState, BWIContentScannerError> {
+        debug!(
+            "###BWI### media with uri {:?} is scanned via the content scanner",
+            encrypted_media.url
+        );
         let public_key = self.get_public_key().await?;
         let scan_result = self.send_scan_request(encrypted_media, &public_key).await?;
         match scan_result {
