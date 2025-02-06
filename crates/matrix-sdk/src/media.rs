@@ -531,15 +531,17 @@ impl Media {
         settings: &MediaThumbnailSettings,
     ) -> Result<Vec<u8>, Error> {
         #[allow(deprecated)]
-        let mut request = media::get_content_thumbnail::v3::Request::from_url(
-            uri,
-            settings.width,
-            settings.height,
-        )?;
-        request.method = Some(settings.method.clone());
-        request.animated = Some(settings.animated);
+        {
+            let mut request = media::get_content_thumbnail::v3::Request::from_url(
+                uri,
+                settings.width,
+                settings.height,
+            )?;
+            request.method = Some(settings.method.clone());
+            request.animated = Some(settings.animated);
 
-        Ok(self.client.send(request, None).await?.file)
+            Ok(self.client.send(request, None).await?.file)
+        }
     }
 
     async fn fetch_media(
