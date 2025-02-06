@@ -9,6 +9,7 @@ pub mod v1 {
         //! [spec]: https://spec.matrix.org/latest/client-server-api/#get_matrixclientv1mediadownloadservernamemediaid
 
         use crate::content_scanner::dto::EncryptedMetadataRequest;
+        #[allow(unused_imports)] // actually used in the macros
         use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
         use ruma_common::{
             api::{request, response, Metadata},
@@ -28,6 +29,7 @@ pub mod v1 {
         };
 
         /// Request type for the `get_media_content` endpoint.
+        #[allow(dead_code)] // needed because of the macro complexity
         #[request(error=ruma_common::api::error::MatrixError)]
         pub struct Request {
             #[ruma_api(body)]
@@ -35,6 +37,7 @@ pub mod v1 {
         }
 
         /// Response type for the `get_media_content` endpoint.
+        #[allow(dead_code)] // needed because of the macro complexity
         #[response(error=ruma_common::api::error::MatrixError)]
         pub struct Response {
             /// The content that was previously uploaded.
@@ -60,21 +63,6 @@ pub mod v1 {
             /// Creates a new `Request` with the given URI.
             pub fn from_encrypted_metadata(encrypted_metadata: EncryptedMetadataRequest) -> Self {
                 Self::new(encrypted_metadata)
-            }
-        }
-
-        impl Response {
-            /// Creates a new `Response` with the given file contents.
-            pub fn new(
-                file: Vec<u8>,
-                content_type: String,
-                content_disposition: ContentDisposition,
-            ) -> Self {
-                Self {
-                    file,
-                    content_type: Some(content_type),
-                    content_disposition: Some(content_disposition),
-                }
             }
         }
     }
