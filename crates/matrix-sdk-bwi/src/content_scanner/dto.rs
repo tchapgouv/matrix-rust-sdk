@@ -50,6 +50,13 @@ pub struct BWIScanStateResultDto {
     pub info: String,
 }
 
+#[derive(Deserialize)]
+pub struct BWIScanStateForbiddenResultDto {
+    pub reason: String,
+    #[allow(dead_code)]
+    pub info: String,
+}
+
 #[derive(Serialize)]
 pub struct BWIEncryptedFileDto {
     file: EncryptedFile,

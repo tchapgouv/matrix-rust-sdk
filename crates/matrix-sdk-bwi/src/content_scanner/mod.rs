@@ -18,8 +18,8 @@ mod request;
 mod url;
 
 use crate::content_scanner::dto::{
-    BWIContentScannerPublicKey, BWIPublicKeyDto, BWIScanStateResultDto,
-    EncryptedMetadataRequestBuilder,
+    BWIContentScannerPublicKey, BWIPublicKeyDto, BWIScanStateForbiddenResultDto,
+    BWIScanStateResultDto, EncryptedMetadataRequestBuilder,
 };
 use crate::content_scanner::url::BWIContentScannerUrl;
 use crate::content_scanner::BWIContentScannerError::ScanFailed;
@@ -32,17 +32,50 @@ use reqwest::{Error, Response};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::content_scanner::request::v1::download_encrypted::Request;
 use tracing::{debug, error, warn};
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum BWIContentScannerError {
-    PublicKeyNotAvailable(HttpError),
-    PublicKeyParseError,
+    #[error("Public key for content scanner is not available")]
+    PublicKeyNotAvailable(#[from] HttpError),
+    #[error("Public key could not parsed")]
+    PublicKeyParseFailed,
+    #[error("There was an error in the response of the content scanner")]
+    ResponseError(#[from] ResponseError),
+    #[error("Scan failed")]
     ScanFailed,
+    #[error("Download failed")]
     DownloadFailed,
+}
+
+#[derive(Error, Debug)]
+pub enum ResponseError {
+    #[error("The status code does not match with the body")]
+    InconsistentResponse,
+    #[error("The response was malformed")]
+    UnableToParseResponse,
+}
+
+pub enum ReasonForForbiddenResponse {
+    MediaInfected,
+    MimeTypeForbidden,
+    DecryptionFailed,
+}
+
+/// map the magic String from https://github.com/element-hq/matrix-content-scanner-python/blob/main/docs/api.md for status code 403 to enum entries
+fn map_forbidden_reason_string_to_enum(
+    reason_as_string: &str,
+) -> Result<ReasonForForbiddenResponse, ResponseError> {
+    match reason_as_string {
+        "MCS_MEDIA_NOT_CLEAN" => Ok(ReasonForForbiddenResponse::MediaInfected),
+        "MCS_MIME_TYPE_FORBIDDEN" => Ok(ReasonForForbiddenResponse::MimeTypeForbidden),
+        "MCS_BAD_DECRYPTION" => Ok(ReasonForForbiddenResponse::DecryptionFailed),
+        _ => Err(ResponseError::UnableToParseResponse),
+    }
 }
 
 #[derive(Clone)]
@@ -103,7 +136,7 @@ impl BWIContentScanner {
             .await?
             .json::<BWIPublicKeyDto>()
             .await
-            .map_err(|_| BWIContentScannerError::PublicKeyParseError)?;
+            .map_err(|_| BWIContentScannerError::PublicKeyParseFailed)?;
         Ok(BWIContentScannerPublicKey(public_key.public_key))
     }
 
@@ -203,15 +236,34 @@ impl BWIContentScanner {
     async fn handle_forbidden_response(
         response: Response,
     ) -> Result<BWIScanState, BWIContentScannerError> {
-        let body = response.json::<BWIScanStateResultDto>().await.map_err(|_| ScanFailed)?;
-        let scan_result = match body.clean {
-            true => {
-                warn!("###BWI### inconsistent response from the content scanner. Is is forbidden but clean");
-                BWIScanState::Error
-            }
-            false => BWIScanState::Infected,
+        let forbidden_reason =
+            Self::map_response_to_forbidden_reason(response).await.map_err(|_| ScanFailed)?;
+        let scan_result = match forbidden_reason {
+            ReasonForForbiddenResponse::MediaInfected => BWIScanState::Infected,
+            ReasonForForbiddenResponse::MimeTypeForbidden => BWIScanState::MimeTypeNotAllowed,
+            ReasonForForbiddenResponse::DecryptionFailed => BWIScanState::Error,
         };
         Ok(scan_result)
+    }
+
+    async fn map_response_to_forbidden_reason(
+        response: Response,
+    ) -> Result<ReasonForForbiddenResponse, ResponseError> {
+        let raw_body = response.text().await.unwrap();
+        debug!("###BWI### Handle forbidden response {:?}", &raw_body);
+        if let Ok(body) = serde_json::from_str::<BWIScanStateForbiddenResultDto>(&raw_body) {
+            map_forbidden_reason_string_to_enum(&body.reason)
+        } else {
+            let body = serde_json::from_str::<BWIScanStateResultDto>(&raw_body)
+                .map_err(|_| ResponseError::UnableToParseResponse)?;
+            match body.clean {
+                true => {
+                    warn!("###BWI### inconsistent response from the content scanner. Is is forbidden but clean");
+                    Err(ResponseError::InconsistentResponse)
+                }
+                false => Ok(ReasonForForbiddenResponse::MediaInfected),
+            }
+        }
     }
 
     async fn handle_ok_response(

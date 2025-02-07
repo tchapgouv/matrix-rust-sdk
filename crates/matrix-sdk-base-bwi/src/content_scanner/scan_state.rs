@@ -23,6 +23,9 @@ pub enum BWIScanState {
     /// The content is marked as infected and must not be loaded
     Infected,
 
+    /// The mime type of the content is not allowed
+    MimeTypeNotAllowed,
+
     /**
     The content can not be scanned.
     That could happen because the ContentScanner is not available

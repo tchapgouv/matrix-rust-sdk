@@ -202,7 +202,32 @@ async fn test_media_scan_error_with_403_and_mime_type_forbidden() {
     mount_public_key_mock(&mock_server).await;
     mount_scan_mock(
         &mock_server,
-        ResponseTemplate::new(403).set_body_json(json!({"reason": "MCS_MIME_TYPE_FORBIDDEN"})),
+        ResponseTemplate::new(403).set_body_json(json!({
+            "reason": "MCS_MIME_TYPE_FORBIDDEN",
+            "info": "File type: application/octet-stream not allowed"
+        })),
+    )
+    .await;
+
+    let content_scanner = setup_content_scanner(&mock_server);
+
+    // Act
+    let scan_state = content_scanner.scan_attachment(Encrypted(Box::from(encrypted_file()))).await;
+
+    // Assert
+    assert_eq!(scan_state, BWIScanState::MimeTypeNotAllowed);
+}
+
+#[tokio::test]
+async fn test_media_scan_error_with_403_and_bad_decryption() {
+    // Arrange
+    let mock_server = MockServer::builder().start().await;
+    mount_public_key_mock(&mock_server).await;
+    mount_scan_mock(
+        &mock_server,
+        ResponseTemplate::new(403).set_body_json(json!({
+            "reason": "MCS_BAD_DECRYPTION",
+        })),
     )
     .await;
 

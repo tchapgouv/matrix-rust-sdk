@@ -40,6 +40,7 @@ use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::{fs::File as TokioFile, io::AsyncWriteExt};
 
+use crate::Error::UnknownError;
 use crate::{
     attachment::Thumbnail, config::RequestConfig, futures::SendRequest, Client, Error, Result,
     TransmissionProgress,
@@ -485,8 +486,12 @@ impl Media {
             true => request_config,
             false => None,
         };
-        let request =
-            self.client.content_scanner().download_authenticated_media_request(file).await.unwrap();
+        let request = self
+            .client
+            .content_scanner()
+            .download_authenticated_media_request(file)
+            .await
+            .map_err(|e| UnknownError(Box::new(e)))?;
         let content = self.client.send(request, request_config).await?.file;
         Ok(content)
     }
