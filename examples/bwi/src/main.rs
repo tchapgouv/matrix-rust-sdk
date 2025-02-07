@@ -7,14 +7,16 @@ use matrix_sdk::encryption::backups::BackupState;
 use matrix_sdk::encryption::secret_storage::SecretStore;
 use matrix_sdk::media::{MediaEventContent, MediaFormat, MediaRequestParameters};
 use matrix_sdk::ruma::events::room::message::{ImageMessageEventContent, MessageType};
+use matrix_sdk::ruma::push::ComparisonOperator::Le;
 use matrix_sdk::{config::SyncSettings, ruma::OwnedRoomId, Client, Room};
 use matrix_sdk_ui::timeline::{RoomExt, TimelineItem, TimelineItemContent, TimelineItemKind};
 use std::path::{absolute, Path};
 use std::sync::Arc;
-use tracing_subscriber::filter::filter_fn;
+use tracing::Level;
+use tracing_subscriber::filter::{filter_fn, FilterExt};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::Layer;
+use tracing_subscriber::{filter, Layer};
 use url::Url;
 
 const BWI_TARGET: &str = "BWI";
@@ -110,15 +112,10 @@ async fn listen_for_backup_state_changes(client: Client) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_filter(filter_fn(|meta| meta.target() == BWI_TARGET)),
-        )
-        .init();
-    // tracing_subscriber::fmt::init();
-
     let cli = Cli::parse();
+
+    setup_logging(cli.verbose);
+
     let room_id = cli.room_id.clone();
     let client = login(&cli).await?;
 
@@ -202,11 +199,32 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_timeline_item(item: &Arc<TimelineItem>, client: &Client) {
+fn setup_logging(verbose: bool) {
+    println!("with verbose logging {:?}", verbose);
+    if verbose {
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_filter(filter::LevelFilter::from_level(Level::DEBUG)),
+            )
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_filter(filter_fn(|meta| meta.target() == BWI_TARGET))
+                    .with_filter(filter::LevelFilter::from_level(Level::INFO)),
+            )
+            .init();
+    }
+}
+
+async fn handle_timeline_item(item: &Arc<TimelineItem>, _client: &Client) {
     if let TimelineItemKind::Event(e) = item.kind() {
         if let TimelineItemContent::Message(m) = e.content() {
             match m.msgtype() {
-                MessageType::Image(content) => handle_image_content(content, client).await,
+                MessageType::Image(_content) => {}
+                // MessageType::Image(content) => handle_image_content(content, client).await,
                 _ => {}
             }
         }

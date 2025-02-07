@@ -122,6 +122,9 @@ pub enum BWIScanState {
     /// The content is marked as infected and must not be loaded
     Infected,
 
+    /// The mime type of the file is not allowed
+    MimeTypeNotAllowed,
+
     /**
     The content can not be scanned.
     That could happen because the ContentScanner is not available
@@ -144,6 +147,7 @@ impl From<SDKScanState> for BWIScanState {
             SDKScanState::Error => BWIScanState::Error,
             SDKScanState::InProgress => BWIScanState::InProgress,
             SDKScanState::NotFound => BWIScanState::NotFound,
+            SDKScanState::MimeTypeNotAllowed => BWIScanState::MimeTypeNotAllowed,
         }
     }
 }
