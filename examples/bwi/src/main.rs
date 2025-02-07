@@ -219,7 +219,7 @@ fn setup_logging(verbose: bool) {
     }
 }
 
-async fn handle_timeline_item(item: &Arc<TimelineItem>, client: &Client) {
+async fn handle_timeline_item(item: &Arc<TimelineItem>, _client: &Client) {
     if let TimelineItemKind::Event(e) = item.kind() {
         if let TimelineItemContent::Message(m) = e.content() {
             match m.msgtype() {
