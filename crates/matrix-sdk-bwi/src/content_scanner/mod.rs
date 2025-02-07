@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 mod dto;
+mod request;
 mod url;
 
 use crate::content_scanner::dto::{
@@ -22,7 +23,6 @@ use crate::content_scanner::dto::{
 };
 use crate::content_scanner::url::BWIContentScannerUrl;
 use crate::content_scanner::BWIContentScannerError::ScanFailed;
-use ::url::{ParseError, Url};
 use http::StatusCode;
 use matrix_sdk_base::ruma::events::room::MediaSource::{Encrypted, Plain};
 use matrix_sdk_base::ruma::events::room::{EncryptedFile, MediaSource};
@@ -33,6 +33,8 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+use crate::content_scanner::request::v1::download_encrypted::Request;
 use tracing::{debug, error, warn};
 
 #[derive(Debug)]
@@ -40,6 +42,7 @@ pub enum BWIContentScannerError {
     PublicKeyNotAvailable(HttpError),
     PublicKeyParseError,
     ScanFailed,
+    DownloadFailed,
 }
 
 #[derive(Clone)]
@@ -77,6 +80,21 @@ impl BWIContentScanner {
         Self { http_client, content_scanner_url, scanned_media }
     }
 
+    pub fn new_with_url_as_str(
+        http_client: reqwest::Client,
+        content_scanner_url: &str,
+    ) -> Result<Self, ::url::ParseError> {
+        let content_scanner_url =
+            BWIContentScannerUrl::for_base_url_as_string(content_scanner_url)?;
+        Ok(Self::new(http_client, content_scanner_url, BWIScannedMedia::new()))
+    }
+
+    pub fn new_with_url(http_client: &reqwest::Client, content_scanner_url: &::url::Url) -> Self {
+        let content_scanner_url =
+            BWIContentScannerUrl::for_base_url(content_scanner_url.to_owned());
+        Self::new(http_client.to_owned(), content_scanner_url, BWIScannedMedia::new())
+    }
+
     pub async fn get_public_key(
         &self,
     ) -> Result<BWIContentScannerPublicKey, BWIContentScannerError> {
@@ -100,26 +118,9 @@ impl BWIContentScanner {
         )
     }
 
-    pub fn new_with_url_as_str(
-        http_client: reqwest::Client,
-        content_scanner_url: &str,
-    ) -> Result<Self, ParseError> {
-        let content_scanner_url =
-            BWIContentScannerUrl::for_base_url_as_string(content_scanner_url)?;
-        Ok(Self::new(http_client, content_scanner_url, BWIScannedMedia::new()))
-    }
-
-    pub fn new_with_url(http_client: reqwest::Client, content_scanner_url: Url) -> Self {
-        let content_scanner_url = BWIContentScannerUrl::for_base_url(content_scanner_url);
-        Self::new(http_client, content_scanner_url, BWIScannedMedia::new())
-    }
-
-    pub async fn scan_attachment_with_content_scanner(
-        &self,
-        media_source: MediaSource,
-    ) -> BWIScanState {
+    pub async fn scan_attachment(&self, media_source: MediaSource) -> BWIScanState {
         match media_source {
-            Encrypted(encrypted_file) => self.scan_encrypted_file(encrypted_file).await,
+            Encrypted(encrypted_file) => self.scan_encrypted_attachment(encrypted_file).await,
             Plain(attachment) => {
                 debug!("###BWI### All media should be encrypted. This should be a local echo with uri {:?}", attachment);
                 BWIScanState::InProgress
@@ -127,24 +128,33 @@ impl BWIContentScanner {
         }
     }
 
-    async fn scan_encrypted_file(&self, encrypted_file: Box<EncryptedFile>) -> BWIScanState {
+    async fn scan_encrypted_attachment(&self, encrypted_file: Box<EncryptedFile>) -> BWIScanState {
         let mut guard = self.scanned_media.scanned_media.lock().await;
 
         let media_uri = encrypted_file.url.to_string();
-        let media_is_scanned = guard.contains_key(&media_uri);
+        let optional_previous_scan_state = guard.get(&media_uri);
 
-        if !media_is_scanned {
-            let scan_result =
-                self.scan_encrypted_media(encrypted_file).await.unwrap_or(BWIScanState::Error);
-            guard.insert(media_uri.clone(), scan_result);
+        match optional_previous_scan_state {
+            None | Some(BWIScanState::Error) => {
+                let scan_result = self
+                    .trigger_scan_request_for_encrypted_media(encrypted_file)
+                    .await
+                    .unwrap_or(BWIScanState::Error);
+                guard.insert(media_uri.clone(), scan_result.clone());
+                scan_result
+            }
+            Some(previous_scan_state) => previous_scan_state.clone(),
         }
-        guard.get(&media_uri).cloned().expect("entry should always be present")
     }
 
-    async fn scan_encrypted_media(
+    async fn trigger_scan_request_for_encrypted_media(
         &self,
         encrypted_media: Box<EncryptedFile>,
     ) -> Result<BWIScanState, BWIContentScannerError> {
+        debug!(
+            "###BWI### media with uri {:?} is scanned via the content scanner",
+            encrypted_media.url
+        );
         let public_key = self.get_public_key().await?;
         let scan_result = self.send_scan_request(encrypted_media, &public_key).await?;
         match scan_result {
@@ -153,38 +163,6 @@ impl BWIContentScanner {
                 error!("###BWI### Failed to encrypt media");
                 Err(ScanFailed)
             }
-        }
-    }
-
-    /// Map the responses to the given semantic used by NV
-    /// https://github.com/element-hq/matrix-content-scanner-python/blob/main/docs/api.md
-    async fn handle_scan_response(
-        &self,
-        response: Response,
-    ) -> Result<BWIScanState, BWIContentScannerError> {
-        let status = response.status();
-        let body = response.json::<BWIScanStateResultDto>().await.map_err(|_| ScanFailed)?;
-        debug!("###BWI### Scan finished with status {:?}", &status);
-
-        match status {
-            StatusCode::OK => {
-                if !body.clean {
-                    warn!("###BWI### inconsistent response from the content scanner. Maybe an old version of the content scanner ist used");
-                    Ok(BWIScanState::Infected)
-                } else {
-                    Ok(BWIScanState::Trusted)
-                }
-            }
-            StatusCode::FORBIDDEN => {
-                if !body.clean {
-                    Ok(BWIScanState::Infected)
-                } else {
-                    warn!("###BWI### inconsistent response from the content scanner. Is is forbidden but clean");
-                    Ok(BWIScanState::Error)
-                }
-            }
-            StatusCode::NOT_FOUND => Ok(BWIScanState::NotFound),
-            _ => Err(ScanFailed),
         }
     }
 
@@ -204,21 +182,61 @@ impl BWIContentScanner {
             .send()
             .await)
     }
-}
 
-#[cfg(test)]
-mod test {
-    use serde_json::json;
+    /// Map the responses to the given semantic used by NV
+    /// https://github.com/element-hq/matrix-content-scanner-python/blob/main/docs/api.md
+    async fn handle_scan_response(
+        &self,
+        response: Response,
+    ) -> Result<BWIScanState, BWIContentScannerError> {
+        let status = response.status();
+        debug!("###BWI### Scan finished with status {:?}", &status);
 
-    #[tokio::test]
-    async fn test_scan() {
-        let response = reqwest::Client::default()
-            .post("https://example.com")
-            .json(&json!({
-                "test": "false",
-            }))
-            .send()
-            .await;
-        println!("{:#?}", response);
+        match status {
+            StatusCode::OK => Self::handle_ok_response(response).await,
+            StatusCode::FORBIDDEN => Self::handle_forbidden_response(response).await,
+            StatusCode::NOT_FOUND => Ok(BWIScanState::NotFound),
+            _ => Err(ScanFailed),
+        }
+    }
+
+    async fn handle_forbidden_response(
+        response: Response,
+    ) -> Result<BWIScanState, BWIContentScannerError> {
+        let body = response.json::<BWIScanStateResultDto>().await.map_err(|_| ScanFailed)?;
+        let scan_result = match body.clean {
+            true => {
+                warn!("###BWI### inconsistent response from the content scanner. Is is forbidden but clean");
+                BWIScanState::Error
+            }
+            false => BWIScanState::Infected,
+        };
+        Ok(scan_result)
+    }
+
+    async fn handle_ok_response(
+        response: Response,
+    ) -> Result<BWIScanState, BWIContentScannerError> {
+        let body = response.json::<BWIScanStateResultDto>().await.map_err(|_| ScanFailed)?;
+        let scan_result = match body.clean {
+            true => BWIScanState::Trusted,
+            false => {
+                warn!("###BWI### inconsistent response from the content scanner. Maybe an old version of the content scanner ist used");
+                BWIScanState::Infected
+            }
+        };
+        Ok(scan_result)
+    }
+
+    pub async fn download_authenticated_media_request(
+        &self,
+        file: Box<EncryptedFile>,
+    ) -> Result<Request, BWIContentScannerError> {
+        let public_key = self.get_public_key().await?;
+        let encrypted_metadata = EncryptedMetadataRequestBuilder::for_encrypted_file(*file.clone())
+            .build_encrypted_request(&public_key)
+            .map_err(|_| BWIContentScannerError::DownloadFailed)?;
+        debug!("###BWI### Downloading authenticated media with url {:?}", file.url);
+        Ok(Request::from_encrypted_metadata(encrypted_metadata))
     }
 }

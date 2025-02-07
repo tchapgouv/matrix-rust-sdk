@@ -69,6 +69,7 @@ use matrix_sdk_base::{
     StateStoreDataKey, StateStoreDataValue, SyncOutsideWasm,
 };
 use matrix_sdk_base_bwi::room_alias::BWIRoomAlias;
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use ruma::events::room::history_visibility::{
     HistoryVisibility, RoomHistoryVisibilityEventContent,
 };
@@ -267,6 +268,9 @@ pub(crate) struct ClientInner {
     /// The underlying HTTP client.
     pub(crate) http_client: HttpClient,
 
+    // BWI-specific
+    pub(crate) content_scanner: Arc<BWIContentScanner>,
+    // end BWI-specific
     /// User session data.
     pub(super) base_client: BaseClient,
 
@@ -350,6 +354,9 @@ impl ClientInner {
         homeserver: Url,
         #[cfg(feature = "experimental-sliding-sync")] sliding_sync_version: SlidingSyncVersion,
         http_client: HttpClient,
+        // BWI-specific
+        content_scanner: Arc<BWIContentScanner>,
+        // end BWI-specific
         base_client: BaseClient,
         server_capabilities: ClientServerCapabilities,
         respect_login_well_known: bool,
@@ -365,6 +372,7 @@ impl ClientInner {
             #[cfg(feature = "experimental-sliding-sync")]
             sliding_sync_version: StdRwLock::new(sliding_sync_version),
             http_client,
+            content_scanner,
             base_client,
             locks: Default::default(),
             cross_process_store_locks_holder_name,
@@ -437,6 +445,13 @@ impl Client {
     pub fn http_client(&self) -> &reqwest::Client {
         &self.inner.http_client.inner
     }
+
+    // BWI-specific
+    /// The content scanner
+    pub fn content_scanner(&self) -> &Arc<BWIContentScanner> {
+        &self.inner.content_scanner
+    }
+    // end BWI-specific
 
     pub(crate) fn locks(&self) -> &ClientLocks {
         &self.inner.locks
@@ -2415,6 +2430,7 @@ impl Client {
                 #[cfg(feature = "experimental-sliding-sync")]
                 self.sliding_sync_version(),
                 self.inner.http_client.clone(),
+                self.inner.content_scanner.clone(),
                 self.inner
                     .base_client
                     .clone_with_in_memory_state_store(&cross_process_store_locks_holder_name)

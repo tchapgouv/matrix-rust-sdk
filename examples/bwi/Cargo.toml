@@ -1,12 +1,12 @@
 [package]
-name = "example-timeline"
+name = "bwi-example"
 version = "0.1.0"
 edition = "2021"
 publish = false
 license = "Apache-2.0"
 
 [[bin]]
-name = "example-timeline"
+name = "bwi-example"
 test = false
 
 [dependencies]
@@ -21,10 +21,11 @@ url = { workspace = true }
 matrix-sdk = { path = "../../crates/matrix-sdk" }
 matrix-sdk-bwi = { path = "../../crates/matrix-sdk-bwi" }
 matrix-sdk-base-bwi = { path = "../../crates/matrix-sdk-base-bwi" }
-matrix-sdk-ui = { path = "../../crates/matrix-sdk-ui" }
+matrix-sdk-ui = { path = "../../crates/matrix-sdk-ui", features = ["enable_external_content_scanner_setup"] }
 eyeball-im = "0.5.0"
 log = "0.4.22"
 tracing = "0.1.40"
+mime = "0.3.17"
 
 [lints]
 workspace = true

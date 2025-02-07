@@ -30,7 +30,6 @@ use matrix_sdk::{
     executor::spawn,
     Room,
 };
-use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use ruma::{events::AnySyncTimelineEvent, RoomVersionId};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, info_span, trace, warn, Instrument, Span};
@@ -162,11 +161,7 @@ impl TimelineBuilder {
 
         // BWI-specific
         let client = room.client();
-        let homeserver_url = client.homeserver();
-        let content_scanner = Arc::from(BWIContentScanner::new_with_url(
-            client.http_client().clone(),
-            homeserver_url,
-        ));
+        let content_scanner = client.content_scanner();
         // end BWI-specific
 
         let controller = TimelineController::new(
@@ -175,7 +170,7 @@ impl TimelineBuilder {
             internal_id_prefix.clone(),
             unable_to_decrypt_hook,
             is_room_encrypted,
-            content_scanner,
+            content_scanner.to_owned(),
         )
         .with_settings(settings);
 

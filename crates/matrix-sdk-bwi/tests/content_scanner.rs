@@ -21,7 +21,7 @@ use matrix_sdk_base::ruma::events::room::MediaSource::Encrypted;
 use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState;
 use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use serde_json::json;
-use wiremock::ResponseTemplate;
+use wiremock::{MockServer, ResponseTemplate};
 
 #[tokio::test]
 #[ignore]
@@ -109,10 +109,16 @@ mod helpers {
     }
 }
 
+fn setup_content_scanner(mock_server: &MockServer) -> BWIContentScanner {
+    let client = reqwest::Client::builder().build().unwrap();
+    let mock_server_url = url::Url::parse(&mock_server.uri()).unwrap();
+    BWIContentScanner::new_with_url(&client, &mock_server_url)
+}
+
 #[tokio::test]
 async fn test_media_scan_trusted() {
     // Arrange
-    let mock_server = wiremock::MockServer::builder().start().await;
+    let mock_server = MockServer::builder().start().await;
     mount_public_key_mock(&mock_server).await;
     mount_scan_mock(
         &mock_server,
@@ -120,14 +126,10 @@ async fn test_media_scan_trusted() {
     )
     .await;
 
-    let client = reqwest::Client::builder().build().unwrap();
-    let mock_server_url = url::Url::parse(&mock_server.uri()).unwrap();
-    let content_scanner = BWIContentScanner::new_with_url(client, mock_server_url);
+    let content_scanner = setup_content_scanner(&mock_server);
 
     // Act
-    let scan_state = content_scanner
-        .scan_attachment_with_content_scanner(Encrypted(Box::from(encrypted_file())))
-        .await;
+    let scan_state = content_scanner.scan_attachment(Encrypted(Box::from(encrypted_file()))).await;
 
     // Assert
     assert_eq!(scan_state, BWIScanState::Trusted);
@@ -136,7 +138,7 @@ async fn test_media_scan_trusted() {
 #[tokio::test]
 async fn test_media_scan_infected_with_200() {
     // Arrange
-    let mock_server = wiremock::MockServer::builder().start().await;
+    let mock_server = MockServer::builder().start().await;
     mount_public_key_mock(&mock_server).await;
     mount_scan_mock(
         &mock_server,
@@ -144,14 +146,10 @@ async fn test_media_scan_infected_with_200() {
     )
     .await;
 
-    let client = reqwest::Client::builder().build().unwrap();
-    let mock_server_url = url::Url::parse(&mock_server.uri()).unwrap();
-    let content_scanner = BWIContentScanner::new_with_url(client, mock_server_url);
+    let content_scanner = setup_content_scanner(&mock_server);
 
     // Act
-    let scan_state = content_scanner
-        .scan_attachment_with_content_scanner(Encrypted(Box::from(encrypted_file())))
-        .await;
+    let scan_state = content_scanner.scan_attachment(Encrypted(Box::from(encrypted_file()))).await;
 
     // Assert
     assert_eq!(scan_state, BWIScanState::Infected);
@@ -160,7 +158,7 @@ async fn test_media_scan_infected_with_200() {
 #[tokio::test]
 async fn test_media_scan_infected_with_403_and_not_clean_body() {
     // Arrange
-    let mock_server = wiremock::MockServer::builder().start().await;
+    let mock_server = MockServer::builder().start().await;
     mount_public_key_mock(&mock_server).await;
     mount_scan_mock(
         &mock_server,
@@ -168,14 +166,10 @@ async fn test_media_scan_infected_with_403_and_not_clean_body() {
     )
     .await;
 
-    let client = reqwest::Client::builder().build().unwrap();
-    let mock_server_url = url::Url::parse(&mock_server.uri()).unwrap();
-    let content_scanner = BWIContentScanner::new_with_url(client, mock_server_url);
+    let content_scanner = setup_content_scanner(&mock_server);
 
     // Act
-    let scan_state = content_scanner
-        .scan_attachment_with_content_scanner(Encrypted(Box::from(encrypted_file())))
-        .await;
+    let scan_state = content_scanner.scan_attachment(Encrypted(Box::from(encrypted_file()))).await;
 
     // Assert
     assert_eq!(scan_state, BWIScanState::Infected);
@@ -184,7 +178,7 @@ async fn test_media_scan_infected_with_403_and_not_clean_body() {
 #[tokio::test]
 async fn test_media_scan_error_with_403_and_clean_body() {
     // Arrange
-    let mock_server = wiremock::MockServer::builder().start().await;
+    let mock_server = MockServer::builder().start().await;
     mount_public_key_mock(&mock_server).await;
     mount_scan_mock(
         &mock_server,
@@ -192,14 +186,10 @@ async fn test_media_scan_error_with_403_and_clean_body() {
     )
     .await;
 
-    let client = reqwest::Client::builder().build().unwrap();
-    let mock_server_url = url::Url::parse(&mock_server.uri()).unwrap();
-    let content_scanner = BWIContentScanner::new_with_url(client, mock_server_url);
+    let content_scanner = setup_content_scanner(&mock_server);
 
     // Act
-    let scan_state = content_scanner
-        .scan_attachment_with_content_scanner(Encrypted(Box::from(encrypted_file())))
-        .await;
+    let scan_state = content_scanner.scan_attachment(Encrypted(Box::from(encrypted_file()))).await;
 
     // Assert
     assert_eq!(scan_state, BWIScanState::Error);
@@ -208,7 +198,7 @@ async fn test_media_scan_error_with_403_and_clean_body() {
 #[tokio::test]
 async fn test_media_scan_error_with_403_and_mime_type_forbidden() {
     // Arrange
-    let mock_server = wiremock::MockServer::builder().start().await;
+    let mock_server = MockServer::builder().start().await;
     mount_public_key_mock(&mock_server).await;
     mount_scan_mock(
         &mock_server,
@@ -216,15 +206,31 @@ async fn test_media_scan_error_with_403_and_mime_type_forbidden() {
     )
     .await;
 
-    let client = reqwest::Client::builder().build().unwrap();
-    let mock_server_url = url::Url::parse(&mock_server.uri()).unwrap();
-    let content_scanner = BWIContentScanner::new_with_url(client, mock_server_url);
+    let content_scanner = setup_content_scanner(&mock_server);
 
     // Act
-    let scan_state = content_scanner
-        .scan_attachment_with_content_scanner(Encrypted(Box::from(encrypted_file())))
-        .await;
+    let scan_state = content_scanner.scan_attachment(Encrypted(Box::from(encrypted_file()))).await;
 
     // Assert
     assert_eq!(scan_state, BWIScanState::Error);
+}
+
+#[tokio::test]
+async fn test_media_scan_media_not_found() {
+    // Arrange
+    let mock_server = MockServer::builder().start().await;
+    mount_public_key_mock(&mock_server).await;
+    mount_scan_mock(
+        &mock_server,
+        ResponseTemplate::new(404).set_body_json(json!({"reason": "M_NOT_FOUND"})),
+    )
+    .await;
+
+    let content_scanner = setup_content_scanner(&mock_server);
+
+    // Act
+    let scan_state = content_scanner.scan_attachment(Encrypted(Box::from(encrypted_file()))).await;
+
+    // Assert
+    assert_eq!(scan_state, BWIScanState::NotFound);
 }
