@@ -68,10 +68,9 @@ use matrix_sdk_base::{
     BaseClient, RoomInfoNotableUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
     StateStoreDataKey, StateStoreDataValue, SyncOutsideWasm,
 };
-use matrix_sdk_base_bwi::federation::BWIFederationHandler;
-use matrix_sdk_base_bwi::jwt_token::BWIJwtToken;
 use matrix_sdk_base_bwi::room_alias::BWIRoomAlias;
 use matrix_sdk_bwi::content_scanner::BWIContentScanner;
+use matrix_sdk_bwi::federation::BWIFederationHandler;
 use ruma::events::room::history_visibility::{
     HistoryVisibility, RoomHistoryVisibilityEventContent,
 };
@@ -1557,13 +1556,8 @@ impl Client {
         request: &mut create_room::v3::Request,
         is_federated: bool,
     ) {
-        #[cfg(any(not(feature = "wiremock")))]
-        let server = self.server().expect("Server should be set").to_owned();
-
-        #[cfg(feature = "wiremock")]
-        let server = Url::parse("https://test.de").unwrap();
-
-        let federation_handler = BWIFederationHandler::for_server(server);
+        let federation_handler =
+            BWIFederationHandler::for_user_id(self.user_id().expect("Server should be set"));
 
         request.initial_state.push(
             InitialStateEvent::new(RoomServerAclEventContent::new(

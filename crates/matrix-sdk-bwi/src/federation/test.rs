@@ -17,16 +17,15 @@
 #[cfg(test)]
 mod test_federation_create_server_acl {
     use crate::federation::BWIFederationHandler;
-    use url::Url;
+    use ruma_common::OwnedUserId;
+    use std::str::FromStr;
 
-    const SERVER_URL: &str = "https://test.de/";
+    const SERVER_DOMAIN: &str = "test.de";
 
     #[test]
     fn test_is_federated() {
-        let server_url = Url::parse(SERVER_URL).unwrap();
-
         // Act
-        let federation_handler = BWIFederationHandler::for_server(server_url);
+        let federation_handler = BWIFederationHandler::for_server(SERVER_DOMAIN);
 
         let allow = federation_handler.create_server_acl(true);
 
@@ -37,15 +36,26 @@ mod test_federation_create_server_acl {
 
     #[test]
     fn test_is_not_federated() {
-        let server_url = Url::parse(SERVER_URL).unwrap();
-
         // Act
-        let federation_handler = BWIFederationHandler::for_server(server_url);
+        let federation_handler = BWIFederationHandler::for_server(SERVER_DOMAIN);
 
         let allow = federation_handler.create_server_acl(false);
 
         // Assert
-        assert!(allow.contains(&"test.de".to_string()));
-        assert_eq!(allow.iter().count(), 1);
+        assert_eq!(allow, vec!["test.de".to_string()]);
+    }
+
+    #[test]
+    fn test_is_not_federated_from_user_id() {
+        // Arrange
+        let user_id = OwnedUserId::from_str("@example.user:test.de").unwrap();
+
+        // Act
+        let federation_handler = BWIFederationHandler::for_user_id(&user_id);
+
+        let allow = federation_handler.create_server_acl(false);
+
+        // Assert
+        assert_eq!(allow, vec!["test.de".to_string()]);
     }
 }

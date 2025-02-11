@@ -13,20 +13,26 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+use ruma_common::UserId;
+
 mod test;
-use url::Url;
 
 pub struct BWIFederationHandler {
-    server_url: Url,
+    server_domain: String,
 }
 
 impl BWIFederationHandler {
-    pub fn for_server(server_url: Url) -> Self {
-        BWIFederationHandler { server_url }
+    pub fn for_server(server_url: &str) -> Self {
+        BWIFederationHandler { server_domain: server_url.to_owned() }
     }
 
-    fn server_domain(&self) -> String {
-        self.server_url.domain().expect("The url of the domain should be valid").to_owned()
+    pub fn for_user_id(user_id: &UserId) -> Self {
+        let server = user_id.server_name().host();
+        Self::for_server(server)
+    }
+
+    fn server_domain(&self) -> &str {
+        &self.server_domain
     }
 
     pub fn create_server_acl(&self, is_federated: bool) -> Vec<String> {
@@ -34,7 +40,7 @@ impl BWIFederationHandler {
             // Room is federated, allow other user from other servers to join the room
             true => vec!["*".to_owned()],
             // Room is not federated, only user from the same homeserver can join the room
-            false => vec![self.server_domain()],
+            false => vec![self.server_domain().to_owned()],
         }
     }
 }
