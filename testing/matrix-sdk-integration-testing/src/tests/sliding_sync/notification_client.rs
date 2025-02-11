@@ -54,7 +54,7 @@ async fn test_notification() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room(request, false).await?;
     let room_id = alice_room.room_id().to_owned();
 
     // Bob receives a notification about it.

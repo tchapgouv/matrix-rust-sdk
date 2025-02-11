@@ -70,9 +70,11 @@ use matrix_sdk_base::{
 };
 use matrix_sdk_base_bwi::room_alias::BWIRoomAlias;
 use matrix_sdk_bwi::content_scanner::BWIContentScanner;
+use matrix_sdk_bwi::federation::BWIFederationHandler;
 use ruma::events::room::history_visibility::{
     HistoryVisibility, RoomHistoryVisibilityEventContent,
 };
+use ruma::events::room::server_acl::RoomServerAclEventContent;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{room::encryption::RoomEncryptionEventContent, InitialStateEvent};
 use ruma::{
@@ -1485,27 +1487,30 @@ impl Client {
     /// # let homeserver = Url::parse("http://example.com").unwrap();
     /// let request = CreateRoomRequest::new();
     /// let client = Client::new(homeserver).await.unwrap();
-    /// assert!(client.create_room(request).await.is_ok());
+    /// assert!(client.create_room(request, false).await.is_ok());
     /// # };
     /// ```
-    pub async fn create_room(&self, mut request: create_room::v3::Request) -> Result<Room> {
+    pub async fn create_room(
+        &self,
+        mut request: create_room::v3::Request,
+        is_federated: bool,
+    ) -> Result<Room> {
         let invite = request.invite.clone();
         let is_direct_room = request.is_direct;
 
-        // BWI specific: create room alias
         if !is_direct_room {
-            if let Some(room_name) = &request.name {
-                request.room_alias_name = Some(BWIRoomAlias::alias_for_room_name(room_name));
-            }
+            // BWI specific: create room alias
+            Client::add_room_alias(&mut request);
+            // END BWI specific
+
+            // BWI specific: add acl initial state event
+            self.add_acl_initial_state_event(&mut request, is_federated);
+            // END #6880 BWI specific
         }
 
         // BWI specific: #5991 create room with HistoryVisibility set to invite
-        request.initial_state.push(
-            InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(
-                HistoryVisibility::Invited,
-            ))
-            .to_raw_any(),
-        );
+        Client::add_history_visibility_initial_state_event(&mut request);
+        // END #5991 BWI specific
 
         let response = self.send(request, None).await?;
         let base_room = self.base_client().get_or_create_room(&response.room_id, RoomState::Joined);
@@ -1523,6 +1528,47 @@ impl Client {
 
         Ok(joined_room)
     }
+
+    // BWI specific: create room alias
+    pub(self) fn add_room_alias(request: &mut create_room::v3::Request) {
+        if let Some(room_name) = &request.name {
+            request.room_alias_name = Some(BWIRoomAlias::alias_for_room_name(room_name));
+        }
+    }
+    // END BWI specific
+
+    // BWI specific: #5991 create room with HistoryVisibility set to invite
+    pub(self) fn add_history_visibility_initial_state_event(
+        request: &mut create_room::v3::Request,
+    ) {
+        request.initial_state.push(
+            InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(
+                HistoryVisibility::Invited,
+            ))
+            .to_raw_any(),
+        );
+    }
+    // END #5991 BWI specific
+
+    // BWI specific: #6880 add acl initial state event
+    pub(self) fn add_acl_initial_state_event(
+        &self,
+        request: &mut create_room::v3::Request,
+        is_federated: bool,
+    ) {
+        let federation_handler =
+            BWIFederationHandler::for_user_id(self.user_id().expect("Server should be set"));
+
+        request.initial_state.push(
+            InitialStateEvent::new(RoomServerAclEventContent::new(
+                false,
+                federation_handler.create_server_acl(is_federated),
+                Vec::new(),
+            ))
+            .to_raw_any(),
+        );
+    }
+    // END #6880 BWI specific
 
     /// Create a DM room.
     ///
@@ -1552,7 +1598,7 @@ impl Client {
             initial_state,
         });
 
-        self.create_room(request).await
+        self.create_room(request, false).await
     }
 
     /// Search the homeserver's directory for public rooms with a filter.
@@ -3147,10 +3193,13 @@ pub(crate) mod tests {
 
         // Create a room in the internal store
         let room = client
-            .create_room(assign!(CreateRoomRequest::new(), {
-                invite: vec![],
-                is_direct: false,
-            }))
+            .create_room(
+                assign!(CreateRoomRequest::new(), {
+                    invite: vec![],
+                    is_direct: false,
+                }),
+                false,
+            )
             .await
             .unwrap();
 

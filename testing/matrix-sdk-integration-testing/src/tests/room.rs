@@ -52,10 +52,13 @@ async fn test_event_with_context() -> Result<()> {
 
     // alice creates a room and invites bob.
     let room_id = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![bob.user_id().unwrap().to_owned()],
-            is_direct: true,
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![bob.user_id().unwrap().to_owned()],
+                is_direct: true,
+            }),
+            false,
+        )
         .await?
         .room_id()
         .to_owned();
@@ -205,7 +208,7 @@ async fn test_room_account_data() -> Result<()> {
     });
 
     // alice creates a room and invites bob.
-    let room_id = alice.create_room(CreateRoomRequest::new()).await?.room_id().to_owned();
+    let room_id = alice.create_room(CreateRoomRequest::new(), false).await?.room_id().to_owned();
 
     let alice_room = wait_for_room(&alice, &room_id).await;
 

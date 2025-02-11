@@ -2948,13 +2948,15 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.3",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "url",
  "wiremock",
 ]
 
 [[package]]
 name = "matrix-sdk-bwi"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",

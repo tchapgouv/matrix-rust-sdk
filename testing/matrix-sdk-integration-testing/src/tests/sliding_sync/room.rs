@@ -110,10 +110,13 @@ async fn test_left_room() -> Result<()> {
 
     // Peter creates a room and invites Steven.
     let peter_room = peter
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![steven.user_id().unwrap().to_owned()],
-            is_direct: true,
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![steven.user_id().unwrap().to_owned()],
+                is_direct: true,
+            }),
+            false,
+        )
         .await?;
 
     // Steven joins it.
@@ -195,7 +198,7 @@ async fn test_room_avatar_group_conversation() -> Result<()> {
         .create_room(assign!(CreateRoomRequest::new(), {
             invite: vec![bob.user_id().unwrap().to_owned(), celine.user_id().unwrap().to_owned()],
             is_direct: true,
-        }))
+        }), false)
         .await?;
 
     sleep(Duration::from_secs(1)).await;
@@ -282,10 +285,13 @@ async fn test_joined_user_can_create_push_context_with_room_list_service() -> Re
 
     // Alice creates a room and invites Bob.
     let alice_room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![bob.user_id().unwrap().to_owned()],
-            is_direct: false,
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![bob.user_id().unwrap().to_owned()],
+                is_direct: false,
+            }),
+            false,
+        )
         .await?;
 
     sleep(Duration::from_secs(1)).await;
@@ -462,10 +468,13 @@ async fn test_room_notification_count() -> Result<()> {
 
     // Alice creates a room and invites Bob.
     let room_id = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![bob.user_id().unwrap().to_owned()],
-            is_direct: true,
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![bob.user_id().unwrap().to_owned()],
+                is_direct: true,
+            }),
+            false,
+        )
         .await?
         .room_id()
         .to_owned();
@@ -751,11 +760,14 @@ async fn test_delayed_decryption_latest_event() -> Result<()> {
 
     // Alice creates a room and invites Bob.
     let room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![bob.user_id().unwrap().to_owned()],
-            is_direct: true,
-            preset: Some(RoomPreset::TrustedPrivateChat),
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![bob.user_id().unwrap().to_owned()],
+                is_direct: true,
+                preset: Some(RoomPreset::TrustedPrivateChat),
+            }),
+            false,
+        )
         .await?;
 
     // Room is created by Alice. Let's enable encryption.
@@ -848,11 +860,14 @@ async fn test_delayed_invite_response_and_sent_message_decryption() -> Result<()
 
     // alice creates a room and invites bob.
     let alice_room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![],
-            is_direct: true,
-            preset: Some(RoomPreset::PrivateChat),
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![],
+                is_direct: true,
+                preset: Some(RoomPreset::PrivateChat),
+            }),
+            false,
+        )
         .await?;
     alice_room.enable_encryption().await?;
 
@@ -931,11 +946,14 @@ async fn test_room_info_notable_update_deduplication() -> Result<()> {
 
     // alice creates a room and invites bob.
     let alice_room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![bob.user_id().unwrap().to_owned()],
-            is_direct: true,
-            preset: Some(RoomPreset::TrustedPrivateChat),
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![bob.user_id().unwrap().to_owned()],
+                is_direct: true,
+                preset: Some(RoomPreset::TrustedPrivateChat),
+            }),
+            false,
+        )
         .await?;
 
     alice_room.enable_encryption().await.unwrap();
@@ -1049,7 +1067,7 @@ async fn test_room_preview() -> Result<()> {
                 InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(HistoryVisibility::WorldReadable)).to_raw_any(),
                 InitialStateEvent::new(RoomJoinRulesEventContent::new(JoinRule::Invite)).to_raw_any(),
             ],
-        }))
+        }), false)
         .await?;
 
     room.set_avatar_url(mxc_uri!("mxc://localhost/alice"), None).await?;
@@ -1062,7 +1080,7 @@ async fn test_room_preview() -> Result<()> {
                 InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(HistoryVisibility::Shared)).to_raw_any(),
                 InitialStateEvent::new(RoomJoinRulesEventContent::new(JoinRule::Public)).to_raw_any(),
             ],
-        }))
+        }), false)
         .await?;
 
     let room_id = room.room_id();

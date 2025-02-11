@@ -15,5 +15,6 @@
  */
 
 pub mod content_scanner;
+pub mod federation;
 pub mod password_evaluator;
 pub mod regulatory;
