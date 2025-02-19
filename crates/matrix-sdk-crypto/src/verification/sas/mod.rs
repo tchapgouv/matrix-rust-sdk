@@ -43,9 +43,9 @@ use super::{
 use crate::{
     identities::{DeviceData, UserIdentityData},
     olm::StaticAccountData,
-    requests::{OutgoingVerificationRequest, RoomMessageRequest},
     store::CryptoStoreError,
-    Emoji, ToDeviceRequest,
+    types::requests::{OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest},
+    Emoji,
 };
 
 /// Short authentication string object.
@@ -899,7 +899,7 @@ mod tests {
     }
 
     fn bob_device_id() -> &'static DeviceId {
-        device_id!("BOBDEVCIE")
+        device_id!("BOBDEVICE")
     }
 
     fn machine_pair_test_helper() -> (VerificationStore, DeviceData, VerificationStore, DeviceData)

@@ -1,21 +1,30 @@
 use anyhow::{bail, Context};
-use ruma::events::{
-    room::{message::Relation, redaction::SyncRoomRedactionEvent},
-    AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, AnyTimelineEvent,
-    MessageLikeEventContent as RumaMessageLikeEventContent, RedactContent,
-    RedactedStateEventContent, StaticStateEventContent, SyncMessageLikeEvent, SyncStateEvent,
+use matrix_sdk::IdParseError;
+use matrix_sdk_ui::timeline::TimelineEventItemId;
+use ruma::{
+    events::{
+        room::{
+            message::{MessageType as RumaMessageType, Relation},
+            redaction::SyncRoomRedactionEvent,
+        },
+        AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent, AnyTimelineEvent,
+        MessageLikeEventContent as RumaMessageLikeEventContent, RedactContent,
+        RedactedStateEventContent, StaticStateEventContent, SyncMessageLikeEvent, SyncStateEvent,
+    },
+    EventId,
 };
 
 use crate::{
     room_member::MembershipState,
     ruma::{MessageType, NotifyType},
+    utils::Timestamp,
     ClientError,
 };
 
 #[derive(uniffi::Object)]
 pub struct TimelineEvent(pub(crate) AnySyncTimelineEvent);
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl TimelineEvent {
     pub fn event_id(&self) -> String {
         self.0.event_id().to_string()
@@ -25,8 +34,8 @@ impl TimelineEvent {
         self.0.sender().to_string()
     }
 
-    pub fn timestamp(&self) -> u64 {
-        self.0.origin_server_ts().0.into()
+    pub fn timestamp(&self) -> Timestamp {
+        self.0.origin_server_ts().into()
     }
 
     pub fn event_type(&self) -> Result<TimelineEventType, ClientError> {
@@ -100,7 +109,7 @@ impl TryFrom<AnySyncStateEvent> for StateEventContent {
                 let original_content = get_state_event_original_content(content)?;
                 StateEventContent::RoomMemberContent {
                     user_id: state_key,
-                    membership_state: original_content.membership.into(),
+                    membership_state: original_content.membership.try_into()?,
                 }
             }
             AnySyncStateEvent::RoomName(_) => StateEventContent::RoomName,
@@ -197,7 +206,7 @@ impl TryFrom<AnySyncMessageLikeEvent> for MessageLikeEventContent {
                         _ => None,
                     });
                 MessageLikeEventContent::RoomMessage {
-                    message_type: original_content.msgtype.into(),
+                    message_type: original_content.msgtype.try_into()?,
                     in_reply_to_event_id,
                 }
             }
@@ -347,6 +356,74 @@ impl From<MessageLikeEventType> for ruma::events::MessageLikeEventType {
             MessageLikeEventType::UnstablePollEnd => Self::UnstablePollEnd,
             MessageLikeEventType::UnstablePollResponse => Self::UnstablePollResponse,
             MessageLikeEventType::UnstablePollStart => Self::UnstablePollStart,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, uniffi::Enum)]
+pub enum RoomMessageEventMessageType {
+    Audio,
+    Emote,
+    File,
+    Image,
+    Location,
+    Notice,
+    ServerNotice,
+    Text,
+    Video,
+    VerificationRequest,
+    Other,
+}
+
+impl From<RumaMessageType> for RoomMessageEventMessageType {
+    fn from(val: ruma::events::room::message::MessageType) -> Self {
+        match val {
+            RumaMessageType::Audio { .. } => Self::Audio,
+            RumaMessageType::Emote { .. } => Self::Emote,
+            RumaMessageType::File { .. } => Self::File,
+            RumaMessageType::Image { .. } => Self::Image,
+            RumaMessageType::Location { .. } => Self::Location,
+            RumaMessageType::Notice { .. } => Self::Notice,
+            RumaMessageType::ServerNotice { .. } => Self::ServerNotice,
+            RumaMessageType::Text { .. } => Self::Text,
+            RumaMessageType::Video { .. } => Self::Video,
+            RumaMessageType::VerificationRequest { .. } => Self::VerificationRequest,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Contains the 2 possible identifiers of an event, either it has a remote
+/// event id or a local transaction id, never both or none.
+#[derive(Clone, uniffi::Enum)]
+pub enum EventOrTransactionId {
+    EventId { event_id: String },
+    TransactionId { transaction_id: String },
+}
+
+impl From<TimelineEventItemId> for EventOrTransactionId {
+    fn from(value: TimelineEventItemId) -> Self {
+        match value {
+            TimelineEventItemId::EventId(event_id) => {
+                EventOrTransactionId::EventId { event_id: event_id.to_string() }
+            }
+            TimelineEventItemId::TransactionId(transaction_id) => {
+                EventOrTransactionId::TransactionId { transaction_id: transaction_id.to_string() }
+            }
+        }
+    }
+}
+
+impl TryFrom<EventOrTransactionId> for TimelineEventItemId {
+    type Error = IdParseError;
+    fn try_from(value: EventOrTransactionId) -> Result<Self, Self::Error> {
+        match value {
+            EventOrTransactionId::EventId { event_id } => {
+                Ok(TimelineEventItemId::EventId(EventId::parse(event_id)?))
+            }
+            EventOrTransactionId::TransactionId { transaction_id } => {
+                Ok(TimelineEventItemId::TransactionId(transaction_id.into()))
+            }
         }
     }
 }

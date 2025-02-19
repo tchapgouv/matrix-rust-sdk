@@ -21,7 +21,7 @@ use std::{
     io::{Cursor, Read, Write},
     iter,
     path::PathBuf,
-    sync::{Arc, Mutex as StdMutex},
+    sync::Arc,
 };
 
 use eyeball::{SharedObservable, Subscriber};
@@ -31,12 +31,15 @@ use futures_util::{
     stream::{self, StreamExt},
 };
 use matrix_sdk_base::crypto::{
-    CrossSigningBootstrapRequests, OlmMachine, OutgoingRequest, RoomMessageRequest, ToDeviceRequest,
+    store::RoomKeyInfo,
+    types::requests::{
+        OutgoingRequest, OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest,
+    },
+    CrossSigningBootstrapRequests, OlmMachine,
 };
-use matrix_sdk_common::executor::spawn;
+use matrix_sdk_common::{executor::spawn, locks::Mutex as StdMutex};
 use ruma::{
     api::client::{
-        error::{ErrorBody, ErrorKind},
         keys::{
             get_keys, upload_keys, upload_signatures::v3::Request as UploadSignaturesRequest,
             upload_signing_keys::v3::Request as UploadSigningKeysRequest,
@@ -48,23 +51,22 @@ use ruma::{
         uiaa::{AuthData, UiaaInfo},
     },
     assign,
-    events::room::{
-        message::{
-            AudioMessageEventContent, FileInfo, FileMessageEventContent, ImageMessageEventContent,
-            MessageType, VideoInfo, VideoMessageEventContent,
-        },
-        ImageInfo, MediaSource, ThumbnailInfo,
+    events::{
+        direct::DirectUserIdentifier,
+        room::{MediaSource, ThumbnailInfo},
     },
-    DeviceId, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
+    DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
 };
+use serde::Deserialize;
 use tokio::sync::{Mutex, RwLockReadGuard};
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::{debug, error, instrument, trace, warn};
 use url::Url;
 use vodozemac::Curve25519PublicKey;
 
 use self::{
     backups::{types::BackupClientState, Backups},
-    futures::PrepareEncryptedFile,
+    futures::UploadEncryptedFile,
     identities::{Device, DeviceUpdates, IdentityUpdates, UserDevices, UserIdentity},
     recovery::{Recovery, RecoveryState},
     secret_storage::SecretStorage,
@@ -72,7 +74,7 @@ use self::{
     verification::{SasVerification, Verification, VerificationRequest},
 };
 use crate::{
-    attachment::{AttachmentConfig, Thumbnail},
+    attachment::Thumbnail,
     client::{ClientInner, WeakClient},
     error::HttpResult,
     store_locks::CrossProcessStoreLockGuard,
@@ -129,7 +131,7 @@ impl EncryptionData {
     pub fn initialize_room_key_tasks(&self, client: &Arc<ClientInner>) {
         let weak_client = WeakClient::from_inner(client);
 
-        let mut tasks = self.tasks.lock().unwrap();
+        let mut tasks = self.tasks.lock();
         tasks.upload_room_keys = Some(BackupUploadingTask::new(weak_client.clone()));
 
         if self.encryption_settings.backup_download_strategy
@@ -145,7 +147,7 @@ impl EncryptionData {
     /// This should happen after the usual tasks have been set up and after the
     /// E2EE initialization tasks have been set up.
     pub fn initialize_recovery_state_update_task(&self, client: &Client) {
-        let mut guard = self.tasks.lock().unwrap();
+        let mut guard = self.tasks.lock();
 
         let future = Recovery::update_state_after_backup_state_change(client);
         let join_handle = spawn(future);
@@ -279,18 +281,17 @@ impl CrossSigningResetHandle {
         let mut upload_request = self.upload_request.clone();
         upload_request.auth = auth;
 
-        // TODO: Do we want to put a limit on this infinite loop? 🤷
-        while let Err(e) = self.client.send(upload_request.clone(), None).await {
+        while let Err(e) = self.client.send(upload_request.clone()).await {
             if *self.is_cancelled.lock().await {
                 return Ok(());
             }
 
-            if e.client_api_error_kind() != Some(&ErrorKind::Unrecognized) {
+            if e.as_uiaa_response().is_none() {
                 return Err(e.into());
             }
         }
 
-        self.client.send(self.signatures_request.clone(), None).await?;
+        self.client.send(self.signatures_request.clone()).await?;
 
         Ok(())
     }
@@ -313,15 +314,22 @@ pub enum CrossSigningResetAuthType {
 }
 
 impl CrossSigningResetAuthType {
-    async fn new(client: &Client, error: &HttpError) -> Result<Option<Self>> {
+    #[allow(clippy::unused_async)]
+    async fn new(
+        #[allow(unused_variables)] client: &Client,
+        error: &HttpError,
+    ) -> Result<Option<Self>> {
         if let Some(auth_info) = error.as_uiaa_response() {
+            #[cfg(feature = "experimental-oidc")]
+            if client.oidc().issuer().is_some() {
+                OidcCrossSigningResetInfo::from_auth_info(client, auth_info)
+                    .map(|t| Some(CrossSigningResetAuthType::Oidc(t)))
+            } else {
+                Ok(Some(CrossSigningResetAuthType::Uiaa(auth_info.clone())))
+            }
+
+            #[cfg(not(feature = "experimental-oidc"))]
             Ok(Some(CrossSigningResetAuthType::Uiaa(auth_info.clone())))
-        } else if let Some(ErrorBody::Standard { kind, message }) =
-            error.as_client_api_error().map(|e| &e.body)
-        {
-            OidcCrossSigningResetInfo::from_matrix_error(client, kind, message)
-                .await
-                .map(|t| t.map(CrossSigningResetAuthType::Oidc))
         } else {
             Ok(None)
         }
@@ -330,45 +338,43 @@ impl CrossSigningResetAuthType {
 
 /// OIDC specific information about the required authentication for the upload
 /// of cross-signing keys.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct OidcCrossSigningResetInfo {
-    /// The error message we received from the homeserver after we attempted to
-    /// reset the cross-signing keys.
-    pub error: String,
     /// The URL where the user can approve the reset of the cross-signing keys.
     pub approval_url: Url,
 }
 
 impl OidcCrossSigningResetInfo {
-    #[allow(clippy::unused_async)]
-    async fn from_matrix_error(
+    #[cfg(feature = "experimental-oidc")]
+    fn from_auth_info(
         // This is used if the OIDC feature is enabled.
         #[allow(unused_variables)] client: &Client,
-        kind: &ErrorKind,
-        message: &str,
-    ) -> Result<Option<Self>> {
-        #[cfg(feature = "experimental-oidc")]
-        use mas_oidc_client::requests::account_management::AccountManagementActionFull;
+        auth_info: &UiaaInfo,
+    ) -> Result<Self> {
+        let parameters =
+            serde_json::from_str::<OidcCrossSigningResetUiaaParameters>(auth_info.params.get())?;
 
-        if kind == &ErrorKind::Unrecognized {
-            #[cfg(feature = "experimental-oidc")]
-            let approval_url = client
-                .oidc()
-                .account_management_url(Some(AccountManagementActionFull::CrossSigningReset))
-                .await?;
-
-            #[cfg(not(feature = "experimental-oidc"))]
-            let approval_url = None;
-
-            if let Some(approval_url) = approval_url {
-                Ok(Some(OidcCrossSigningResetInfo { error: message.to_owned(), approval_url }))
-            } else {
-                Ok(None)
-            }
-        } else {
-            Ok(None)
-        }
+        Ok(OidcCrossSigningResetInfo { approval_url: parameters.reset.url })
     }
+}
+
+/// The parsed `parameters` part of a [`ruma::api::client::uiaa::UiaaInfo`]
+/// response
+#[cfg(feature = "experimental-oidc")]
+#[derive(Debug, Deserialize)]
+struct OidcCrossSigningResetUiaaParameters {
+    /// The URL where the user can approve the reset of the cross-signing keys.
+    #[serde(rename = "org.matrix.cross_signing_reset")]
+    reset: OidcCrossSigningResetUiaaResetParameter,
+}
+
+/// The `org.matrix.cross_signing_reset` part of the Uiaa response `parameters``
+/// dictionary.
+#[cfg(feature = "experimental-oidc")]
+#[derive(Debug, Deserialize)]
+struct OidcCrossSigningResetUiaaResetParameter {
+    /// The URL where the user can approve the reset of the cross-signing keys.
+    url: Url,
 }
 
 impl Client {
@@ -379,7 +385,7 @@ impl Client {
     pub(crate) async fn mark_request_as_sent(
         &self,
         request_id: &TransactionId,
-        response: impl Into<matrix_sdk_base::crypto::IncomingResponse<'_>>,
+        response: impl Into<matrix_sdk_base::crypto::types::requests::AnyIncomingResponse<'_>>,
     ) -> Result<(), matrix_sdk_base::Error> {
         Ok(self
             .olm_machine()
@@ -405,7 +411,7 @@ impl Client {
     ) -> Result<get_keys::v3::Response> {
         let request = assign!(get_keys::v3::Request::new(), { device_keys });
 
-        let response = self.send(request, None).await?;
+        let response = self.send(request).await?;
         self.mark_request_as_sent(request_id, &response).await?;
         self.encryption().update_state_after_keys_query(&response).await;
 
@@ -440,123 +446,62 @@ impl Client {
     /// # let client = Client::new(homeserver).await?;
     /// # let room = client.get_room(&room_id!("!test:example.com")).unwrap();
     /// let mut reader = std::io::Cursor::new(b"Hello, world!");
-    /// let encrypted_file = client.prepare_encrypted_file(&mime::TEXT_PLAIN, &mut reader).await?;
+    /// let encrypted_file = client.upload_encrypted_file(&mime::TEXT_PLAIN, &mut reader).await?;
     ///
     /// room.send(CustomEventContent { encrypted_file }).await?;
     /// # anyhow::Ok(()) };
     /// ```
-    pub fn prepare_encrypted_file<'a, R: Read + ?Sized + 'a>(
+    pub fn upload_encrypted_file<'a, R: Read + ?Sized + 'a>(
         &'a self,
         content_type: &'a mime::Mime,
         reader: &'a mut R,
-    ) -> PrepareEncryptedFile<'a, R> {
-        PrepareEncryptedFile::new(self, content_type, reader)
+    ) -> UploadEncryptedFile<'a, R> {
+        UploadEncryptedFile::new(self, content_type, reader)
     }
 
-    /// Encrypt and upload the file to be read from `reader` and construct an
-    /// attachment message.
-    pub(crate) async fn prepare_encrypted_attachment_message(
+    /// Encrypt and upload the file and thumbnails, and return the source
+    /// information.
+    pub(crate) async fn upload_encrypted_media_and_thumbnail(
         &self,
-        filename: &str,
         content_type: &mime::Mime,
-        data: Vec<u8>,
-        config: AttachmentConfig,
+        data: &[u8],
+        thumbnail: Option<Thumbnail>,
         send_progress: SharedObservable<TransmissionProgress>,
-    ) -> Result<MessageType> {
-        let upload_thumbnail =
-            self.upload_encrypted_thumbnail(config.thumbnail, content_type, send_progress.clone());
+    ) -> Result<(MediaSource, Option<(MediaSource, Box<ThumbnailInfo>)>)> {
+        let upload_thumbnail = self.upload_encrypted_thumbnail(thumbnail, send_progress.clone());
 
         let upload_attachment = async {
             let mut cursor = Cursor::new(data);
-            self.prepare_encrypted_file(content_type, &mut cursor)
+            self.upload_encrypted_file(content_type, &mut cursor)
                 .with_send_progress_observable(send_progress)
                 .await
         };
 
-        let ((thumbnail_source, thumbnail_info), file) =
-            try_join(upload_thumbnail, upload_attachment).await?;
+        let (thumbnail, file) = try_join(upload_thumbnail, upload_attachment).await?;
 
-        // if config.caption is set, use it as body, and filename as the file name
-        // otherwise, body is the filename, and the filename is not set
-        // https://github.com/tulir/matrix-spec-proposals/blob/body-as-caption/proposals/2530-body-as-caption.md
-        let (body, filename) = match config.caption {
-            Some(caption) => (caption, Some(filename.to_owned())),
-            None => (filename.to_owned(), None),
-        };
-
-        Ok(match content_type.type_() {
-            mime::IMAGE => {
-                let info = assign!(config.info.map(ImageInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content = assign!(ImageMessageEventContent::encrypted(body, file), {
-                    info: Some(Box::new(info)),
-                    formatted: config.formatted_caption,
-                    filename
-                });
-                MessageType::Image(content)
-            }
-            mime::AUDIO => {
-                let audio_message_event_content = AudioMessageEventContent::encrypted(body, file);
-                MessageType::Audio(crate::media::update_audio_message_event(
-                    audio_message_event_content,
-                    content_type,
-                    config.info,
-                ))
-            }
-            mime::VIDEO => {
-                let info = assign!(config.info.map(VideoInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content = assign!(VideoMessageEventContent::encrypted(body, file), {
-                    info: Some(Box::new(info)),
-                    formatted: config.formatted_caption,
-                    filename
-                });
-                MessageType::Video(content)
-            }
-            _ => {
-                let info = assign!(config.info.map(FileInfo::from).unwrap_or_default(), {
-                    mimetype: Some(content_type.as_ref().to_owned()),
-                    thumbnail_source,
-                    thumbnail_info
-                });
-                let content = assign!(FileMessageEventContent::encrypted(body, file), {
-                    info: Some(Box::new(info))
-                });
-                MessageType::File(content)
-            }
-        })
+        Ok((MediaSource::Encrypted(Box::new(file)), thumbnail))
     }
 
+    /// Uploads an encrypted thumbnail to the media repository, and returns
+    /// its source and extra information.
     async fn upload_encrypted_thumbnail(
         &self,
         thumbnail: Option<Thumbnail>,
-        content_type: &mime::Mime,
         send_progress: SharedObservable<TransmissionProgress>,
-    ) -> Result<(Option<MediaSource>, Option<Box<ThumbnailInfo>>)> {
-        if let Some(thumbnail) = thumbnail {
-            let mut cursor = Cursor::new(thumbnail.data);
+    ) -> Result<Option<(MediaSource, Box<ThumbnailInfo>)>> {
+        let Some(thumbnail) = thumbnail else {
+            return Ok(None);
+        };
 
-            let file = self
-                .prepare_encrypted_file(content_type, &mut cursor)
-                .with_send_progress_observable(send_progress)
-                .await?;
+        let (data, content_type, thumbnail_info) = thumbnail.into_parts();
+        let mut cursor = Cursor::new(data);
 
-            #[rustfmt::skip]
-            let thumbnail_info =
-                assign!(thumbnail.info.map(ThumbnailInfo::from).unwrap_or_default(), {
-                    mimetype: Some(thumbnail.content_type.as_ref().to_owned())
-                });
+        let file = self
+            .upload_encrypted_file(&content_type, &mut cursor)
+            .with_send_progress_observable(send_progress)
+            .await?;
 
-            Ok((Some(MediaSource::Encrypted(Box::new(file))), Some(Box::new(thumbnail_info))))
-        } else {
-            Ok((None, None))
-        }
+        Ok(Some((MediaSource::Encrypted(Box::new(file)), thumbnail_info)))
     }
 
     /// Claim one-time keys creating new Olm sessions.
@@ -578,7 +523,7 @@ impl Client {
             .get_missing_sessions(users)
             .await?
         {
-            let response = self.send(request, None).await?;
+            let response = self.send(request).await?;
             self.mark_request_as_sent(&request_id, &response).await?;
         }
 
@@ -606,7 +551,7 @@ impl Client {
             "Uploading public encryption keys",
         );
 
-        let response = self.send(request.clone(), None).await?;
+        let response = self.send(request.clone()).await?;
         self.mark_request_as_sent(request_id, &response).await?;
 
         Ok(response)
@@ -617,7 +562,7 @@ impl Client {
         request: &RoomMessageRequest,
     ) -> Result<send_message_event::v3::Response> {
         let content = request.content.clone();
-        let txn_id = &request.txn_id;
+        let txn_id = request.txn_id.clone();
         let room_id = &request.room_id;
 
         self.get_room(room_id)
@@ -637,18 +582,20 @@ impl Client {
             request.messages.clone(),
         );
 
-        self.send(request, None).await
+        self.send(request).await
     }
 
     pub(crate) async fn send_verification_request(
         &self,
-        request: matrix_sdk_base::crypto::OutgoingVerificationRequest,
+        request: OutgoingVerificationRequest,
     ) -> Result<()> {
+        use matrix_sdk_base::crypto::types::requests::OutgoingVerificationRequest::*;
+
         match request {
-            matrix_sdk_base::crypto::OutgoingVerificationRequest::ToDevice(t) => {
+            ToDevice(t) => {
                 self.send_to_device(&t).await?;
             }
-            matrix_sdk_base::crypto::OutgoingVerificationRequest::InRoom(r) => {
+            InRoom(r) => {
                 self.room_send_helper(&r).await?;
             }
         }
@@ -663,7 +610,7 @@ impl Client {
         // Find the room we share with the `user_id` and only with `user_id`
         let room = rooms.into_iter().find(|r| {
             let targets = r.direct_targets();
-            targets.len() == 1 && targets.contains(user_id)
+            targets.len() == 1 && targets.contains(<&DirectUserIdentifier>::from(user_id))
         });
 
         trace!(?room, "Found room");
@@ -671,29 +618,29 @@ impl Client {
     }
 
     async fn send_outgoing_request(&self, r: OutgoingRequest) -> Result<()> {
-        use matrix_sdk_base::crypto::OutgoingRequests;
+        use matrix_sdk_base::crypto::types::requests::AnyOutgoingRequest;
 
         match r.request() {
-            OutgoingRequests::KeysQuery(request) => {
+            AnyOutgoingRequest::KeysQuery(request) => {
                 self.keys_query(r.request_id(), request.device_keys.clone()).await?;
             }
-            OutgoingRequests::KeysUpload(request) => {
+            AnyOutgoingRequest::KeysUpload(request) => {
                 self.keys_upload(r.request_id(), request).await?;
             }
-            OutgoingRequests::ToDeviceRequest(request) => {
+            AnyOutgoingRequest::ToDeviceRequest(request) => {
                 let response = self.send_to_device(request).await?;
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
-            OutgoingRequests::SignatureUpload(request) => {
-                let response = self.send(request.clone(), None).await?;
+            AnyOutgoingRequest::SignatureUpload(request) => {
+                let response = self.send(request.clone()).await?;
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
-            OutgoingRequests::RoomMessage(request) => {
+            AnyOutgoingRequest::RoomMessage(request) => {
                 let response = self.room_send_helper(request).await?;
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
-            OutgoingRequests::KeysClaim(request) => {
-                let response = self.send(request.clone(), None).await?;
+            AnyOutgoingRequest::KeysClaim(request) => {
+                let response = self.send(request.clone()).await?;
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
         }
@@ -773,6 +720,15 @@ impl Encryption {
         self.client.olm_machine().await.as_ref().map(|o| o.identity_keys().curve25519)
     }
 
+    /// Get the current device creation timestamp.
+    pub async fn device_creation_timestamp(&self) -> MilliSecondsSinceUnixEpoch {
+        match self.get_own_device().await {
+            Ok(Some(device)) => device.first_time_seen_ts(),
+            // Should not happen, there should always be an own device
+            _ => MilliSecondsSinceUnixEpoch::now(),
+        }
+    }
+
     #[cfg(feature = "experimental-oidc")]
     pub(crate) async fn import_secrets_bundle(
         &self,
@@ -830,7 +786,7 @@ impl Encryption {
     /// # anyhow::Ok(()) };
     /// ```
     pub fn verification_state(&self) -> Subscriber<VerificationState> {
-        self.client.inner.verification_state.subscribe()
+        self.client.inner.verification_state.subscribe_reset()
     }
 
     /// Get a verification object with the given flow id.
@@ -1190,8 +1146,8 @@ impl Encryption {
         if let Some(req) = upload_keys_req {
             self.client.send_outgoing_request(req).await?;
         }
-        self.client.send(upload_signing_keys_req, None).await?;
-        self.client.send(upload_signatures_req, None).await?;
+        self.client.send(upload_signing_keys_req).await?;
+        self.client.send(upload_signatures_req).await?;
 
         Ok(())
     }
@@ -1208,7 +1164,7 @@ impl Encryption {
     /// # let client = Client::new(homeserver).await?;
     /// # let user_id = unimplemented!();
     /// let encryption = client.encryption();
-    ///       
+    ///
     /// if let Some(handle) = encryption.reset_cross_signing().await? {
     ///     match handle.auth_type() {
     ///         CrossSigningResetAuthType::Uiaa(uiaa) => {
@@ -1253,7 +1209,7 @@ impl Encryption {
             self.client.send_outgoing_request(req).await?;
         }
 
-        if let Err(error) = self.client.send(upload_signing_keys_req.clone(), None).await {
+        if let Err(error) = self.client.send(upload_signing_keys_req.clone()).await {
             if let Some(auth_type) = CrossSigningResetAuthType::new(&self.client, &error).await? {
                 let client = self.client.clone();
 
@@ -1267,7 +1223,7 @@ impl Encryption {
                 Err(error.into())
             }
         } else {
-            self.client.send(upload_signatures_req, None).await?;
+            self.client.send(upload_signatures_req).await?;
 
             Ok(None)
         }
@@ -1490,6 +1446,45 @@ impl Encryption {
         Ok(ret)
     }
 
+    /// Receive notifications of room keys being received as a [`Stream`].
+    ///
+    /// Each time a room key is updated in any way, an update will be sent to
+    /// the stream. Updates that happen at the same time are batched into a
+    /// [`Vec`].
+    ///
+    /// If the reader of the stream lags too far behind, an error is broadcast
+    /// containing the number of skipped items.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::Client;
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// use futures_util::StreamExt;
+    ///
+    /// let Some(mut room_keys_stream) =
+    ///     client.encryption().room_keys_received_stream().await
+    /// else {
+    ///     return Ok(());
+    /// };
+    ///
+    /// while let Some(update) = room_keys_stream.next().await {
+    ///     println!("Received room keys {update:?}");
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn room_keys_received_stream(
+        &self,
+    ) -> Option<impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>>> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref()?;
+
+        Some(olm.store().room_keys_received_stream())
+    }
+
     /// Get the secret storage manager of the client.
     pub fn secret_storage(&self) -> SecretStorage {
         SecretStorage { client: self.client.to_owned() }
@@ -1514,6 +1509,8 @@ impl Encryption {
     /// caches.
     ///
     /// The provided `lock_value` must be a unique identifier for this process.
+    /// Check [`Client::cross_process_store_locks_holder_name`] to
+    /// get the global value.
     pub async fn enable_cross_process_store_lock(&self, lock_value: String) -> Result<(), Error> {
         // If the lock has already been created, don't recreate it from scratch.
         if let Some(prev_lock) = self.client.locks().cross_process_crypto_store_lock.get() {
@@ -1656,10 +1653,14 @@ impl Encryption {
     ///   allow for the initial upload of cross-signing keys without
     ///   authentication, rendering this parameter obsolete.
     pub(crate) fn spawn_initialization_task(&self, auth_data: Option<AuthData>) {
-        let mut tasks = self.client.inner.e2ee.tasks.lock().unwrap();
+        let mut tasks = self.client.inner.e2ee.tasks.lock();
 
         let this = self.clone();
         tasks.setup_e2ee = Some(spawn(async move {
+            // Update the current state first, so we don't have to wait for the result of
+            // network requests
+            this.update_verification_state().await;
+
             if this.settings().auto_enable_cross_signing {
                 if let Err(e) = this.bootstrap_cross_signing_if_needed(auth_data).await {
                     error!("Couldn't bootstrap cross signing {e:?}");
@@ -1672,15 +1673,13 @@ impl Encryption {
             if let Err(e) = this.recovery().setup().await {
                 error!("Couldn't setup and resume recovery {e:?}");
             }
-
-            this.update_verification_state().await;
         }));
     }
 
     /// Waits for end-to-end encryption initialization tasks to finish, if any
     /// was running in the background.
     pub async fn wait_for_e2ee_initialization_tasks(&self) {
-        let task = self.client.inner.e2ee.tasks.lock().unwrap().setup_e2ee.take();
+        let task = self.client.inner.e2ee.tasks.lock().setup_e2ee.take();
 
         if let Some(task) = task {
             if let Err(err) = task.await {
@@ -1752,7 +1751,14 @@ impl Encryption {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        ops::Not,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use matrix_sdk_base::SessionMeta;
     use matrix_sdk_test::{
@@ -1767,13 +1773,15 @@ mod tests {
     use serde_json::json;
     use wiremock::{
         matchers::{header, method, path_regex},
-        Mock, MockServer, ResponseTemplate,
+        Mock, MockServer, Request, ResponseTemplate,
     };
 
     use crate::{
+        assert_next_matches_with_timeout,
+        authentication::matrix::{MatrixSession, MatrixSessionTokens},
         config::RequestConfig,
-        matrix_auth::{MatrixSession, MatrixSessionTokens},
-        test_utils::logged_in_client,
+        encryption::VerificationState,
+        test_utils::{logged_in_client, no_retry_test_client, set_client_session},
         Client,
     };
 
@@ -2072,5 +2080,41 @@ mod tests {
         // Re-taking the lock doesn't update the olm machine.
         let after_taking_lock_second_time = client.olm_machine().await.as_ref().unwrap().clone();
         assert!(after_taking_lock_first_time.same_as(&after_taking_lock_second_time));
+    }
+
+    #[async_test]
+    async fn test_update_verification_state_is_updated_before_any_requests_happen() {
+        // Given a client and a server
+        let client = no_retry_test_client(None).await;
+        let server = MockServer::start().await;
+
+        // When we subscribe to its verification state
+        let mut verification_state = client.encryption().verification_state();
+
+        // We can get its initial value, and it's Unknown
+        assert_next_matches_with_timeout!(verification_state, VerificationState::Unknown);
+
+        // We set up a mocked request to check this endpoint is not called before
+        // reading the new state
+        let keys_requested = Arc::new(AtomicBool::new(false));
+        let inner_bool = keys_requested.clone();
+
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"/_matrix/client/r0/user/.*/account_data/m.secret_storage.default_key",
+            ))
+            .respond_with(move |_req: &Request| {
+                inner_bool.fetch_or(true, Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(json!({}))
+            })
+            .mount(&server)
+            .await;
+
+        // When the session is initialised and the encryption tasks spawn
+        set_client_session(&client).await;
+
+        // Then we can get an updated value without waiting for any network requests
+        assert!(keys_requested.load(Ordering::SeqCst).not());
+        assert_next_matches_with_timeout!(verification_state, VerificationState::Unverified);
     }
 }

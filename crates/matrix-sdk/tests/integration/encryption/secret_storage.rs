@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use assert_matches::assert_matches;
 use matrix_sdk::{
+    authentication::matrix::{MatrixSession, MatrixSessionTokens},
     encryption::secret_storage::SecretStorageError,
-    matrix_auth::{MatrixSession, MatrixSessionTokens},
     test_utils::no_retry_test_client_with_server,
 };
 use matrix_sdk_base::SessionMeta;
@@ -76,11 +76,11 @@ async fn test_secret_store_create_default_key() {
         let key_id = key_id.to_owned();
 
         move |request: &wiremock::Request| {
-            let path_segments =
+            let mut path_segments =
                 request.url.path_segments().expect("The URL should be able to be a base");
 
             let key_id_segment = path_segments
-                .last()
+                .next_back()
                 .expect("The path should have a key ID as the last segment")
                 .to_owned();
 

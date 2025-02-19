@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use matrix_sdk::{
+    authentication::matrix::{MatrixSession, MatrixSessionTokens},
     config::StoreConfig,
-    matrix_auth::{MatrixSession, MatrixSessionTokens},
     Client, RoomInfo, RoomState, StateChanges,
 };
 use matrix_sdk_base::{store::MemoryStore, SessionMeta, StateStore as _};
@@ -69,7 +69,10 @@ pub fn restore_session(c: &mut Criterion) {
         b.to_async(&runtime).iter(|| async {
             let client = Client::builder()
                 .homeserver_url("https://matrix.example.com")
-                .store_config(StoreConfig::new().state_store(store.clone()))
+                .store_config(
+                    StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
+                        .state_store(store.clone()),
+                )
                 .build()
                 .await
                 .expect("Can't build client");
@@ -96,7 +99,10 @@ pub fn restore_session(c: &mut Criterion) {
                 b.to_async(&runtime).iter(|| async {
                     let client = Client::builder()
                         .homeserver_url("https://matrix.example.com")
-                        .store_config(StoreConfig::new().state_store(store.clone()))
+                        .store_config(
+                            StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
+                                .state_store(store.clone()),
+                        )
                         .build()
                         .await
                         .expect("Can't build client");

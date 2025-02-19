@@ -68,11 +68,6 @@ pub(in crate::timeline) struct RemoteEventTimelineItem {
 }
 
 impl RemoteEventTimelineItem {
-    /// Clone the current event item, and update its `encryption_info`.
-    pub fn with_encryption_info(&self, encryption_info: Option<EncryptionInfo>) -> Self {
-        Self { encryption_info, ..self.clone() }
-    }
-
     /// Clone the current event item, and redacts its fields.
     pub fn redact(&self) -> Self {
         Self { original_json: None, latest_edit_json: None, ..self.clone() }
@@ -89,7 +84,6 @@ pub(in crate::timeline) enum RemoteEventOrigin {
     /// The event came from pagination.
     Pagination,
     /// We don't know.
-    #[cfg(feature = "e2e-encryption")]
     Unknown,
 }
 

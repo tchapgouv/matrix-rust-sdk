@@ -17,29 +17,39 @@
 use std::{fmt, sync::Arc};
 
 use imbl::{vector, Vector};
-use matrix_sdk::{deserialized_responses::TimelineEvent, Room};
+use matrix_sdk::{
+    crypto::types::events::UtdCause,
+    deserialized_responses::{TimelineEvent, TimelineEventKind},
+    Room,
+};
 use ruma::{
     assign,
     events::{
+        poll::unstable_start::{
+            NewUnstablePollStartEventContentWithoutRelation, SyncUnstablePollStartEvent,
+            UnstablePollStartEventContent,
+        },
         relation::{InReplyTo, Thread},
         room::message::{
             MessageType, Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
             SyncRoomMessageEvent,
         },
-        AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnyTimelineEvent,
+        AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
         BundledMessageLikeRelations, Mentions,
     },
     html::RemoveReplyFallback,
-    OwnedEventId, OwnedUserId, RoomVersionId, UserId,
+    serde::Raw,
+    OwnedEventId, OwnedUserId, UserId,
 };
-use tracing::error;
+use tracing::{debug, error, instrument, trace, warn};
 
 use super::TimelineItemContent;
 use crate::{
     timeline::{
         event_item::{EventTimelineItem, Profile, TimelineDetails},
         traits::RoomDataProvider,
-        Error as TimelineError, TimelineItem,
+        EncryptedMessage, Error as TimelineError, PollState, ReactionsByKeyBySender, Sticker,
+        TimelineItem,
     },
     DEFAULT_SANITIZER_MODE,
 };
@@ -53,34 +63,17 @@ pub struct Message {
     pub(in crate::timeline) thread_root: Option<OwnedEventId>,
     pub(in crate::timeline) edited: bool,
     pub(in crate::timeline) mentions: Option<Mentions>,
+    pub(in crate::timeline) reactions: ReactionsByKeyBySender,
 }
 
 impl Message {
     /// Construct a `Message` from a `m.room.message` event.
     pub(in crate::timeline) fn from_event(
         c: RoomMessageEventContent,
-        relations: BundledMessageLikeRelations<AnySyncMessageLikeEvent>,
+        edit: Option<RoomMessageEventContentWithoutRelation>,
         timeline_items: &Vector<Arc<TimelineItem>>,
+        reactions: ReactionsByKeyBySender,
     ) -> Self {
-        let edited = relations.has_replacement();
-        let edit = relations.replace.and_then(|r| match *r {
-            AnySyncMessageLikeEvent::RoomMessage(SyncRoomMessageEvent::Original(ev)) => match ev
-                .content
-                .relates_to
-            {
-                Some(Relation::Replacement(re)) => Some(re),
-                _ => {
-                    error!("got m.room.message event with an edit without a valid m.replace relation");
-                    None
-                }
-            },
-            AnySyncMessageLikeEvent::RoomMessage(SyncRoomMessageEvent::Redacted(_)) => None,
-            _ => {
-                error!("got m.room.message event with an edit of a different event type");
-                None
-            }
-        });
-
         let mut thread_root = None;
         let in_reply_to = c.relates_to.and_then(|relation| match relation {
             Relation::Reply { in_reply_to } => {
@@ -95,26 +88,36 @@ impl Message {
             _ => None,
         });
 
-        let (msgtype, mentions) = match edit {
-            Some(mut e) => {
-                // Edit's content is never supposed to contain the reply fallback.
-                e.new_content.msgtype.sanitize(DEFAULT_SANITIZER_MODE, RemoveReplyFallback::No);
-                (e.new_content.msgtype, e.new_content.mentions)
-            }
-            None => {
-                let remove_reply_fallback = if in_reply_to.is_some() {
-                    RemoveReplyFallback::Yes
-                } else {
-                    RemoveReplyFallback::No
-                };
+        let remove_reply_fallback =
+            if in_reply_to.is_some() { RemoveReplyFallback::Yes } else { RemoveReplyFallback::No };
 
-                let mut msgtype = c.msgtype;
-                msgtype.sanitize(DEFAULT_SANITIZER_MODE, remove_reply_fallback);
-                (msgtype, c.mentions)
-            }
+        let mut msgtype = c.msgtype;
+        msgtype.sanitize(DEFAULT_SANITIZER_MODE, remove_reply_fallback);
+
+        let mut ret = Self {
+            msgtype,
+            in_reply_to,
+            thread_root,
+            edited: false,
+            mentions: c.mentions,
+            reactions,
         };
 
-        Self { msgtype, in_reply_to, thread_root, edited, mentions }
+        if let Some(edit) = edit {
+            ret.apply_edit(edit);
+        }
+
+        ret
+    }
+
+    /// Apply an edit to the current message.
+    pub(crate) fn apply_edit(&mut self, mut new_content: RoomMessageEventContentWithoutRelation) {
+        trace!("applying edit to a Message");
+        // Edit's content is never supposed to contain the reply fallback.
+        new_content.msgtype.sanitize(DEFAULT_SANITIZER_MODE, RemoveReplyFallback::No);
+        self.msgtype = new_content.msgtype;
+        self.mentions = new_content.mentions;
+        self.edited = true;
     }
 
     /// Get the `msgtype`-specific data of this message.
@@ -137,6 +140,11 @@ impl Message {
     /// Whether this message is part of a thread.
     pub fn is_threaded(&self) -> bool {
         self.thread_root.is_some()
+    }
+
+    /// Get the [`OwnedEventId`] of the root event of a thread if it exists.
+    pub fn thread_root(&self) -> Option<&OwnedEventId> {
+        self.thread_root.as_ref()
     }
 
     /// Get the edit state of this message (has been edited: `true` /
@@ -173,6 +181,77 @@ impl From<Message> for RoomMessageEventContent {
     }
 }
 
+/// Extracts the raw json of the edit event part of bundled relations.
+///
+/// Note: while we had access to the deserialized event earlier, events are not
+/// serializable, by design of Ruma, so we can't extract a bundled related event
+/// and serialize it back to a raw JSON event.
+pub(crate) fn extract_bundled_edit_event_json(
+    raw: &Raw<AnySyncTimelineEvent>,
+) -> Option<Raw<AnySyncTimelineEvent>> {
+    // Follow the `unsigned`.`m.relations`.`m.replace` path.
+    let raw_unsigned: Raw<serde_json::Value> = raw.get_field("unsigned").ok()??;
+    let raw_relations: Raw<serde_json::Value> = raw_unsigned.get_field("m.relations").ok()??;
+    raw_relations.get_field::<Raw<AnySyncTimelineEvent>>("m.replace").ok()?
+}
+
+/// Extracts a replacement for a room message, if present in the bundled
+/// relations.
+pub(crate) fn extract_room_msg_edit_content(
+    relations: BundledMessageLikeRelations<AnySyncMessageLikeEvent>,
+) -> Option<RoomMessageEventContentWithoutRelation> {
+    match *relations.replace? {
+        AnySyncMessageLikeEvent::RoomMessage(SyncRoomMessageEvent::Original(ev)) => match ev
+            .content
+            .relates_to
+        {
+            Some(Relation::Replacement(re)) => {
+                trace!("found a bundled edit event in a room message");
+                Some(re.new_content)
+            }
+            _ => {
+                error!("got m.room.message event with an edit without a valid m.replace relation");
+                None
+            }
+        },
+
+        AnySyncMessageLikeEvent::RoomMessage(SyncRoomMessageEvent::Redacted(_)) => None,
+
+        _ => {
+            error!("got m.room.message event with an edit of a different event type");
+            None
+        }
+    }
+}
+
+/// Extracts a replacement for a room message, if present in the bundled
+/// relations.
+pub(crate) fn extract_poll_edit_content(
+    relations: BundledMessageLikeRelations<AnySyncMessageLikeEvent>,
+) -> Option<NewUnstablePollStartEventContentWithoutRelation> {
+    match *relations.replace? {
+        AnySyncMessageLikeEvent::UnstablePollStart(SyncUnstablePollStartEvent::Original(ev)) => {
+            match ev.content {
+                UnstablePollStartEventContent::Replacement(re) => {
+                    trace!("found a bundled edit event in a poll");
+                    Some(re.relates_to.new_content)
+                }
+                _ => {
+                    error!("got new poll start event in a bundled edit");
+                    None
+                }
+            }
+        }
+
+        AnySyncMessageLikeEvent::UnstablePollStart(SyncUnstablePollStartEvent::Redacted(_)) => None,
+
+        _ => {
+            error!("got poll edit event with an edit of a different event type");
+            None
+        }
+    }
+}
+
 /// Turn a pair of thread root ID and in-reply-to ID as stored in [`Message`]
 /// back into a [`Relation`].
 ///
@@ -198,7 +277,7 @@ fn make_relates_to(
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { msgtype: _, in_reply_to, thread_root, edited, mentions: _ } = self;
+        let Self { msgtype: _, in_reply_to, thread_root, edited, reactions: _, mentions: _ } = self;
         // since timeline items are logged, don't include all fields here so
         // people don't leak personal data in bug reports
         f.debug_struct("Message")
@@ -271,14 +350,6 @@ impl RepliedToEvent {
         }
     }
 
-    pub(in crate::timeline) fn redact(&self, room_version: &RoomVersionId) -> Self {
-        Self {
-            content: self.content.redact(room_version),
-            sender: self.sender.clone(),
-            sender_profile: self.sender_profile.clone(),
-        }
-    }
-
     /// Try to create a `RepliedToEvent` from a `TimelineEvent` by providing the
     /// room.
     pub async fn try_from_timeline_event_for_room(
@@ -288,23 +359,86 @@ impl RepliedToEvent {
         Self::try_from_timeline_event(timeline_event, room_data_provider).await
     }
 
+    #[instrument(skip_all)]
     pub(in crate::timeline) async fn try_from_timeline_event<P: RoomDataProvider>(
         timeline_event: TimelineEvent,
         room_data_provider: &P,
     ) -> Result<Self, TimelineError> {
-        let event = match timeline_event.event.deserialize() {
-            Ok(AnyTimelineEvent::MessageLike(event)) => event,
-            _ => {
+        let event = match timeline_event.raw().deserialize() {
+            Ok(AnySyncTimelineEvent::MessageLike(event)) => event,
+            Ok(_) => {
+                warn!("can't get details, event isn't a message-like event");
+                return Err(TimelineError::UnsupportedEvent);
+            }
+            Err(err) => {
+                warn!("can't get details, event couldn't be deserialized: {err}");
                 return Err(TimelineError::UnsupportedEvent);
             }
         };
 
-        let Some(AnyMessageLikeEventContent::RoomMessage(c)) = event.original_content() else {
-            return Err(TimelineError::UnsupportedEvent);
+        debug!(event_type = %event.event_type(), "got deserialized event");
+
+        let content = match event.original_content() {
+            Some(content) => match content {
+                AnyMessageLikeEventContent::RoomMessage(c) => {
+                    // Assume we're not interested in reactions in this context: this is
+                    // information for an embedded (replied-to) event, that will usually not
+                    // include detailed information like reactions.
+                    let reactions = ReactionsByKeyBySender::default();
+
+                    TimelineItemContent::Message(Message::from_event(
+                        c,
+                        extract_room_msg_edit_content(event.relations()),
+                        &vector![],
+                        reactions,
+                    ))
+                }
+
+                AnyMessageLikeEventContent::Sticker(content) => {
+                    // Assume we're not interested in reactions in this context. (See above an
+                    // explanation as to why that's the case.)
+                    let reactions = ReactionsByKeyBySender::default();
+                    TimelineItemContent::Sticker(Sticker { content, reactions })
+                }
+
+                AnyMessageLikeEventContent::RoomEncrypted(content) => {
+                    let utd_cause = match &timeline_event.kind {
+                        TimelineEventKind::UnableToDecrypt { utd_info, .. } => UtdCause::determine(
+                            timeline_event.raw(),
+                            room_data_provider.crypto_context_info().await,
+                            utd_info,
+                        ),
+                        _ => UtdCause::Unknown,
+                    };
+
+                    TimelineItemContent::UnableToDecrypt(EncryptedMessage::from_content(
+                        content, utd_cause,
+                    ))
+                }
+
+                AnyMessageLikeEventContent::UnstablePollStart(
+                    UnstablePollStartEventContent::New(content),
+                ) => {
+                    // Assume we're not interested in reactions in this context. (See above an
+                    // explanation as to why that's the case.)
+                    let reactions = ReactionsByKeyBySender::default();
+                    // TODO: could we provide the bundled edit here?
+                    let poll_state = PollState::new(content, None, reactions);
+                    TimelineItemContent::Poll(poll_state)
+                }
+
+                _ => {
+                    warn!("unsupported event type");
+                    return Err(TimelineError::UnsupportedEvent);
+                }
+            },
+
+            None => {
+                // Redacted message.
+                TimelineItemContent::RedactedMessage
+            }
         };
 
-        let content =
-            TimelineItemContent::Message(Message::from_event(c, event.relations(), &vector![]));
         let sender = event.sender().to_owned();
         let sender_profile = TimelineDetails::from_initial_value(
             room_data_provider.profile_from_user_id(&sender).await,

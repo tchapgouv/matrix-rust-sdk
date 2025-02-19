@@ -15,9 +15,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use extension_trait::extension_trait;
-use matrix_sdk::attachment::{
-    BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseThumbnailInfo, BaseVideoInfo,
-};
+use matrix_sdk::attachment::{BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo};
 use ruma::{
     assign,
     events::{
@@ -42,7 +40,8 @@ use ruma::{
                 VideoInfo as RumaVideoInfo,
                 VideoMessageEventContent as RumaVideoMessageEventContent,
             },
-            ImageInfo as RumaImageInfo, MediaSource, ThumbnailInfo as RumaThumbnailInfo,
+            ImageInfo as RumaImageInfo, MediaSource as RumaMediaSource,
+            ThumbnailInfo as RumaThumbnailInfo,
         },
     },
     matrix_uri::MatrixId as RumaMatrixId,
@@ -54,6 +53,7 @@ use tracing::info;
 use crate::{
     error::{ClientError, MediaInfoError},
     helpers::unwrap_or_clone_arc,
+    timeline::MessageContent,
     utils::u64_to_uint,
 };
 
@@ -89,7 +89,7 @@ impl From<AuthData> for ruma::api::client::uiaa::AuthData {
 
 /// Parse a matrix entity from a given URI, be it either
 /// a `matrix.to` link or a `matrix:` URI
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 pub fn parse_matrix_entity_from(uri: String) -> Option<MatrixEntity> {
     if let Ok(matrix_uri) = RumaMatrixUri::parse(&uri) {
         return Some(MatrixEntity {
@@ -153,33 +153,28 @@ impl From<&RumaMatrixId> for MatrixId {
     }
 }
 
-#[uniffi::export]
-pub fn media_source_from_url(url: String) -> Arc<MediaSource> {
-    Arc::new(MediaSource::Plain(url.into()))
-}
-
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 pub fn message_event_content_new(
     msgtype: MessageType,
 ) -> Result<Arc<RoomMessageEventContentWithoutRelation>, ClientError> {
     Ok(Arc::new(RoomMessageEventContentWithoutRelation::new(msgtype.try_into()?)))
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 pub fn message_event_content_from_markdown(
     md: String,
 ) -> Arc<RoomMessageEventContentWithoutRelation> {
     Arc::new(RoomMessageEventContentWithoutRelation::new(RumaMessageType::text_markdown(md)))
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 pub fn message_event_content_from_markdown_as_emote(
     md: String,
 ) -> Arc<RoomMessageEventContentWithoutRelation> {
     Arc::new(RoomMessageEventContentWithoutRelation::new(RumaMessageType::emote_markdown(md)))
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 pub fn message_event_content_from_html(
     body: String,
     html_body: String,
@@ -189,7 +184,7 @@ pub fn message_event_content_from_html(
     )))
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 pub fn message_event_content_from_html_as_emote(
     body: String,
     html_body: String,
@@ -199,21 +194,84 @@ pub fn message_event_content_from_html_as_emote(
     )))
 }
 
-#[extension_trait]
-pub impl MediaSourceExt for MediaSource {
-    fn from_json(json: String) -> Result<MediaSource, ClientError> {
-        let res = serde_json::from_str(&json)?;
-        Ok(res)
+#[derive(Clone, uniffi::Object)]
+pub struct MediaSource {
+    pub(crate) media_source: RumaMediaSource,
+}
+
+#[matrix_sdk_ffi_macros::export]
+impl MediaSource {
+    #[uniffi::constructor]
+    pub fn from_url(url: String) -> Result<Arc<MediaSource>, ClientError> {
+        let media_source = RumaMediaSource::Plain(url.into());
+        media_source.verify()?;
+
+        Ok(Arc::new(MediaSource { media_source }))
     }
 
-    fn to_json(&self) -> String {
-        serde_json::to_string(self).expect("Media source should always be serializable ")
+    pub fn url(&self) -> String {
+        self.media_source.url()
+    }
+
+    // Used on Element X Android
+    #[uniffi::constructor]
+    pub fn from_json(json: String) -> Result<Arc<Self>, ClientError> {
+        let media_source: RumaMediaSource = serde_json::from_str(&json)?;
+        media_source.verify()?;
+
+        Ok(Arc::new(MediaSource { media_source }))
+    }
+
+    // Used on Element X Android
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(&self.media_source)
+            .expect("Media source should always be serializable ")
+    }
+}
+
+impl TryFrom<RumaMediaSource> for MediaSource {
+    type Error = ClientError;
+
+    fn try_from(value: RumaMediaSource) -> Result<Self, Self::Error> {
+        value.verify()?;
+        Ok(Self { media_source: value })
+    }
+}
+
+impl TryFrom<&RumaMediaSource> for MediaSource {
+    type Error = ClientError;
+
+    fn try_from(value: &RumaMediaSource) -> Result<Self, Self::Error> {
+        value.verify()?;
+        Ok(Self { media_source: value.clone() })
+    }
+}
+
+impl From<MediaSource> for RumaMediaSource {
+    fn from(value: MediaSource) -> Self {
+        value.media_source
+    }
+}
+
+#[extension_trait]
+pub(crate) impl MediaSourceExt for RumaMediaSource {
+    fn verify(&self) -> Result<(), ClientError> {
+        match self {
+            RumaMediaSource::Plain(url) => {
+                url.validate().map_err(|e| ClientError::Generic { msg: e.to_string() })?;
+            }
+            RumaMediaSource::Encrypted(file) => {
+                file.url.validate().map_err(|e| ClientError::Generic { msg: e.to_string() })?;
+            }
+        }
+
+        Ok(())
     }
 
     fn url(&self) -> String {
         match self {
-            MediaSource::Plain(url) => url.to_string(),
-            MediaSource::Encrypted(file) => file.url.to_string(),
+            RumaMediaSource::Plain(url) => url.to_string(),
+            RumaMediaSource::Encrypted(file) => file.url.to_string(),
         }
     }
 }
@@ -227,6 +285,7 @@ pub impl RoomMessageEventContentWithoutRelationExt for RoomMessageEventContentWi
     }
 }
 
+#[derive(Clone)]
 pub struct Mentions {
     pub user_ids: Vec<String>,
     pub room: bool,
@@ -260,8 +319,25 @@ pub enum MessageType {
     Other { msgtype: String, body: String },
 }
 
+/// From MSC2530: https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/2530-body-as-caption.md
+/// If the filename field is present in a media message, clients should treat
+/// body as a caption instead of a file name. Otherwise, the body is the
+/// file name.
+///
+/// So:
+/// - if a media has a filename and a caption, the body is the caption, filename
+///   is its own field.
+/// - if a media only has a filename, then body is the filename.
+fn get_body_and_filename(filename: String, caption: Option<String>) -> (String, Option<String>) {
+    if let Some(caption) = caption {
+        (caption, Some(filename))
+    } else {
+        (filename, None)
+    }
+}
+
 impl TryFrom<MessageType> for RumaMessageType {
-    type Error = serde_json::Error;
+    type Error = ClientError;
 
     fn try_from(value: MessageType) -> Result<Self, Self::Error> {
         Ok(match value {
@@ -271,35 +347,39 @@ impl TryFrom<MessageType> for RumaMessageType {
                 }))
             }
             MessageType::Image { content } => {
+                let (body, filename) = get_body_and_filename(content.filename, content.caption);
                 let mut event_content =
-                    RumaImageMessageEventContent::new(content.body, (*content.source).clone())
+                    RumaImageMessageEventContent::new(body, (*content.source).clone().into())
                         .info(content.info.map(Into::into).map(Box::new));
-                event_content.formatted = content.formatted.map(Into::into);
-                event_content.filename = content.filename;
+                event_content.formatted = content.formatted_caption.map(Into::into);
+                event_content.filename = filename;
                 Self::Image(event_content)
             }
             MessageType::Audio { content } => {
+                let (body, filename) = get_body_and_filename(content.filename, content.caption);
                 let mut event_content =
-                    RumaAudioMessageEventContent::new(content.body, (*content.source).clone())
+                    RumaAudioMessageEventContent::new(body, (*content.source).clone().into())
                         .info(content.info.map(Into::into).map(Box::new));
-                event_content.formatted = content.formatted.map(Into::into);
-                event_content.filename = content.filename;
+                event_content.formatted = content.formatted_caption.map(Into::into);
+                event_content.filename = filename;
                 Self::Audio(event_content)
             }
             MessageType::Video { content } => {
+                let (body, filename) = get_body_and_filename(content.filename, content.caption);
                 let mut event_content =
-                    RumaVideoMessageEventContent::new(content.body, (*content.source).clone())
+                    RumaVideoMessageEventContent::new(body, (*content.source).clone().into())
                         .info(content.info.map(Into::into).map(Box::new));
-                event_content.formatted = content.formatted.map(Into::into);
-                event_content.filename = content.filename;
+                event_content.formatted = content.formatted_caption.map(Into::into);
+                event_content.filename = filename;
                 Self::Video(event_content)
             }
             MessageType::File { content } => {
+                let (body, filename) = get_body_and_filename(content.filename, content.caption);
                 let mut event_content =
-                    RumaFileMessageEventContent::new(content.body, (*content.source).clone())
+                    RumaFileMessageEventContent::new(body, (*content.source).clone().into())
                         .info(content.info.map(Into::into).map(Box::new));
-                event_content.formatted = content.formatted.map(Into::into);
-                event_content.filename = content.filename;
+                event_content.formatted = content.formatted_caption.map(Into::into);
+                event_content.filename = filename;
                 Self::File(event_content)
             }
             MessageType::Notice { content } => {
@@ -322,9 +402,11 @@ impl TryFrom<MessageType> for RumaMessageType {
     }
 }
 
-impl From<RumaMessageType> for MessageType {
-    fn from(value: RumaMessageType) -> Self {
-        match value {
+impl TryFrom<RumaMessageType> for MessageType {
+    type Error = ClientError;
+
+    fn try_from(value: RumaMessageType) -> Result<Self, Self::Error> {
+        Ok(match value {
             RumaMessageType::Emote(c) => MessageType::Emote {
                 content: EmoteMessageContent {
                     body: c.body.clone(),
@@ -333,19 +415,20 @@ impl From<RumaMessageType> for MessageType {
             },
             RumaMessageType::Image(c) => MessageType::Image {
                 content: ImageMessageContent {
-                    body: c.body.clone(),
-                    formatted: c.formatted.as_ref().map(Into::into),
-                    filename: c.filename.clone(),
-                    source: Arc::new(c.source.clone()),
-                    info: c.info.as_deref().map(Into::into),
+                    filename: c.filename().to_owned(),
+                    caption: c.caption().map(ToString::to_string),
+                    formatted_caption: c.formatted_caption().map(Into::into),
+                    source: Arc::new(c.source.try_into()?),
+                    info: c.info.as_deref().map(TryInto::try_into).transpose()?,
                 },
             },
+
             RumaMessageType::Audio(c) => MessageType::Audio {
                 content: AudioMessageContent {
-                    body: c.body.clone(),
-                    formatted: c.formatted.as_ref().map(Into::into),
-                    filename: c.filename.clone(),
-                    source: Arc::new(c.source.clone()),
+                    filename: c.filename().to_owned(),
+                    caption: c.caption().map(ToString::to_string),
+                    formatted_caption: c.formatted_caption().map(Into::into),
+                    source: Arc::new(c.source.try_into()?),
                     info: c.info.as_deref().map(Into::into),
                     audio: c.audio.map(Into::into),
                     voice: c.voice.map(Into::into),
@@ -353,20 +436,20 @@ impl From<RumaMessageType> for MessageType {
             },
             RumaMessageType::Video(c) => MessageType::Video {
                 content: VideoMessageContent {
-                    body: c.body.clone(),
-                    formatted: c.formatted.as_ref().map(Into::into),
-                    filename: c.filename.clone(),
-                    source: Arc::new(c.source.clone()),
-                    info: c.info.as_deref().map(Into::into),
+                    filename: c.filename().to_owned(),
+                    caption: c.caption().map(ToString::to_string),
+                    formatted_caption: c.formatted_caption().map(Into::into),
+                    source: Arc::new(c.source.try_into()?),
+                    info: c.info.as_deref().map(TryInto::try_into).transpose()?,
                 },
             },
             RumaMessageType::File(c) => MessageType::File {
                 content: FileMessageContent {
-                    body: c.body.clone(),
-                    formatted: c.formatted.as_ref().map(Into::into),
-                    filename: c.filename.clone(),
-                    source: Arc::new(c.source.clone()),
-                    info: c.info.as_deref().map(Into::into),
+                    filename: c.filename().to_owned(),
+                    caption: c.caption().map(ToString::to_string),
+                    formatted_caption: c.formatted_caption().map(Into::into),
+                    source: Arc::new(c.source.try_into()?),
+                    info: c.info.as_deref().map(TryInto::try_into).transpose()?,
                 },
             },
             RumaMessageType::Notice(c) => MessageType::Notice {
@@ -402,7 +485,7 @@ impl From<RumaMessageType> for MessageType {
                 msgtype: value.msgtype().to_owned(),
                 body: value.body().to_owned(),
             },
-        }
+        })
     }
 }
 
@@ -438,18 +521,20 @@ pub struct EmoteMessageContent {
 
 #[derive(Clone, uniffi::Record)]
 pub struct ImageMessageContent {
-    pub body: String,
-    pub formatted: Option<FormattedBody>,
-    pub filename: Option<String>,
+    /// The computed filename, for use in a client.
+    pub filename: String,
+    pub caption: Option<String>,
+    pub formatted_caption: Option<FormattedBody>,
     pub source: Arc<MediaSource>,
     pub info: Option<ImageInfo>,
 }
 
 #[derive(Clone, uniffi::Record)]
 pub struct AudioMessageContent {
-    pub body: String,
-    pub formatted: Option<FormattedBody>,
-    pub filename: Option<String>,
+    /// The computed filename, for use in a client.
+    pub filename: String,
+    pub caption: Option<String>,
+    pub formatted_caption: Option<FormattedBody>,
     pub source: Arc<MediaSource>,
     pub info: Option<AudioInfo>,
     pub audio: Option<UnstableAudioDetailsContent>,
@@ -458,18 +543,20 @@ pub struct AudioMessageContent {
 
 #[derive(Clone, uniffi::Record)]
 pub struct VideoMessageContent {
-    pub body: String,
-    pub formatted: Option<FormattedBody>,
-    pub filename: Option<String>,
+    /// The computed filename, for use in a client.
+    pub filename: String,
+    pub caption: Option<String>,
+    pub formatted_caption: Option<FormattedBody>,
     pub source: Arc<MediaSource>,
     pub info: Option<VideoInfo>,
 }
 
 #[derive(Clone, uniffi::Record)]
 pub struct FileMessageContent {
-    pub body: String,
-    pub formatted: Option<FormattedBody>,
-    pub filename: Option<String>,
+    /// The computed filename, for use in a client.
+    pub filename: String,
+    pub caption: Option<String>,
+    pub formatted_caption: Option<FormattedBody>,
     pub source: Arc<MediaSource>,
     pub info: Option<FileInfo>,
 }
@@ -483,6 +570,7 @@ pub struct ImageInfo {
     pub thumbnail_info: Option<ThumbnailInfo>,
     pub thumbnail_source: Option<Arc<MediaSource>>,
     pub blurhash: Option<String>,
+    pub is_animated: Option<bool>,
 }
 
 impl From<ImageInfo> for RumaImageInfo {
@@ -493,8 +581,9 @@ impl From<ImageInfo> for RumaImageInfo {
             mimetype: value.mimetype,
             size: value.size.map(u64_to_uint),
             thumbnail_info: value.thumbnail_info.map(Into::into).map(Box::new),
-            thumbnail_source: value.thumbnail_source.map(|source| (*source).clone()),
+            thumbnail_source: value.thumbnail_source.map(|source| (*source).clone().into()),
             blurhash: value.blurhash,
+            is_animated: value.is_animated,
         })
     }
 }
@@ -516,6 +605,7 @@ impl TryFrom<&ImageInfo> for BaseImageInfo {
             width: Some(width),
             size: Some(size),
             blurhash: Some(blurhash),
+            is_animated: value.is_animated,
         })
     }
 }
@@ -598,7 +688,7 @@ impl From<VideoInfo> for RumaVideoInfo {
             mimetype: value.mimetype,
             size: value.size.map(u64_to_uint),
             thumbnail_info: value.thumbnail_info.map(Into::into).map(Box::new),
-            thumbnail_source: value.thumbnail_source.map(|source| (*source).clone()),
+            thumbnail_source: value.thumbnail_source.map(|source| (*source).clone().into()),
             blurhash: value.blurhash,
         })
     }
@@ -641,7 +731,7 @@ impl From<FileInfo> for RumaFileInfo {
             mimetype: value.mimetype,
             size: value.size.map(u64_to_uint),
             thumbnail_info: value.thumbnail_info.map(Into::into).map(Box::new),
-            thumbnail_source: value.thumbnail_source.map(|source| (*source).clone()),
+            thumbnail_source: value.thumbnail_source.map(|source| (*source).clone().into()),
         })
     }
 }
@@ -673,21 +763,6 @@ impl From<ThumbnailInfo> for RumaThumbnailInfo {
             mimetype: value.mimetype,
             size: value.size.map(u64_to_uint),
         })
-    }
-}
-
-impl TryFrom<&ThumbnailInfo> for BaseThumbnailInfo {
-    type Error = MediaInfoError;
-
-    fn try_from(value: &ThumbnailInfo) -> Result<Self, MediaInfoError> {
-        let height = UInt::try_from(value.height.ok_or(MediaInfoError::MissingField)?)
-            .map_err(|_| MediaInfoError::InvalidField)?;
-        let width = UInt::try_from(value.width.ok_or(MediaInfoError::MissingField)?)
-            .map_err(|_| MediaInfoError::InvalidField)?;
-        let size = UInt::try_from(value.size.ok_or(MediaInfoError::MissingField)?)
-            .map_err(|_| MediaInfoError::InvalidField)?;
-
-        Ok(BaseThumbnailInfo { height: Some(height), width: Some(width), size: Some(size) })
     }
 }
 
@@ -763,8 +838,10 @@ pub enum MessageFormat {
     Unknown { format: String },
 }
 
-impl From<&matrix_sdk::ruma::events::room::ImageInfo> for ImageInfo {
-    fn from(info: &matrix_sdk::ruma::events::room::ImageInfo) -> Self {
+impl TryFrom<&matrix_sdk::ruma::events::room::ImageInfo> for ImageInfo {
+    type Error = ClientError;
+
+    fn try_from(info: &matrix_sdk::ruma::events::room::ImageInfo) -> Result<Self, Self::Error> {
         let thumbnail_info = info.thumbnail_info.as_ref().map(|info| ThumbnailInfo {
             height: info.height.map(Into::into),
             width: info.width.map(Into::into),
@@ -772,15 +849,21 @@ impl From<&matrix_sdk::ruma::events::room::ImageInfo> for ImageInfo {
             size: info.size.map(Into::into),
         });
 
-        Self {
+        Ok(Self {
             height: info.height.map(Into::into),
             width: info.width.map(Into::into),
             mimetype: info.mimetype.clone(),
             size: info.size.map(Into::into),
             thumbnail_info,
-            thumbnail_source: info.thumbnail_source.clone().map(Arc::new),
+            thumbnail_source: info
+                .thumbnail_source
+                .as_ref()
+                .map(TryInto::try_into)
+                .transpose()?
+                .map(Arc::new),
             blurhash: info.blurhash.clone(),
-        }
+            is_animated: info.is_animated,
+        })
     }
 }
 
@@ -794,8 +877,10 @@ impl From<&RumaAudioInfo> for AudioInfo {
     }
 }
 
-impl From<&RumaVideoInfo> for VideoInfo {
-    fn from(info: &RumaVideoInfo) -> Self {
+impl TryFrom<&RumaVideoInfo> for VideoInfo {
+    type Error = ClientError;
+
+    fn try_from(info: &RumaVideoInfo) -> Result<Self, Self::Error> {
         let thumbnail_info = info.thumbnail_info.as_ref().map(|info| ThumbnailInfo {
             height: info.height.map(Into::into),
             width: info.width.map(Into::into),
@@ -803,21 +888,28 @@ impl From<&RumaVideoInfo> for VideoInfo {
             size: info.size.map(Into::into),
         });
 
-        Self {
+        Ok(Self {
             duration: info.duration,
             height: info.height.map(Into::into),
             width: info.width.map(Into::into),
             mimetype: info.mimetype.clone(),
             size: info.size.map(Into::into),
             thumbnail_info,
-            thumbnail_source: info.thumbnail_source.clone().map(Arc::new),
+            thumbnail_source: info
+                .thumbnail_source
+                .as_ref()
+                .map(TryInto::try_into)
+                .transpose()?
+                .map(Arc::new),
             blurhash: info.blurhash.clone(),
-        }
+        })
     }
 }
 
-impl From<&RumaFileInfo> for FileInfo {
-    fn from(info: &RumaFileInfo) -> Self {
+impl TryFrom<&RumaFileInfo> for FileInfo {
+    type Error = ClientError;
+
+    fn try_from(info: &RumaFileInfo) -> Result<Self, Self::Error> {
         let thumbnail_info = info.thumbnail_info.as_ref().map(|info| ThumbnailInfo {
             height: info.height.map(Into::into),
             width: info.width.map(Into::into),
@@ -825,16 +917,21 @@ impl From<&RumaFileInfo> for FileInfo {
             size: info.size.map(Into::into),
         });
 
-        Self {
+        Ok(Self {
             mimetype: info.mimetype.clone(),
             size: info.size.map(Into::into),
             thumbnail_info,
-            thumbnail_source: info.thumbnail_source.clone().map(Arc::new),
-        }
+            thumbnail_source: info
+                .thumbnail_source
+                .as_ref()
+                .map(TryInto::try_into)
+                .transpose()?
+                .map(Arc::new),
+        })
     }
 }
 
-#[derive(uniffi::Enum)]
+#[derive(Clone, uniffi::Enum)]
 pub enum PollKind {
     Disclosed,
     Undisclosed,
@@ -860,4 +957,14 @@ impl From<RumaPollKind> for PollKind {
             }
         }
     }
+}
+
+/// Creates a [`RoomMessageEventContentWithoutRelation`] given a
+/// [`MessageContent`] value.
+#[matrix_sdk_ffi_macros::export]
+pub fn content_without_relation_from_message(
+    message: MessageContent,
+) -> Result<Arc<RoomMessageEventContentWithoutRelation>, ClientError> {
+    let msg_type = message.msg_type.try_into()?;
+    Ok(Arc::new(RoomMessageEventContentWithoutRelation::new(msg_type)))
 }

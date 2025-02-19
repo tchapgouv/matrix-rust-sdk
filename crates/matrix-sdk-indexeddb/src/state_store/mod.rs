@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -23,14 +23,13 @@ use gloo_utils::format::JsValueSerdeExt;
 use growable_bloom_filter::GrowableBloom;
 use indexed_db_futures::prelude::*;
 use matrix_sdk_base::{
-    deserialized_responses::RawAnySyncOrStrippedState,
+    deserialized_responses::{DisplayName, RawAnySyncOrStrippedState},
     store::{
-        ChildTransactionId, ComposerDraft, DependentQueuedEvent, DependentQueuedEventKind,
-        QueuedEvent, SerializableEventContent, ServerCapabilities, StateChanges, StateStore,
-        StoreError,
+        ChildTransactionId, ComposerDraft, DependentQueuedRequest, DependentQueuedRequestKind,
+        QueuedRequest, QueuedRequestKind, SentRequestKey, SerializableEventContent,
+        ServerCapabilities, StateChanges, StateStore, StoreError,
     },
-    MinimalRoomMemberEvent, RoomInfo, RoomMemberships, RoomState, StateStoreDataKey,
-    StateStoreDataValue,
+    MinimalRoomMemberEvent, RoomInfo, RoomMemberships, StateStoreDataKey, StateStoreDataValue,
 };
 use matrix_sdk_store_encryption::{Error as EncryptionError, StoreCipher};
 use ruma::{
@@ -45,8 +44,8 @@ use ruma::{
         GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType, SyncStateEvent,
     },
     serde::Raw,
-    CanonicalJsonObject, EventId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedTransactionId,
-    OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
+    CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri,
+    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -148,6 +147,7 @@ mod keys {
 }
 
 pub use keys::ALL_STORES;
+use matrix_sdk_base::store::QueueWedgeError;
 
 /// Encrypt (if needs be) then JSON-serialize a value.
 fn serialize_value(store_cipher: Option<&StoreCipher>, event: &impl Serialize) -> Result<JsValue> {
@@ -419,21 +419,70 @@ impl IndexeddbStateStore {
             StateStoreDataKey::ComposerDraft(room_id) => {
                 self.encode_key(keys::KV, (StateStoreDataKey::COMPOSER_DRAFT, room_id))
             }
+            StateStoreDataKey::SeenKnockRequests(room_id) => {
+                self.encode_key(keys::KV, (StateStoreDataKey::SEEN_KNOCK_REQUESTS, room_id))
+            }
         }
     }
 }
 
-/// A superset of [`QueuedEvent`] that also contains the room id, since we want
-/// to return them.
+/// A superset of [`QueuedRequest`] that also contains the room id, since we
+/// want to return them.
 #[derive(Serialize, Deserialize)]
-struct PersistedQueuedEvent {
+struct PersistedQueuedRequest {
     /// In which room is this event going to be sent.
     pub room_id: OwnedRoomId,
 
-    // All these fields are the same as in [`QueuedEvent`].
-    event: SerializableEventContent,
+    // All these fields are the same as in [`QueuedRequest`].
+    /// Kind. Optional because it might be missing from previous formats.
+    kind: Option<QueuedRequestKind>,
     transaction_id: OwnedTransactionId,
-    is_wedged: bool,
+
+    pub error: Option<QueueWedgeError>,
+
+    priority: Option<usize>,
+
+    /// The time the original message was first attempted to be sent at.
+    #[serde(default = "created_now")]
+    created_at: MilliSecondsSinceUnixEpoch,
+
+    // Migrated fields: keep these private, they're not used anymore elsewhere in the code base.
+    /// Deprecated (from old format), now replaced with error field.
+    is_wedged: Option<bool>,
+
+    event: Option<SerializableEventContent>,
+}
+
+fn created_now() -> MilliSecondsSinceUnixEpoch {
+    MilliSecondsSinceUnixEpoch::now()
+}
+
+impl PersistedQueuedRequest {
+    fn into_queued_request(self) -> Option<QueuedRequest> {
+        let kind =
+            self.kind.or_else(|| self.event.map(|content| QueuedRequestKind::Event { content }))?;
+
+        let error = match self.is_wedged {
+            Some(true) => {
+                // Migrate to a generic error.
+                Some(QueueWedgeError::GenericApiError {
+                    msg: "local echo failed to send in a previous session".into(),
+                })
+            }
+            _ => self.error,
+        };
+
+        // By default, events without a priority have a priority of 0.
+        let priority = self.priority.unwrap_or(0);
+
+        Some(QueuedRequest {
+            kind,
+            transaction_id: self.transaction_id,
+            error,
+            priority,
+            created_at: self.created_at,
+        })
+    }
 }
 
 // Small hack to have the following macro invocation act as the appropriate
@@ -505,6 +554,10 @@ impl_state_store!({
                 .map(|f| self.deserialize_value::<ComposerDraft>(&f))
                 .transpose()?
                 .map(StateStoreDataValue::ComposerDraft),
+            StateStoreDataKey::SeenKnockRequests(_) => value
+                .map(|f| self.deserialize_value::<BTreeMap<OwnedEventId, OwnedUserId>>(&f))
+                .transpose()?
+                .map(StateStoreDataValue::SeenKnockRequests),
         };
 
         Ok(value)
@@ -541,6 +594,11 @@ impl_state_store!({
             ),
             StateStoreDataKey::ComposerDraft(_) => self.serialize_value(
                 &value.into_composer_draft().expect("Session data not a composer draft"),
+            ),
+            StateStoreDataKey::SeenKnockRequests(_) => self.serialize_value(
+                &value
+                    .into_seen_knock_requests()
+                    .expect("Session data is not a set of seen knock request ids"),
             ),
         };
 
@@ -633,7 +691,15 @@ impl_state_store!({
             let store = tx.object_store(keys::DISPLAY_NAMES)?;
             for (room_id, ambiguity_maps) in &changes.ambiguity_maps {
                 for (display_name, map) in ambiguity_maps {
-                    let key = self.encode_key(keys::DISPLAY_NAMES, (room_id, display_name));
+                    let key = self.encode_key(
+                        keys::DISPLAY_NAMES,
+                        (
+                            room_id,
+                            display_name
+                                .as_normalized_str()
+                                .unwrap_or_else(|| display_name.as_raw_str()),
+                        ),
+                    );
 
                     store.put_key_val(&key, &self.serialize_value(&map)?)?;
                 }
@@ -1087,42 +1153,21 @@ impl_state_store!({
         Ok(entries)
     }
 
-    async fn get_stripped_room_infos(&self) -> Result<Vec<RoomInfo>> {
-        let txn = self
-            .inner
-            .transaction_on_one_with_mode(keys::ROOM_INFOS, IdbTransactionMode::Readonly)?;
-        let store = txn.object_store(keys::ROOM_INFOS)?;
-
-        let mut infos = Vec::new();
-        let cursor = store.open_cursor()?.await?;
-
-        if let Some(cursor) = cursor {
-            loop {
-                let value = cursor.value();
-                let info = self.deserialize_value::<RoomInfo>(&value)?;
-
-                if info.state() == RoomState::Invited {
-                    infos.push(info);
-                }
-
-                if !cursor.continue_cursor()?.await? {
-                    break;
-                }
-            }
-        }
-
-        Ok(infos)
-    }
-
     async fn get_users_with_display_name(
         &self,
         room_id: &RoomId,
-        display_name: &str,
+        display_name: &DisplayName,
     ) -> Result<BTreeSet<OwnedUserId>> {
         self.inner
             .transaction_on_one_with_mode(keys::DISPLAY_NAMES, IdbTransactionMode::Readonly)?
             .object_store(keys::DISPLAY_NAMES)?
-            .get(&self.encode_key(keys::DISPLAY_NAMES, (room_id, display_name)))?
+            .get(&self.encode_key(
+                keys::DISPLAY_NAMES,
+                (
+                    room_id,
+                    display_name.as_normalized_str().unwrap_or_else(|| display_name.as_raw_str()),
+                ),
+            ))?
             .await?
             .map(|f| self.deserialize_value::<BTreeSet<OwnedUserId>>(&f))
             .unwrap_or_else(|| Ok(Default::default()))
@@ -1131,10 +1176,12 @@ impl_state_store!({
     async fn get_users_with_display_names<'a>(
         &self,
         room_id: &RoomId,
-        display_names: &'a [String],
-    ) -> Result<BTreeMap<&'a str, BTreeSet<OwnedUserId>>> {
+        display_names: &'a [DisplayName],
+    ) -> Result<HashMap<&'a DisplayName, BTreeSet<OwnedUserId>>> {
+        let mut map = HashMap::new();
+
         if display_names.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok(map);
         }
 
         let txn = self
@@ -1142,15 +1189,24 @@ impl_state_store!({
             .transaction_on_one_with_mode(keys::DISPLAY_NAMES, IdbTransactionMode::Readonly)?;
         let store = txn.object_store(keys::DISPLAY_NAMES)?;
 
-        let mut map = BTreeMap::new();
         for display_name in display_names {
             if let Some(user_ids) = store
-                .get(&self.encode_key(keys::DISPLAY_NAMES, (room_id, display_name)))?
+                .get(
+                    &self.encode_key(
+                        keys::DISPLAY_NAMES,
+                        (
+                            room_id,
+                            display_name
+                                .as_normalized_str()
+                                .unwrap_or_else(|| display_name.as_raw_str()),
+                        ),
+                    ),
+                )?
                 .await?
                 .map(|f| self.deserialize_value::<BTreeSet<OwnedUserId>>(&f))
                 .transpose()?
             {
-                map.insert(display_name.as_ref(), user_ids);
+                map.insert(display_name, user_ids);
             }
         }
 
@@ -1324,19 +1380,13 @@ impl_state_store!({
         self.get_user_ids_inner(room_id, memberships, false).await
     }
 
-    async fn get_invited_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>> {
-        self.get_user_ids(room_id, RoomMemberships::INVITE).await
-    }
-
-    async fn get_joined_user_ids(&self, room_id: &RoomId) -> Result<Vec<OwnedUserId>> {
-        self.get_user_ids(room_id, RoomMemberships::JOIN).await
-    }
-
-    async fn save_send_queue_event(
+    async fn save_send_queue_request(
         &self,
         room_id: &RoomId,
         transaction_id: OwnedTransactionId,
-        content: SerializableEventContent,
+        created_at: MilliSecondsSinceUnixEpoch,
+        kind: QueuedRequestKind,
+        priority: usize,
     ) -> Result<()> {
         let encoded_key = self.encode_key(keys::ROOM_SEND_QUEUE, room_id);
 
@@ -1346,22 +1396,27 @@ impl_state_store!({
 
         let obj = tx.object_store(keys::ROOM_SEND_QUEUE)?;
 
-        // We store an encoded vector of the queued events, with their transaction ids.
+        // We store an encoded vector of the queued requests, with their transaction
+        // ids.
 
         // Reload the previous vector for this room, or create an empty one.
         let prev = obj.get(&encoded_key)?.await?;
 
         let mut prev = prev.map_or_else(
             || Ok(Vec::new()),
-            |val| self.deserialize_value::<Vec<PersistedQueuedEvent>>(&val),
+            |val| self.deserialize_value::<Vec<PersistedQueuedRequest>>(&val),
         )?;
 
-        // Push the new event.
-        prev.push(PersistedQueuedEvent {
+        // Push the new request.
+        prev.push(PersistedQueuedRequest {
             room_id: room_id.to_owned(),
-            event: content,
+            kind: Some(kind),
             transaction_id,
-            is_wedged: false,
+            error: None,
+            is_wedged: None,
+            event: None,
+            priority: Some(priority),
+            created_at,
         });
 
         // Save the new vector into db.
@@ -1372,11 +1427,11 @@ impl_state_store!({
         Ok(())
     }
 
-    async fn update_send_queue_event(
+    async fn update_send_queue_request(
         &self,
         room_id: &RoomId,
         transaction_id: &TransactionId,
-        content: SerializableEventContent,
+        kind: QueuedRequestKind,
     ) -> Result<bool> {
         let encoded_key = self.encode_key(keys::ROOM_SEND_QUEUE, room_id);
 
@@ -1386,20 +1441,25 @@ impl_state_store!({
 
         let obj = tx.object_store(keys::ROOM_SEND_QUEUE)?;
 
-        // We store an encoded vector of the queued events, with their transaction ids.
+        // We store an encoded vector of the queued requests, with their transaction
+        // ids.
 
         // Reload the previous vector for this room, or create an empty one.
         let prev = obj.get(&encoded_key)?.await?;
 
         let mut prev = prev.map_or_else(
             || Ok(Vec::new()),
-            |val| self.deserialize_value::<Vec<PersistedQueuedEvent>>(&val),
+            |val| self.deserialize_value::<Vec<PersistedQueuedRequest>>(&val),
         )?;
 
-        // Modify the one event.
+        // Modify the one request.
         if let Some(entry) = prev.iter_mut().find(|entry| entry.transaction_id == transaction_id) {
-            entry.event = content;
-            entry.is_wedged = false;
+            entry.kind = Some(kind);
+            // Reset the error state.
+            entry.error = None;
+            // Remove migrated fields.
+            entry.is_wedged = None;
+            entry.event = None;
 
             // Save the new vector into db.
             obj.put_key_val(&encoded_key, &self.serialize_value(&prev)?)?;
@@ -1411,7 +1471,7 @@ impl_state_store!({
         }
     }
 
-    async fn remove_send_queue_event(
+    async fn remove_send_queue_request(
         &self,
         room_id: &RoomId,
         transaction_id: &TransactionId,
@@ -1425,11 +1485,12 @@ impl_state_store!({
 
         let obj = tx.object_store(keys::ROOM_SEND_QUEUE)?;
 
-        // We store an encoded vector of the queued events, with their transaction ids.
+        // We store an encoded vector of the queued requests, with their transaction
+        // ids.
 
         // Reload the previous vector for this room.
         if let Some(val) = obj.get(&encoded_key)?.await? {
-            let mut prev = self.deserialize_value::<Vec<PersistedQueuedEvent>>(&val)?;
+            let mut prev = self.deserialize_value::<Vec<PersistedQueuedRequest>>(&val)?;
             if let Some(pos) = prev.iter().position(|item| item.transaction_id == transaction_id) {
                 prev.remove(pos);
 
@@ -1447,10 +1508,11 @@ impl_state_store!({
         Ok(false)
     }
 
-    async fn load_send_queue_events(&self, room_id: &RoomId) -> Result<Vec<QueuedEvent>> {
+    async fn load_send_queue_requests(&self, room_id: &RoomId) -> Result<Vec<QueuedRequest>> {
         let encoded_key = self.encode_key(keys::ROOM_SEND_QUEUE, room_id);
 
-        // We store an encoded vector of the queued events, with their transaction ids.
+        // We store an encoded vector of the queued requests, with their transaction
+        // ids.
         let prev = self
             .inner
             .transaction_on_one_with_mode(keys::ROOM_SEND_QUEUE, IdbTransactionMode::Readwrite)?
@@ -1458,26 +1520,22 @@ impl_state_store!({
             .get(&encoded_key)?
             .await?;
 
-        let prev = prev.map_or_else(
+        let mut prev = prev.map_or_else(
             || Ok(Vec::new()),
-            |val| self.deserialize_value::<Vec<PersistedQueuedEvent>>(&val),
+            |val| self.deserialize_value::<Vec<PersistedQueuedRequest>>(&val),
         )?;
 
-        Ok(prev
-            .into_iter()
-            .map(|item| QueuedEvent {
-                event: item.event,
-                transaction_id: item.transaction_id,
-                is_wedged: item.is_wedged,
-            })
-            .collect())
+        // Inverted stable ordering on priority.
+        prev.sort_by(|lhs, rhs| rhs.priority.unwrap_or(0).cmp(&lhs.priority.unwrap_or(0)));
+
+        Ok(prev.into_iter().filter_map(PersistedQueuedRequest::into_queued_request).collect())
     }
 
-    async fn update_send_queue_event_status(
+    async fn update_send_queue_request_status(
         &self,
         room_id: &RoomId,
         transaction_id: &TransactionId,
-        wedged: bool,
+        error: Option<QueueWedgeError>,
     ) -> Result<()> {
         let encoded_key = self.encode_key(keys::ROOM_SEND_QUEUE, room_id);
 
@@ -1488,11 +1546,12 @@ impl_state_store!({
         let obj = tx.object_store(keys::ROOM_SEND_QUEUE)?;
 
         if let Some(val) = obj.get(&encoded_key)?.await? {
-            let mut prev = self.deserialize_value::<Vec<PersistedQueuedEvent>>(&val)?;
-            if let Some(queued_event) =
+            let mut prev = self.deserialize_value::<Vec<PersistedQueuedRequest>>(&val)?;
+            if let Some(request) =
                 prev.iter_mut().find(|item| item.transaction_id == transaction_id)
             {
-                queued_event.is_wedged = wedged;
+                request.is_wedged = None;
+                request.error = error;
                 obj.put_key_val(&encoded_key, &self.serialize_value(&prev)?)?;
             }
         }
@@ -1502,7 +1561,7 @@ impl_state_store!({
         Ok(())
     }
 
-    async fn load_rooms_with_unsent_events(&self) -> Result<Vec<OwnedRoomId>> {
+    async fn load_rooms_with_unsent_requests(&self) -> Result<Vec<OwnedRoomId>> {
         let tx = self
             .inner
             .transaction_on_one_with_mode(keys::ROOM_SEND_QUEUE, IdbTransactionMode::Readwrite)?;
@@ -1513,8 +1572,8 @@ impl_state_store!({
             .get_all()?
             .await?
             .into_iter()
-            .map(|item| self.deserialize_value::<Vec<PersistedQueuedEvent>>(&item))
-            .collect::<Result<Vec<Vec<PersistedQueuedEvent>>, _>>()?
+            .map(|item| self.deserialize_value::<Vec<PersistedQueuedRequest>>(&item))
+            .collect::<Result<Vec<Vec<PersistedQueuedRequest>>, _>>()?
             .into_iter()
             .flat_map(|vec| vec.into_iter().map(|item| item.room_id))
             .collect::<BTreeSet<_>>();
@@ -1522,12 +1581,13 @@ impl_state_store!({
         Ok(all_entries.into_iter().collect())
     }
 
-    async fn save_dependent_send_queue_event(
+    async fn save_dependent_queued_request(
         &self,
         room_id: &RoomId,
         parent_txn_id: &TransactionId,
         own_txn_id: ChildTransactionId,
-        content: DependentQueuedEventKind,
+        created_at: MilliSecondsSinceUnixEpoch,
+        content: DependentQueuedRequestKind,
     ) -> Result<()> {
         let encoded_key = self.encode_key(keys::DEPENDENT_SEND_QUEUE, room_id);
 
@@ -1538,21 +1598,22 @@ impl_state_store!({
 
         let obj = tx.object_store(keys::DEPENDENT_SEND_QUEUE)?;
 
-        // We store an encoded vector of the dependent events.
+        // We store an encoded vector of the dependent requests.
         // Reload the previous vector for this room, or create an empty one.
         let prev = obj.get(&encoded_key)?.await?;
 
         let mut prev = prev.map_or_else(
             || Ok(Vec::new()),
-            |val| self.deserialize_value::<Vec<DependentQueuedEvent>>(&val),
+            |val| self.deserialize_value::<Vec<DependentQueuedRequest>>(&val),
         )?;
 
-        // Push the new event.
-        prev.push(DependentQueuedEvent {
+        // Push the new request.
+        prev.push(DependentQueuedRequest {
             kind: content,
             parent_transaction_id: parent_txn_id.to_owned(),
             own_transaction_id: own_txn_id,
-            event_id: None,
+            parent_key: None,
+            created_at,
         });
 
         // Save the new vector into db.
@@ -1563,11 +1624,53 @@ impl_state_store!({
         Ok(())
     }
 
-    async fn update_dependent_send_queue_event(
+    async fn update_dependent_queued_request(
+        &self,
+        room_id: &RoomId,
+        own_transaction_id: &ChildTransactionId,
+        new_content: DependentQueuedRequestKind,
+    ) -> Result<bool> {
+        let encoded_key = self.encode_key(keys::DEPENDENT_SEND_QUEUE, room_id);
+
+        let tx = self.inner.transaction_on_one_with_mode(
+            keys::DEPENDENT_SEND_QUEUE,
+            IdbTransactionMode::Readwrite,
+        )?;
+
+        let obj = tx.object_store(keys::DEPENDENT_SEND_QUEUE)?;
+
+        // We store an encoded vector of the dependent requests.
+        // Reload the previous vector for this room, or create an empty one.
+        let prev = obj.get(&encoded_key)?.await?;
+
+        let mut prev = prev.map_or_else(
+            || Ok(Vec::new()),
+            |val| self.deserialize_value::<Vec<DependentQueuedRequest>>(&val),
+        )?;
+
+        // Modify the dependent request, if found.
+        let mut found = false;
+        for entry in prev.iter_mut() {
+            if entry.own_transaction_id == *own_transaction_id {
+                found = true;
+                entry.kind = new_content;
+                break;
+            }
+        }
+
+        if found {
+            obj.put_key_val(&encoded_key, &self.serialize_value(&prev)?)?;
+            tx.await.into_result()?;
+        }
+
+        Ok(found)
+    }
+
+    async fn mark_dependent_queued_requests_as_ready(
         &self,
         room_id: &RoomId,
         parent_txn_id: &TransactionId,
-        event_id: OwnedEventId,
+        parent_key: SentRequestKey,
     ) -> Result<usize> {
         let encoded_key = self.encode_key(keys::DEPENDENT_SEND_QUEUE, room_id);
 
@@ -1578,19 +1681,19 @@ impl_state_store!({
 
         let obj = tx.object_store(keys::DEPENDENT_SEND_QUEUE)?;
 
-        // We store an encoded vector of the dependent events.
+        // We store an encoded vector of the dependent requests.
         // Reload the previous vector for this room, or create an empty one.
         let prev = obj.get(&encoded_key)?.await?;
 
         let mut prev = prev.map_or_else(
             || Ok(Vec::new()),
-            |val| self.deserialize_value::<Vec<DependentQueuedEvent>>(&val),
+            |val| self.deserialize_value::<Vec<DependentQueuedRequest>>(&val),
         )?;
 
-        // Modify all events that match.
+        // Modify all requests that match.
         let mut num_updated = 0;
         for entry in prev.iter_mut().filter(|entry| entry.parent_transaction_id == parent_txn_id) {
-            entry.event_id = Some(event_id.clone());
+            entry.parent_key = Some(parent_key.clone());
             num_updated += 1;
         }
 
@@ -1602,7 +1705,7 @@ impl_state_store!({
         Ok(num_updated)
     }
 
-    async fn remove_dependent_send_queue_event(
+    async fn remove_dependent_queued_request(
         &self,
         room_id: &RoomId,
         txn_id: &ChildTransactionId,
@@ -1616,10 +1719,10 @@ impl_state_store!({
 
         let obj = tx.object_store(keys::DEPENDENT_SEND_QUEUE)?;
 
-        // We store an encoded vector of the dependent events.
+        // We store an encoded vector of the dependent requests.
         // Reload the previous vector for this room.
         if let Some(val) = obj.get(&encoded_key)?.await? {
-            let mut prev = self.deserialize_value::<Vec<DependentQueuedEvent>>(&val)?;
+            let mut prev = self.deserialize_value::<Vec<DependentQueuedRequest>>(&val)?;
             if let Some(pos) = prev.iter().position(|item| item.own_transaction_id == *txn_id) {
                 prev.remove(pos);
 
@@ -1637,13 +1740,13 @@ impl_state_store!({
         Ok(false)
     }
 
-    async fn list_dependent_send_queue_events(
+    async fn load_dependent_queued_requests(
         &self,
         room_id: &RoomId,
-    ) -> Result<Vec<DependentQueuedEvent>> {
+    ) -> Result<Vec<DependentQueuedRequest>> {
         let encoded_key = self.encode_key(keys::DEPENDENT_SEND_QUEUE, room_id);
 
-        // We store an encoded vector of the dependent events.
+        // We store an encoded vector of the dependent requests.
         let prev = self
             .inner
             .transaction_on_one_with_mode(
@@ -1656,7 +1759,7 @@ impl_state_store!({
 
         prev.map_or_else(
             || Ok(Vec::new()),
-            |val| self.deserialize_value::<Vec<DependentQueuedEvent>>(&val),
+            |val| self.deserialize_value::<Vec<DependentQueuedRequest>>(&val),
         )
     }
 });
@@ -1677,6 +1780,63 @@ impl From<&SyncStateEvent<RoomMemberEventContent>> for RoomMember {
 impl From<&StrippedRoomMemberEvent> for RoomMember {
     fn from(event: &StrippedRoomMemberEvent) -> Self {
         Self { user_id: event.state_key.clone(), membership: event.content.membership.clone() }
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use assert_matches2::assert_matches;
+    use matrix_sdk_base::store::{QueuedRequestKind, SerializableEventContent};
+    use ruma::{
+        events::room::message::RoomMessageEventContent, room_id, OwnedRoomId, OwnedTransactionId,
+        TransactionId,
+    };
+    use serde::{Deserialize, Serialize};
+
+    use crate::state_store::PersistedQueuedRequest;
+
+    #[derive(Serialize, Deserialize)]
+    struct OldPersistedQueuedRequest {
+        room_id: OwnedRoomId,
+        event: SerializableEventContent,
+        transaction_id: OwnedTransactionId,
+        is_wedged: bool,
+    }
+
+    // We now persist an error when an event failed to send instead of just a
+    // boolean. To support that, `PersistedQueueEvent` changed a bool to
+    // Option<bool>, ensures that this work properly.
+    #[test]
+    fn test_migrating_persisted_queue_event_serialization() {
+        let room_a_id = room_id!("!room_a:dummy.local");
+        let transaction_id = TransactionId::new();
+        let content =
+            SerializableEventContent::new(&RoomMessageEventContent::text_plain("Hello").into())
+                .unwrap();
+
+        let old_persisted_queue_event = OldPersistedQueuedRequest {
+            room_id: room_a_id.to_owned(),
+            event: content,
+            transaction_id: transaction_id.clone(),
+            is_wedged: true,
+        };
+
+        let serialized_persisted = serde_json::to_vec(&old_persisted_queue_event).unwrap();
+
+        // Load it with the new version.
+        let new_persisted: PersistedQueuedRequest =
+            serde_json::from_slice(&serialized_persisted).unwrap();
+
+        assert_eq!(new_persisted.is_wedged, Some(true));
+        assert!(new_persisted.error.is_none());
+
+        assert!(new_persisted.event.is_some());
+        assert!(new_persisted.kind.is_none());
+
+        let queued = new_persisted.into_queued_request().unwrap();
+        assert_matches!(queued.kind, QueuedRequestKind::Event { .. });
+        assert_eq!(queued.transaction_id, transaction_id);
+        assert!(queued.error.is_some());
     }
 }
 

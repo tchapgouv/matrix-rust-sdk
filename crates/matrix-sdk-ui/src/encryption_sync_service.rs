@@ -31,9 +31,8 @@ use std::{pin::Pin, time::Duration};
 use async_stream::stream;
 use futures_core::stream::Stream;
 use futures_util::{pin_mut, StreamExt};
-use matrix_sdk::{Client, SlidingSync, LEASE_DURATION_MS};
-use matrix_sdk_base::sliding_sync::http;
-use ruma::assign;
+use matrix_sdk::{sleep::sleep, Client, SlidingSync, LEASE_DURATION_MS};
+use ruma::{api::client::sync::sync_events::v5 as http, assign};
 use tokio::sync::OwnedMutexGuard;
 use tracing::{debug, instrument, trace, Span};
 
@@ -88,11 +87,7 @@ impl EncryptionSyncService {
     /// Creates a new instance of a `EncryptionSyncService`.
     ///
     /// This will create and manage an instance of [`matrix_sdk::SlidingSync`].
-    /// The `process_id` is used as the identifier of that instance, as such
-    /// make sure to not reuse a name used by another process, at the risk
-    /// of causing problems.
     pub async fn new(
-        process_id: String,
         client: Client,
         poll_and_network_timeouts: Option<(Duration, Duration)>,
         with_locking: WithLocking,
@@ -119,7 +114,13 @@ impl EncryptionSyncService {
 
         if with_locking {
             // Gently try to enable the cross-process lock on behalf of the user.
-            match client.encryption().enable_cross_process_store_lock(process_id).await {
+            match client
+                .encryption()
+                .enable_cross_process_store_lock(
+                    client.cross_process_store_locks_holder_name().to_owned(),
+                )
+                .await
+            {
                 Ok(()) | Err(matrix_sdk::Error::BadCryptoStoreState) => {
                     // Ignore; we've already set the crypto store lock to
                     // something, and that's sufficient as
@@ -172,7 +173,7 @@ impl EncryptionSyncService {
                     LEASE_DURATION_MS
                 );
 
-                tokio::time::sleep(Duration::from_millis(LEASE_DURATION_MS.into())).await;
+                sleep(Duration::from_millis(LEASE_DURATION_MS.into())).await;
 
                 lock_guard = self
                     .client
@@ -200,7 +201,7 @@ impl EncryptionSyncService {
             match sync.next().await {
                 Some(Ok(update_summary)) => {
                     // This API is only concerned with the e2ee and to-device extensions.
-                    // Warn if anything weird has been received from the proxy.
+                    // Warn if anything weird has been received from the homeserver.
                     if !update_summary.lists.is_empty() {
                         debug!(?update_summary.lists, "unexpected non-empty list of lists in encryption sync API");
                     }
@@ -248,7 +249,7 @@ impl EncryptionSyncService {
                 match self.next_sync_with_lock(&mut sync).await? {
                     Some(Ok(update_summary)) => {
                         // This API is only concerned with the e2ee and to-device extensions.
-                        // Warn if anything weird has been received from the proxy.
+                        // Warn if anything weird has been received from the homeserver.
                         if !update_summary.lists.is_empty() {
                             debug!(?update_summary.lists, "unexpected non-empty list of lists in encryption sync API");
                         }

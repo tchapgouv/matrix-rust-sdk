@@ -2,6 +2,19 @@
 
 Breaking changes:
 
+- Matrix client API errors coming from API responses will now be mapped to `ClientError::MatrixApi`, containing both the
+  original message and the associated error code and kind. 
+
+- `EventSendState` now has two additional variants: `CrossSigningNotSetup` and
+  `SendingFromUnverifiedDevice`. These indicate that your own device is not
+  properly cross-signed, which is a requirement when using the identity-based
+  strategy, and can only be returned when using the identity-based strategy.
+
+  In addition, the `VerifiedUserHasUnsignedDevice` and
+  `VerifiedUserChangedIdentity` variants can be returned when using the
+  identity-based strategy, in addition to when using the device-based strategy
+  with `error_on_verified_user_problem` is set.
+
 - `EventSendState` now has two additional variants: `VerifiedUserHasUnsignedDevice` and
   `VerifiedUserChangedIdentity`. These reflect problems with verified users in the room
   and as such can only be returned when the room key recipient strategy has
@@ -21,4 +34,7 @@ Breaking changes:
 
 Additions:
 
+- Add `Encryption::get_user_identity` which returns `UserIdentity`
 - Add `ClientBuilder::room_key_recipient_strategy`
+- Add `Room::send_raw`
+- Expose `withdraw_verification` to `UserIdentity`

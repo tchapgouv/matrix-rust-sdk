@@ -55,6 +55,7 @@ async fn mock_sync(server: &MockServer, response_body: impl Serialize, since: Op
 ///
 /// Note: pass `events_before` in the normal order, I'll revert the order for
 /// you.
+// TODO: replace with MatrixMockServer
 #[allow(clippy::too_many_arguments)] // clippy you've got such a fixed mindset
 async fn mock_context(
     server: &MockServer,
@@ -71,9 +72,9 @@ async fn mock_context(
         .and(path(format!("/_matrix/client/r0/rooms/{room_id}/context/{event_id}")))
         .and(header("authorization", "Bearer 1234"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "events_before": events_before.into_iter().rev().map(|ev| ev.event).collect_vec(),
-            "event": event.event,
-            "events_after": events_after.into_iter().map(|ev| ev.event).collect_vec(),
+            "events_before": events_before.into_iter().rev().map(|ev| ev.into_raw()).collect_vec(),
+            "event": event.into_raw(),
+            "events_after": events_after.into_iter().map(|ev| ev.into_raw()).collect_vec(),
             "state": state,
             "start": prev_batch_token,
             "end": next_batch_token
@@ -82,26 +83,11 @@ async fn mock_context(
         .await;
 }
 
-/// Mocks the /event endpoint
-#[allow(clippy::too_many_arguments)] // clippy you've got such a fixed mindset
-async fn mock_event(
-    server: &MockServer,
-    room_id: &RoomId,
-    event_id: &EventId,
-    event: TimelineEvent,
-) {
-    Mock::given(method("GET"))
-        .and(path(format!("/_matrix/client/r0/rooms/{room_id}/event/{event_id}")))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(event.event.json()))
-        .mount(server)
-        .await;
-}
-
 /// Mocks the /messages endpoint.
 ///
 /// Note: pass `chunk` in the correct order: topological for forward pagination,
 /// reverse topological for backwards pagination.
+// TODO: replace with MatrixMockServer
 async fn mock_messages(
     server: &MockServer,
     start: String,
@@ -116,7 +102,7 @@ async fn mock_messages(
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "start": start,
             "end": end,
-            "chunk": chunk.into_iter().map(|ev| ev.event).collect_vec(),
+            "chunk": chunk.into_iter().map(|ev| ev.into_raw()).collect_vec(),
             "state": state,
         })))
         .expect(1)

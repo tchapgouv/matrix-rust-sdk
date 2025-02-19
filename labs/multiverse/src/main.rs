@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     env,
     io::{self, stdout, Write},
-    path::PathBuf,
+    path::Path,
     process::exit,
     sync::{Arc, Mutex},
     time::Duration,
@@ -17,15 +17,16 @@ use crossterm::{
 use futures_util::{pin_mut, StreamExt as _};
 use imbl::Vector;
 use matrix_sdk::{
+    authentication::matrix::MatrixSession,
     config::StoreConfig,
     encryption::{BackupDownloadStrategy, EncryptionSettings},
-    matrix_auth::MatrixSession,
     ruma::{
         api::client::receipt::create_receipt::v3::ReceiptType,
         events::room::message::{MessageType, RoomMessageEventContent},
         MilliSecondsSinceUnixEpoch, OwnedRoomId, RoomId,
     },
-    AuthSession, Client, ServerName, SqliteCryptoStore, SqliteStateStore,
+    sleep::sleep,
+    AuthSession, Client, ServerName, SqliteCryptoStore, SqliteEventCacheStore, SqliteStateStore,
 };
 use matrix_sdk_ui::{
     room_list_service::{self, filters::new_filter_non_left},
@@ -35,7 +36,7 @@ use matrix_sdk_ui::{
 };
 use ratatui::{prelude::*, style::palette::tailwind, widgets::*};
 use tokio::{runtime::Handle, spawn, task::JoinHandle};
-use tracing::error;
+use tracing::{error, warn};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _, EnvFilter};
 
 const HEADER_BG: Color = tailwind::BLUE.c950;
@@ -62,7 +63,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let config_path = env::args().nth(2).unwrap_or("/tmp/".to_owned());
-    let client = configure_client(server_name, config_path).await?;
+    let client = configure_client(&server_name, &config_path).await?;
+
+    let ec = client.event_cache();
+    ec.subscribe().unwrap();
+    ec.enable_storage().unwrap();
 
     init_error_hooks()?;
     let terminal = init_terminal()?;
@@ -113,6 +118,7 @@ enum DetailsMode {
     #[default]
     TimelineItems,
     Events,
+    LinkedChunk,
 }
 
 struct Timeline {
@@ -129,6 +135,9 @@ struct ExtraRoomInfo {
 
     /// Calculated display name for the room.
     display_name: Option<String>,
+
+    /// Is the room a DM?
+    is_dm: Option<bool>,
 }
 
 struct App {
@@ -179,7 +188,6 @@ impl App {
             Default::default();
         let timelines = Arc::new(Mutex::new(HashMap::new()));
 
-        let c = client.clone();
         let r = rooms.clone();
         let ri = room_infos.clone();
         let ur = ui_rooms.clone();
@@ -189,14 +197,12 @@ impl App {
         let all_rooms = room_list_service.all_rooms().await?;
 
         let listen_task = spawn(async move {
-            let client = c;
             let rooms = r;
             let room_infos = ri;
             let ui_rooms = ur;
             let timelines = t;
 
-            let (stream, entries_controller) = all_rooms
-                .entries_with_dynamic_adapters(50_000, client.room_info_notable_update_receiver());
+            let (stream, entries_controller) = all_rooms.entries_with_dynamic_adapters(50_000);
             entries_controller.set_filter(Box::new(new_filter_non_left()));
 
             pin_mut!(stream);
@@ -223,6 +229,23 @@ impl App {
                 let mut new_ui_rooms = HashMap::new();
                 let mut new_timelines = Vec::new();
 
+                // Update all the room info for all rooms.
+                for room in all_rooms.iter() {
+                    let raw_name = room.name();
+                    let display_name = room.cached_display_name();
+                    let is_dm = room
+                        .is_direct()
+                        .await
+                        .map_err(|err| {
+                            warn!("couldn't figure whether a room is a DM or not: {err}");
+                        })
+                        .ok();
+                    room_infos.lock().unwrap().insert(
+                        room.room_id().to_owned(),
+                        ExtraRoomInfo { raw_name, display_name, is_dm },
+                    );
+                }
+
                 // Initialize all the new rooms.
                 for ui_room in all_rooms
                     .into_iter()
@@ -239,6 +262,7 @@ impl App {
 
                     if let Err(err) = ui_room.init_timeline_with_builder(builder).await {
                         error!("error when creating default timeline: {err}");
+                        continue;
                     }
 
                     // Save the timeline in the cache.
@@ -251,9 +275,12 @@ impl App {
                     let timeline_task = spawn(async move {
                         pin_mut!(stream);
                         let items = i;
-                        while let Some(diff) = stream.next().await {
+                        while let Some(diffs) = stream.next().await {
                             let mut items = items.lock().unwrap();
-                            diff.apply(&mut items);
+
+                            for diff in diffs {
+                                diff.apply(&mut items);
+                            }
                         }
                     });
 
@@ -264,15 +291,6 @@ impl App {
 
                     // Save the room list service room in the cache.
                     new_ui_rooms.insert(ui_room.room_id().to_owned(), ui_room);
-                }
-
-                for (room_id, room) in &new_ui_rooms {
-                    let raw_name = room.name();
-                    let display_name = room.cached_display_name();
-                    room_infos
-                        .lock()
-                        .unwrap()
-                        .insert(room_id.to_owned(), ExtraRoomInfo { raw_name, display_name });
                 }
 
                 ui_rooms.lock().unwrap().extend(new_ui_rooms);
@@ -315,7 +333,7 @@ impl App {
         let message = self.last_status_message.clone();
         self.clear_status_message = Some(spawn(async move {
             // Clear the status message in 4 seconds.
-            tokio::time::sleep(Duration::from_secs(4)).await;
+            sleep(Duration::from_secs(4)).await;
 
             *message.lock().unwrap() = None;
         }));
@@ -345,6 +363,41 @@ impl App {
         }
     }
 
+    async fn toggle_reaction_to_latest_msg(&mut self) {
+        let selected = self.get_selected_room_id(None);
+
+        if let Some((sdk_timeline, items)) = selected.and_then(|room_id| {
+            self.timelines
+                .lock()
+                .unwrap()
+                .get(&room_id)
+                .map(|timeline| (timeline.timeline.clone(), timeline.items.clone()))
+        }) {
+            // Look for the latest (most recent) room message.
+            let item_id = {
+                let items = items.lock().unwrap();
+                items.iter().rev().find_map(|it| {
+                    it.as_event()
+                        .and_then(|ev| ev.content().as_message().is_some().then(|| ev.identifier()))
+                })
+            };
+
+            // If found, send a reaction.
+            if let Some(item_id) = item_id {
+                match sdk_timeline.toggle_reaction(&item_id, "🥰").await {
+                    Ok(_) => {
+                        self.set_status_message("reaction sent!".to_owned());
+                    }
+                    Err(err) => self.set_status_message(format!("error when reacting: {err}")),
+                }
+            } else {
+                self.set_status_message("no item to react to".to_owned());
+            }
+        } else {
+            self.set_status_message("missing timeline for room".to_owned());
+        };
+    }
+
     /// Run a small back-pagination (expect a batch of 20 events, continue until
     /// we get 10 timeline items or hit the timeline start).
     fn back_paginate(&mut self) {
@@ -365,7 +418,7 @@ impl App {
         // Start a new one, request batches of 20 events, stop after 10 timeline items
         // have been added.
         *pagination = Some(spawn(async move {
-            if let Err(err) = sdk_timeline.live_paginate_backwards(20).await {
+            if let Err(err) = sdk_timeline.paginate_backwards(20).await {
                 // TODO: would be nice to be able to set the status
                 // message remotely?
                 //self.set_status_message(format!(
@@ -398,7 +451,7 @@ impl App {
             .get_selected_room_id(Some(selected))
             .and_then(|room_id| self.ui_rooms.lock().unwrap().get(&room_id).cloned())
         {
-            self.sync_service.room_list_service().subscribe_to_rooms(&[room.room_id()], None);
+            self.sync_service.room_list_service().subscribe_to_rooms(&[room.room_id()]);
             self.current_room_subscription = Some(room);
         }
     }
@@ -427,7 +480,7 @@ impl App {
                             }
 
                             Char('s') => self.sync_service.start().await,
-                            Char('S') => self.sync_service.stop().await?,
+                            Char('S') => self.sync_service.stop().await,
 
                             Char('Q') => {
                                 let q = self.client.send_queue();
@@ -469,11 +522,17 @@ impl App {
                                 };
                             }
 
+                            Char('L') => self.toggle_reaction_to_latest_msg().await,
+
                             Char('r') => self.details_mode = DetailsMode::ReadReceipts,
                             Char('t') => self.details_mode = DetailsMode::TimelineItems,
                             Char('e') => self.details_mode = DetailsMode::Events,
+                            Char('l') => self.details_mode = DetailsMode::LinkedChunk,
 
-                            Char('b') if self.details_mode == DetailsMode::TimelineItems => {
+                            Char('b')
+                                if self.details_mode == DetailsMode::TimelineItems
+                                    || self.details_mode == DetailsMode::LinkedChunk =>
+                            {
                                 self.back_paginate();
                             }
 
@@ -506,7 +565,7 @@ impl App {
             }
         });
 
-        self.sync_service.stop().await?;
+        self.sync_service.stop().await;
         self.listen_task.abort();
         for timeline in self.timelines.lock().unwrap().values() {
             timeline.task.abort();
@@ -588,11 +647,13 @@ impl App {
                     let room_id = room.room_id();
                     let room_info = room_info.remove(room_id);
 
-                    let (raw, display) = if let Some(info) = room_info {
-                        (info.raw_name, info.display_name)
+                    let (raw, display, is_dm) = if let Some(info) = room_info {
+                        (info.raw_name, info.display_name, info.is_dm)
                     } else {
-                        (None, None)
+                        (None, None, None)
                     };
+
+                    let dm_marker = if is_dm.unwrap_or(false) { "🤫" } else { "" };
 
                     let room_name = if let Some(n) = display {
                         format!("{n} ({room_id})")
@@ -602,7 +663,7 @@ impl App {
                         room_id.to_string()
                     };
 
-                    format!("#{i} {}", room_name)
+                    format!("#{i}{dm_marker} {}", room_name)
                 };
 
                 let line = Line::styled(line, TEXT_COLOR);
@@ -699,20 +760,43 @@ impl App {
                     }
                 }
 
+                DetailsMode::LinkedChunk => {
+                    // In linked chunk mode, show a rough representation of the chunks.
+                    match self.ui_rooms.lock().unwrap().get(&room_id).cloned() {
+                        Some(room) => {
+                            let lines = tokio::task::block_in_place(|| {
+                                Handle::current().block_on(async {
+                                    let (cache, _drop_guards) = room
+                                        .event_cache()
+                                        .await
+                                        .expect("no event cache for that room");
+                                    cache.debug_string().await
+                                })
+                            });
+                            render_paragraph(buf, lines.join("\n"));
+                        }
+
+                        None => render_paragraph(
+                            buf,
+                            "(room disappeared in the room list service)".to_owned(),
+                        ),
+                    }
+                }
+
                 DetailsMode::Events => match self.ui_rooms.lock().unwrap().get(&room_id).cloned() {
                     Some(room) => {
                         let events = tokio::task::block_in_place(|| {
                             Handle::current().block_on(async {
                                 let (room_event_cache, _drop_handles) =
                                     room.event_cache().await.unwrap();
-                                let (events, _) = room_event_cache.subscribe().await.unwrap();
+                                let (events, _) = room_event_cache.subscribe().await;
                                 events
                             })
                         });
 
                         let rendered_events = events
                             .into_iter()
-                            .map(|sync_timeline_item| sync_timeline_item.event.json().to_string())
+                            .map(|sync_timeline_item| sync_timeline_item.raw().json().to_string())
                             .collect::<Vec<_>>()
                             .join("\n\n");
 
@@ -780,7 +864,7 @@ impl App {
                 }
 
                 TimelineItemKind::Virtual(virt) => match virt {
-                    VirtualTimelineItem::DayDivider(unix_ts) => {
+                    VirtualTimelineItem::DateDivider(unix_ts) => {
                         content.push(format!("Date: {unix_ts:?}"));
                     }
                     VirtualTimelineItem::ReadMarker => {
@@ -831,10 +915,13 @@ impl App {
                     "\nUse j/k to move, s/S to start/stop the sync service, m to mark as read, t to show the timeline, e to show events.".to_owned()
                 }
                 DetailsMode::TimelineItems => {
-                    "\nUse j/k to move, s/S to start/stop the sync service, r to show read receipts, e to show events, Q to enable/disable the send queue, M to send a message.".to_owned()
+                    "\nUse j/k to move, s/S to start/stop the sync service, r to show read receipts, e to show events, Q to enable/disable the send queue, M to send a message, L to like the last message.".to_owned()
                 }
                 DetailsMode::Events => {
                     "\nUse j/k to move, s/S to start/stop the sync service, r to show read receipts, t to show the timeline".to_owned()
+                }
+                DetailsMode::LinkedChunk => {
+                    "\nUse j/k to move, s/S to start/stop the sync service, r to show read receipts, t to show the timeline, e to show events".to_owned()
                 }
             }
         };
@@ -895,17 +982,18 @@ impl<T> StatefulList<T> {
 /// Configure the client so it's ready for sync'ing.
 ///
 /// Will log in or reuse a previous session.
-async fn configure_client(server_name: String, config_path: String) -> anyhow::Result<Client> {
-    let server_name = ServerName::parse(&server_name)?;
+async fn configure_client(server_name: &str, config_path: &str) -> anyhow::Result<Client> {
+    let server_name = ServerName::parse(server_name)?;
 
-    let config_path = PathBuf::from(config_path);
+    let config_path = Path::new(config_path);
     let mut client_builder = Client::builder()
         .store_config(
-            StoreConfig::default()
-                .crypto_store(
-                    SqliteCryptoStore::open(config_path.join("crypto.sqlite"), None).await?,
-                )
-                .state_store(SqliteStateStore::open(config_path.join("state.sqlite"), None).await?),
+            StoreConfig::new("multiverse".to_owned())
+                .crypto_store(SqliteCryptoStore::open(config_path.join("crypto"), None).await?)
+                .state_store(SqliteStateStore::open(config_path.join("state"), None).await?)
+                .event_cache_store(
+                    SqliteEventCacheStore::open(config_path.join("cache"), None).await?,
+                ),
         )
         .server_name(&server_name)
         .with_encryption_settings(EncryptionSettings {

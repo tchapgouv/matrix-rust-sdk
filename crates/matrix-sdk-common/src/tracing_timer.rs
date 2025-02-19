@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Instant;
-
+use ruma::time::Instant;
 use tracing::{callsite::DefaultCallsite, Callsite as _};
 
 /// A named RAII that will show on Drop how long its covered section took to
@@ -105,7 +104,7 @@ macro_rules! timer {
 #[cfg(test)]
 mod tests {
     #[cfg(not(target_arch = "wasm32"))]
-    #[matrix_sdk_test::async_test]
+    #[matrix_sdk_test_macros::async_test]
     async fn test_timer_name() {
         use tracing::{span, Level};
 

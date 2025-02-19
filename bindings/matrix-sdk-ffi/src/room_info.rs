@@ -1,16 +1,20 @@
 use std::collections::HashMap;
 
 use matrix_sdk::RoomState;
+use tracing::warn;
 
 use crate::{
+    client::JoinRule,
+    error::ClientError,
     notification_settings::RoomNotificationMode,
-    room::{Membership, RoomHero},
+    room::{Membership, RoomHero, RoomHistoryVisibility},
     room_member::RoomMember,
 };
 
 #[derive(uniffi::Record)]
 pub struct RoomInfo {
     id: String,
+    creator: Option<String>,
     /// The room's name from the room state event if received from sync, or one
     /// that's been computed otherwise.
     display_name: Option<String>,
@@ -53,12 +57,16 @@ pub struct RoomInfo {
     /// Events causing mentions/highlights for the user, according to their
     /// notification settings.
     num_unread_mentions: u64,
-    /// The currently pinned event ids
+    /// The currently pinned event ids.
     pinned_event_ids: Vec<String>,
+    /// The join rule for this room, if known.
+    join_rule: Option<JoinRule>,
+    /// The history visibility for this room, if known.
+    history_visibility: RoomHistoryVisibility,
 }
 
 impl RoomInfo {
-    pub(crate) async fn new(room: &matrix_sdk::Room) -> matrix_sdk::Result<Self> {
+    pub(crate) async fn new(room: &matrix_sdk::Room) -> Result<Self, ClientError> {
         let unread_notification_counts = room.unread_notification_counts();
 
         let power_levels_map = room.users_with_power_levels().await;
@@ -66,10 +74,17 @@ impl RoomInfo {
         for (id, level) in power_levels_map.iter() {
             user_power_levels.insert(id.to_string(), *level);
         }
-        let pinned_event_ids = room.pinned_event_ids().iter().map(|id| id.to_string()).collect();
+        let pinned_event_ids =
+            room.pinned_event_ids().unwrap_or_default().iter().map(|id| id.to_string()).collect();
+
+        let join_rule = room.join_rule().try_into();
+        if let Err(e) = &join_rule {
+            warn!("Failed to parse join rule: {:?}", e);
+        }
 
         Ok(Self {
             id: room.room_id().to_string(),
+            creator: room.creator().as_ref().map(ToString::to_string),
             display_name: room.cached_display_name().map(|name| name.to_string()),
             raw_name: room.name(),
             topic: room.topic(),
@@ -88,7 +103,10 @@ impl RoomInfo {
                     .await
                     .ok()
                     .and_then(|details| details.inviter)
-                    .map(Into::into),
+                    .map(TryInto::try_into)
+                    .transpose()
+                    .ok()
+                    .flatten(),
                 _ => None,
             },
             heroes: room.heroes().into_iter().map(Into::into).collect(),
@@ -112,6 +130,8 @@ impl RoomInfo {
             num_unread_notifications: room.num_unread_notifications(),
             num_unread_mentions: room.num_unread_mentions(),
             pinned_event_ids,
+            join_rule: join_rule.ok(),
+            history_visibility: room.history_visibility_or_default().try_into()?,
         })
     }
 }

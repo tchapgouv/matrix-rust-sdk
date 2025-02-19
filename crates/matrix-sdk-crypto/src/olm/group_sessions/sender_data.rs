@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, fmt};
 
 use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId};
-use serde::{Deserialize, Serialize};
+use serde::{de, de::Visitor, Deserialize, Deserializer, Serialize};
 use vodozemac::Ed25519PublicKey;
 
-use crate::types::DeviceKeys;
+use crate::types::{serialize_ed25519_key, DeviceKeys};
 
 /// Information about the sender of a megolm session where we know the
 /// cross-signing identity of the sender.
@@ -33,7 +33,71 @@ pub struct KnownSenderData {
     pub device_id: Option<OwnedDeviceId>,
 
     /// The cross-signing key of the user who established this session.
+    #[serde(
+        serialize_with = "serialize_ed25519_key",
+        deserialize_with = "deserialize_sender_msk_base64_or_array"
+    )]
     pub master_key: Box<Ed25519PublicKey>,
+}
+
+/// In an initial version the master key was serialized as an array of number,
+/// it is now exported in base64. This code adds backward compatibility.
+pub(crate) fn deserialize_sender_msk_base64_or_array<'de, D>(
+    de: D,
+) -> Result<Box<Ed25519PublicKey>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct KeyVisitor;
+
+    impl<'de> Visitor<'de> for KeyVisitor {
+        type Value = Box<Ed25519PublicKey>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "a base64 string or an array of 32 bytes")
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let decoded = Ed25519PublicKey::from_base64(v)
+                .map_err(|_| de::Error::custom("Base64 decoding error"))?;
+            Ok(Box::new(decoded))
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut buf = [0u8; Ed25519PublicKey::LENGTH];
+
+            for (i, item) in buf.iter_mut().enumerate() {
+                *item = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(i, &self))?;
+            }
+
+            let key = Ed25519PublicKey::from_slice(&buf).map_err(|e| de::Error::custom(&e))?;
+
+            Ok(Box::new(key))
+        }
+
+        fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if v.len() == Ed25519PublicKey::LENGTH {
+                let mut buf = [0u8; Ed25519PublicKey::LENGTH];
+                buf.copy_from_slice(v);
+
+                let key = Ed25519PublicKey::from_slice(&buf).map_err(|e| de::Error::custom(&e))?;
+                Ok(Box::new(key))
+            } else {
+                Err(de::Error::invalid_length(v.len(), &self))
+            }
+        }
+    }
+
+    de.deserialize_any(KeyVisitor)
 }
 
 /// Information on the device and user that sent the megolm session data to us
@@ -41,7 +105,7 @@ pub struct KnownSenderData {
 /// Sessions start off in `UnknownDevice` state, and progress into `DeviceInfo`
 /// state when we get the device info. Finally, if we can look up the sender
 /// using the device info, the session can be moved into
-/// `SenderUnverifiedButPreviouslyVerified`, `SenderUnverified`, or
+/// `VerificationViolation`, `SenderUnverified`, or
 /// `SenderVerified` state, depending on the verification status of the user.
 /// If the user's verification state changes, the state may change accordingly.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -79,7 +143,7 @@ pub enum SenderData {
     /// the to-device message that established this session, but we have not yet
     /// verified the cross-signing key, and we had verified a previous
     /// cross-signing key for this user.
-    SenderUnverifiedButPreviouslyVerified(KnownSenderData),
+    VerificationViolation(KnownSenderData),
 
     /// We have found proof that this user, with this cross-signing key, sent
     /// the to-device message that established this session, but we have not yet
@@ -95,36 +159,22 @@ pub enum SenderData {
 impl SenderData {
     /// Create a [`SenderData`] which contains no device info.
     pub fn unknown() -> Self {
-        Self::UnknownDevice {
-            // TODO: when we have implemented all of SenderDataFinder,
-            // legacy_session should be set to false, but for now we leave
-            // it as true because we might lose device info while
-            // this code is still in transition.
-            legacy_session: true,
-            owner_check_failed: false,
-        }
+        Self::UnknownDevice { legacy_session: false, owner_check_failed: false }
     }
 
     /// Create a [`SenderData`] which contains device info.
     pub fn device_info(device_keys: DeviceKeys) -> Self {
-        Self::DeviceInfo {
-            device_keys,
-            // TODO: when we have implemented all of SenderDataFinder,
-            // legacy_session should be set to false, but for now we leave
-            // it as true because we might lose device info while
-            // this code is still in transition.
-            legacy_session: true,
-        }
+        Self::DeviceInfo { device_keys, legacy_session: false }
     }
 
     /// Create a [`SenderData`] with a known but unverified sender, where the
     /// sender was previously verified.
-    pub fn sender_previously_verified(
+    pub fn sender_verification_violation(
         user_id: &UserId,
         device_id: &DeviceId,
         master_key: Ed25519PublicKey,
     ) -> Self {
-        Self::SenderUnverifiedButPreviouslyVerified(KnownSenderData {
+        Self::VerificationViolation(KnownSenderData {
             user_id: user_id.to_owned(),
             device_id: Some(device_id.to_owned()),
             master_key: Box::new(master_key),
@@ -186,9 +236,20 @@ impl SenderData {
         match self {
             SenderData::UnknownDevice { .. } => 0,
             SenderData::DeviceInfo { .. } => 1,
-            SenderData::SenderUnverifiedButPreviouslyVerified(..) => 2,
+            SenderData::VerificationViolation(..) => 2,
             SenderData::SenderUnverified(..) => 3,
             SenderData::SenderVerified(..) => 4,
+        }
+    }
+
+    /// Return our type as a [`SenderDataType`].
+    pub fn to_type(&self) -> SenderDataType {
+        match self {
+            Self::UnknownDevice { .. } => SenderDataType::UnknownDevice,
+            Self::DeviceInfo { .. } => SenderDataType::DeviceInfo,
+            Self::VerificationViolation { .. } => SenderDataType::VerificationViolation,
+            Self::SenderUnverified { .. } => SenderDataType::SenderUnverified,
+            Self::SenderVerified { .. } => SenderDataType::SenderVerified,
         }
     }
 }
@@ -196,9 +257,8 @@ impl SenderData {
 /// Used when deserialising and the sender_data property is missing.
 /// If we are deserialising an InboundGroupSession session with missing
 /// sender_data, this must be a legacy session (i.e. it was created before we
-/// started tracking sender data). We set its legacy flag to true, and set it up
-/// to be retried soon, so we can populate it with trust information if it is
-/// available.
+/// started tracking sender data). We set its legacy flag to true, so we can
+/// populate it with trust information if it is available later.
 impl Default for SenderData {
     fn default() -> Self {
         Self::legacy()
@@ -219,7 +279,8 @@ enum SenderDataReader {
         legacy_session: bool,
     },
 
-    SenderUnverifiedButPreviouslyVerified(KnownSenderData),
+    #[serde(alias = "SenderUnverifiedButPreviouslyVerified")]
+    VerificationViolation(KnownSenderData),
 
     SenderUnverified(KnownSenderData),
 
@@ -244,9 +305,7 @@ impl From<SenderDataReader> for SenderData {
             SenderDataReader::DeviceInfo { device_keys, legacy_session } => {
                 Self::DeviceInfo { device_keys, legacy_session }
             }
-            SenderDataReader::SenderUnverifiedButPreviouslyVerified(data) => {
-                Self::SenderUnverifiedButPreviouslyVerified(data)
-            }
+            SenderDataReader::VerificationViolation(data) => Self::VerificationViolation(data),
             SenderDataReader::SenderUnverified(data) => Self::SenderUnverified(data),
             SenderDataReader::SenderVerified(data) => Self::SenderVerified(data),
             SenderDataReader::SenderKnown {
@@ -266,16 +325,40 @@ impl From<SenderDataReader> for SenderData {
     }
 }
 
+/// Used when serializing [`crate::olm::group_sessions::InboundGroupSession`]s.
+/// We want just the type of the session's [`SenderData`] to be queryable, so we
+/// store the type as a separate column/property in the database.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+pub enum SenderDataType {
+    /// The [`SenderData`] is of type `UnknownDevice`.
+    UnknownDevice = 1,
+    /// The [`SenderData`] is of type `DeviceInfo`.
+    DeviceInfo = 2,
+    /// The [`SenderData`] is of type `VerificationViolation`.
+    VerificationViolation = 3,
+    /// The [`SenderData`] is of type `SenderUnverified`.
+    SenderUnverified = 4,
+    /// The [`SenderData`] is of type `SenderVerified`.
+    SenderVerified = 5,
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cmp::Ordering, collections::BTreeMap};
 
     use assert_matches2::assert_let;
-    use ruma::{device_id, owned_device_id, owned_user_id, user_id};
-    use vodozemac::Ed25519PublicKey;
+    use insta::assert_json_snapshot;
+    use ruma::{
+        device_id, owned_device_id, owned_user_id, user_id, DeviceKeyAlgorithm, DeviceKeyId,
+    };
+    use serde_json::json;
+    use vodozemac::{base64_decode, Curve25519PublicKey, Ed25519PublicKey};
 
     use super::SenderData;
-    use crate::types::{DeviceKeys, Signatures};
+    use crate::{
+        olm::{KnownSenderData, PickledInboundGroupSession},
+        types::{DeviceKey, DeviceKeys, EventEncryptionAlgorithm, Signatures},
+    };
 
     #[test]
     fn serializing_unknown_device_correctly_preserves_owner_check_failed_if_true() {
@@ -350,6 +433,47 @@ mod tests {
     }
 
     #[test]
+    fn deserializing_sender_unverified_but_previously_verified_migrates_to_verification_violation()
+    {
+        let json = r#"
+            {
+                "SenderUnverifiedButPreviouslyVerified":{
+                    "user_id":"@u:s.co",
+                    "master_key":[
+                        150,140,249,139,141,29,63,230,179,14,213,175,176,61,11,255,
+                        26,103,10,51,100,154,183,47,181,117,87,204,33,215,241,92
+                    ],
+                    "master_key_verified":true
+                }
+            }
+            "#;
+
+        let end: SenderData = serde_json::from_str(json).expect("Failed to parse!");
+        assert_let!(SenderData::VerificationViolation(KnownSenderData { user_id, .. }) = end);
+        assert_eq!(user_id, owned_user_id!("@u:s.co"));
+    }
+
+    #[test]
+    fn deserializing_verification_violation() {
+        let json = r#"
+            {
+                "VerificationViolation":{
+                    "user_id":"@u:s.co",
+                    "master_key":[
+                        150,140,249,139,141,29,63,230,179,14,213,175,176,61,11,255,
+                        26,103,10,51,100,154,183,47,181,117,87,204,33,215,241,92
+                    ],
+                    "master_key_verified":true
+                }
+            }
+            "#;
+
+        let end: SenderData = serde_json::from_str(json).expect("Failed to parse!");
+        assert_let!(SenderData::VerificationViolation(KnownSenderData { user_id, .. }) = end);
+        assert_eq!(user_id, owned_user_id!("@u:s.co"));
+    }
+
+    #[test]
     fn equal_sessions_have_same_trust_level() {
         let unknown = SenderData::unknown();
         let device_keys = SenderData::device_info(DeviceKeys::new(
@@ -384,7 +508,7 @@ mod tests {
         ));
         let master_key =
             Ed25519PublicKey::from_base64("2/5LWJMow5zhJqakV88SIc7q/1pa8fmkfgAzx72w9G4").unwrap();
-        let sender_previously_verified = SenderData::sender_previously_verified(
+        let sender_verification_violation = SenderData::sender_verification_violation(
             user_id!("@u:s.co"),
             device_id!("DEV"),
             master_key,
@@ -395,29 +519,133 @@ mod tests {
             SenderData::sender_verified(user_id!("@u:s.co"), device_id!("DEV"), master_key);
 
         assert_eq!(unknown.compare_trust_level(&device_keys), Ordering::Less);
-        assert_eq!(unknown.compare_trust_level(&sender_previously_verified), Ordering::Less);
+        assert_eq!(unknown.compare_trust_level(&sender_verification_violation), Ordering::Less);
         assert_eq!(unknown.compare_trust_level(&sender_unverified), Ordering::Less);
         assert_eq!(unknown.compare_trust_level(&sender_verified), Ordering::Less);
         assert_eq!(device_keys.compare_trust_level(&unknown), Ordering::Greater);
-        assert_eq!(sender_previously_verified.compare_trust_level(&unknown), Ordering::Greater);
+        assert_eq!(sender_verification_violation.compare_trust_level(&unknown), Ordering::Greater);
         assert_eq!(sender_unverified.compare_trust_level(&unknown), Ordering::Greater);
         assert_eq!(sender_verified.compare_trust_level(&unknown), Ordering::Greater);
 
         assert_eq!(device_keys.compare_trust_level(&sender_unverified), Ordering::Less);
         assert_eq!(device_keys.compare_trust_level(&sender_verified), Ordering::Less);
-        assert_eq!(sender_previously_verified.compare_trust_level(&device_keys), Ordering::Greater);
+        assert_eq!(
+            sender_verification_violation.compare_trust_level(&device_keys),
+            Ordering::Greater
+        );
         assert_eq!(sender_unverified.compare_trust_level(&device_keys), Ordering::Greater);
         assert_eq!(sender_verified.compare_trust_level(&device_keys), Ordering::Greater);
 
         assert_eq!(
-            sender_previously_verified.compare_trust_level(&sender_verified),
+            sender_verification_violation.compare_trust_level(&sender_verified),
             Ordering::Less
         );
         assert_eq!(
-            sender_previously_verified.compare_trust_level(&sender_unverified),
+            sender_verification_violation.compare_trust_level(&sender_unverified),
             Ordering::Less
         );
         assert_eq!(sender_unverified.compare_trust_level(&sender_verified), Ordering::Less);
         assert_eq!(sender_verified.compare_trust_level(&sender_unverified), Ordering::Greater);
+    }
+
+    #[test]
+    fn snapshot_sender_data() {
+        assert_json_snapshot!(SenderData::UnknownDevice {
+            legacy_session: false,
+            owner_check_failed: true,
+        });
+
+        assert_json_snapshot!(SenderData::UnknownDevice {
+            legacy_session: true,
+            owner_check_failed: false,
+        });
+
+        assert_json_snapshot!(SenderData::DeviceInfo {
+            device_keys: DeviceKeys::new(
+                owned_user_id!("@foo:bar.baz"),
+                owned_device_id!("DEV"),
+                vec![
+                    EventEncryptionAlgorithm::MegolmV1AesSha2,
+                    EventEncryptionAlgorithm::OlmV1Curve25519AesSha2
+                ],
+                BTreeMap::from_iter(vec![(
+                    DeviceKeyId::from_parts(DeviceKeyAlgorithm::Ed25519, device_id!("ABCDEFGH")),
+                    DeviceKey::Curve25519(Curve25519PublicKey::from_bytes([0u8; 32])),
+                )]),
+                Default::default(),
+            ),
+            legacy_session: false,
+        });
+
+        assert_json_snapshot!(SenderData::VerificationViolation(KnownSenderData {
+            user_id: owned_user_id!("@foo:bar.baz"),
+            device_id: Some(owned_device_id!("DEV")),
+            master_key: Box::new(Ed25519PublicKey::from_slice(&[0u8; 32]).unwrap()),
+        }));
+
+        assert_json_snapshot!(SenderData::SenderUnverified(KnownSenderData {
+            user_id: owned_user_id!("@foo:bar.baz"),
+            device_id: None,
+            master_key: Box::new(Ed25519PublicKey::from_slice(&[1u8; 32]).unwrap()),
+        }));
+
+        assert_json_snapshot!(SenderData::SenderVerified(KnownSenderData {
+            user_id: owned_user_id!("@foo:bar.baz"),
+            device_id: None,
+            master_key: Box::new(Ed25519PublicKey::from_slice(&[1u8; 32]).unwrap()),
+        }));
+    }
+
+    #[test]
+    fn test_sender_known_data_migration() {
+        let old_format = json!(
+        {
+            "SenderVerified": {
+                "user_id": "@foo:bar.baz",
+                "device_id": null,
+                "master_key": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+            }
+        });
+
+        let migrated: SenderData = serde_json::from_value(old_format).unwrap();
+
+        assert_let!(SenderData::SenderVerified(KnownSenderData { master_key, .. }) = migrated);
+
+        assert_eq!(
+            master_key.to_base64(),
+            Ed25519PublicKey::from_slice(&[0u8; 32]).unwrap().to_base64()
+        );
+    }
+
+    #[test]
+    fn test_sender_known_data_migration_with_efficient_bytes_array() {
+        // This is an serialized PickledInboundGroupSession as rmp_serde will generate.
+        //
+        // This export usse a more efficient serialization format for bytes. This was
+        // exported when the `KnownSenderData` master_key was serialized as an byte
+        // array instead of a base64 encoded string.
+        const SERIALIZED_B64: &str =
+            "iaZwaWNrbGWEr2luaXRpYWxfcmF0Y2hldIKlaW5uZXLcAIABYMzfSnBRzMlPKF1uKjYbzLtkzNJ4RcylzN0HzP\
+             9DzON1Tm05zO7M2MzFQsy9Acz9zPnMqDvM4syQzNrMzxF5KzbM4sy9zPUbBWfM7m4/zJzM18zDzMESKgfMkE7M\
+             yszIHszqWjYyQURbzKTMkx7M58zANsy+AGPM2A8tbcyFYczge8ykzMFdbVxJMMyAzN8azJEXGsy8zPJazMMaP8\
+             ziDszmWwfM+My2ajLMr8y+eczTRm9TFadjb3VudGVyAKtzaWduaW5nX2tlecQgefpCr6Duu7QUWzKIeMOFmxv/\
+             NjfcsYwZz8IN2ZOhdaS0c2lnbmluZ19rZXlfdmVyaWZpZWTDpmNvbmZpZ4GndmVyc2lvbqJWMapzZW5kZXJfa2\
+             V52StoMkIySDg2ajFpYmk2SW13ak9UUkhzbTVMamtyT2kyUGtiSXVUb0w0TWtFq3NpZ25pbmdfa2V5gadlZDI1\
+             NTE52StUWHJqNS9UYXpia3Yram1CZDl4UlB4NWNVaFFzNUNnblc1Q1pNRjgvNjZzq3NlbmRlcl9kYXRhgbBTZW\
+             5kZXJVbnZlcmlmaWVkg6d1c2VyX2lks0B2YWxvdTM1Om1hdHJpeC5vcmepZGV2aWNlX2lkqkZJQlNaRlJLUE2q\
+             bWFzdGVyX2tlecQgkOp9s4ClyQujYD7rRZA8xgE6kvYlqKSNnMrQNmSrcuGncm9vbV9pZL4hRWt5VEtGdkViYl\
+             B6SmxhaUhFOm1hdHJpeC5vcmeoaW1wb3J0ZWTCqWJhY2tlZF91cMKyaGlzdG9yeV92aXNpYmlsaXR5wKlhbGdv\
+             cml0aG20bS5tZWdvbG0udjEuYWVzLXNoYTI";
+
+        let input = base64_decode(SERIALIZED_B64).unwrap();
+        let sender_data: PickledInboundGroupSession = rmp_serde::from_slice(&input)
+            .expect("Should be able to deserialize serialized inbound group session");
+
+        assert_let!(
+            SenderData::SenderUnverified(KnownSenderData { master_key, .. }) =
+                sender_data.sender_data
+        );
+
+        assert_eq!(master_key.to_base64(), "kOp9s4ClyQujYD7rRZA8xgE6kvYlqKSNnMrQNmSrcuE");
     }
 }

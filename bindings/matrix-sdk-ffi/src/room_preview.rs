@@ -1,9 +1,114 @@
-use matrix_sdk::{room_preview::RoomPreview as SdkRoomPreview, RoomState};
-use ruma::space::SpaceRoomJoinRule;
+use anyhow::Context as _;
+use matrix_sdk::{room_preview::RoomPreview as SdkRoomPreview, Client};
+use ruma::{room::RoomType as RumaRoomType, space::SpaceRoomJoinRule};
+use tracing::warn;
+
+use crate::{
+    client::JoinRule,
+    error::ClientError,
+    room::{Membership, RoomHero},
+    room_member::RoomMember,
+    utils::AsyncRuntimeDropped,
+};
+
+/// A room preview for a room. It's intended to be used to represent rooms that
+/// aren't joined yet.
+#[derive(uniffi::Object)]
+pub struct RoomPreview {
+    inner: SdkRoomPreview,
+    client: AsyncRuntimeDropped<Client>,
+}
+
+#[matrix_sdk_ffi_macros::export]
+impl RoomPreview {
+    /// Returns the room info the preview contains.
+    pub fn info(&self) -> Result<RoomPreviewInfo, ClientError> {
+        let info = &self.inner;
+        Ok(RoomPreviewInfo {
+            room_id: info.room_id.to_string(),
+            canonical_alias: info.canonical_alias.as_ref().map(|alias| alias.to_string()),
+            name: info.name.clone(),
+            topic: info.topic.clone(),
+            avatar_url: info.avatar_url.as_ref().map(|url| url.to_string()),
+            num_joined_members: info.num_joined_members,
+            num_active_members: info.num_active_members,
+            room_type: info.room_type.as_ref().into(),
+            is_history_world_readable: info.is_world_readable,
+            membership: info.state.map(|state| state.into()),
+            join_rule: info
+                .join_rule
+                .clone()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("unhandled SpaceRoomJoinRule kind"))?,
+            is_direct: info.is_direct,
+            heroes: info
+                .heroes
+                .as_ref()
+                .map(|heroes| heroes.iter().map(|h| h.to_owned().into()).collect()),
+        })
+    }
+
+    /// Leave the room if the room preview state is either joined, invited or
+    /// knocked.
+    ///
+    /// Will return an error otherwise.
+    pub async fn leave(&self) -> Result<(), ClientError> {
+        let room =
+            self.client.get_room(&self.inner.room_id).context("missing room for a room preview")?;
+        room.leave().await.map_err(Into::into)
+    }
+
+    /// Get the user who created the invite, if any.
+    pub async fn inviter(&self) -> Option<RoomMember> {
+        let room = self.client.get_room(&self.inner.room_id)?;
+        let invite_details = room.invite_details().await.ok()?;
+        invite_details.inviter.and_then(|m| m.try_into().ok())
+    }
+
+    /// Forget the room if we had access to it, and it was left or banned.
+    pub async fn forget(&self) -> Result<(), ClientError> {
+        let room =
+            self.client.get_room(&self.inner.room_id).context("missing room for a room preview")?;
+        room.forget().await?;
+        Ok(())
+    }
+
+    /// Get the membership details for the current user.
+    pub async fn own_membership_details(&self) -> Option<RoomMembershipDetails> {
+        let room = self.client.get_room(&self.inner.room_id)?;
+
+        let (own_member, sender_member) = match room.own_membership_details().await {
+            Ok(memberships) => memberships,
+            Err(error) => {
+                warn!("Couldn't get membership info: {error}");
+                return None;
+            }
+        };
+
+        Some(RoomMembershipDetails {
+            own_room_member: own_member.try_into().ok()?,
+            sender_room_member: sender_member.and_then(|member| member.try_into().ok()),
+        })
+    }
+}
+
+/// Contains the current user's room member info and the optional room member
+/// info of the sender of the `m.room.member` event that this info represents.
+#[derive(uniffi::Record)]
+pub struct RoomMembershipDetails {
+    pub own_room_member: RoomMember,
+    pub sender_room_member: Option<RoomMember>,
+}
+
+impl RoomPreview {
+    pub(crate) fn new(client: AsyncRuntimeDropped<Client>, inner: SdkRoomPreview) -> Self {
+        Self { client, inner }
+    }
+}
 
 /// The preview of a room, be it invited/joined/left, or not.
 #[derive(uniffi::Record)]
-pub struct RoomPreview {
+pub struct RoomPreviewInfo {
     /// The room id for this room.
     pub room_id: String,
     /// The canonical alias for the room.
@@ -16,38 +121,62 @@ pub struct RoomPreview {
     pub avatar_url: Option<String>,
     /// The number of joined members.
     pub num_joined_members: u64,
+    /// The number of active members, if known (joined + invited).
+    pub num_active_members: Option<u64>,
     /// The room type (space, custom) or nothing, if it's a regular room.
-    pub room_type: Option<String>,
+    pub room_type: RoomType,
     /// Is the history world-readable for this room?
-    pub is_history_world_readable: bool,
-    /// Is the room joined by the current user?
-    pub is_joined: bool,
-    /// Is the current user invited to this room?
-    pub is_invited: bool,
-    /// is the join rule public for this room?
-    pub is_public: bool,
-    /// Can we knock (or restricted-knock) to this room?
-    pub can_knock: bool,
+    pub is_history_world_readable: Option<bool>,
+    /// The membership state for the current user, if known.
+    pub membership: Option<Membership>,
+    /// The join rule for this room (private, public, knock, etc.).
+    pub join_rule: JoinRule,
+    /// Whether the room is direct or not, if known.
+    pub is_direct: Option<bool>,
+    /// Room heroes.
+    pub heroes: Option<Vec<RoomHero>>,
 }
 
-impl RoomPreview {
-    pub(crate) fn from_sdk(preview: SdkRoomPreview) -> Self {
-        Self {
-            room_id: preview.room_id.to_string(),
-            canonical_alias: preview.canonical_alias.map(|alias| alias.to_string()),
-            name: preview.name,
-            topic: preview.topic,
-            avatar_url: preview.avatar_url.map(|url| url.to_string()),
-            num_joined_members: preview.num_joined_members,
-            room_type: preview.room_type.map(|room_type| room_type.to_string()),
-            is_history_world_readable: preview.is_world_readable,
-            is_joined: preview.state.map_or(false, |state| state == RoomState::Joined),
-            is_invited: preview.state.map_or(false, |state| state == RoomState::Invited),
-            is_public: preview.join_rule == SpaceRoomJoinRule::Public,
-            can_knock: matches!(
-                preview.join_rule,
-                SpaceRoomJoinRule::KnockRestricted | SpaceRoomJoinRule::Knock
-            ),
+impl TryFrom<SpaceRoomJoinRule> for JoinRule {
+    type Error = ();
+
+    fn try_from(join_rule: SpaceRoomJoinRule) -> Result<Self, ()> {
+        Ok(match join_rule {
+            SpaceRoomJoinRule::Invite => JoinRule::Invite,
+            SpaceRoomJoinRule::Knock => JoinRule::Knock,
+            SpaceRoomJoinRule::Private => JoinRule::Private,
+            SpaceRoomJoinRule::Restricted => JoinRule::Restricted { rules: Vec::new() },
+            SpaceRoomJoinRule::KnockRestricted => JoinRule::KnockRestricted { rules: Vec::new() },
+            SpaceRoomJoinRule::Public => JoinRule::Public,
+            SpaceRoomJoinRule::_Custom(_) => JoinRule::Custom { repr: join_rule.to_string() },
+            _ => {
+                warn!("unhandled SpaceRoomJoinRule: {join_rule}");
+                return Err(());
+            }
+        })
+    }
+}
+
+/// The type of room for a [`RoomPreviewInfo`].
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum RoomType {
+    /// It's a plain chat room.
+    Room,
+    /// It's a space that can group several rooms.
+    Space,
+    /// It's a custom implementation.
+    Custom { value: String },
+}
+
+impl From<Option<&RumaRoomType>> for RoomType {
+    fn from(value: Option<&RumaRoomType>) -> Self {
+        match value {
+            Some(RumaRoomType::Space) => RoomType::Space,
+            Some(RumaRoomType::_Custom(_)) => RoomType::Custom {
+                // SAFETY: this was checked in the match branch above
+                value: value.unwrap().to_string(),
+            },
+            _ => RoomType::Room,
         }
     }
 }

@@ -4,7 +4,10 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use matrix_sdk_common::store_locks::CrossProcessStoreLock;
 use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{
+    broadcast::{self},
+    Mutex,
+};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{debug, trace, warn};
 
@@ -102,7 +105,7 @@ impl CryptoStoreWrapper {
             .await?
             .as_ref()
             .and_then(|i| i.own())
-            .map_or(false, |own| own.is_verified());
+            .is_some_and(|own| own.is_verified());
 
         let secrets = changes.secrets.to_owned();
         let devices = changes.devices.to_owned();
@@ -125,6 +128,26 @@ impl CryptoStoreWrapper {
         }
 
         self.store.save_changes(changes).await?;
+
+        // If we updated our own public identity, log it for debugging purposes
+        if tracing::level_enabled!(tracing::Level::DEBUG) {
+            for updated_identity in
+                identities.new.iter().chain(identities.changed.iter()).filter_map(|id| id.own())
+            {
+                let master_key = updated_identity.master_key().get_first_key();
+                let user_signing_key = updated_identity.user_signing_key().get_first_key();
+                let self_signing_key = updated_identity.self_signing_key().get_first_key();
+
+                debug!(
+                    ?master_key,
+                    ?user_signing_key,
+                    ?self_signing_key,
+                    previously_verified = updated_identity.was_previously_verified(),
+                    verified = updated_identity.is_verified(),
+                    "Stored our own identity"
+                );
+            }
+        }
 
         if !room_key_updates.is_empty() {
             // Ignore the result. It can only fail if there are no listeners.
@@ -152,7 +175,9 @@ impl CryptoStoreWrapper {
             if let Some(own_identity_after) = maybe_own_identity.as_ref() {
                 // Only do this if our identity is passing from not verified to verified,
                 // the previously_verified can only change in that case.
-                if !own_identity_was_verified_before_change && own_identity_after.is_verified() {
+                let own_identity_is_verified = own_identity_after.is_verified();
+
+                if !own_identity_was_verified_before_change && own_identity_is_verified {
                     debug!("Own identity is now verified, check all known identities for verification status changes");
                     // We need to review all the other identities to see if they are verified now
                     // and mark them as such
@@ -160,6 +185,12 @@ impl CryptoStoreWrapper {
                         own_identity_after,
                     )
                     .await?;
+                } else if own_identity_was_verified_before_change != own_identity_is_verified {
+                    // Log that the verification state of the identity changed.
+                    debug!(
+                        own_identity_is_verified,
+                        "The verification state of our own identity has changed",
+                    );
                 }
             }
 
@@ -272,11 +303,12 @@ impl CryptoStoreWrapper {
     /// the stream. Updates that happen at the same time are batched into a
     /// [`Vec`].
     ///
-    /// If the reader of the stream lags too far behind, a warning will be
-    /// logged and items will be dropped.
-    pub fn room_keys_received_stream(&self) -> impl Stream<Item = Vec<RoomKeyInfo>> {
-        let stream = BroadcastStream::new(self.room_keys_received_sender.subscribe());
-        Self::filter_errors_out_of_stream(stream, "room_keys_received_stream")
+    /// If the reader of the stream lags too far behind an error will be sent to
+    /// the reader.
+    pub fn room_keys_received_stream(
+        &self,
+    ) -> impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>> {
+        BroadcastStream::new(self.room_keys_received_sender.subscribe())
     }
 
     /// Receive notifications of received `m.room_key.withheld` messages.

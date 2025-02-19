@@ -5,10 +5,11 @@ use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use assign::assign;
 use matrix_sdk::{
+    assert_next_eq_with_timeout,
     crypto::{format_emojis, SasState},
     encryption::{
         backups::BackupState,
-        recovery::RecoveryState,
+        recovery::{Recovery, RecoveryState},
         verification::{
             QrVerificationData, QrVerificationState, Verification, VerificationRequestState,
         },
@@ -22,13 +23,14 @@ use matrix_sdk::{
                 MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
                 SyncRoomMessageEvent,
             },
-            OriginalSyncMessageLikeEvent,
+            secret_storage::secret::SecretEventContent,
+            GlobalAccountDataEventType, OriginalSyncMessageLikeEvent,
         },
     },
     Client,
 };
 use similar_asserts::assert_eq;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::helpers::{SyncTokenAwareClient, TestClientBuilder};
 
@@ -70,6 +72,7 @@ async fn test_mutual_sas_verification() -> Result<()> {
     bob.get_room(room_id).unwrap().join().await?;
 
     alice.sync_once().await?;
+    bob.sync_once().await?;
 
     warn!("alice and bob are both aware of each other in the e2ee room");
 
@@ -331,6 +334,7 @@ async fn test_mutual_qrcode_verification() -> Result<()> {
     bob.get_room(room_id).unwrap().join().await?;
 
     alice.sync_once().await?;
+    bob.sync_once().await?;
 
     warn!("alice and bob are both aware of each other in the e2ee room");
 
@@ -670,11 +674,14 @@ async fn test_failed_members_response() -> Result<()> {
 
     bob.sync_once().await?;
 
-    // Cause a failure of a sync_members request by asking for members before
-    // joining. Since this is a private DM room, it will fail with a 401, as
-    // we're not authorized to look at state history.
+    // Although we haven't joined the room yet, logic in `sync_members` looks at the
+    // room's visibility first; since it may be unknown for this room, from the
+    // point of view of Bob, it'll be assumed to be the default, aka shared. As
+    // a result, `sync_members()` doesn't even spawn a network request, and
+    // silently ignores the request.
+
     let result = bob.get_room(alice_room.room_id()).unwrap().sync_members().await;
-    assert!(result.is_err());
+    assert!(result.is_ok());
 
     bob.get_room(alice_room.room_id()).unwrap().join().await?;
 
@@ -841,6 +848,9 @@ async fn test_secret_gossip_after_interactive_verification() -> Result<()> {
     // The first client is not verified from the point of view of the second client.
     assert!(!seconds_first_device.is_verified());
 
+    // Make the first client aware of the device we're requesting verification for
+    first_client.sync_once().await?;
+
     // Let's send out a request to verify with each other.
     let seconds_verification_request = seconds_first_device.request_verification().await?;
     let flow_id = seconds_verification_request.flow_id();
@@ -950,11 +960,11 @@ async fn test_secret_gossip_after_interactive_verification() -> Result<()> {
 
     let timeline_event = room.event(&event_id, None).await?;
     timeline_event
-        .encryption_info
+        .encryption_info()
         .expect("The event should have been encrypted and successfully decrypted.");
 
     let event: OriginalSyncMessageLikeEvent<RoomMessageEventContent> =
-        timeline_event.event.deserialize_as()?;
+        timeline_event.raw().deserialize_as()?;
     let message = event.content.msgtype;
 
     assert_let!(MessageType::Text(message) = message);
@@ -963,6 +973,83 @@ async fn test_secret_gossip_after_interactive_verification() -> Result<()> {
         message.body, "It's a secret to everybody",
         "The decrypted message should match the text we encrypted."
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_recovery_disabling_deletes_secret_storage_secrets() -> Result<()> {
+    let encryption_settings = EncryptionSettings {
+        auto_enable_cross_signing: true,
+        auto_enable_backups: true,
+        ..Default::default()
+    };
+    let client = SyncTokenAwareClient::new(
+        TestClientBuilder::new("alice_recovery_deletion_test")
+            .encryption_settings(encryption_settings)
+            .build()
+            .await?,
+    );
+
+    debug!("Enabling recovery");
+
+    client.encryption().wait_for_e2ee_initialization_tasks().await;
+    client.encryption().recovery().enable().await?;
+
+    // Let's wait for recovery to become enabled.
+    let mut recovery_state = client.encryption().recovery().state_stream();
+
+    debug!("Checking that recovery has been enabled");
+
+    assert_next_eq_with_timeout!(
+        recovery_state,
+        RecoveryState::Enabled,
+        "Recovery should have been enabled"
+    );
+
+    debug!("Checking that the secrets have been stored on the server");
+
+    for event_type in Recovery::KNOWN_SECRETS {
+        let event_type = GlobalAccountDataEventType::from(event_type.clone());
+        let event = client
+            .account()
+            .fetch_account_data(event_type.clone())
+            .await?
+            .expect("The secret event should still exist");
+
+        let event = event
+            .deserialize_as::<SecretEventContent>()
+            .expect("We should be able to deserialize the content of known secrets");
+
+        assert!(
+            !event.encrypted.is_empty(),
+            "The known secret {event_type} should exist on the server"
+        );
+    }
+
+    debug!("Disabling recovery");
+
+    client.encryption().recovery().disable().await?;
+
+    debug!("Checking that the secrets have been removed from the server");
+
+    for event_type in Recovery::KNOWN_SECRETS {
+        let event_type = GlobalAccountDataEventType::from(event_type.clone());
+        let event = client
+            .account()
+            .fetch_account_data(event_type.clone())
+            .await?
+            .expect("The secret event should still exist");
+
+        let event = event
+            .deserialize_as::<SecretEventContent>()
+            .expect("We should be able to deserialize the content since that's what we uploaded");
+
+        assert!(
+            event.encrypted.is_empty(),
+            "The known secret {event_type} should have been deleted from the server"
+        );
+    }
 
     Ok(())
 }

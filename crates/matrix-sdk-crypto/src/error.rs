@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 
+use matrix_sdk_common::deserialized_responses::{VerificationLevel, WithheldCode};
 use ruma::{CanonicalJsonError, IdParseError, OwnedDeviceId, OwnedRoomId, OwnedUserId};
 use serde::{ser::SerializeMap, Serializer};
 use serde_json::Error as SerdeError;
@@ -21,12 +22,9 @@ use thiserror::Error;
 use vodozemac::{Curve25519PublicKey, Ed25519PublicKey};
 
 use super::store::CryptoStoreError;
-use crate::{
-    olm::SessionExportError,
-    types::{events::room_key_withheld::WithheldCode, SignedKey},
-};
+use crate::{olm::SessionExportError, types::SignedKey};
 #[cfg(doc)]
-use crate::{CollectStrategy, Device, LocalTrust, UserIdentity};
+use crate::{CollectStrategy, Device, LocalTrust, OtherUserIdentity};
 
 pub type OlmResult<T> = Result<T, OlmError>;
 pub type MegolmResult<T> = Result<T, MegolmError>;
@@ -115,6 +113,14 @@ pub enum MegolmError {
     /// The storage layer returned an error.
     #[error(transparent)]
     Store(#[from] CryptoStoreError),
+
+    /// An encrypted message wasn't decrypted, because the sender's
+    /// cross-signing identity did not satisfy the requested
+    /// [`crate::TrustRequirement`].
+    ///
+    /// The nested value is the sender's current verification level.
+    #[error("decryption failed because trust requirement not satisfied: {0}")]
+    SenderIdentityNotTrusted(VerificationLevel),
 }
 
 /// Decryption failed because of a mismatch between the identity keys of the
@@ -296,13 +302,6 @@ pub enum SessionCreationError {
     )]
     OneTimeKeyMissing(OwnedUserId, OwnedDeviceId),
 
-    /// The one-time key algorithm is unsupported.
-    #[error(
-        "Tried to create a new Olm session for {0} {1}, but the one-time \
-        key algorithm is unsupported"
-    )]
-    OneTimeKeyUnknown(OwnedUserId, OwnedDeviceId),
-
     /// Failed to verify the one-time key signatures.
     #[error(
         "Failed to verify the signature of a one-time key, key: {one_time_key:?}, \
@@ -375,9 +374,7 @@ pub enum SetRoomSettingsError {
 pub enum SessionRecipientCollectionError {
     /// One or more verified users has one or more unsigned devices.
     ///
-    /// Happens only with [`CollectStrategy::DeviceBasedStrategy`] when
-    /// [`error_on_verified_user_problem`](`CollectStrategy::DeviceBasedStrategy::error_on_verified_user_problem`)
-    /// is true.
+    /// Happens only with [`CollectStrategy::ErrorOnVerifiedUserProblem`].
     ///
     /// In order to resolve this, the caller can set the trust level of the
     /// affected devices to [`LocalTrust::Ignored`] or
@@ -389,16 +386,15 @@ pub enum SessionRecipientCollectionError {
     /// One or more users was previously verified, but they have changed their
     /// identity.
     ///
-    /// Happens only with [`CollectStrategy::DeviceBasedStrategy`] when
-    /// [`error_on_verified_user_problem`](`CollectStrategy::DeviceBasedStrategy::error_on_verified_user_problem`)
-    /// is true.
+    /// Happens only with [`CollectStrategy::ErrorOnVerifiedUserProblem`] or
+    /// [`CollectStrategy::IdentityBasedStrategy`].
     ///
     /// In order to resolve this, the user can:
     ///
     /// * re-verify the problematic recipients, or
     ///
     /// * withdraw verification of the problematic recipients with
-    ///   [`UserIdentity::withdraw_verification`], or
+    ///   [`OtherUserIdentity::withdraw_verification`], or
     ///
     /// * set the trust level of all of the devices belonging to the problematic
     ///   recipients to [`LocalTrust::Ignored`] or [`LocalTrust::BlackListed`]
@@ -407,4 +403,24 @@ pub enum SessionRecipientCollectionError {
     /// The caller can then retry the encryption operation.
     #[error("one or more users that were verified have changed their identity")]
     VerifiedUserChangedIdentity(Vec<OwnedUserId>),
+
+    /// Cross-signing has not been configured on our own identity.
+    ///
+    /// Happens only with [`CollectStrategy::IdentityBasedStrategy`].
+    /// (Cross-signing is required for encryption when using
+    /// `IdentityBasedStrategy`.) Apps should detect this condition and prevent
+    /// sending in the UI rather than waiting for this error to be returned when
+    /// encrypting.
+    #[error("Encryption failed because cross-signing is not set up on your account")]
+    CrossSigningNotSetup,
+
+    /// The current device has not been cross-signed by our own identity.
+    ///
+    /// Happens only with [`CollectStrategy::IdentityBasedStrategy`].
+    /// (Cross-signing is required for encryption when using
+    /// `IdentityBasedStrategy`.) Apps should detect this condition and prevent
+    /// sending in the UI rather than waiting for this error to be returned when
+    /// encrypting.
+    #[error("Encryption failed because your device is not verified")]
+    SendingFromUnverifiedDevice,
 }

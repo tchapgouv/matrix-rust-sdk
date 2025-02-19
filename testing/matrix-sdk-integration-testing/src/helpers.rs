@@ -20,7 +20,6 @@ use matrix_sdk::{
 };
 use once_cell::sync::Lazy;
 use rand::Rng as _;
-use reqwest::Url;
 use tempfile::{tempdir, TempDir};
 use tokio::{sync::Mutex, time::sleep};
 
@@ -38,6 +37,7 @@ pub struct TestClientBuilder {
     use_sqlite_dir: Option<SqlitePath>,
     encryption_settings: EncryptionSettings,
     http_proxy: Option<String>,
+    cross_process_store_locks_holder_name: Option<String>,
 }
 
 impl TestClientBuilder {
@@ -53,6 +53,7 @@ impl TestClientBuilder {
             use_sqlite_dir: None,
             encryption_settings: Default::default(),
             http_proxy: None,
+            cross_process_store_locks_holder_name: None,
         }
     }
 
@@ -75,23 +76,31 @@ impl TestClientBuilder {
         self
     }
 
+    pub fn http_proxy(mut self, url: String) -> Self {
+        self.http_proxy = Some(url);
+        self
+    }
+
+    pub fn cross_process_store_locks_holder_name(mut self, holder_name: String) -> Self {
+        self.cross_process_store_locks_holder_name = Some(holder_name);
+        self
+    }
+
     fn common_client_builder(&self) -> ClientBuilder {
         let homeserver_url =
             option_env!("HOMESERVER_URL").unwrap_or("http://localhost:8228").to_owned();
-        let sliding_sync_proxy_url =
-            option_env!("SLIDING_SYNC_PROXY_URL").unwrap_or("http://localhost:8338").to_owned();
 
         let mut client_builder = Client::builder()
             .user_agent("matrix-sdk-integration-tests")
             .homeserver_url(homeserver_url)
-            // Disable Simplified MSC3575 for the integration tests as, at the time of writing
-            // (2024-07-15), we use a Synapse version that doesn't support Simplified MSC3575.
-            .sliding_sync_version_builder(VersionBuilder::Proxy {
-                url: Url::parse(&sliding_sync_proxy_url)
-                    .expect("Sliding sync proxy URL is invalid"),
-            })
+            .sliding_sync_version_builder(VersionBuilder::Native)
             .with_encryption_settings(self.encryption_settings)
             .request_config(RequestConfig::short_retry());
+
+        if let Some(holder_name) = &self.cross_process_store_locks_holder_name {
+            client_builder =
+                client_builder.cross_process_store_locks_holder_name(holder_name.clone());
+        }
 
         if let Some(proxy) = &self.http_proxy {
             client_builder = client_builder.proxy(proxy);

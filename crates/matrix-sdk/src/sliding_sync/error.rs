@@ -1,7 +1,7 @@
 //! Sliding Sync errors.
 
+use matrix_sdk_common::executor::JoinError;
 use thiserror::Error;
-use tokio::task::JoinError;
 
 /// Internal representation of errors in Sliding Sync.
 #[derive(Error, Debug)]
@@ -53,4 +53,14 @@ pub enum Error {
         /// The original `JoinError`.
         error: JoinError,
     },
+
+    /// No Olm machine.
+    #[cfg(feature = "e2e-encryption")]
+    #[error("The Olm machine is missing")]
+    NoOlmMachine,
+
+    /// An error occurred during a E2EE operation.
+    #[cfg(feature = "e2e-encryption")]
+    #[error(transparent)]
+    CryptoStoreError(#[from] matrix_sdk_base::crypto::CryptoStoreError),
 }

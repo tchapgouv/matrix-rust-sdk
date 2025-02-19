@@ -17,20 +17,30 @@
 
 use std::collections::BTreeMap;
 
+use as_variant::as_variant;
 use matrix_sdk_test::{ruma_response_from_json, test_json};
 use ruma::{
-    api::client::keys::{claim_keys, get_keys, upload_keys},
+    api::client::keys::{
+        claim_keys,
+        get_keys::{self, v3::Response as KeysQueryResponse},
+        upload_keys,
+    },
     device_id,
     encryption::OneTimeKey,
     events::dummy::ToDeviceDummyEventContent,
     serde::Raw,
-    user_id, DeviceId, OwnedDeviceKeyId, TransactionId, UserId,
+    user_id, DeviceId, OwnedOneTimeKeyId, TransactionId, UserId,
+};
+use serde_json::json;
+
+use crate::{
+    store::{Changes, MemoryStore},
+    types::{events::ToDeviceEvent, requests::AnyOutgoingRequest},
+    CrossSigningBootstrapRequests, DeviceData, OlmMachine,
 };
 
-use crate::{store::Changes, types::events::ToDeviceEvent, DeviceData, OlmMachine};
-
 /// These keys need to be periodically uploaded to the server.
-type OneTimeKeys = BTreeMap<OwnedDeviceKeyId, Raw<OneTimeKey>>;
+type OneTimeKeys = BTreeMap<OwnedOneTimeKeyId, Raw<OneTimeKey>>;
 
 fn alice_device_id() -> &'static DeviceId {
     device_id!("JLAFKJWSCS")
@@ -92,6 +102,23 @@ pub async fn get_machine_after_query_test_helper() -> (OlmMachine, OneTimeKeys) 
     (machine, otk)
 }
 
+pub async fn get_machine_pair_using_store(
+    alice: &UserId,
+    bob: &UserId,
+    use_fallback_key: bool,
+    alice_store: MemoryStore,
+    alice_device_id: &DeviceId,
+) -> (OlmMachine, OlmMachine, OneTimeKeys) {
+    let (bob, otk) = get_prepared_machine_test_helper(bob, use_fallback_key).await;
+
+    let alice = OlmMachine::with_store(alice, alice_device_id, alice_store, None)
+        .await
+        .expect("Failed to create OlmMachine from supplied store");
+
+    store_each_others_device_data(&alice, &bob).await;
+    (alice, bob, otk)
+}
+
 pub async fn get_machine_pair(
     alice: &UserId,
     bob: &UserId,
@@ -102,21 +129,57 @@ pub async fn get_machine_pair(
     let alice_device = alice_device_id();
     let alice = OlmMachine::new(alice, alice_device).await;
 
-    let alice_device = DeviceData::from_machine_test_helper(&alice).await.unwrap();
-    let bob_device = DeviceData::from_machine_test_helper(&bob).await.unwrap();
-    alice.store().save_device_data(&[bob_device]).await.unwrap();
-    bob.store().save_device_data(&[alice_device]).await.unwrap();
-
+    store_each_others_device_data(&alice, &bob).await;
     (alice, bob, otk)
 }
 
+/// Store alice's device data in bob's store and vice versa
+async fn store_each_others_device_data(alice: &OlmMachine, bob: &OlmMachine) {
+    let alice_device = DeviceData::from_machine_test_helper(alice).await.unwrap();
+    let bob_device = DeviceData::from_machine_test_helper(bob).await.unwrap();
+    alice.store().save_device_data(&[bob_device]).await.unwrap();
+    bob.store().save_device_data(&[alice_device]).await.unwrap();
+}
+
+/// Return a pair of [`OlmMachine`]s, with an olm session created on Alice's
+/// side, but with no message yet sent.
+///
+/// Create Alice's `OlmMachine` using the [`MemoryStore`] provided
+pub async fn get_machine_pair_with_session_using_store(
+    alice: &UserId,
+    bob: &UserId,
+    use_fallback_key: bool,
+    alice_store: MemoryStore,
+    alice_device_id: &DeviceId,
+) -> (OlmMachine, OlmMachine) {
+    let (alice, bob, one_time_keys) =
+        get_machine_pair_using_store(alice, bob, use_fallback_key, alice_store, alice_device_id)
+            .await;
+
+    build_session_for_pair(alice, bob, one_time_keys).await
+}
+
+/// Return a pair of [`OlmMachine`]s, with an olm session created on Alice's
+/// side, but with no message yet sent.
 pub async fn get_machine_pair_with_session(
     alice: &UserId,
     bob: &UserId,
     use_fallback_key: bool,
 ) -> (OlmMachine, OlmMachine) {
-    let (alice, bob, mut one_time_keys) = get_machine_pair(alice, bob, use_fallback_key).await;
+    let (alice, bob, one_time_keys) = get_machine_pair(alice, bob, use_fallback_key).await;
 
+    build_session_for_pair(alice, bob, one_time_keys).await
+}
+
+/// Create a session for the two supplied Olm machines to communicate.
+async fn build_session_for_pair(
+    alice: OlmMachine,
+    bob: OlmMachine,
+    mut one_time_keys: BTreeMap<
+        ruma::OwnedKeyId<ruma::OneTimeKeyAlgorithm, ruma::OneTimeKeyName>,
+        Raw<OneTimeKey>,
+    >,
+) -> (OlmMachine, OlmMachine) {
     let (device_key_id, one_time_key) = one_time_keys.pop_first().unwrap();
 
     let one_time_keys = BTreeMap::from([(
@@ -133,6 +196,8 @@ pub async fn get_machine_pair_with_session(
     (alice, bob)
 }
 
+/// Return a pair of [`OlmMachine`]s, with an olm session (initiated
+/// by Alice) established between the two.
 pub async fn get_machine_pair_with_setup_sessions_test_helper(
     alice: &UserId,
     bob: &UserId,
@@ -167,7 +232,7 @@ pub async fn create_session(
     machine: &OlmMachine,
     user_id: &UserId,
     device_id: &DeviceId,
-    key_id: OwnedDeviceKeyId,
+    key_id: OwnedOneTimeKeyId,
     one_time_key: Raw<OneTimeKey>,
 ) {
     let one_time_keys = BTreeMap::from([(
@@ -177,4 +242,37 @@ pub async fn create_session(
 
     let response = claim_keys::v3::Response::new(one_time_keys);
     machine.inner.session_manager.create_sessions(&response).await.unwrap();
+}
+
+/// Given a set of requests returned by `bootstrap_cross_signing` for one user,
+/// return a `/keys/query` response which might be returned to another user/
+pub fn bootstrap_requests_to_keys_query_response(
+    bootstrap_requests: CrossSigningBootstrapRequests,
+) -> KeysQueryResponse {
+    let mut kq_response = json!({});
+
+    // If we have a master key, add that to the response
+    if let Some(key) = bootstrap_requests.upload_signing_keys_req.master_key {
+        let user_id = key.user_id.clone();
+        kq_response["master_keys"] = json!({user_id: key});
+    }
+
+    // If we have a self-signing key, add that
+    if let Some(key) = bootstrap_requests.upload_signing_keys_req.self_signing_key {
+        let user_id = key.user_id.clone();
+        kq_response["self_signing_keys"] = json!({user_id: key});
+    }
+
+    // And if we have a device, add that
+    if let Some(dk) = bootstrap_requests
+        .upload_keys_req
+        .and_then(|req| as_variant!(req.request.as_ref(), AnyOutgoingRequest::KeysUpload).cloned())
+        .and_then(|keys_upload_request| keys_upload_request.device_keys)
+    {
+        let user_id: String = dk.get_field("user_id").unwrap().unwrap();
+        let device_id: String = dk.get_field("device_id").unwrap().unwrap();
+        kq_response["device_keys"] = json!({user_id: { device_id: dk }});
+    }
+
+    ruma_response_from_json(&kq_response)
 }

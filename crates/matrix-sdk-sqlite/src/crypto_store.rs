@@ -25,9 +25,12 @@ use deadpool_sqlite::{Object as SqliteAsyncConn, Pool as SqlitePool, Runtime};
 use matrix_sdk_crypto::{
     olm::{
         InboundGroupSession, OutboundGroupSession, PickledInboundGroupSession,
-        PrivateCrossSigningIdentity, Session, StaticAccountData,
+        PrivateCrossSigningIdentity, SenderDataType, Session, StaticAccountData,
     },
-    store::{BackupKeys, Changes, CryptoStore, PendingChanges, RoomKeyCounts, RoomSettings},
+    store::{
+        BackupKeys, Changes, CryptoStore, DehydratedDeviceKey, PendingChanges, RoomKeyCounts,
+        RoomSettings,
+    },
     types::events::room_key_withheld::RoomKeyWithheldEvent,
     Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, TrackedUser, UserIdentityData,
 };
@@ -36,10 +39,11 @@ use ruma::{
     events::secret::request::SecretName, DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId,
     RoomId, TransactionId, UserId,
 };
-use rusqlite::{params_from_iter, OptionalExtension};
+use rusqlite::{named_params, params_from_iter, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::{fs, sync::Mutex};
 use tracing::{debug, instrument, warn};
+use vodozemac::Curve25519PublicKey;
 
 use crate::{
     error::{Error, Result},
@@ -90,8 +94,12 @@ impl SqliteCryptoStore {
         passphrase: Option<&str>,
     ) -> Result<Self, OpenStoreError> {
         let conn = pool.get().await?;
+        conn.set_journal_size_limit().await?;
+
         let version = conn.db_version().await?;
         run_migrations(&conn, version).await?;
+        conn.optimize().await?;
+
         let store_cipher = match passphrase {
             Some(p) => Some(Arc::new(conn.get_or_create_store_cipher(p).await?)),
             None => None,
@@ -186,7 +194,10 @@ impl SqliteCryptoStore {
     }
 }
 
-const DATABASE_VERSION: u8 = 8;
+const DATABASE_VERSION: u8 = 9;
+
+/// key for the dehydrated device pickle key in the key/value table.
+const DEHYDRATED_DEVICE_PICKLE_KEY: &str = "dehydrated_device_pickle_key";
 
 /// Run migrations for the given version of the database.
 async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
@@ -269,6 +280,16 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
         .await?;
     }
 
+    if version < 9 {
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!(
+                "../migrations/crypto_store/009_inbound_group_session_sender_key_sender_data_type.sql"
+            ))?;
+            txn.set_db_version(9)
+        })
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -286,6 +307,8 @@ trait SqliteConnectionExt {
         session_id: &[u8],
         data: &[u8],
         backed_up: bool,
+        sender_key: Option<&[u8]>,
+        sender_data_type: Option<u8>,
     ) -> rusqlite::Result<()>;
 
     fn set_outbound_group_session(&self, room_id: &[u8], data: &[u8]) -> rusqlite::Result<()>;
@@ -338,12 +361,14 @@ impl SqliteConnectionExt for rusqlite::Connection {
         session_id: &[u8],
         data: &[u8],
         backed_up: bool,
+        sender_key: Option<&[u8]>,
+        sender_data_type: Option<u8>,
     ) -> rusqlite::Result<()> {
         self.execute(
-            "INSERT INTO inbound_group_session (session_id, room_id, data, backed_up) \
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (session_id) DO UPDATE SET data = ?3, backed_up = ?4",
-            (session_id, room_id, data, backed_up),
+            "INSERT INTO inbound_group_session (session_id, room_id, data, backed_up, sender_key, sender_data_type) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (session_id) DO UPDATE SET data = ?3, backed_up = ?4, sender_key = ?5, sender_data_type = ?6",
+            (session_id, room_id, data, backed_up, sender_key, sender_data_type),
         )?;
         Ok(())
     }
@@ -489,6 +514,44 @@ trait SqliteObjectCryptoStoreExt: SqliteAsyncConnExt {
             )
             .await?;
         Ok(RoomKeyCounts { total, backed_up })
+    }
+
+    async fn get_inbound_group_sessions_for_device_batch(
+        &self,
+        sender_key: Key,
+        sender_data_type: SenderDataType,
+        after_session_id: Option<Key>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, bool)>> {
+        Ok(self
+            .prepare(
+                "
+                SELECT data, backed_up
+                FROM inbound_group_session
+                WHERE sender_key = :sender_key
+                    AND sender_data_type = :sender_data_type
+                    AND session_id > :after_session_id
+                ORDER BY session_id
+                LIMIT :limit
+                ",
+                move |mut stmt| {
+                    let sender_data_type = sender_data_type as u8;
+
+                    // If we are not provided with an `after_session_id`, use a key which will sort
+                    // before all real keys: the empty string.
+                    let after_session_id = after_session_id.unwrap_or(Key::Plain(Vec::new()));
+
+                    stmt.query(named_params! {
+                        ":sender_key": sender_key,
+                        ":sender_data_type": sender_data_type,
+                        ":after_session_id": after_session_id,
+                        ":limit": limit,
+                    })?
+                    .mapped(|row| Ok((row.get(0)?, row.get(1)?)))
+                    .collect()
+                },
+            )
+            .await?)
     }
 
     async fn get_inbound_group_sessions_for_backup(&self, limit: usize) -> Result<Vec<Vec<u8>>> {
@@ -756,7 +819,9 @@ impl CryptoStore for SqliteCryptoStore {
             let room_id = self.encode_key("inbound_group_session", session.room_id().as_bytes());
             let session_id = self.encode_key("inbound_group_session", session.session_id());
             let pickle = session.pickle().await;
-            inbound_session_changes.push((room_id, session_id, pickle));
+            let sender_key =
+                self.encode_key("inbound_group_session", session.sender_key().to_base64());
+            inbound_session_changes.push((room_id, session_id, pickle, sender_key));
         }
 
         let mut outbound_session_changes = Vec::new();
@@ -791,6 +856,11 @@ impl CryptoStore for SqliteCryptoStore {
                     txn.set_kv("backup_version_v1", &serialized_backup_version)?;
                 }
 
+                if let Some(pickle_key) = &changes.dehydrated_device_pickle_key {
+                    let serialized_pickle_key = this.serialize_value(pickle_key)?;
+                    txn.set_kv(DEHYDRATED_DEVICE_PICKLE_KEY, &serialized_pickle_key)?;
+                }
+
                 for device in changes.devices.new.iter().chain(&changes.devices.changed) {
                     let user_id = this.encode_key("device", device.user_id().as_bytes());
                     let device_id = this.encode_key("device", device.device_id().as_bytes());
@@ -815,13 +885,15 @@ impl CryptoStore for SqliteCryptoStore {
                     txn.set_session(session_id, sender_key, &serialized_session)?;
                 }
 
-                for (room_id, session_id, pickle) in &inbound_session_changes {
+                for (room_id, session_id, pickle, sender_key) in &inbound_session_changes {
                     let serialized_session = this.serialize_value(&pickle)?;
                     txn.set_inbound_group_session(
                         room_id,
                         session_id,
                         &serialized_session,
                         pickle.backed_up,
+                        Some(sender_key),
+                        Some(pickle.sender_data.to_type() as u8),
                     )?;
                 }
 
@@ -947,6 +1019,33 @@ impl CryptoStore for SqliteCryptoStore {
             .collect()
     }
 
+    async fn get_inbound_group_sessions_for_device_batch(
+        &self,
+        sender_key: Curve25519PublicKey,
+        sender_data_type: SenderDataType,
+        after_session_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<InboundGroupSession>, Self::Error> {
+        let after_session_id =
+            after_session_id.map(|session_id| self.encode_key("inbound_group_session", session_id));
+        let sender_key = self.encode_key("inbound_group_session", sender_key.to_base64());
+
+        self.acquire()
+            .await?
+            .get_inbound_group_sessions_for_device_batch(
+                sender_key,
+                sender_data_type,
+                after_session_id,
+                limit,
+            )
+            .await?
+            .into_iter()
+            .map(|(value, backed_up)| {
+                self.deserialize_and_unpickle_inbound_group_session(value, backed_up)
+            })
+            .collect()
+    }
+
     async fn inbound_group_session_counts(
         &self,
         backup_version: Option<&str>,
@@ -1007,6 +1106,21 @@ impl CryptoStore for SqliteCryptoStore {
         Ok(BackupKeys { backup_version, decryption_key })
     }
 
+    async fn load_dehydrated_device_pickle_key(&self) -> Result<Option<DehydratedDeviceKey>> {
+        let conn = self.acquire().await?;
+
+        conn.get_kv(DEHYDRATED_DEVICE_PICKLE_KEY)
+            .await?
+            .map(|value| self.deserialize_value(&value))
+            .transpose()
+    }
+
+    async fn delete_dehydrated_device_pickle_key(&self) -> Result<(), Self::Error> {
+        let conn = self.acquire().await?;
+        conn.clear_kv(DEHYDRATED_DEVICE_PICKLE_KEY).await?;
+
+        Ok(())
+    }
     async fn get_outbound_group_session(
         &self,
         room_id: &RoomId,
@@ -1292,13 +1406,16 @@ impl CryptoStore for SqliteCryptoStore {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::Path;
 
+    use matrix_sdk_common::deserialized_responses::WithheldCode;
     use matrix_sdk_crypto::{
-        cryptostore_integration_tests, cryptostore_integration_tests_time, store::CryptoStore,
+        cryptostore_integration_tests, cryptostore_integration_tests_time, olm::SenderDataType,
+        store::CryptoStore,
     };
     use matrix_sdk_test::async_test;
     use once_cell::sync::Lazy;
+    use ruma::{device_id, room_id, user_id};
     use similar_asserts::assert_eq;
     use tempfile::{tempdir, TempDir};
     use tokio::fs;
@@ -1310,16 +1427,15 @@ mod tests {
     struct TestDb {
         // Needs to be kept alive because the Drop implementation for TempDir deletes the
         // directory.
-        #[allow(dead_code)]
-        dir: TempDir,
+        _dir: TempDir,
         database: SqliteCryptoStore,
     }
 
-    async fn get_test_db() -> TestDb {
+    async fn get_test_db(data_path: &str, passphrase: Option<&str>) -> TestDb {
         let db_name = "matrix-sdk-crypto.sqlite3";
 
-        let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let database_path = manifest_path.join("testing/data/storage").join(db_name);
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let database_path = manifest_path.join(data_path).join(db_name);
 
         let tmpdir = tempdir().unwrap();
         let destination = tmpdir.path().join(db_name);
@@ -1327,17 +1443,18 @@ mod tests {
         // Copy the test database to the tempdir so our test runs are idempotent.
         std::fs::copy(&database_path, destination).unwrap();
 
-        let database =
-            SqliteCryptoStore::open(tmpdir.path(), None).await.expect("Can't open the test store");
+        let database = SqliteCryptoStore::open(tmpdir.path(), passphrase)
+            .await
+            .expect("Can't open the test store");
 
-        TestDb { dir: tmpdir, database }
+        TestDb { _dir: tmpdir, database }
     }
 
     /// Test that we didn't regress in our storage layer by loading data from a
     /// pre-filled database, or in other words use a test vector for this.
     #[async_test]
     async fn test_open_test_vector_store() {
-        let TestDb { dir: _, database } = get_test_db().await;
+        let TestDb { _dir: _, database } = get_test_db("testing/data/storage", None).await;
 
         let account = database
             .load_account()
@@ -1399,6 +1516,277 @@ mod tests {
         assert_eq!(master_key.to_base64(), "iCUEtB1RwANeqRa5epDrblLk4mer/36sylwQ5hYY3oE");
     }
 
+    /// Test that we didn't regress in our storage layer by loading data from a
+    /// pre-filled database, or in other words use a test vector for this.
+    #[async_test]
+    async fn test_open_test_vector_encrypted_store() {
+        let TestDb { _dir: _, database } = get_test_db(
+            "testing/data/storage/alice",
+            Some(concat!(
+                "/rCia2fYAJ+twCZ1Xm2mxFCYcmJdyzkdJjwtgXsziWpYS/UeNxnixuSieuwZXm+x1VsJHmWpl",
+                "H+QIQBZpEGZtC9/S/l8xK+WOCesmET0o6yJ/KP73ofDtjBlnNpPwuHLKFpyTbyicpCgQ4UT+5E",
+                "UBuJ08TY9Ujdf1D13k5kr5tSZUefDKKCuG1fCRqlU8ByRas1PMQsZxT2W8t7QgBrQiiGmhpo/O",
+                "Ti4hfx97GOxncKcxTzppiYQNoHs/f15+XXQD7/oiCcqRIuUlXNsU6hRpFGmbYx2Pi1eyQViQCt",
+                "B5dAEiSD0N8U81wXYnpynuTPtnL+hfnOJIn7Sy7mkERQeKg"
+            )),
+        )
+        .await;
+
+        let account = database
+            .load_account()
+            .await
+            .unwrap()
+            .expect("The test database is prefilled with data, we should find an account");
+
+        let user_id = account.user_id();
+        let device_id = account.device_id();
+
+        assert_eq!(
+            user_id.as_str(),
+            "@alice:localhost",
+            "The user ID should match to the one we expect."
+        );
+
+        assert_eq!(
+            device_id.as_str(),
+            "JVVORTHFXY",
+            "The device ID should match to the one we expect."
+        );
+
+        let tracked_users =
+            database.load_tracked_users().await.expect("Should be tracking some users");
+
+        assert_eq!(tracked_users.len(), 6);
+
+        let known_users = vec![
+            user_id!("@alice:localhost"),
+            user_id!("@dehydration3:localhost"),
+            user_id!("@eve:localhost"),
+            user_id!("@bob:localhost"),
+            user_id!("@malo:localhost"),
+            user_id!("@carl:localhost"),
+        ];
+
+        // load the identities
+        for user_id in known_users {
+            database.get_user_identity(user_id).await.expect("Should load this identity").unwrap();
+        }
+
+        let carl_identity =
+            database.get_user_identity(user_id!("@carl:localhost")).await.unwrap().unwrap();
+
+        assert_eq!(
+            carl_identity.master_key().get_first_key().unwrap().to_base64(),
+            "CdhKYYDeBDQveOioXEGWhTPCyzc63Irpar3CNyfun2Q"
+        );
+        assert!(!carl_identity.was_previously_verified());
+
+        let bob_identity =
+            database.get_user_identity(user_id!("@bob:localhost")).await.unwrap().unwrap();
+
+        assert_eq!(
+            bob_identity.master_key().get_first_key().unwrap().to_base64(),
+            "COh2GYOJWSjem5QPRCaGp9iWV83IELG1IzLKW2S3pFY"
+        );
+        // Bob is verified so this flag should be set
+        assert!(bob_identity.was_previously_verified());
+
+        let known_devices = vec![
+            (device_id!("OPXQHCZSKW"), user_id!("@alice:localhost")),
+            // a dehydrated one
+            (
+                device_id!("EvW+9IrGR10KVgVeZP25/KaPfx4R86FofVMcaz7VOho"),
+                user_id!("@alice:localhost"),
+            ),
+            (device_id!("HEEFRFQENV"), user_id!("@alice:localhost")),
+            (device_id!("JVVORTHFXY"), user_id!("@alice:localhost")),
+            (device_id!("NQUWWSKKHS"), user_id!("@alice:localhost")),
+            (device_id!("ORBLPFYCPG"), user_id!("@alice:localhost")),
+            (device_id!("YXOWENSEGM"), user_id!("@dehydration3:localhost")),
+            (device_id!("VXLFMYCHXC"), user_id!("@bob:localhost")),
+            (device_id!("FDGDQAEWOW"), user_id!("@bob:localhost")),
+            (device_id!("VXLFMYCHXC"), user_id!("@bob:localhost")),
+            (device_id!("FDGDQAEWOW"), user_id!("@bob:localhost")),
+            (device_id!("QKUKWJTTQC"), user_id!("@malo:localhost")),
+            (device_id!("LOUXJECTFG"), user_id!("@malo:localhost")),
+            (device_id!("MKKMAEVLPB"), user_id!("@carl:localhost")),
+        ];
+
+        for (device_id, user_id) in known_devices {
+            database.get_device(user_id, device_id).await.expect("Should load the device").unwrap();
+        }
+
+        let known_sender_key_to_session_count = vec![
+            ("FfYcYfDF4nWy+LHdK6CEpIMlFAQDORc30WUkghL06kM", 1),
+            ("EvW+9IrGR10KVgVeZP25/KaPfx4R86FofVMcaz7VOho", 1),
+            ("hAGsoA4a9M6wwEUX5Q1jux1i+tUngLi01n5AmhDoHTY", 1),
+            ("aKqtSJymLzuoglWFwPGk1r/Vm2LE2hFESzXxn4RNjRM", 0),
+            ("zHK1psCrgeMn0kaz8hcdvA3INyar9jg1yfrSp0p1pHo", 1),
+            ("1QmBA316Wj5jIFRwNOti6N6Xh/vW0bsYCcR4uPfy8VQ", 1),
+            ("g5ef2vZF3VXgSPyODIeXpyHIRkuthvLhGvd6uwYggWU", 1),
+            ("o7hfupPd1VsNkRIvdlH6ujrEJFSKjFCGbxhAd31XxjI", 1),
+            ("Z3RxKQLxY7xpP+ZdOGR2SiNE37SrvmRhW7GPu1UGdm8", 1),
+            ("GDomaav8NiY3J+dNEeApJm+O0FooJ3IpVaIyJzCN4w4", 1),
+            ("7m7fqkHyEr47V5s/KjaxtJMOr3pSHrrns2q2lWpAQi8", 0),
+            ("9psAkPUIF8vNbWbnviX3PlwRcaeO53EHJdNtKpTY1X0", 0),
+            ("mqanh+ztw5oRtpqYQgLGW864i6NY2zpoKMIlrcyC+Aw", 0),
+            ("fJU/TJdbsv7tVbbpHw1Ke73ziElnM32cNhP2WIg4T10", 0),
+            ("sUIeFeFcCZoa5IC6nJ6Vrbvztcyx09m8BBg57XKRClg", 1),
+        ];
+
+        for (id, count) in known_sender_key_to_session_count {
+            let olm_sessions =
+                database.get_sessions(id).await.expect("Should have some olm sessions");
+
+            println!("### Session id: {:?}", id);
+            assert_eq!(olm_sessions.map_or(0, |v| v.len()), count);
+        }
+
+        let inbound_group_sessions = database.get_inbound_group_sessions().await.unwrap();
+        assert_eq!(inbound_group_sessions.len(), 15);
+        let known_inbound_group_sessions = vec![
+            (
+                "5hNAxrLai3VI0LKBwfh3wLfksfBFWds0W1a5X5/vSXA",
+                room_id!("!SRstFdydzrGwJYtVfm:localhost"),
+            ),
+            (
+                "M6d2eU3y54gaYTbvGSlqa/xc1Az35l56Cp9sxzHWO4g",
+                room_id!("!SRstFdydzrGwJYtVfm:localhost"),
+            ),
+            (
+                "IrydwXkRk2N2AqUMIVmLL3oJgMq14R9KId0P/uSD100",
+                room_id!("!SRstFdydzrGwJYtVfm:localhost"),
+            ),
+            (
+                "Y74+l9jTo7N5UF+GQwdpgJGe4sn1+QtWITq7BxulHIE",
+                room_id!("!SRstFdydzrGwJYtVfm:localhost"),
+            ),
+            (
+                "HpJxQR57WbQGdY6w2Q+C16znVvbXGa+JvQdRoMpWbXg",
+                room_id!("!SRstFdydzrGwJYtVfm:localhost"),
+            ),
+            (
+                "Xetvi+ydFkZt8dpONGFbEusQb/Chc2V0XlLByZhsbgE",
+                room_id!("!ZIwZcFqZVAYLAqVjfV:localhost"),
+            ),
+            (
+                "wv/WN/39akyerIXczTaIpjAuLnwgXKRtbXFSEHiJqxo",
+                room_id!("!ZIwZcFqZVAYLAqVjfV:localhost"),
+            ),
+            (
+                "nA4gQwL//Cm8OdlyjABl/jChbPT/cP5V4Sd8iuE6H0s",
+                room_id!("!ZIwZcFqZVAYLAqVjfV:localhost"),
+            ),
+            (
+                "bAAgqFeRDTjfEqL6Qf/c9mk55zoNDCSlboAIRd6b0hw",
+                room_id!("!ZIwZcFqZVAYLAqVjfV:localhost"),
+            ),
+            (
+                "exPbsMMdGfAG2qmDdFtpAn+koVprfzS0Zip/RA9QRCE",
+                room_id!("!ZIwZcFqZVAYLAqVjfV:localhost"),
+            ),
+            (
+                "h+om7oSw/ZV94fcKaoe8FGXJwQXWOfKQfzbGgNWQILI",
+                room_id!("!ZIwZcFqZVAYLAqVjfV:localhost"),
+            ),
+            (
+                "ul3VXonpgk4lO2L3fEWubP/nxsTmLHqu5v8ZM9vHEcw",
+                room_id!("!ZIwZcFqZVAYLAqVjfV:localhost"),
+            ),
+            (
+                "JXY15UxC3az2mwg8uX4qwgxfvCM4aygiIWMcdNiVQoc",
+                room_id!("!ZIwZcFqZVAYLAqVjfV:localhost"),
+            ),
+            (
+                "OGB9lObr9kWUvha9tB5sMfOF/Mztk24JwQz/nwg3iFQ",
+                room_id!("!OgRiTRMaUzLdpCeDBM:localhost"),
+            ),
+            (
+                "SFkHcbxjUOYF7mUAYI/oEMDZFaXszQbCN6Jza7iemj0",
+                room_id!("!OgRiTRMaUzLdpCeDBM:localhost"),
+            ),
+        ];
+
+        // ensure we can load them all
+        for (session_id, room_id) in &known_inbound_group_sessions {
+            database
+                .get_inbound_group_session(room_id, session_id)
+                .await
+                .expect("Should be able to load inbound group session")
+                .unwrap();
+        }
+
+        let bob_sender_verified = database
+            .get_inbound_group_session(
+                room_id!("!ZIwZcFqZVAYLAqVjfV:localhost"),
+                "exPbsMMdGfAG2qmDdFtpAn+koVprfzS0Zip/RA9QRCE",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(bob_sender_verified.sender_data.to_type(), SenderDataType::SenderVerified);
+        assert!(bob_sender_verified.backed_up());
+        assert!(!bob_sender_verified.has_been_imported());
+
+        let alice_unknown_device = database
+            .get_inbound_group_session(
+                room_id!("!SRstFdydzrGwJYtVfm:localhost"),
+                "IrydwXkRk2N2AqUMIVmLL3oJgMq14R9KId0P/uSD100",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(alice_unknown_device.sender_data.to_type(), SenderDataType::UnknownDevice);
+        assert!(alice_unknown_device.backed_up());
+        assert!(alice_unknown_device.has_been_imported());
+
+        let carl_tofu_session = database
+            .get_inbound_group_session(
+                room_id!("!OgRiTRMaUzLdpCeDBM:localhost"),
+                "OGB9lObr9kWUvha9tB5sMfOF/Mztk24JwQz/nwg3iFQ",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(carl_tofu_session.sender_data.to_type(), SenderDataType::SenderUnverified);
+        assert!(carl_tofu_session.backed_up());
+        assert!(!carl_tofu_session.has_been_imported());
+
+        // Load outbound sessions
+        database
+            .get_outbound_group_session(room_id!("!OgRiTRMaUzLdpCeDBM:localhost"))
+            .await
+            .unwrap()
+            .unwrap();
+        database
+            .get_outbound_group_session(room_id!("!ZIwZcFqZVAYLAqVjfV:localhost"))
+            .await
+            .unwrap()
+            .unwrap();
+        database
+            .get_outbound_group_session(room_id!("!SRstFdydzrGwJYtVfm:localhost"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let withheld_info = database
+            .get_withheld_info(
+                room_id!("!OgRiTRMaUzLdpCeDBM:localhost"),
+                "SASgZ+EklvAF4QxJclMlDRlmL0fAMjAJJIKFMdb4Ht0",
+            )
+            .await
+            .expect("This session should be withheld")
+            .unwrap();
+
+        assert_eq!(withheld_info.content.withheld_code(), WithheldCode::Unverified);
+
+        let backup_keys = database.load_backup_keys().await.expect("backup key should be cached");
+        assert_eq!(backup_keys.backup_version.unwrap(), "6");
+        assert!(backup_keys.decryption_key.is_some());
+    }
     async fn get_store(
         name: &str,
         passphrase: Option<&str>,

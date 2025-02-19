@@ -1,23 +1,21 @@
 use std::{iter, time::Duration};
 
-use assert_matches2::assert_let;
+use assert_matches2::{assert_let, assert_matches};
 use js_int::uint;
-use matrix_sdk::{
-    config::SyncSettings, room::RoomMember, test_utils::events::EventFactory, DisplayName,
-    RoomMemberships,
-};
+use matrix_sdk::{config::SyncSettings, room::RoomMember, RoomDisplayName, RoomMemberships};
 use matrix_sdk_test::{
-    async_test, bulk_room_members, sync_state_event, sync_timeline_event, test_json,
-    GlobalAccountDataTestEvent, JoinedRoomBuilder, LeftRoomBuilder, StateTestEvent,
-    SyncResponseBuilder, BOB, DEFAULT_TEST_ROOM_ID,
+    async_test, bulk_room_members, event_factory::EventFactory, sync_state_event,
+    sync_timeline_event, test_json, GlobalAccountDataTestEvent, JoinedRoomBuilder, LeftRoomBuilder,
+    StateTestEvent, SyncResponseBuilder, BOB, DEFAULT_TEST_ROOM_ID,
 };
 use ruma::{
     event_id,
     events::{
-        room::{member::MembershipState, message::RoomMessageEventContent},
-        AnyStateEvent, AnySyncStateEvent, AnyTimelineEvent, StateEventType,
+        direct::DirectUserIdentifier,
+        room::{avatar, member::MembershipState, message::RoomMessageEventContent},
+        AnySyncStateEvent, AnySyncTimelineEvent, StateEventType,
     },
-    room_id,
+    mxc_uri, room_id,
 };
 use serde_json::json;
 use wiremock::{
@@ -62,8 +60,8 @@ async fn test_calculate_room_names_from_summary() {
     let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
 
     assert_eq!(
-        DisplayName::Calculated("example2".to_owned()),
-        room.compute_display_name().await.unwrap()
+        RoomDisplayName::Calculated("example2".to_owned()),
+        room.display_name().await.unwrap()
     );
 }
 
@@ -81,10 +79,7 @@ async fn test_room_names() {
     assert_eq!(client.rooms().len(), 1);
     let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
 
-    assert_eq!(
-        DisplayName::Aliased("tutorial".to_owned()),
-        room.compute_display_name().await.unwrap()
-    );
+    assert_eq!(RoomDisplayName::Aliased("tutorial".to_owned()), room.display_name().await.unwrap());
 
     // Room with a name.
     mock_sync(&server, &*test_json::INVITE_SYNC, None).await;
@@ -96,8 +91,8 @@ async fn test_room_names() {
     let invited_room = client.get_room(room_id!("!696r7674:example.com")).unwrap();
 
     assert_eq!(
-        DisplayName::Named("My Room Name".to_owned()),
-        invited_room.compute_display_name().await.unwrap()
+        RoomDisplayName::Named("My Room Name".to_owned()),
+        invited_room.display_name().await.unwrap()
     );
 
     let mut sync_builder = SyncResponseBuilder::new();
@@ -132,10 +127,10 @@ async fn test_room_names() {
     let room = client.get_room(room_id).unwrap();
 
     assert_eq!(
-        DisplayName::Calculated(
+        RoomDisplayName::Calculated(
             "user_0, user_1, user_10, user_11, user_12, and 10 others".to_owned()
         ),
-        room.compute_display_name().await.unwrap()
+        room.display_name().await.unwrap()
     );
 
     // Room with joined and invited members.
@@ -182,8 +177,8 @@ async fn test_room_names() {
     let room = client.get_room(room_id).unwrap();
 
     assert_eq!(
-        DisplayName::Calculated("Bob, example1".to_owned()),
-        room.compute_display_name().await.unwrap()
+        RoomDisplayName::Calculated("Bob, example1".to_owned()),
+        room.display_name().await.unwrap()
     );
 
     // Room with only left members.
@@ -202,8 +197,8 @@ async fn test_room_names() {
     let room = client.get_room(room_id).unwrap();
 
     assert_eq!(
-        DisplayName::EmptyWas("user_0, user_1, user_2".to_owned()),
-        room.compute_display_name().await.unwrap()
+        RoomDisplayName::EmptyWas("user_0, user_1, user_2".to_owned()),
+        room.display_name().await.unwrap()
     );
 }
 
@@ -667,8 +662,8 @@ async fn test_event() {
 
     let timeline_event = room.event(event_id, None).await.unwrap();
     assert_let!(
-        AnyTimelineEvent::State(AnyStateEvent::RoomTombstone(event)) =
-            timeline_event.event.deserialize().unwrap()
+        AnySyncTimelineEvent::State(AnySyncStateEvent::RoomTombstone(event)) =
+            timeline_event.raw().deserialize().unwrap()
     );
     assert_eq!(event.event_id(), event_id);
 
@@ -730,15 +725,15 @@ async fn test_event_with_context() {
     let context_ret = room.event_with_context(event_id, false, uint!(1), None).await.unwrap();
 
     assert_let!(Some(timeline_event) = context_ret.event);
-    assert_let!(Ok(event) = timeline_event.event.deserialize());
+    assert_let!(Ok(event) = timeline_event.raw().deserialize());
     assert_eq!(event.event_id(), event_id);
 
     assert_eq!(1, context_ret.events_before.len());
-    assert_let!(Ok(event) = context_ret.events_before[0].event.deserialize());
+    assert_let!(Ok(event) = context_ret.events_before[0].raw().deserialize());
     assert_eq!(event.event_id(), prev_event_id);
 
     assert_eq!(1, context_ret.events_after.len());
-    assert_let!(Ok(event) = context_ret.events_after[0].event.deserialize());
+    assert_let!(Ok(event) = context_ret.events_after[0].raw().deserialize());
     assert_eq!(event.event_id(), next_event_id);
 
     // Requested event and their context ones were saved to the cache
@@ -829,7 +824,7 @@ async fn test_is_direct() {
     // The room is direct now.
     let direct_targets = room.direct_targets();
     assert_eq!(direct_targets.len(), 1);
-    assert!(direct_targets.contains(*BOB));
+    assert!(direct_targets.contains(<&DirectUserIdentifier>::from(*BOB)));
     assert!(room.is_direct().await.unwrap());
 
     // Unset the room as direct.
@@ -857,4 +852,63 @@ async fn test_is_direct() {
     // The room is not direct anymore.
     assert!(room.direct_targets().is_empty());
     assert!(!room.is_direct().await.unwrap());
+}
+
+#[async_test]
+async fn test_room_avatar() {
+    let (client, server) = logged_in_client_with_server().await;
+    let own_user_id = client.user_id().unwrap();
+
+    // Room without avatar.
+    mock_sync(&server, &*test_json::SYNC, None).await;
+
+    client.sync_once(SyncSettings::default()).await.unwrap();
+    server.reset().await;
+
+    assert_eq!(client.rooms().len(), 1);
+    let room_id = *DEFAULT_TEST_ROOM_ID;
+    let room = client.get_room(room_id).unwrap();
+
+    assert_eq!(room.avatar_url(), None);
+    assert_matches!(room.avatar_info(), None);
+
+    let factory = EventFactory::new().room(room_id).sender(own_user_id);
+
+    // Set the avatar, but not the info.
+    let avatar_url_1 = mxc_uri!("mxc://server.local/abcdef");
+
+    let event = factory.room_avatar().url(avatar_url_1).into_raw_sync();
+
+    let mut sync_builder = SyncResponseBuilder::new();
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(event));
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+
+    client.sync_once(SyncSettings::default()).await.unwrap();
+    server.reset().await;
+
+    assert_eq!(room.avatar_url().as_deref(), Some(avatar_url_1));
+    assert_matches!(room.avatar_info(), None);
+
+    // Set the avatar and the info.
+    let avatar_url_2 = mxc_uri!("mxc://server.local/ghijkl");
+    let mut avatar_info_2 = avatar::ImageInfo::new();
+    avatar_info_2.height = Some(uint!(200));
+    avatar_info_2.width = Some(uint!(200));
+    avatar_info_2.mimetype = Some("image/png".to_owned());
+    avatar_info_2.size = Some(uint!(5243));
+
+    let event = factory.room_avatar().url(avatar_url_2).info(avatar_info_2).into_raw_sync();
+
+    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(event));
+    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
+
+    client.sync_once(SyncSettings::default()).await.unwrap();
+    server.reset().await;
+
+    assert_eq!(room.avatar_url().as_deref(), Some(avatar_url_2));
+    let avatar_info = room.avatar_info().unwrap();
+    assert_eq!(avatar_info.height, Some(uint!(200)));
+    assert_eq!(avatar_info.width, Some(uint!(200)));
+    assert_eq!(avatar_info.mimetype.as_deref(), Some("image/png"));
+    assert_eq!(avatar_info.size, Some(uint!(5243)));
 }

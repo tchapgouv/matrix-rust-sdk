@@ -1,21 +1,144 @@
-# unreleased
+# Changelog
 
+All notable changes to this project will be documented in this file.
+
+<!-- next-header -->
+
+## [Unreleased] - ReleaseDate
+
+### Features
+
+- [**breaking**] The `MediaRetentionPolicy` can now trigger regular cleanups
+  with its new `cleanup_frequency` setting.
+  ([#4603](https://github.com/matrix-org/matrix-rust-sdk/pull/4603))
+  - `Clone` is a supertrait of `EventCacheStoreMedia`.
+  - `EventCacheStoreMedia` has a new method `last_media_cleanup_time_inner`
+  - There are new `'static` bounds in `MediaService` for the media cache stores
+- `event_cache::store::MemoryStore` implements `Clone`.
+
+## [0.10.0] - 2025-02-04
+
+### Features
+
+- [**breaking**] `EventCacheStore` allows to control which media content is
+  allowed in the media cache, and how long it should be kept, with a
+  `MediaRetentionPolicy`:
+  - `EventCacheStore::add_media_content()` has an extra argument,
+    `ignore_policy`, which decides whether a media content should ignore the
+    `MediaRetentionPolicy`. It should be stored alongside the media content.
+  - `EventCacheStore` has four new methods: `media_retention_policy()`,
+    `set_media_retention_policy()`, `set_ignore_media_retention_policy()` and
+    `clean_up_media_cache()`.
+  - `EventCacheStore` implementations should delegate media cache methods to the
+    methods of the same name of `MediaService` to use the `MediaRetentionPolicy`.
+    They need to implement the `EventCacheStoreMedia` trait that can be tested
+    with the `event_cache_store_media_integration_tests!` macro.
+    ([#4571](https://github.com/matrix-org/matrix-rust-sdk/pull/4571))
+
+### Refactor
+
+- [**breaking**] Replaced `Room::compute_display_name` with the reintroduced
+  `Room::display_name()`. The new method computes a display name, or return a
+  cached value from the previous successful computation. If you need a sync
+  variant, consider using `Room::cached_display_name()`.
+  ([#4470](https://github.com/matrix-org/matrix-rust-sdk/pull/4470))
+- [**breaking**]: The reexported types `SyncTimelineEvent` and `TimelineEvent`
+  have been fused into a single type `TimelineEvent`, and its field
+  `push_actions` has been made `Option`al (it is set to `None` when we couldn't
+  compute the push actions, because we lacked some information).
+  ([#4568](https://github.com/matrix-org/matrix-rust-sdk/pull/4568))
+
+## [0.9.0] - 2024-12-18
+
+### Features
+
+- Introduced support for
+  [MSC4171](https://github.com/matrix-org/matrix-rust-sdk/pull/4335), enabling
+  the designation of certain users as service members. These flagged users are
+  excluded from the room display name calculation.
+  ([#4335](https://github.com/matrix-org/matrix-rust-sdk/pull/4335))
+
+### Bug Fixes
+
+- Fix an off-by-one error in the `ObservableMap` when the `remove()` method is
+  called. Previously, items following the removed item were not shifted left by
+  one position, leaving them at incorrect indices.
+  ([#4346](https://github.com/matrix-org/matrix-rust-sdk/pull/4346))
+
+## [0.8.0] - 2024-11-19
+
+### Bug Fixes
+
+- Add more invalid characters for room aliases.
+
+- Use the `DisplayName` struct to protect against homoglyph attacks.
+
+
+### Features
 - Add `BaseClient::room_key_recipient_strategy` field
-- Replace the `Notification` type from Ruma in `SyncResponse` and `StateChanges` by a custom one
-- The ambiguity maps in `SyncResponse` are moved to `JoinedRoom` and `LeftRoom`
-- `AmbiguityCache` contains the room member's user ID
+
+- `AmbiguityCache` contains the room member's user ID.
+
+- [**breaking**] `Media::get_thumbnail` and `MediaFormat::Thumbnail` allow to
+  request an animated thumbnail They both take a `MediaThumbnailSettings`
+  instead of `MediaThumbnailSize`.
+
+- Consider knocked members to be part of the room for display name
+  disambiguation.
+
+- `Client::cross_process_store_locks_holder_name` is used everywhere:
+ - `StoreConfig::new()` now takes a
+   `cross_process_store_locks_holder_name` argument.
+ - `StoreConfig` no longer implements `Default`.
+ - `BaseClient::new()` has been removed.
+ - `BaseClient::clone_with_in_memory_state_store()` now takes a
+   `cross_process_store_locks_holder_name` argument.
+ - `BaseClient` no longer implements `Default`.
+ - `EventCacheStoreLock::new()` no longer takes a `key` argument.
+ - `BuilderStoreConfig` no longer has
+   `cross_process_store_locks_holder_name` field for `Sqlite` and
+   `IndexedDb`.
+
+- Make `ObservableMap::stream` works on `wasm32-unknown-unknown`.
+
+- Allow aborting media uploads.
+
+- Replace the `Notification` type from Ruma in `SyncResponse` and `StateChanges`
+  by a custom one.
+
+- Introduce a `DisplayName` struct which normalizes and sanitizes
+display names.
+
+
+### Refactor
+
+- [**breaking**] Rename `DisplayName` to `RoomDisplayName`.
+
+- Rename `AmbiguityMap` to `DisplayNameUsers`.
+
+- Move `event_cache_store/` to `event_cache/store/` in `matrix-sdk-base`.
+
+- Move `linked_chunk` from `matrix-sdk` to `matrix-sdk-common`.
+
+- Move `Event` and `Gap` into `matrix_sdk_base::event_cache`.
+
+- The ambiguity maps in `SyncResponse` are moved to `JoinedRoom` and `LeftRoom`.
+
 - `Store::get_rooms` and `Store::get_rooms_filtered` are way faster because they
   don't acquire the lock for every room they read.
+
 - `Store::get_rooms`, `Store::get_rooms_filtered` and `Store::get_room` are
   renamed `Store::rooms`, `Store::rooms_filtered` and `Store::room`.
-- `Client::get_rooms` and `Client::get_rooms_filtered` are renamed
+
+- [**breaking**] `Client::get_rooms` and `Client::get_rooms_filtered` are renamed
   `Client::rooms` and `Client::rooms_filtered`.
-- `Client::get_stripped_rooms` has finally been removed.
-- `Media::get_thumbnail` and `MediaFormat::Thumbnail` allow to request an animated thumbnail
-  - They both take a `MediaThumbnailSettings` instead of `MediaThumbnailSize`.
-- The `StateStore` methods to access data in the media cache where moved to a separate
-  `EventCacheStore` trait.
-- The `instant` module was removed, use the `ruma::time` module instead.
+
+- [**breaking**] `Client::get_stripped_rooms` has finally been removed.
+
+- [**breaking**] The `StateStore` methods to access data in the media cache
+  where moved to a separate `EventCacheStore` trait.
+
+- [**breaking**] The `instant` module was removed, use the `ruma::time` module instead.
 
 # 0.7.0
 

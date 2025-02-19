@@ -1,4 +1,4 @@
-#![allow(clippy::assign_op_pattern)] // triggered by bitflags! usage
+#![allow(clippy::assign_op_pattern)] // Triggered by bitflags! usage
 
 mod members;
 pub(crate) mod normal;
@@ -12,14 +12,16 @@ use std::{
 use bitflags::bitflags;
 pub use members::RoomMember;
 pub use normal::{
-    Room, RoomHero, RoomInfo, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomState,
-    RoomStateFilter,
+    apply_redaction, Room, RoomHero, RoomInfo, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons,
+    RoomMembersUpdate, RoomState, RoomStateFilter,
 };
+use regex::Regex;
 use ruma::{
     assign,
     events::{
         beacon_info::BeaconInfoEventContent,
-        call::member::CallMemberEventContent,
+        call::member::{CallMemberEventContent, CallMemberStateKey},
+        direct::OwnedDirectUserIdentifier,
         macros::EventContent,
         room::{
             avatar::RoomAvatarEventContent,
@@ -40,7 +42,7 @@ use ruma::{
         RedactedStateEventContent, StaticStateEventContent, SyncStateEvent,
     },
     room::RoomType,
-    EventId, OwnedUserId, RoomVersionId, UserId,
+    EventId, OwnedUserId, RoomVersionId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,7 +51,7 @@ use crate::MinimalStateEvent;
 /// The name of the room, either from the metadata or calculated
 /// according to [matrix specification](https://matrix.org/docs/spec/client_server/latest#calculating-the-display-name-for-a-room)
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum DisplayName {
+pub enum RoomDisplayName {
     /// The room has been named explicitly as
     Named(String),
     /// The room has a canonical alias that should be used
@@ -64,14 +66,48 @@ pub enum DisplayName {
     Empty,
 }
 
-impl fmt::Display for DisplayName {
+const WHITESPACE_REGEX: &str = r"\s+";
+const INVALID_SYMBOLS_REGEX: &str = r"[#,:\{\}\\]+";
+
+impl RoomDisplayName {
+    /// Transforms the current display name into the name part of a
+    /// `RoomAliasId`.
+    pub fn to_room_alias_name(&self) -> String {
+        let room_name = match self {
+            Self::Named(name) => name,
+            Self::Aliased(name) => name,
+            Self::Calculated(name) => name,
+            Self::EmptyWas(name) => name,
+            Self::Empty => "",
+        };
+
+        let whitespace_regex =
+            Regex::new(WHITESPACE_REGEX).expect("`WHITESPACE_REGEX` should be valid");
+        let symbol_regex =
+            Regex::new(INVALID_SYMBOLS_REGEX).expect("`INVALID_SYMBOLS_REGEX` should be valid");
+
+        // Replace whitespaces with `-`
+        let sanitised = whitespace_regex.replace_all(room_name, "-");
+        // Remove non-ASCII characters and ASCII control characters
+        let sanitised =
+            String::from_iter(sanitised.chars().filter(|c| c.is_ascii() && !c.is_ascii_control()));
+        // Remove other problematic ASCII symbols
+        let sanitised = symbol_regex.replace_all(&sanitised, "");
+        // Lowercased
+        sanitised.to_lowercase()
+    }
+}
+
+impl fmt::Display for RoomDisplayName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DisplayName::Named(s) | DisplayName::Calculated(s) | DisplayName::Aliased(s) => {
+            RoomDisplayName::Named(s)
+            | RoomDisplayName::Calculated(s)
+            | RoomDisplayName::Aliased(s) => {
                 write!(f, "{s}")
             }
-            DisplayName::EmptyWas(s) => write!(f, "Empty Room (was {s})"),
-            DisplayName::Empty => write!(f, "Empty Room"),
+            RoomDisplayName::EmptyWas(s) => write!(f, "Empty Room (was {s})"),
+            RoomDisplayName::Empty => write!(f, "Empty Room"),
         }
     }
 }
@@ -92,7 +128,7 @@ pub struct BaseRoomInfo {
     pub(crate) create: Option<MinimalStateEvent<RoomCreateWithCreatorEventContent>>,
     /// A list of user ids this room is considered as direct message, if this
     /// room is a DM.
-    pub(crate) dm_targets: HashSet<OwnedUserId>,
+    pub(crate) dm_targets: HashSet<OwnedDirectUserIdentifier>,
     /// The `m.room.encryption` event content that enabled E2EE in this room.
     pub(crate) encryption: Option<RoomEncryptionEventContent>,
     /// The guest access policy of this room.
@@ -112,7 +148,8 @@ pub struct BaseRoomInfo {
     /// All minimal state events that containing one or more running matrixRTC
     /// memberships.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
-    pub(crate) rtc_member: BTreeMap<OwnedUserId, MinimalStateEvent<CallMemberEventContent>>,
+    pub(crate) rtc_member_events:
+        BTreeMap<CallMemberStateKey, MinimalStateEvent<CallMemberEventContent>>,
     /// Whether this room has been manually marked as unread.
     #[serde(default)]
     pub(crate) is_marked_unread: bool,
@@ -195,15 +232,12 @@ impl BaseRoomInfo {
                 let mut o_ev = o_ev.clone();
                 o_ev.content.set_created_ts_if_none(o_ev.origin_server_ts);
 
-                let Some(owned_user_id) = get_user_id_for_state_key(m.state_key()) else {
-                    return false;
-                };
-
-                // add the new event.
-                self.rtc_member.insert(owned_user_id, SyncStateEvent::Original(o_ev).into());
+                // Add the new event.
+                self.rtc_member_events
+                    .insert(m.state_key().clone(), SyncStateEvent::Original(o_ev).into());
 
                 // Remove all events that don't contain any memberships anymore.
-                self.rtc_member.retain(|_, ev| {
+                self.rtc_member_events.retain(|_, ev| {
                     ev.as_original().is_some_and(|o| !o.content.active_memberships(None).is_empty())
                 });
             }
@@ -303,7 +337,8 @@ impl BaseRoomInfo {
         } else if self.topic.has_event_id(redacts) {
             self.topic.as_mut().unwrap().redact(&room_version);
         } else {
-            self.rtc_member.retain(|_, member_event| member_event.event_id() != Some(redacts));
+            self.rtc_member_events
+                .retain(|_, member_event| member_event.event_id() != Some(redacts));
         }
     }
 
@@ -320,33 +355,6 @@ impl BaseRoomInfo {
 
         self.notable_tags = notable_tags;
     }
-}
-
-/// Extract a user ID from a state key that matches one of these formats:
-/// - `<user ID>`
-/// - `<user ID>_<string>`
-/// - `_<user ID>_<string>`
-fn get_user_id_for_state_key(state_key: &str) -> Option<OwnedUserId> {
-    if let Ok(user_id) = UserId::parse(state_key) {
-        return Some(user_id);
-    }
-
-    // Ignore leading underscore if present
-    // (used for avoiding auth rules on @-prefixed state keys)
-    let state_key = state_key.strip_prefix('_').unwrap_or(state_key);
-    if state_key.starts_with('@') {
-        if let Some(colon_idx) = state_key.find(':') {
-            let state_key_user_id = match state_key[colon_idx + 1..].find('_') {
-                None => state_key,
-                Some(suffix_idx) => &state_key[..colon_idx + 1 + suffix_idx],
-            };
-            if let Ok(user_id) = UserId::parse(state_key_user_id) {
-                return Some(user_id);
-            }
-        }
-    }
-
-    None
 }
 
 bitflags! {
@@ -395,7 +403,7 @@ impl Default for BaseRoomInfo {
             name: None,
             tombstone: None,
             topic: None,
-            rtc_member: BTreeMap::new(),
+            rtc_member_events: BTreeMap::new(),
             is_marked_unread: false,
             notable_tags: RoomNotableTags::empty(),
             pinned_events: None,
@@ -566,12 +574,10 @@ impl RoomMemberships {
 mod tests {
     use std::ops::Not;
 
-    use ruma::{
-        events::tag::{TagInfo, TagName, Tags},
-        user_id,
-    };
+    use ruma::events::tag::{TagInfo, TagName, Tags};
 
-    use super::{get_user_id_for_state_key, BaseRoomInfo, RoomNotableTags};
+    use super::{BaseRoomInfo, RoomNotableTags};
+    use crate::RoomDisplayName;
 
     #[test]
     fn test_handle_notable_tags_favourite() {
@@ -604,30 +610,34 @@ mod tests {
     }
 
     #[test]
-    fn test_get_user_id_for_state_key() {
-        assert!(get_user_id_for_state_key("").is_none());
-        assert!(get_user_id_for_state_key("abc").is_none());
-        assert!(get_user_id_for_state_key("@nocolon").is_none());
-        assert!(get_user_id_for_state_key("@noserverpart:").is_none());
-        assert!(get_user_id_for_state_key("@noserverpart:_suffix").is_none());
-
-        let user_id = user_id!("@username:example.org");
-
-        assert_eq!(get_user_id_for_state_key(user_id.as_str()).as_deref(), Some(user_id));
+    fn test_room_alias_from_room_display_name_lowercases() {
         assert_eq!(
-            get_user_id_for_state_key(format!("{user_id}_valid_suffix").as_str()).as_deref(),
-            Some(user_id)
+            "roomalias",
+            RoomDisplayName::Named("RoomAlias".to_owned()).to_room_alias_name()
         );
-        assert!(get_user_id_for_state_key(format!("{user_id}:invalid_suffix").as_str()).is_none());
+    }
 
+    #[test]
+    fn test_room_alias_from_room_display_name_removes_whitespace() {
         assert_eq!(
-            get_user_id_for_state_key(format!("_{user_id}").as_str()).as_deref(),
-            Some(user_id)
+            "room-alias",
+            RoomDisplayName::Named("Room Alias".to_owned()).to_room_alias_name()
         );
+    }
+
+    #[test]
+    fn test_room_alias_from_room_display_name_removes_non_ascii_symbols() {
         assert_eq!(
-            get_user_id_for_state_key(format!("_{user_id}_valid_suffix").as_str()).as_deref(),
-            Some(user_id)
+            "roomalias",
+            RoomDisplayName::Named("Room±Alias√".to_owned()).to_room_alias_name()
         );
-        assert!(get_user_id_for_state_key(format!("_{user_id}:invalid_suffix").as_str()).is_none());
+    }
+
+    #[test]
+    fn test_room_alias_from_room_display_name_removes_invalid_ascii_symbols() {
+        assert_eq!(
+            "roomalias",
+            RoomDisplayName::Named("#Room,{Alias}:".to_owned()).to_room_alias_name()
+        );
     }
 }

@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use matrix_sdk_base::crypto::types::SecretsBundle;
-use openidconnect::{
-    core::CoreDeviceAuthorizationResponse, EndUserVerificationUrl, VerificationUriComplete,
+use matrix_sdk_common::deserialized_responses::PrivOwnedStr;
+use oauth2::{
+    EndUserVerificationUrl, StandardDeviceAuthorizationResponse, VerificationUriComplete,
 };
 use ruma::serde::StringEnum;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -106,8 +107,8 @@ impl QrAuthMessage {
     }
 }
 
-impl From<&CoreDeviceAuthorizationResponse> for AuthorizationGrant {
-    fn from(value: &CoreDeviceAuthorizationResponse) -> Self {
+impl From<&StandardDeviceAuthorizationResponse> for AuthorizationGrant {
+    fn from(value: &StandardDeviceAuthorizationResponse) -> Self {
         Self {
             verification_uri: value.verification_uri().clone(),
             verification_uri_complete: value.verification_uri_complete().cloned(),
@@ -182,15 +183,6 @@ where
 {
     s.serialize_str(&key.to_base64())
 }
-
-// Wrapper around `Box<str>` that cannot be used in a meaningful way outside of
-// this crate. Used for string enums because their `_Custom` variant can't be
-// truly private (only `#[doc(hidden)]`).
-// TODO: It probably makes sense to move the above messages into Ruma, if for
-// nothing else, to get rid of this `PrivOwnedStr`.
-#[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PrivOwnedStr(Box<str>);
 
 #[cfg(test)]
 mod test {

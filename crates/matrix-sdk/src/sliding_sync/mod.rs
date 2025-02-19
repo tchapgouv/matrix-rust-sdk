@@ -25,7 +25,7 @@ mod sticky_parameters;
 mod utils;
 
 use std::{
-    collections::{btree_map::Entry, BTreeMap, HashSet},
+    collections::{btree_map::Entry, BTreeMap},
     fmt::Debug,
     future::Future,
     sync::{Arc, RwLock as StdRwLock},
@@ -35,15 +35,14 @@ use std::{
 use async_stream::stream;
 pub use client::{Version, VersionBuilder};
 use futures_core::stream::Stream;
-pub use matrix_sdk_base::sliding_sync::http;
-use matrix_sdk_common::timer;
+use matrix_sdk_common::{deserialized_responses::TimelineEvent, executor::spawn, timer};
 use ruma::{
-    api::{client::error::ErrorKind, OutgoingRequest},
-    assign, OwnedEventId, OwnedRoomId, RoomId,
+    api::client::{error::ErrorKind, sync::sync_events::v5 as http},
+    assign, OwnedRoomId, RoomId,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
-    select, spawn,
+    select,
     sync::{broadcast::Sender, Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock},
 };
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
@@ -56,7 +55,7 @@ use self::{
     client::SlidingSyncResponseProcessor,
     sticky_parameters::{LazyTransactionId, SlidingSyncStickyManager, StickyData},
 };
-use crate::{config::RequestConfig, Client, HttpError, Result};
+use crate::{config::RequestConfig, Client, Result};
 
 /// The Sliding Sync instance.
 ///
@@ -71,17 +70,13 @@ pub struct SlidingSync {
 pub(super) struct SlidingSyncInner {
     /// A unique identifier for this instance of sliding sync.
     ///
-    /// Used to distinguish different connections to the sliding sync proxy.
+    /// Used to distinguish different connections to sliding sync.
     id: String,
-
-    /// Either an overridden sliding sync [`Version`], or one inherited from the
-    /// client.
-    version: Version,
 
     /// The HTTP Matrix client.
     client: Client,
 
-    /// Long-polling timeout that appears the sliding sync proxy request.
+    /// Long-polling timeout that appears in sliding sync request.
     poll_timeout: Duration,
 
     /// Extra duration for the sliding sync request to timeout. This is added to
@@ -151,12 +146,13 @@ impl SlidingSync {
         &self,
         room_ids: &[&RoomId],
         settings: Option<http::request::RoomSubscription>,
+        cancel_in_flight_request: bool,
     ) {
         let settings = settings.unwrap_or_default();
         let mut sticky = self.inner.sticky.write().unwrap();
         let room_subscriptions = &mut sticky.data_mut().room_subscriptions;
 
-        let mut skip_sync_loop = false;
+        let mut skip_over_current_sync_loop_iteration = false;
 
         for room_id in room_ids {
             // If the room subscription already exists, let's not
@@ -172,11 +168,11 @@ impl SlidingSync {
 
                 entry.insert((RoomSubscriptionState::default(), settings.clone()));
 
-                skip_sync_loop = true;
+                skip_over_current_sync_loop_iteration = true;
             }
         }
 
-        if skip_sync_loop {
+        if cancel_in_flight_request && skip_over_current_sync_loop_iteration {
             self.inner.internal_channel_send_if_possible(
                 SlidingSyncInternalMessage::SyncLoopSkipOverCurrentIteration,
             );
@@ -267,7 +263,7 @@ impl SlidingSync {
     #[instrument(skip_all)]
     async fn handle_response(
         &self,
-        mut sliding_sync_response: http::Response,
+        sliding_sync_response: http::Response,
         position: &mut SlidingSyncPositionMarkers,
     ) -> Result<UpdateSummary, crate::Error> {
         let pos = Some(sliding_sync_response.pos.clone());
@@ -275,13 +271,6 @@ impl SlidingSync {
         let must_process_rooms_response = self.must_process_rooms_response().await;
 
         trace!(yes = must_process_rooms_response, "Must process rooms response?");
-
-        // Compute `limited` for the SS proxy only, if we're interested in a room list
-        // query.
-        if !self.inner.version.is_native() && must_process_rooms_response {
-            let known_rooms = self.inner.rooms.read().await;
-            compute_limited(&known_rooms, &mut sliding_sync_response.rooms);
-        }
 
         // Transform a Sliding Sync Response to a `SyncResponse`.
         //
@@ -305,15 +294,9 @@ impl SlidingSync {
             }
 
             // Only handle the room's subsection of the response, if this sliding sync was
-            // configured to do so. That's because even when not requesting it,
-            // sometimes the current (2023-07-20) proxy will forward room events
-            // unrelated to the current connection's parameters.
-            //
-            // NOTE: SS proxy workaround.
+            // configured to do so.
             if must_process_rooms_response {
-                response_processor
-                    .handle_room_response(&sliding_sync_response, self.inner.version.is_native())
-                    .await?;
+                response_processor.handle_room_response(&sliding_sync_response).await?;
             }
 
             response_processor.process_and_take_response().await?
@@ -344,7 +327,7 @@ impl SlidingSync {
                         if let Some(joined_room) = sync_response.rooms.join.remove(&room_id) {
                             joined_room.timeline.events
                         } else {
-                            room_data.timeline.drain(..).map(Into::into).collect()
+                            room_data.timeline.drain(..).map(TimelineEvent::new).collect()
                         };
 
                     match rooms_map.get_mut(&room_id) {
@@ -358,7 +341,6 @@ impl SlidingSync {
                             rooms_map.insert(
                                 room_id.clone(),
                                 SlidingSyncRoom::new(
-                                    self.inner.client.clone(),
                                     room_id.clone(),
                                     room_data.prev_batch,
                                     timeline,
@@ -491,6 +473,23 @@ impl SlidingSync {
 
         Span::current().record("pos", &pos);
 
+        // When the client sends a request with no `pos`, MSC4186 returns no device
+        // lists updates, as it only returns changes since the provided `pos`
+        // (which is `null` in this case); this is in line with sync v2.
+        //
+        // Therefore, with MSC4186, the device list cache must be marked as to be
+        // re-downloaded if the `since` token is `None`, otherwise it's easy to miss
+        // device lists updates that happened between the previous request and the new
+        // “initial” request.
+        #[cfg(feature = "e2e-encryption")]
+        if pos.is_none() && self.is_e2ee_enabled() {
+            info!("Marking all tracked users as dirty");
+
+            let olm_machine = self.inner.client.olm_machine().await;
+            let olm_machine = olm_machine.as_ref().ok_or(Error::NoOlmMachine)?;
+            olm_machine.mark_all_tracked_users_as_dirty().await?;
+        }
+
         // Configure the timeout.
         //
         // The `timeout` query is necessary when all lists require it. Please see
@@ -507,7 +506,9 @@ impl SlidingSync {
         // Apply sticky parameters, if needs be.
         self.inner.sticky.write().unwrap().maybe_apply(&mut request, txn_id);
 
-        // Set the to-device token if the extension is enabled.
+        // Extensions are now applied (via sticky parameters).
+        //
+        // Override the to-device token if the extension is enabled.
         if to_device_enabled {
             request.extensions.to_device.since =
                 restored_fields.and_then(|fields| fields.to_device_token);
@@ -523,38 +524,26 @@ impl SlidingSync {
             request,
             // Configure long-polling. We need some time for the long-poll itself,
             // and extra time for the network delays.
-            RequestConfig::default().timeout(self.inner.poll_timeout + self.inner.network_timeout),
+            RequestConfig::default()
+                .timeout(self.inner.poll_timeout + self.inner.network_timeout)
+                .retry_limit(3),
             position_guard,
         ))
     }
 
     /// Send a sliding sync request.
     ///
-    /// This method contains the sending logic. It takes a generic `Request`
-    /// because it can be a Simplified MSC3575 or a MSC3575 `Request`.
-    async fn send_sync_request<Request>(
+    /// This method contains the sending logic.
+    async fn send_sync_request(
         &self,
-        request: Request,
+        request: http::Request,
         request_config: RequestConfig,
         mut position_guard: OwnedMutexGuard<SlidingSyncPositionMarkers>,
-    ) -> Result<UpdateSummary>
-    where
-        Request: OutgoingRequest + Clone + Debug + Send + Sync + 'static,
-        Request::IncomingResponse: Send
-            + Sync
-            +
-            // This is required to get back a Simplified MSC3575 `Response` whatever the
-            // `Request` type.
-            Into<http::Response>,
-        HttpError: From<ruma::api::error::FromHttpResponseError<Request::EndpointError>>,
-    {
+    ) -> Result<UpdateSummary> {
         debug!("Sending request");
 
         // Prepare the request.
-        let request =
-            self.inner.client.send(request, Some(request_config)).with_homeserver_override(
-                self.inner.version.overriding_url().map(ToString::to_string),
-            );
+        let request = self.inner.client.send(request).with_request_config(request_config);
 
         // Send the request and get a response with end-to-end encryption support.
         //
@@ -612,12 +601,6 @@ impl SlidingSync {
         // Send the request and get a response _without_ end-to-end encryption support.
         #[cfg(not(feature = "e2e-encryption"))]
         let response = request.await?;
-
-        // The code manipulates `Request` and `Response` from Simplified MSC3575 because
-        // it's the future standard. But this function may have received a `Request`
-        // from Simplified MSC3575 or MSC3575. We need to get back a
-        // Simplified MSC3575 `Response`.
-        let response = Into::<http::simplified_msc3575::Response>::into(response);
 
         debug!("Received response");
 
@@ -677,25 +660,18 @@ impl SlidingSync {
             || !self.inner.lists.read().await.is_empty()
     }
 
-    #[instrument(skip_all, fields(pos))]
+    #[instrument(skip_all, fields(pos, conn_id = self.inner.id))]
     async fn sync_once(&self) -> Result<UpdateSummary> {
         let (request, request_config, position_guard) =
             self.generate_sync_request(&mut LazyTransactionId::new()).await?;
 
-        // The code manipulates `Request` and `Response` from Simplified MSC3575
-        // because it's the future standard. If
-        // `Client::is_simplified_sliding_sync_enabled` is turned off, the
-        // Simplified MSC3575 `Request` must be transformed into a MSC3575 `Request`.
-        if !self.inner.version.is_native() {
-            self.send_sync_request(
-                Into::<http::msc3575::Request>::into(request),
-                request_config,
-                position_guard,
-            )
-            .await
-        } else {
-            self.send_sync_request(request, request_config, position_guard).await
-        }
+        // Send the request, kaboom.
+        let summaries = self.send_sync_request(request, request_config, position_guard).await?;
+
+        // Notify a new sync was received
+        self.inner.client.inner.sync_beat.notify(usize::MAX);
+
+        Ok(summaries)
     }
 
     /// Create a _new_ Sliding Sync sync loop.
@@ -841,21 +817,10 @@ enum SlidingSyncInternalMessage {
 
 #[cfg(any(test, feature = "testing"))]
 impl SlidingSync {
-    /// Get a copy of the `pos` value.
-    pub fn pos(&self) -> Option<String> {
-        let position_lock = self.inner.position.blocking_lock();
-        position_lock.pos.clone()
-    }
-
     /// Set a new value for `pos`.
-    pub fn set_pos(&self, new_pos: String) {
-        let mut position_lock = self.inner.position.blocking_lock();
+    pub async fn set_pos(&self, new_pos: String) {
+        let mut position_lock = self.inner.position.lock().await;
         position_lock.pos = Some(new_pos);
-    }
-
-    /// Get the sliding sync version used by this instance.
-    pub fn version(&self) -> &Version {
-        &self.inner.version
     }
 
     /// Read the static extension configuration for this Sliding Sync.
@@ -988,83 +953,7 @@ impl StickyData for SlidingSyncStickyParameters {
     }
 }
 
-/// As of 2023-07-13, the sliding sync proxy doesn't provide us with `limited`
-/// correctly, so we cheat and "correct" it using heuristics here.
-/// TODO remove this workaround as soon as support of the `limited` flag is
-/// properly implemented in the open-source proxy: https://github.com/matrix-org/sliding-sync/issues/197
-// NOTE: SS proxy workaround.
-fn compute_limited(
-    local_rooms: &BTreeMap<OwnedRoomId, SlidingSyncRoom>,
-    remote_rooms: &mut BTreeMap<OwnedRoomId, http::response::Room>,
-) {
-    for (room_id, remote_room) in remote_rooms {
-        // Only rooms marked as initially loaded are subject to the fixup.
-        let initial = remote_room.initial.unwrap_or(false);
-        if !initial {
-            continue;
-        }
-
-        if remote_room.limited {
-            // If the room was already marked as limited, the server knew more than we do.
-            continue;
-        }
-
-        let remote_events = &remote_room.timeline;
-        if remote_events.is_empty() {
-            trace!(?room_id, "no timeline updates in the response => not limited");
-            continue;
-        }
-
-        let Some(local_room) = local_rooms.get(room_id) else {
-            trace!(?room_id, "room isn't known locally => not limited");
-            continue;
-        };
-
-        let local_events = local_room.timeline_queue();
-
-        if local_events.is_empty() {
-            trace!(?room_id, "local timeline had no events => not limited");
-            continue;
-        }
-
-        // If the local room had some timeline events, consider it's a `limited` if
-        // there's absolutely no overlap between the known events and the new
-        // events in the timeline.
-
-        // Gather all the known event IDs. Ignore events that don't have an event ID.
-        let num_local_events = local_events.len();
-        let local_events_with_ids: HashSet<OwnedEventId> =
-            HashSet::from_iter(local_events.into_iter().filter_map(|event| event.event_id()));
-
-        // There's overlap if, and only if, there's at least one event in the response's
-        // timeline that matches an event id we've seen before.
-        let mut num_remote_events_missing_ids = 0;
-        let overlap = remote_events.iter().any(|remote_event| {
-            if let Some(remote_event_id) =
-                remote_event.get_field::<OwnedEventId>("event_id").ok().flatten()
-            {
-                local_events_with_ids.contains(&remote_event_id)
-            } else {
-                num_remote_events_missing_ids += 1;
-                false
-            }
-        });
-
-        remote_room.limited = !overlap;
-
-        trace!(
-            ?room_id,
-            num_events_response = remote_events.len(),
-            num_local_events,
-            num_local_events_with_ids = local_events_with_ids.len(),
-            num_remote_events_missing_ids,
-            room_limited = remote_room.limited,
-            "done"
-        );
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 #[allow(clippy::dbg_macro)]
 mod tests {
     use std::{
@@ -1076,23 +965,22 @@ mod tests {
     };
 
     use assert_matches::assert_matches;
+    use event_listener::Listener;
     use futures_util::{future::join_all, pin_mut, StreamExt};
-    use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
     use matrix_sdk_test::async_test;
     use ruma::{
         api::client::error::ErrorKind, assign, owned_room_id, room_id, serde::Raw, uint,
-        DeviceKeyAlgorithm, OwnedRoomId, TransactionId,
+        OwnedRoomId, TransactionId,
     };
     use serde::Deserialize;
     use serde_json::json;
-    use url::Url;
     use wiremock::{http::Method, Match, Mock, MockServer, Request, ResponseTemplate};
 
     use super::{
-        compute_limited, http,
+        http,
         sticky_parameters::{LazyTransactionId, SlidingSyncStickyManager},
         FrozenSlidingSync, SlidingSync, SlidingSyncList, SlidingSyncListBuilder, SlidingSyncMode,
-        SlidingSyncRoom, SlidingSyncStickyParameters, Version,
+        SlidingSyncStickyParameters,
     };
     use crate::{
         sliding_sync::cache::restore_sliding_sync_state, test_utils::logged_in_client, Result,
@@ -1195,7 +1083,7 @@ mod tests {
         // Members are now synced! We can start subscribing and see how it goes.
         assert!(room0.are_members_synced());
 
-        sliding_sync.subscribe_to_rooms(&[room_id_0, room_id_1], None);
+        sliding_sync.subscribe_to_rooms(&[room_id_0, room_id_1], None, true);
 
         // OK, we have subscribed to some rooms. Let's check on `room0` if members are
         // now marked as not synced.
@@ -1236,7 +1124,7 @@ mod tests {
         // Members are synced, good, good.
         assert!(room0.are_members_synced());
 
-        sliding_sync.subscribe_to_rooms(&[room_id_0], None);
+        sliding_sync.subscribe_to_rooms(&[room_id_0], None, false);
 
         // Members are still synced: because we have already subscribed to the
         // room, the members aren't marked as unsynced.
@@ -1256,7 +1144,7 @@ mod tests {
         let room_id_2 = room_id!("!r2:bar.org");
 
         // Subscribe to two rooms.
-        sliding_sync.subscribe_to_rooms(&[room_id_0, room_id_1], None);
+        sliding_sync.subscribe_to_rooms(&[room_id_0, room_id_1], None, false);
 
         {
             let sticky = sliding_sync.inner.sticky.read().unwrap();
@@ -1268,7 +1156,7 @@ mod tests {
         }
 
         // Subscribe to one more room.
-        sliding_sync.subscribe_to_rooms(&[room_id_2], None);
+        sliding_sync.subscribe_to_rooms(&[room_id_2], None, false);
 
         {
             let sticky = sliding_sync.inner.sticky.read().unwrap();
@@ -1290,7 +1178,7 @@ mod tests {
         }
 
         // Subscribe to one room again.
-        sliding_sync.subscribe_to_rooms(&[room_id_2], None);
+        sliding_sync.subscribe_to_rooms(&[room_id_2], None, false);
 
         {
             let sticky = sliding_sync.inner.sticky.read().unwrap();
@@ -1533,11 +1421,11 @@ mod tests {
         // to-device.
         let extensions = &sticky.data().extensions;
         assert_eq!(extensions.e2ee.enabled, None);
-        assert_eq!(extensions.to_device.enabled, None,);
-        assert_eq!(extensions.to_device.since, None,);
+        assert_eq!(extensions.to_device.enabled, None);
+        assert_eq!(extensions.to_device.since, None);
 
-        // What the user explicitly enabled is... enabled.
-        assert_eq!(extensions.account_data.enabled, Some(true),);
+        // What the user explicitly enabled is… enabled.
+        assert_eq!(extensions.account_data.enabled, Some(true));
 
         let txn_id: &TransactionId = "tid123".into();
         let mut request = http::Request::default();
@@ -1562,7 +1450,7 @@ mod tests {
             .await?;
 
         // No extensions have been explicitly enabled here.
-        assert_eq!(sync.inner.sticky.read().unwrap().data().extensions.to_device.enabled, None,);
+        assert_eq!(sync.inner.sticky.read().unwrap().data().extensions.to_device.enabled, None);
         assert_eq!(sync.inner.sticky.read().unwrap().data().extensions.e2ee.enabled, None);
         assert_eq!(sync.inner.sticky.read().unwrap().data().extensions.account_data.enabled, None);
 
@@ -1656,6 +1544,153 @@ mod tests {
 
         #[cfg(feature = "e2e-encryption")]
         assert_eq!(request.extensions.to_device.since.as_deref(), Some(_since_token));
+
+        Ok(())
+    }
+
+    // With MSC4186, with the `e2ee` extension enabled, if a request has no `pos`,
+    // all the tracked users by the `OlmMachine` must be marked as dirty, i.e.
+    // `/key/query` requests must be sent. See the code to see the details.
+    //
+    // This test is asserting that.
+    #[async_test]
+    #[cfg(feature = "e2e-encryption")]
+    async fn test_no_pos_with_e2ee_marks_all_tracked_users_as_dirty() -> anyhow::Result<()> {
+        use matrix_sdk_base::crypto::types::requests::{AnyIncomingResponse, AnyOutgoingRequest};
+        use matrix_sdk_test::ruma_response_from_json;
+        use ruma::user_id;
+
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        let alice = user_id!("@alice:localhost");
+        let bob = user_id!("@bob:localhost");
+        let me = user_id!("@example:localhost");
+
+        // Track and mark users are not dirty, so that we can check they are “dirty”
+        // after that. Dirty here means that a `/key/query` must be sent.
+        {
+            let olm_machine = client.olm_machine().await;
+            let olm_machine = olm_machine.as_ref().unwrap();
+
+            olm_machine.update_tracked_users([alice, bob]).await?;
+
+            // Assert requests.
+            let outgoing_requests = olm_machine.outgoing_requests().await?;
+
+            assert_eq!(outgoing_requests.len(), 2);
+            assert_matches!(outgoing_requests[0].request(), AnyOutgoingRequest::KeysUpload(_));
+            assert_matches!(outgoing_requests[1].request(), AnyOutgoingRequest::KeysQuery(_));
+
+            // Fake responses.
+            olm_machine
+                .mark_request_as_sent(
+                    outgoing_requests[0].request_id(),
+                    AnyIncomingResponse::KeysUpload(&ruma_response_from_json(&json!({
+                        "one_time_key_counts": {}
+                    }))),
+                )
+                .await?;
+
+            olm_machine
+                .mark_request_as_sent(
+                    outgoing_requests[1].request_id(),
+                    AnyIncomingResponse::KeysQuery(&ruma_response_from_json(&json!({
+                        "device_keys": {
+                            alice: {},
+                            bob: {},
+                        }
+                    }))),
+                )
+                .await?;
+
+            // Once more.
+            let outgoing_requests = olm_machine.outgoing_requests().await?;
+
+            assert_eq!(outgoing_requests.len(), 1);
+            assert_matches!(outgoing_requests[0].request(), AnyOutgoingRequest::KeysQuery(_));
+
+            olm_machine
+                .mark_request_as_sent(
+                    outgoing_requests[0].request_id(),
+                    AnyIncomingResponse::KeysQuery(&ruma_response_from_json(&json!({
+                        "device_keys": {
+                            me: {},
+                        }
+                    }))),
+                )
+                .await?;
+
+            // No more.
+            let outgoing_requests = olm_machine.outgoing_requests().await?;
+
+            assert!(outgoing_requests.is_empty());
+        }
+
+        let sync = client
+            .sliding_sync("test-slidingsync")?
+            .add_list(SlidingSyncList::builder("new_list"))
+            .with_e2ee_extension(assign!(http::request::E2EE::default(), { enabled: Some(true)}))
+            .build()
+            .await?;
+
+        // First request: no `pos`.
+        let txn_id = TransactionId::new();
+        let (_request, _, _) = sync
+            .generate_sync_request(&mut LazyTransactionId::from_owned(txn_id.to_owned()))
+            .await?;
+
+        // Now, tracked users must be dirty.
+        {
+            let olm_machine = client.olm_machine().await;
+            let olm_machine = olm_machine.as_ref().unwrap();
+
+            // Assert requests.
+            let outgoing_requests = olm_machine.outgoing_requests().await?;
+
+            assert_eq!(outgoing_requests.len(), 1);
+            assert_matches!(
+                outgoing_requests[0].request(),
+                AnyOutgoingRequest::KeysQuery(request) => {
+                    assert!(request.device_keys.contains_key(alice));
+                    assert!(request.device_keys.contains_key(bob));
+                    assert!(request.device_keys.contains_key(me));
+                }
+            );
+
+            // Fake responses.
+            olm_machine
+                .mark_request_as_sent(
+                    outgoing_requests[0].request_id(),
+                    AnyIncomingResponse::KeysQuery(&ruma_response_from_json(&json!({
+                        "device_keys": {
+                            alice: {},
+                            bob: {},
+                            me: {},
+                        }
+                    }))),
+                )
+                .await?;
+        }
+
+        // Second request: with a `pos` this time.
+        sync.set_pos("chocolat".to_owned()).await;
+
+        let txn_id = TransactionId::new();
+        let (_request, _, _) = sync
+            .generate_sync_request(&mut LazyTransactionId::from_owned(txn_id.to_owned()))
+            .await?;
+
+        // Tracked users are not marked as dirty.
+        {
+            let olm_machine = client.olm_machine().await;
+            let olm_machine = olm_machine.as_ref().unwrap();
+
+            // Assert requests.
+            let outgoing_requests = olm_machine.outgoing_requests().await?;
+
+            assert!(outgoing_requests.is_empty());
+        }
 
         Ok(())
     }
@@ -2038,235 +2073,6 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_sliding_sync_version() -> Result<()> {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
-
-        // By default, sliding sync inherits its version from the client, which is
-        // `Native`.
-        {
-            let sync = client.sliding_sync("default")?.build().await?;
-
-            assert_matches!(sync.version(), Version::Native);
-        }
-
-        // Sliding sync can override the configuration from the client.
-        {
-            let url = Url::parse("https://bar.matrix/").unwrap();
-            let sync = client
-                .sliding_sync("own-proxy")?
-                .version(Version::Proxy { url: url.clone() })
-                .build()
-                .await?;
-
-            assert_matches!(
-                sync.version(),
-                Version::Proxy { url: given_url } => {
-                    assert_eq!(&url, given_url);
-                }
-            );
-        }
-
-        // Sliding sync inherits from the client…
-        let url = Url::parse("https://foo.matrix/").unwrap();
-        client.set_sliding_sync_version(Version::Proxy { url: url.clone() });
-
-        {
-            // The sliding sync inherits the client's sliding sync proxy URL.
-            let sync = client.sliding_sync("client-proxy")?.build().await?;
-
-            assert_matches!(
-                sync.version(),
-                Version::Proxy { url: given_url } => {
-                    assert_eq!(&url, given_url);
-                }
-            );
-        }
-
-        {
-            // …unless we override it afterwards.
-            let sync = client.sliding_sync("own-proxy")?.version(Version::Native).build().await?;
-
-            assert_matches!(sync.version(), Version::Native);
-        }
-
-        Ok(())
-    }
-
-    #[async_test]
-    async fn test_limited_flag_computation() {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
-
-        let make_event = |event_id: &str| -> SyncTimelineEvent {
-            SyncTimelineEvent::new(
-                Raw::from_json_string(
-                    json!({
-                        "event_id": event_id,
-                        "sender": "@johnmastodon:example.org",
-                        "origin_server_ts": 1337424242,
-                        "type": "m.room.message",
-                        "room_id": "!meaningless:example.org",
-                        "content": {
-                            "body": "Hello, world!",
-                            "msgtype": "m.text"
-                        },
-                    })
-                    .to_string(),
-                )
-                .unwrap(),
-            )
-        };
-
-        let event_a = make_event("$a");
-        let event_b = make_event("$b");
-        let event_c = make_event("$c");
-        let event_d = make_event("$d");
-
-        let not_initial = room_id!("!croissant:example.org");
-        let no_overlap = room_id!("!omelette:example.org");
-        let partial_overlap = room_id!("!fromage:example.org");
-        let complete_overlap = room_id!("!baguette:example.org");
-        let no_remote_events = room_id!("!pain:example.org");
-        let no_local_events = room_id!("!crepe:example.org");
-        let already_limited = room_id!("!paris:example.org");
-
-        let response_timeline = vec![event_c.event.clone(), event_d.event.clone()];
-
-        let local_rooms = BTreeMap::from_iter([
-            (
-                // This has no events overlapping with the response timeline, hence limited, but
-                // it's not marked as initial in the response.
-                not_initial.to_owned(),
-                SlidingSyncRoom::new(
-                    client.clone(),
-                    no_overlap.to_owned(),
-                    None,
-                    vec![event_a.clone(), event_b.clone()],
-                ),
-            ),
-            (
-                // This has no events overlapping with the response timeline, hence limited.
-                no_overlap.to_owned(),
-                SlidingSyncRoom::new(
-                    client.clone(),
-                    no_overlap.to_owned(),
-                    None,
-                    vec![event_a.clone(), event_b.clone()],
-                ),
-            ),
-            (
-                // This has event_c in common with the response timeline.
-                partial_overlap.to_owned(),
-                SlidingSyncRoom::new(
-                    client.clone(),
-                    partial_overlap.to_owned(),
-                    None,
-                    vec![event_a.clone(), event_b.clone(), event_c.clone()],
-                ),
-            ),
-            (
-                // This has all events in common with the response timeline.
-                complete_overlap.to_owned(),
-                SlidingSyncRoom::new(
-                    client.clone(),
-                    partial_overlap.to_owned(),
-                    None,
-                    vec![event_c.clone(), event_d.clone()],
-                ),
-            ),
-            (
-                // We locally have events for this room, and receive none in the response: not
-                // limited.
-                no_remote_events.to_owned(),
-                SlidingSyncRoom::new(
-                    client.clone(),
-                    no_remote_events.to_owned(),
-                    None,
-                    vec![event_c.clone(), event_d.clone()],
-                ),
-            ),
-            (
-                // We don't have events for this room locally, and even if the remote room contains
-                // some events, it's not a limited sync.
-                no_local_events.to_owned(),
-                SlidingSyncRoom::new(client.clone(), no_local_events.to_owned(), None, vec![]),
-            ),
-            (
-                // Already limited, but would be marked limited if the flag wasn't ignored (same as
-                // partial overlap).
-                already_limited.to_owned(),
-                SlidingSyncRoom::new(
-                    client,
-                    already_limited.to_owned(),
-                    None,
-                    vec![event_a, event_b, event_c.clone()],
-                ),
-            ),
-        ]);
-
-        let mut remote_rooms = BTreeMap::from_iter([
-            (
-                not_initial.to_owned(),
-                assign!(http::response::Room::default(), { timeline: response_timeline }),
-            ),
-            (
-                no_overlap.to_owned(),
-                assign!(http::response::Room::default(), {
-                    initial: Some(true),
-                    timeline: vec![event_c.event.clone(), event_d.event.clone()],
-                }),
-            ),
-            (
-                partial_overlap.to_owned(),
-                assign!(http::response::Room::default(), {
-                    initial: Some(true),
-                    timeline: vec![event_c.event.clone(), event_d.event.clone()],
-                }),
-            ),
-            (
-                complete_overlap.to_owned(),
-                assign!(http::response::Room::default(), {
-                    initial: Some(true),
-                    timeline: vec![event_c.event.clone(), event_d.event.clone()],
-                }),
-            ),
-            (
-                no_remote_events.to_owned(),
-                assign!(http::response::Room::default(), {
-                    initial: Some(true),
-                    timeline: vec![],
-                }),
-            ),
-            (
-                no_local_events.to_owned(),
-                assign!(http::response::Room::default(), {
-                    initial: Some(true),
-                    timeline: vec![event_c.event.clone(), event_d.event.clone()],
-                }),
-            ),
-            (
-                already_limited.to_owned(),
-                assign!(http::response::Room::default(), {
-                    initial: Some(true),
-                    limited: true,
-                    timeline: vec![event_c.event, event_d.event],
-                }),
-            ),
-        ]);
-
-        compute_limited(&local_rooms, &mut remote_rooms);
-
-        assert!(!remote_rooms.get(not_initial).unwrap().limited);
-        assert!(remote_rooms.get(no_overlap).unwrap().limited);
-        assert!(!remote_rooms.get(partial_overlap).unwrap().limited);
-        assert!(!remote_rooms.get(complete_overlap).unwrap().limited);
-        assert!(!remote_rooms.get(no_remote_events).unwrap().limited);
-        assert!(!remote_rooms.get(no_local_events).unwrap().limited);
-        assert!(remote_rooms.get(already_limited).unwrap().limited);
-    }
-
-    #[async_test]
     async fn test_process_read_receipts() -> Result<()> {
         let room = owned_room_id!("!pony:example.org");
 
@@ -2517,6 +2323,8 @@ mod tests {
     #[async_test]
     #[cfg(feature = "e2e-encryption")]
     async fn test_process_only_encryption_events() -> Result<()> {
+        use ruma::OneTimeKeyAlgorithm;
+
         let room = owned_room_id!("!croissant:example.org");
 
         let server = MockServer::start().await;
@@ -2533,7 +2341,7 @@ mod tests {
 
             extensions: assign!(http::response::Extensions::default(), {
                 e2ee: assign!(http::response::E2EE::default(), {
-                    device_one_time_keys_count: BTreeMap::from([(DeviceKeyAlgorithm::SignedCurve25519, uint!(42))])
+                    device_one_time_keys_count: BTreeMap::from([(OneTimeKeyAlgorithm::SignedCurve25519, uint!(42))])
                 }),
                 to_device: Some(assign!(http::response::ToDevice::default(), {
                     next_batch: "to-device-token".to_owned(),
@@ -2681,7 +2489,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(not(target_arch = "wasm32"))] // b/o tokio::time::sleep
     #[async_test]
     async fn test_aborted_request_doesnt_update_future_requests() -> Result<()> {
         let server = MockServer::start().await;
@@ -2905,6 +2712,72 @@ mod tests {
 
         // All lists require a timeout.
         assert!(request.timeout.is_some());
+
+        Ok(())
+    }
+
+    #[async_test]
+    async fn test_sync_beat_is_notified_on_sync_response() -> Result<()> {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        let _mock_guard = Mock::given(SlidingSyncMatcher)
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "pos": "0",
+                "lists": {},
+                "rooms": {}
+            })))
+            .mount_as_scoped(&server)
+            .await;
+
+        let sliding_sync = client
+            .sliding_sync("test")?
+            .with_to_device_extension(
+                assign!(http::request::ToDevice::default(), { enabled: Some(true)}),
+            )
+            .with_e2ee_extension(assign!(http::request::E2EE::default(), { enabled: Some(true)}))
+            .build()
+            .await?;
+
+        let sliding_sync = Arc::new(sliding_sync);
+
+        // Create the listener and perform a sync request
+        let sync_beat_listener = client.inner.sync_beat.listen();
+        sliding_sync.sync_once().await?;
+
+        // The sync beat listener should be notified shortly after
+        assert!(sync_beat_listener.wait_timeout(Duration::from_secs(1)).is_some());
+        Ok(())
+    }
+
+    #[async_test]
+    async fn test_sync_beat_is_not_notified_on_sync_failure() -> Result<()> {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        let _mock_guard = Mock::given(SlidingSyncMatcher)
+            .respond_with(ResponseTemplate::new(404))
+            .mount_as_scoped(&server)
+            .await;
+
+        let sliding_sync = client
+            .sliding_sync("test")?
+            .with_to_device_extension(
+                assign!(http::request::ToDevice::default(), { enabled: Some(true)}),
+            )
+            .with_e2ee_extension(assign!(http::request::E2EE::default(), { enabled: Some(true)}))
+            .build()
+            .await?;
+
+        let sliding_sync = Arc::new(sliding_sync);
+
+        // Create the listener and perform a sync request
+        let sync_beat_listener = client.inner.sync_beat.listen();
+        let sync_result = sliding_sync.sync_once().await;
+        assert!(sync_result.is_err());
+
+        // The sync beat listener won't be notified in this case
+        assert!(sync_beat_listener.wait_timeout(Duration::from_secs(1)).is_none());
 
         Ok(())
     }

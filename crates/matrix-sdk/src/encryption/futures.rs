@@ -25,20 +25,27 @@ use eyeball::Subscriber;
 use matrix_sdk_common::boxed_into_future;
 use ruma::events::room::{EncryptedFile, EncryptedFileInit};
 
-use crate::{Client, Result, TransmissionProgress};
+use crate::{config::RequestConfig, Client, Media, Result, TransmissionProgress};
 
-/// Future returned by [`Client::prepare_encrypted_file`].
+/// Future returned by [`Client::upload_encrypted_file`].
 #[allow(missing_debug_implementations)]
-pub struct PrepareEncryptedFile<'a, R: ?Sized> {
+pub struct UploadEncryptedFile<'a, R: ?Sized> {
     client: &'a Client,
     content_type: &'a mime::Mime,
     reader: &'a mut R,
     send_progress: SharedObservable<TransmissionProgress>,
+    request_config: Option<RequestConfig>,
 }
 
-impl<'a, R: ?Sized> PrepareEncryptedFile<'a, R> {
+impl<'a, R: ?Sized> UploadEncryptedFile<'a, R> {
     pub(crate) fn new(client: &'a Client, content_type: &'a mime::Mime, reader: &'a mut R) -> Self {
-        Self { client, content_type, reader, send_progress: Default::default() }
+        Self {
+            client,
+            content_type,
+            reader,
+            send_progress: Default::default(),
+            request_config: None,
+        }
     }
 
     /// Replace the default `SharedObservable` used for tracking upload
@@ -55,6 +62,15 @@ impl<'a, R: ?Sized> PrepareEncryptedFile<'a, R> {
         self
     }
 
+    /// Replace the default request config used for the upload request.
+    ///
+    /// The timeout value will be overridden with a reasonable default, based on
+    /// the size of the encrypted payload.
+    pub fn with_request_config(mut self, request_config: RequestConfig) -> Self {
+        self.request_config = Some(request_config);
+        self
+    }
+
     /// Get a subscriber to observe the progress of sending the request
     /// body.
     #[cfg(not(target_arch = "wasm32"))]
@@ -63,7 +79,7 @@ impl<'a, R: ?Sized> PrepareEncryptedFile<'a, R> {
     }
 }
 
-impl<'a, R> IntoFuture for PrepareEncryptedFile<'a, R>
+impl<'a, R> IntoFuture for UploadEncryptedFile<'a, R>
 where
     R: Read + Send + ?Sized + 'a,
 {
@@ -71,16 +87,21 @@ where
     boxed_into_future!(extra_bounds: 'a);
 
     fn into_future(self) -> Self::IntoFuture {
-        let Self { client, content_type, reader, send_progress } = self;
+        let Self { client, content_type, reader, send_progress, request_config } = self;
         Box::pin(async move {
             let mut encryptor = matrix_sdk_base::crypto::AttachmentEncryptor::new(reader);
 
             let mut buf = Vec::new();
             encryptor.read_to_end(&mut buf)?;
 
+            // Override the reasonable upload timeout value, based on the size of the
+            // encrypted payload.
+            let request_config =
+                request_config.map(|config| config.timeout(Media::reasonable_upload_timeout(&buf)));
+
             let response = client
                 .media()
-                .upload(content_type, buf)
+                .upload(content_type, buf, request_config)
                 .with_send_progress_observable(send_progress)
                 .await?;
 

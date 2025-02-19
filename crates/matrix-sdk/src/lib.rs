@@ -12,8 +12,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 #![doc = include_str!("../README.md")]
 #![warn(missing_debug_implementations, missing_docs)]
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 pub use async_trait::async_trait;
@@ -23,9 +25,10 @@ pub use matrix_sdk_base::crypto;
 pub use matrix_sdk_base::{
     deserialized_responses,
     store::{DynStateStore, MemoryStore, StateStoreExt},
-    ComposerDraft, ComposerDraftType, DisplayName, Room as BaseRoom,
-    RoomCreateWithCreatorEventContent, RoomHero, RoomInfo, RoomMember as BaseRoomMember,
-    RoomMemberships, RoomState, SessionMeta, StateChanges, StateStore, StoreError,
+    ComposerDraft, ComposerDraftType, QueueWedgeError, Room as BaseRoom,
+    RoomCreateWithCreatorEventContent, RoomDisplayName, RoomHero, RoomInfo,
+    RoomMember as BaseRoomMember, RoomMemberships, RoomState, SessionMeta, StateChanges,
+    StateStore, StoreError,
 };
 pub use matrix_sdk_common::*;
 pub use reqwest;
@@ -42,11 +45,8 @@ mod error;
 pub mod event_cache;
 pub mod event_handler;
 mod http_client;
-pub mod matrix_auth;
 pub mod media;
 pub mod notification_settings;
-#[cfg(feature = "experimental-oidc")]
-pub mod oidc;
 pub mod pusher;
 pub mod room;
 pub mod room_directory_search;
@@ -58,7 +58,6 @@ pub mod futures {
 
     pub use super::client::futures::SendRequest;
 }
-#[cfg(feature = "experimental-sliding-sync")]
 pub mod sliding_sync;
 pub mod sync;
 #[cfg(feature = "experimental-widgets")]
@@ -69,8 +68,6 @@ pub use authentication::{AuthApi, AuthSession, SessionTokens};
 pub use client::{
     sanitize_server_name, Client, ClientBuildError, ClientBuilder, LoopCtrl, SessionChange,
 };
-#[cfg(feature = "image-proc")]
-pub use error::ImageError;
 pub use error::{
     Error, HttpError, HttpResult, NotificationSettingsError, RefreshTokenError, Result,
     RumaApiError,
@@ -79,12 +76,11 @@ pub use http_client::TransmissionProgress;
 #[cfg(all(feature = "e2e-encryption", feature = "sqlite"))]
 pub use matrix_sdk_sqlite::SqliteCryptoStore;
 #[cfg(feature = "sqlite")]
-pub use matrix_sdk_sqlite::SqliteStateStore;
+pub use matrix_sdk_sqlite::{SqliteEventCacheStore, SqliteStateStore};
 pub use media::Media;
 pub use pusher::Pusher;
 pub use room::Room;
 pub use ruma::{IdParseError, OwnedServerName, ServerName};
-#[cfg(feature = "experimental-sliding-sync")]
 pub use sliding_sync::{
     SlidingSync, SlidingSyncBuilder, SlidingSyncList, SlidingSyncListBuilder,
     SlidingSyncListLoadingState, SlidingSyncMode, SlidingSyncRoom, UpdateSummary,
@@ -93,6 +89,7 @@ pub use sliding_sync::{
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
+pub mod live_location_share;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
 

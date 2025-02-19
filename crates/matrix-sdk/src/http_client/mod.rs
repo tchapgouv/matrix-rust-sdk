@@ -108,6 +108,12 @@ impl HttpClient {
     {
         trace!(request_type = type_name::<R>(), "Serializing request");
 
+        let server_versions = if config.force_matrix_version.is_some() {
+            config.force_matrix_version.as_slice()
+        } else {
+            server_versions
+        };
+
         let send_access_token = match access_token {
             Some(access_token) => {
                 if config.force_auth {
@@ -202,15 +208,6 @@ impl HttpClient {
                 span.record("request_size", ByteSize(request_size).to_string_as(true));
             }
 
-            // Since sliding sync is experimental, and the proxy might not do what we expect
-            // it to do given a specific request body, it's useful to log the
-            // request body here. This doesn't contain any personal information.
-            // TODO: Remove this once sliding sync isn't experimental anymore.
-            #[cfg(feature = "experimental-sliding-sync")]
-            if type_name::<R>() == "ruma_client_api::sync::sync_events::v4::Request" {
-                span.record("request_body", debug(request.body()));
-            }
-
             request
         };
 
@@ -264,7 +261,7 @@ async fn response_to_http_response(
 impl tower::Service<http::Request<Bytes>> for HttpClient {
     type Response = http::Response<Bytes>;
     type Error = tower::BoxError;
-    type Future = futures_core::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+    type Future = matrix_sdk_base::BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn poll_ready(
         &mut self,

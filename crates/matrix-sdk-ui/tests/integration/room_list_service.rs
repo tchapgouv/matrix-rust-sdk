@@ -1,16 +1,21 @@
-use std::{
-    ops::Not,
-    time::{Duration, Instant},
-};
+use std::ops::Not;
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, FutureExt, StreamExt};
-use matrix_sdk::{test_utils::logged_in_client_with_server, Client};
-use matrix_sdk_base::{
-    sliding_sync::http::request::RoomSubscription, sync::UnreadNotificationsCount,
+use matrix_sdk::{
+    config::RequestConfig,
+    test_utils::{
+        logged_in_client_with_server,
+        mocks::{MatrixMockServer, RoomMessagesResponseTemplate},
+        set_client_session, test_client_builder,
+    },
+    Client,
 };
-use matrix_sdk_test::{async_test, mocks::mock_encryption_state};
+use matrix_sdk_base::sync::UnreadNotificationsCount;
+use matrix_sdk_test::{
+    async_test, event_factory::EventFactory, mocks::mock_encryption_state, ALICE,
+};
 use matrix_sdk_ui::{
     room_list_service::{
         filters::{new_filter_fuzzy_match_room_name, new_filter_non_left, new_filter_none},
@@ -20,14 +25,20 @@ use matrix_sdk_ui::{
     RoomListService,
 };
 use ruma::{
-    assign, event_id,
-    events::{room::message::RoomMessageEventContent, StateEventType},
-    mxc_uri, room_id, uint,
+    api::client::room::create_room::v3::Request as CreateRoomRequest,
+    event_id,
+    events::room::message::RoomMessageEventContent,
+    mxc_uri, room_id,
+    time::{Duration, Instant},
 };
 use serde_json::json;
 use stream_assert::{assert_next_matches, assert_pending};
-use tokio::{spawn, sync::mpsc::channel, task::yield_now};
-use wiremock::MockServer;
+use tempfile::TempDir;
+use tokio::{spawn, sync::mpsc::channel, task::yield_now, time::sleep};
+use wiremock::{
+    matchers::{header, method, path},
+    Mock, MockServer, ResponseTemplate,
+};
 
 use crate::timeline::sliding_sync::{assert_timeline_stream, timeline_event};
 
@@ -38,12 +49,30 @@ async fn new_room_list_service() -> Result<(Client, MockServer, RoomListService)
     Ok((client, server, room_list))
 }
 
+async fn new_persistent_room_list_service(
+    store_path: &std::path::Path,
+) -> Result<(MockServer, RoomListService), Error> {
+    let server = MockServer::start().await;
+    let client = test_client_builder(Some(server.uri().to_string()))
+        .request_config(RequestConfig::new().disable_retry())
+        .sqlite_store(store_path, None)
+        .build()
+        .await
+        .unwrap();
+    set_client_session(&client).await;
+
+    let room_list = RoomListService::new(client.clone()).await?;
+
+    Ok((server, room_list))
+}
+
 // Same macro as in the main, with additional checking that the state
 // before/after the sync loop match those we expect.
 macro_rules! sync_then_assert_request_and_fake_response {
     (
         [$server:ident, $room_list:ident, $stream:ident]
         $( states = $pre_state:pat => $post_state:pat, )?
+        $( assert pos $pos:expr, )?
         assert request $assert_request:tt { $( $request_json:tt )* },
         respond with = $( ( code $code:expr ) )? { $( $response_json:tt )* }
         $( , after delay = $response_delay:expr )?
@@ -53,6 +82,7 @@ macro_rules! sync_then_assert_request_and_fake_response {
             [$server, $room_list, $stream]
             sync matches Some(Ok(_)),
             $( states = $pre_state => $post_state, )?
+            $( assert pos $pos, )?
             assert request $assert_request { $( $request_json )* },
             respond with = $( ( code $code ) )? { $( $response_json )* },
             $( after delay = $response_delay, )?
@@ -63,6 +93,7 @@ macro_rules! sync_then_assert_request_and_fake_response {
         [$server:ident, $room_list:ident, $stream:ident]
         sync matches $sync_result:pat,
         $( states = $pre_state:pat => $post_state:pat, )?
+        $( assert pos $pos:expr, )?
         assert request $assert_request:tt { $( $request_json:tt )* },
         respond with = $( ( code $code:expr ) )? { $( $response_json:tt )* }
         $( , after delay = $response_delay:expr )?
@@ -80,6 +111,7 @@ macro_rules! sync_then_assert_request_and_fake_response {
             let next = super::sliding_sync_then_assert_request_and_fake_response! {
                 [$server, $stream]
                 sync matches $sync_result,
+                $( assert pos $pos, )?
                 assert request $assert_request { $( $request_json )* },
                 respond with = $( ( code $code ) )? { $( $response_json )* },
                 $( after delay = $response_delay, )?
@@ -323,11 +355,18 @@ async fn test_sync_all_states() -> Result<(), Error> {
                 ALL_ROOMS: {
                     "ranges": [[0, 19]],
                     "required_state": [
+                        ["m.room.name", ""],
                         ["m.room.encryption", ""],
                         ["m.room.member", "$LAZY"],
                         ["m.room.member", "$ME"],
-                        ["m.room.name", ""],
+                        ["m.room.topic", ""],
+                        ["m.room.canonical_alias", ""],
                         ["m.room.power_levels", ""],
+                        ["org.matrix.msc3401.call.member", "*"],
+                        ["m.room.join_rules", ""],
+                        ["m.room.create", ""],
+                        ["m.room.history_visibility", ""],
+                        ["io.element.functional_members", ""],
                     ],
                     "include_heroes": true,
                     "filters": {
@@ -371,6 +410,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -395,6 +435,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 199]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -419,6 +460,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 299]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -443,6 +485,7 @@ async fn test_sync_all_states() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 399]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -474,10 +517,12 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
             states = Init => SettingUp,
+            assert pos None::<String>,
             assert request >= {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 19]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -501,10 +546,12 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
             states = SettingUp => Running,
+            assert pos Some("0"),
             assert request >= {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 9]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -528,10 +575,12 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
             states = Running => Running,
+            assert pos Some("1"),
             assert request >= {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 9]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -545,6 +594,102 @@ async fn test_sync_resumes_from_previous_state() -> Result<(), Error> {
                 "rooms": {},
             },
         };
+    }
+
+    Ok(())
+}
+
+#[async_test]
+#[ignore] // `share_pos()` has been disabled in the room list, see there to learn more.
+async fn test_sync_resumes_from_previous_state_after_restart() -> Result<(), Error> {
+    let tmp_dir = TempDir::new().unwrap();
+    let store_path = tmp_dir.path();
+
+    {
+        let (server, room_list) = new_persistent_room_list_service(store_path).await?;
+        let sync = room_list.sync();
+        pin_mut!(sync);
+
+        let all_rooms = room_list.all_rooms().await?;
+        let mut all_rooms_loading_state = all_rooms.loading_state();
+
+        // The loading is not loaded.
+        assert_next_matches!(all_rooms_loading_state, RoomListLoadingState::NotLoaded);
+        assert_pending!(all_rooms_loading_state);
+
+        sync_then_assert_request_and_fake_response! {
+            [server, room_list, sync]
+            states = Init => SettingUp,
+            assert pos None::<String>,
+            assert request >= {
+                "lists": {
+                    ALL_ROOMS: {
+                        "ranges": [[0, 19]],
+                    },
+                },
+            },
+            respond with = {
+                "pos": "0",
+                "lists": {
+                    ALL_ROOMS: {
+                        "count": 10,
+                    },
+                },
+                "rooms": {},
+            },
+        };
+    }
+
+    {
+        let (server, room_list) = new_persistent_room_list_service(store_path).await?;
+        let sync = room_list.sync();
+        pin_mut!(sync);
+
+        let all_rooms = room_list.all_rooms().await?;
+        let mut all_rooms_loading_state = all_rooms.loading_state();
+
+        // Wait on Tokio to run all the tasks. Necessary only when testing.
+        yield_now().await;
+
+        // We already have a state stored so the list should already be loaded
+        assert_next_matches!(
+            all_rooms_loading_state,
+            RoomListLoadingState::Loaded { maximum_number_of_rooms: Some(10) }
+        );
+        assert_pending!(all_rooms_loading_state);
+
+        // pos has been restored and is used when doing the req
+        sync_then_assert_request_and_fake_response! {
+            [server, room_list, sync]
+            states = Init => SettingUp,
+            assert pos Some("0"),
+            assert request >= {
+                "lists": {
+                    ALL_ROOMS: {
+                        "ranges": [[0, 19]],
+                    },
+                },
+            },
+            respond with = {
+                "pos": "1",
+                "lists": {
+                    ALL_ROOMS: {
+                        "count": 12,
+                    },
+                },
+                "rooms": {},
+            },
+        };
+
+        // Wait on Tokio to run all the tasks. Necessary only when testing.
+        yield_now().await;
+
+        // maximum_number_of_rooms changed so we should get a new loaded state
+        assert_next_matches!(
+            all_rooms_loading_state,
+            RoomListLoadingState::Loaded { maximum_number_of_rooms: Some(12) }
+        );
+        assert_pending!(all_rooms_loading_state);
     }
 
     Ok(())
@@ -566,6 +711,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The default range, in selective sync-mode.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -590,6 +736,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Still the default range, in selective sync-mode.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -613,6 +760,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The sync-mode has changed to growing, with its initial range.
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -637,6 +785,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Due to previous error, the sync-mode is back to selective, with its initial range.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -659,6 +808,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Sync-mode is now growing.
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -682,6 +832,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The sync-mode is still growing, and the range has made progress.
                     "ranges": [[0, 199]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -706,6 +857,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Due to previous error, the sync-mode is back to selective, with its initial range.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -728,6 +880,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The sync-mode is now growing.
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -750,6 +903,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // No error. The range is making progress.
                     "ranges": [[0, 199]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -774,6 +928,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                     // Range is making progress and is even reaching the maximum
                     // number of rooms.
                     "ranges": [[0, 209]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -798,6 +953,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Due to previous error, the sync-mode is back to selective, with its initial range.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -820,6 +976,7 @@ async fn test_sync_resumes_from_error() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Sync-mode is now growing.
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -858,6 +1015,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The default range, in selective sync-mode.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -888,6 +1046,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The sync-mode is still selective, with its initial range.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -911,6 +1070,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The sync-mode is now growing, with its initial range.
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -942,6 +1102,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // The sync-mode is back to selective.
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -965,6 +1126,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Sync-mode is growing, with its initial range.
                     "ranges": [[0, 99]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -988,6 +1150,7 @@ async fn test_sync_resumes_from_terminated() -> Result<(), Error> {
                 ALL_ROOMS: {
                     // Range is making progress, and has reached its maximum.
                     "ranges": [[0, 149]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1018,8 +1181,7 @@ async fn test_loading_states() -> Result<(), Error> {
         let mut all_rooms_loading_state = all_rooms.loading_state();
 
         // The loading is not loaded.
-        assert_matches!(all_rooms_loading_state.get(), RoomListLoadingState::NotLoaded);
-        assert_pending!(all_rooms_loading_state);
+        assert_next_matches!(all_rooms_loading_state, RoomListLoadingState::NotLoaded);
 
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
@@ -1028,6 +1190,7 @@ async fn test_loading_states() -> Result<(), Error> {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 19]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -1058,6 +1221,7 @@ async fn test_loading_states() -> Result<(), Error> {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 9]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -1088,6 +1252,7 @@ async fn test_loading_states() -> Result<(), Error> {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 11]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -1122,11 +1287,10 @@ async fn test_loading_states() -> Result<(), Error> {
         pin_mut!(sync);
 
         // The loading state is loaded! Indeed, there is data loaded from the cache.
-        assert_matches!(
-            all_rooms_loading_state.get(),
+        assert_next_matches!(
+            all_rooms_loading_state,
             RoomListLoadingState::Loaded { maximum_number_of_rooms: Some(12) }
         );
-        assert_pending!(all_rooms_loading_state);
 
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
@@ -1135,6 +1299,7 @@ async fn test_loading_states() -> Result<(), Error> {
                 "lists": {
                     ALL_ROOMS: {
                         "ranges": [[0, 19]],
+                        "timeline_limit": 1,
                     },
                 },
             },
@@ -1163,106 +1328,15 @@ async fn test_loading_states() -> Result<(), Error> {
 }
 
 #[async_test]
-async fn test_entries_stream() -> Result<(), Error> {
-    let (_, server, room_list) = new_room_list_service().await?;
-
-    let sync = room_list.sync();
-    pin_mut!(sync);
-
-    let all_rooms = room_list.all_rooms().await?;
-
-    let (previous_entries, entries_stream) = all_rooms.entries();
-    pin_mut!(entries_stream);
-
-    sync_then_assert_request_and_fake_response! {
-        [server, room_list, sync]
-        states = Init => SettingUp,
-        assert request >= {
-            "lists": {
-                ALL_ROOMS: {
-                    "ranges": [[0, 19]],
-                },
-            },
-        },
-        respond with = {
-            "pos": "0",
-            "lists": {
-                ALL_ROOMS: {
-                    "count": 10,
-                },
-            },
-            "rooms": {
-                "!r0:bar.org": {
-                    "initial": true,
-                    "timeline": [],
-                },
-                "!r1:bar.org": {
-                    "initial": true,
-                    "timeline": [],
-                },
-                "!r2:bar.org": {
-                    "initial": true,
-                    "timeline": [],
-                },
-            },
-        },
-    };
-
-    assert!(previous_entries.is_empty());
-    assert_entries_batch! {
-        [entries_stream]
-        push back [ "!r0:bar.org" ];
-        push back [ "!r1:bar.org" ];
-        push back [ "!r2:bar.org" ];
-        end;
-    };
-
-    sync_then_assert_request_and_fake_response! {
-        [server, room_list, sync]
-        states = SettingUp => Running,
-        assert request >= {
-            "lists": {
-                ALL_ROOMS: {
-                    "ranges": [[0, 9]],
-                },
-            },
-        },
-        respond with = {
-            "pos": "1",
-            "lists": {
-                ALL_ROOMS: {
-                    "count": 9,
-                },
-            },
-            "rooms": {
-                "!r3:bar.org": {
-                    "initial": true,
-                    "timeline": [],
-                },
-            },
-        },
-    };
-
-    assert_entries_batch! {
-        [entries_stream]
-        push back [ "!r3:bar.org" ];
-        end;
-    };
-
-    Ok(())
-}
-
-#[async_test]
 async fn test_dynamic_entries_stream() -> Result<(), Error> {
-    let (client, server, room_list) = new_room_list_service().await?;
+    let (_client, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
 
     let all_rooms = room_list.all_rooms().await?;
 
-    let (dynamic_entries_stream, dynamic_entries) =
-        all_rooms.entries_with_dynamic_adapters(5, client.room_info_notable_update_receiver());
+    let (dynamic_entries_stream, dynamic_entries) = all_rooms.entries_with_dynamic_adapters(5);
     pin_mut!(dynamic_entries_stream);
 
     sync_then_assert_request_and_fake_response! {
@@ -1272,6 +1346,7 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1326,6 +1401,7 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 9]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1435,6 +1511,7 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 9]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1601,6 +1678,7 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 9]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1653,15 +1731,14 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
 
 #[async_test]
 async fn test_room_sorting() -> Result<(), Error> {
-    let (client, server, room_list) = new_room_list_service().await?;
+    let (_client, server, room_list) = new_room_list_service().await?;
 
     let sync = room_list.sync();
     pin_mut!(sync);
 
     let all_rooms = room_list.all_rooms().await?;
 
-    let (stream, dynamic_entries) =
-        all_rooms.entries_with_dynamic_adapters(10, client.room_info_notable_update_receiver());
+    let (stream, dynamic_entries) = all_rooms.entries_with_dynamic_adapters(10);
     pin_mut!(stream);
 
     sync_then_assert_request_and_fake_response! {
@@ -1671,6 +1748,7 @@ async fn test_room_sorting() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1769,6 +1847,7 @@ async fn test_room_sorting() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 4]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1854,6 +1933,7 @@ async fn test_room_sorting() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 4]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -1928,6 +2008,7 @@ async fn test_room_sorting() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 5]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -2101,6 +2182,7 @@ async fn test_room_subscription() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -2127,18 +2209,7 @@ async fn test_room_subscription() -> Result<(), Error> {
 
     // Subscribe.
 
-    room_list.subscribe_to_rooms(
-        &[room_id_1],
-        Some(assign!(RoomSubscription::default(), {
-            required_state: vec![
-                (StateEventType::RoomName, "".to_owned()),
-                (StateEventType::RoomTopic, "".to_owned()),
-                (StateEventType::RoomAvatar, "".to_owned()),
-                (StateEventType::RoomCanonicalAlias, "".to_owned()),
-            ],
-            timeline_limit: Some(uint!(30)),
-        })),
-    );
+    room_list.subscribe_to_rooms(&[room_id_1]);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -2146,18 +2217,27 @@ async fn test_room_subscription() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 2]],
+                    "timeline_limit": 1,
                 },
             },
             "room_subscriptions": {
                 room_id_1: {
                     "required_state": [
                         ["m.room.name", ""],
+                        ["m.room.encryption", ""],
+                        ["m.room.member", "$LAZY"],
+                        ["m.room.member", "$ME"],
                         ["m.room.topic", ""],
-                        ["m.room.avatar", ""],
                         ["m.room.canonical_alias", ""],
+                        ["m.room.power_levels", ""],
+                        ["org.matrix.msc3401.call.member", "*"],
+                        ["m.room.join_rules", ""],
                         ["m.room.create", ""],
+                        ["m.room.history_visibility", ""],
+                        ["io.element.functional_members", ""],
+                        ["m.room.pinned_events", ""],
                     ],
-                    "timeline_limit": 30,
+                    "timeline_limit": 20,
                 },
             },
         },
@@ -2170,18 +2250,7 @@ async fn test_room_subscription() -> Result<(), Error> {
 
     // Subscribe to another room.
 
-    room_list.subscribe_to_rooms(
-        &[room_id_2],
-        Some(assign!(RoomSubscription::default(), {
-            required_state: vec![
-                (StateEventType::RoomName, "".to_owned()),
-                (StateEventType::RoomTopic, "".to_owned()),
-                (StateEventType::RoomAvatar, "".to_owned()),
-                (StateEventType::RoomCanonicalAlias, "".to_owned()),
-            ],
-            timeline_limit: Some(uint!(30)),
-        })),
-    );
+    room_list.subscribe_to_rooms(&[room_id_2]);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -2189,18 +2258,27 @@ async fn test_room_subscription() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 2]],
+                    "timeline_limit": 1,
                 },
             },
             "room_subscriptions": {
                 room_id_2: {
                     "required_state": [
                         ["m.room.name", ""],
+                        ["m.room.encryption", ""],
+                        ["m.room.member", "$LAZY"],
+                        ["m.room.member", "$ME"],
                         ["m.room.topic", ""],
-                        ["m.room.avatar", ""],
                         ["m.room.canonical_alias", ""],
+                        ["m.room.power_levels", ""],
+                        ["org.matrix.msc3401.call.member", "*"],
+                        ["m.room.join_rules", ""],
                         ["m.room.create", ""],
+                        ["m.room.history_visibility", ""],
+                        ["io.element.functional_members", ""],
+                        ["m.room.pinned_events", ""],
                     ],
-                    "timeline_limit": 30,
+                    "timeline_limit": 20,
                 },
             },
         },
@@ -2213,18 +2291,7 @@ async fn test_room_subscription() -> Result<(), Error> {
 
     // Subscribe to an already subscribed room. Nothing happens.
 
-    room_list.subscribe_to_rooms(
-        &[room_id_1],
-        Some(assign!(RoomSubscription::default(), {
-            required_state: vec![
-                (StateEventType::RoomName, "".to_owned()),
-                (StateEventType::RoomTopic, "".to_owned()),
-                (StateEventType::RoomAvatar, "".to_owned()),
-                (StateEventType::RoomCanonicalAlias, "".to_owned()),
-            ],
-            timeline_limit: Some(uint!(30)),
-        })),
-    );
+    room_list.subscribe_to_rooms(&[room_id_1]);
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -2235,6 +2302,7 @@ async fn test_room_subscription() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 2]],
+                    "timeline_limit": 1,
                 },
             },
             // NO `room_subscriptions`!
@@ -2269,6 +2337,7 @@ async fn test_room_unread_notifications() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 19]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -2300,6 +2369,7 @@ async fn test_room_unread_notifications() -> Result<(), Error> {
             "lists": {
                 ALL_ROOMS: {
                     "ranges": [[0, 0]],
+                    "timeline_limit": 1,
                 },
             },
         },
@@ -2382,7 +2452,7 @@ async fn test_room_timeline() -> Result<(), Error> {
     // Previous timeline items.
     assert_matches!(
         **previous_timeline_items[0],
-        TimelineItemKind::Virtual(VirtualTimelineItem::DayDivider(_))
+        TimelineItemKind::Virtual(VirtualTimelineItem::DateDivider(_))
     );
     assert_matches!(
         &**previous_timeline_items[1],
@@ -2401,6 +2471,33 @@ async fn test_room_timeline() -> Result<(), Error> {
     };
 
     Ok(())
+}
+
+#[async_test]
+async fn test_room_empty_timeline() {
+    let (client, server, room_list) = new_room_list_service().await.unwrap();
+    mock_encryption_state(&server, false).await;
+
+    Mock::given(method("POST"))
+        .and(path("_matrix/client/r0/createRoom"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "room_id": "!example:localhost"})),
+        )
+        .mount(&server)
+        .await;
+
+    let room = client.create_room(CreateRoomRequest::default()).await.unwrap();
+    let room_id = room.room_id().to_owned();
+
+    // The room wasn't synced, but it will be available
+    let room = room_list.room(&room_id).unwrap();
+    let timeline = room.default_room_timeline_builder().await.unwrap().build().await.unwrap();
+    let (prev_items, _) = timeline.subscribe().await;
+
+    // However, since the room wasn't synced its timeline won't have any initial
+    // items
+    assert!(prev_items.is_empty());
 }
 
 #[async_test]
@@ -2706,4 +2803,75 @@ async fn test_sync_indicator() -> Result<(), Error> {
     sync_indicator_task.await.unwrap();
 
     Ok(())
+}
+
+#[async_test]
+async fn test_multiple_timeline_init() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let room_list = RoomListService::new(client.clone()).await.unwrap();
+
+    let sync = room_list.sync();
+    pin_mut!(sync);
+
+    let room_id = room_id!("!r0:bar.org");
+
+    let mock_server = server.server();
+    sync_then_assert_request_and_fake_response! {
+        [mock_server, room_list, sync]
+        assert request >= {},
+        respond with = {
+            "pos": "0",
+            "lists": {
+                ALL_ROOMS: {
+                    "count": 2,
+                },
+            },
+            "rooms": {
+                room_id: {
+                    "initial": true,
+                    "timeline": [
+                        timeline_event!("$x0:bar.org" at 0 sec),
+                    ],
+                    "prev_batch": "prev-batch-token"
+                },
+            },
+        },
+    };
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let f = EventFactory::new().room(room_id).sender(*ALICE);
+
+    // Send back-pagination responses with a small delay.
+    server
+        .mock_room_messages()
+        .ok(RoomMessagesResponseTemplate::default()
+            .events(vec![f.text_msg("hello").into_raw_timeline()])
+            .delayed(Duration::from_millis(500)))
+        .mount()
+        .await;
+
+    let task = {
+        // Get a RoomListService::Room, initialize the timeline, start a pagination.
+        let room = room_list.room(room_id).unwrap();
+
+        let builder = room.default_room_timeline_builder().await.unwrap();
+        room.init_timeline_with_builder(builder).await.unwrap();
+
+        let timeline = room.timeline().unwrap();
+
+        spawn(async move { timeline.paginate_backwards(20).await })
+    };
+
+    // Rinse and repeat.
+    let room = room_list.room(room_id).unwrap();
+
+    // Let the pagination start in the other timeline, and quickly abort it.
+    sleep(Duration::from_millis(200)).await;
+    task.abort();
+
+    // A new timeline for the same room can still be constructed.
+    let builder = room.default_room_timeline_builder().await.unwrap();
+    room.init_timeline_with_builder(builder).await.unwrap();
 }

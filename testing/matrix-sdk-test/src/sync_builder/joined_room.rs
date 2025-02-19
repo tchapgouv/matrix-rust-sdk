@@ -25,6 +25,11 @@ impl JoinedRoomBuilder {
         Self { room_id: room_id.to_owned(), inner: Default::default() }
     }
 
+    /// Get the room ID of this [`JoinedRoomBuilder`].
+    pub fn room_id(&self) -> &RoomId {
+        &self.room_id
+    }
+
     /// Add an event to the timeline.
     ///
     /// The raw event can be created with the
@@ -62,8 +67,8 @@ impl JoinedRoomBuilder {
     }
 
     /// Set the `prev_batch` of the timeline.
-    pub fn set_timeline_prev_batch(mut self, prev_batch: String) -> Self {
-        self.inner.timeline.prev_batch = Some(prev_batch);
+    pub fn set_timeline_prev_batch(mut self, prev_batch: impl Into<String>) -> Self {
+        self.inner.timeline.prev_batch = Some(prev_batch.into());
         self
     }
 

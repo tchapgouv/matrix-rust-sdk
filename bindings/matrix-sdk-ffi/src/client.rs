@@ -1,30 +1,29 @@
 use std::{
     collections::HashMap,
     fmt::Debug,
-    mem::ManuallyDrop,
     path::Path,
     sync::{Arc, RwLock},
 };
 
 use anyhow::{anyhow, Context as _};
 use matrix_sdk::{
-    media::{
-        MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequest, MediaThumbnailSettings,
-    },
-    oidc::{
+    authentication::oidc::{
         registrations::{ClientId, OidcRegistrations},
         requests::account_management::AccountManagementActionFull,
         types::{
-            client_credentials::ClientCredentials,
             registration::{
                 ClientMetadata, ClientMetadataVerificationError, VerifiedClientMetadata,
             },
+            requests::Prompt as SdkOidcPrompt,
         },
         OidcAuthorizationData, OidcSession,
     },
+    media::{
+        MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequestParameters,
+        MediaThumbnailSettings,
+    },
     ruma::{
         api::client::{
-            media::get_content_thumbnail::v3::Method,
             push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
             room::{create_room, Visibility},
             session::get_login_types,
@@ -32,9 +31,10 @@ use matrix_sdk::{
         },
         events::{
             room::{
-                avatar::RoomAvatarEventContent, encryption::RoomEncryptionEventContent, MediaSource,
+                avatar::RoomAvatarEventContent, encryption::RoomEncryptionEventContent,
+                message::MessageType,
             },
-            AnyInitialStateEvent, AnyToDeviceEvent, InitialStateEvent,
+            AnyInitialStateEvent, InitialStateEvent,
         },
         serde::Raw,
         EventEncryptionAlgorithm, RoomId, TransactionId, UInt, UserId,
@@ -50,17 +50,26 @@ use mime::Mime;
 use ruma::{
     api::client::{
         alias::get_alias, discovery::discover_homeserver::AuthenticationServerInfo,
-        uiaa::UserIdentifier,
+        error::ErrorKind, uiaa::UserIdentifier,
     },
     events::{
         ignored_user_list::IgnoredUserListEventContent,
-        room::power_levels::RoomPowerLevelsEventContent, GlobalAccountDataEventType,
+        key::verification::request::ToDeviceKeyVerificationRequestEvent,
+        room::{
+            history_visibility::RoomHistoryVisibilityEventContent,
+            join_rules::{
+                AllowRule as RumaAllowRule, JoinRule as RumaJoinRule, RoomJoinRulesEventContent,
+            },
+            message::OriginalSyncRoomMessageEvent,
+            power_levels::RoomPowerLevelsEventContent,
+        },
+        GlobalAccountDataEventType,
     },
     push::{HttpPusherData as RumaHttpPusherData, PushFormat as RumaPushFormat},
     OwnedServerName, RoomAliasId, RoomOrAliasId, ServerName,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, error};
 use url::Url;
@@ -72,10 +81,13 @@ use crate::{
     encryption::Encryption,
     notification::NotificationClient,
     notification_settings::NotificationSettings,
+    room::RoomHistoryVisibility,
     room_directory_search::RoomDirectorySearch,
     room_preview::RoomPreview,
+    ruma::{AuthData, MediaSource},
     sync_service::{SyncService, SyncServiceBuilder},
     task_handle::TaskHandle,
+    utils::AsyncRuntimeDropped,
     ClientError,
 };
 
@@ -113,7 +125,7 @@ impl TryFrom<PusherKind> for RumaPusherKind {
                 let mut ruma_data = RumaHttpPusherData::new(data.url);
                 if let Some(payload) = data.default_payload {
                     let json: Value = serde_json::from_str(&payload)?;
-                    ruma_data.default_payload = json;
+                    ruma_data.data.insert("default_payload".to_owned(), json);
                 }
                 ruma_data.format = data.format.map(Into::into);
                 Ok(Self::Http(ruma_data))
@@ -139,25 +151,25 @@ impl From<PushFormat> for RumaPushFormat {
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait ClientDelegate: Sync + Send {
     fn did_receive_auth_error(&self, is_soft_logout: bool);
     fn did_refresh_tokens(&self);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait ClientSessionDelegate: Sync + Send {
     fn retrieve_session_from_keychain(&self, user_id: String) -> Result<Session, ClientError>;
     fn save_session_in_keychain(&self, session: Session);
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait ProgressWatcher: Send + Sync {
     fn transmission_progress(&self, progress: TransmissionProgress);
 }
 
 /// A listener to the global (client-wide) error reporter of the send queue.
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait SendQueueRoomErrorListener: Sync + Send {
     /// Called every time the send queue has ran into an error for a given room,
     /// which will disable the send queue for that particular room.
@@ -181,58 +193,67 @@ impl From<matrix_sdk::TransmissionProgress> for TransmissionProgress {
 
 #[derive(uniffi::Object)]
 pub struct Client {
-    pub(crate) inner: ManuallyDrop<MatrixClient>,
+    pub(crate) inner: AsyncRuntimeDropped<MatrixClient>,
     delegate: RwLock<Option<Arc<dyn ClientDelegate>>>,
     session_verification_controller:
         Arc<tokio::sync::RwLock<Option<SessionVerificationController>>>,
 }
 
-impl Drop for Client {
-    fn drop(&mut self) {
-        // Dropping the inner OlmMachine must happen within a tokio context
-        // because deadpool drops sqlite connections in the DB pool on tokio's
-        // blocking threadpool to avoid blocking async worker threads.
-        let _guard = RUNTIME.enter();
-        // SAFETY: self.inner is never used again, which is the only requirement
-        //         for ManuallyDrop::drop to be used safely.
-        unsafe {
-            ManuallyDrop::drop(&mut self.inner);
-        }
-    }
-}
-
 impl Client {
     pub async fn new(
         sdk_client: MatrixClient,
-        cross_process_refresh_lock_id: Option<String>,
+        enable_oidc_refresh_lock: bool,
         session_delegate: Option<Arc<dyn ClientSessionDelegate>>,
     ) -> Result<Self, ClientError> {
         let session_verification_controller: Arc<
             tokio::sync::RwLock<Option<SessionVerificationController>>,
         > = Default::default();
-        let ctrl = session_verification_controller.clone();
+        let controller = session_verification_controller.clone();
+        sdk_client.add_event_handler(
+            move |event: ToDeviceKeyVerificationRequestEvent| async move {
+                if let Some(session_verification_controller) = &*controller.clone().read().await {
+                    session_verification_controller
+                        .process_incoming_verification_request(
+                            &event.sender,
+                            event.content.transaction_id,
+                        )
+                        .await;
+                }
+            },
+        );
 
-        sdk_client.add_event_handler(move |ev: AnyToDeviceEvent| async move {
-            if let Some(session_verification_controller) = &*ctrl.clone().read().await {
-                session_verification_controller.process_to_device_message(ev).await;
-            } else {
-                debug!("received to-device message, but verification controller isn't ready");
+        let controller = session_verification_controller.clone();
+        sdk_client.add_event_handler(move |event: OriginalSyncRoomMessageEvent| async move {
+            if let MessageType::VerificationRequest(_) = &event.content.msgtype {
+                if let Some(session_verification_controller) = &*controller.clone().read().await {
+                    session_verification_controller
+                        .process_incoming_verification_request(&event.sender, event.event_id)
+                        .await;
+                }
             }
         });
 
+        let cross_process_store_locks_holder_name =
+            sdk_client.cross_process_store_locks_holder_name().to_owned();
+
         let client = Client {
-            inner: ManuallyDrop::new(sdk_client),
+            inner: AsyncRuntimeDropped::new(sdk_client),
             delegate: RwLock::new(None),
             session_verification_controller,
         };
 
-        if let Some(process_id) = cross_process_refresh_lock_id {
+        if enable_oidc_refresh_lock {
             if session_delegate.is_none() {
                 return Err(anyhow::anyhow!(
                     "missing session delegates when enabling the cross-process lock"
                 ))?;
             }
-            client.inner.oidc().enable_cross_process_refresh_lock(process_id.clone()).await?;
+
+            client
+                .inner
+                .oidc()
+                .enable_cross_process_refresh_lock(cross_process_store_locks_holder_name)
+                .await?;
         }
 
         if let Some(session_delegate) = session_delegate {
@@ -259,11 +280,26 @@ impl Client {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl Client {
     /// Information about login options for the client's homeserver.
     pub async fn homeserver_login_details(&self) -> Arc<HomeserverLoginDetails> {
-        let supports_oidc_login = self.inner.oidc().fetch_authentication_issuer().await.is_ok();
+        let oidc = self.inner.oidc();
+        let (supports_oidc_login, supported_oidc_prompts) = match &oidc.provider_metadata().await {
+            Ok(metadata) => {
+                let prompts = metadata
+                    .prompt_values_supported
+                    .as_ref()
+                    .map_or_else(Vec::new, |prompts| prompts.iter().map(Into::into).collect());
+
+                (true, prompts)
+            }
+            Err(error) => {
+                error!("Failed to fetch OIDC provider metadata: {error}");
+                (true, Default::default())
+            }
+        };
+
         let supports_password_login = self.supports_password_login().await.ok().unwrap_or(false);
         let sliding_sync_version = self.sliding_sync_version();
 
@@ -271,6 +307,7 @@ impl Client {
             url: self.homeserver(),
             sliding_sync_version,
             supports_oidc_login,
+            supported_oidc_prompts,
             supports_password_login,
         })
     }
@@ -290,6 +327,31 @@ impl Client {
         if let Some(device_id) = device_id.as_ref() {
             builder = builder.device_id(device_id);
         }
+        builder.send().await?;
+        Ok(())
+    }
+
+    /// Login using JWT
+    /// This is an implementation of the custom_login https://docs.rs/matrix-sdk/latest/matrix_sdk/matrix_auth/struct.MatrixAuth.html#method.login_custom
+    /// For more information on logging in with JWT: https://element-hq.github.io/synapse/latest/jwt.html
+    pub async fn custom_login_with_jwt(
+        &self,
+        jwt: String,
+        initial_device_name: Option<String>,
+        device_id: Option<String>,
+    ) -> Result<(), ClientError> {
+        let data = json!({ "token": jwt }).as_object().unwrap().clone();
+
+        let mut builder = self.inner.matrix_auth().login_custom("org.matrix.login.jwt", data)?;
+
+        if let Some(initial_device_name) = initial_device_name.as_ref() {
+            builder = builder.initial_device_display_name(initial_device_name);
+        }
+
+        if let Some(device_id) = device_id.as_ref() {
+            builder = builder.device_id(device_id);
+        }
+
         builder.send().await?;
         Ok(())
     }
@@ -334,13 +396,14 @@ impl Client {
         Ok(Arc::new(SsoHandler { client: Arc::clone(self), url }))
     }
 
-    /// Requests the URL needed for login in a web view using OIDC. Once the web
+    /// Requests the URL needed for opening a web view using OIDC. Once the web
     /// view has succeeded, call `login_with_oidc_callback` with the callback it
     /// returns. If a failure occurs and a callback isn't available, make sure
-    /// to call `abort_oidc_login` to inform the client of this.
-    pub async fn url_for_oidc_login(
+    /// to call `abort_oidc_auth` to inform the client of this.
+    pub async fn url_for_oidc(
         &self,
         oidc_configuration: &OidcConfiguration,
+        prompt: OidcPrompt,
     ) -> Result<Arc<OidcAuthorizationData>, OidcError> {
         let oidc_metadata: VerifiedClientMetadata = oidc_configuration.try_into()?;
         let registrations_file = Path::new(&oidc_configuration.dynamic_registrations_file);
@@ -361,14 +424,15 @@ impl Client {
             static_registrations,
         )?;
 
-        let data = self.inner.oidc().url_for_oidc_login(oidc_metadata, registrations).await?;
+        let data =
+            self.inner.oidc().url_for_oidc(oidc_metadata, registrations, prompt.into()).await?;
 
         Ok(Arc::new(data))
     }
 
     /// Aborts an existing OIDC login operation that might have been cancelled,
     /// failed etc.
-    pub async fn abort_oidc_login(&self, authorization_data: Arc<OidcAuthorizationData>) {
+    pub async fn abort_oidc_auth(&self, authorization_data: Arc<OidcAuthorizationData>) {
         self.inner.oidc().abort_authorization(&authorization_data.state).await;
     }
 
@@ -388,7 +452,7 @@ impl Client {
     pub async fn get_media_file(
         &self,
         media_source: Arc<MediaSource>,
-        body: Option<String>,
+        filename: Option<String>,
         mime_type: String,
         use_cache: bool,
         temp_dir: Option<String>,
@@ -400,8 +464,8 @@ impl Client {
             .inner
             .media()
             .get_media_file(
-                &MediaRequest { source, format: MediaFormat::File },
-                body,
+                &MediaRequestParameters { source: source.media_source, format: MediaFormat::File },
+                filename,
                 &mime_type,
                 use_cache,
                 temp_dir,
@@ -448,7 +512,7 @@ impl Client {
         Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
             // Respawn tasks for rooms that had unsent events. At this point we've just
             // created the subscriber, so it'll be notified about errors.
-            q.respawn_tasks_for_rooms_with_unsent_events().await;
+            q.respawn_tasks_for_rooms_with_unsent_requests().await;
 
             loop {
                 match subscriber.recv().await {
@@ -500,7 +564,7 @@ impl Client {
     }
 }
 
-#[uniffi::export(async_runtime = "tokio")]
+#[matrix_sdk_ffi_macros::export]
 impl Client {
     /// The sliding sync version.
     pub fn sliding_sync_version(&self) -> SlidingSyncVersion {
@@ -551,6 +615,10 @@ impl Client {
         &self,
         action: Option<AccountManagementAction>,
     ) -> Result<Option<String>, ClientError> {
+        if !matches!(self.inner.auth_api(), Some(AuthApi::Oidc(..))) {
+            return Ok(None);
+        }
+
         match self.inner.oidc().account_management_url(action.map(Into::into)).await {
             Ok(url) => Ok(url.map(|u| u.to_string())),
             Err(e) => {
@@ -616,7 +684,7 @@ impl Client {
     }
 
     pub async fn create_room(&self, request: CreateRoomParameters) -> Result<String, ClientError> {
-        let response = self.inner.create_room(request.into()).await?;
+        let response = self.inner.create_room(request.try_into()?).await?;
         Ok(String::from(response.room_id()))
     }
 
@@ -649,7 +717,7 @@ impl Client {
         progress_watcher: Option<Box<dyn ProgressWatcher>>,
     ) -> Result<String, ClientError> {
         let mime_type: mime::Mime = mime_type.parse().context("Parsing mime type")?;
-        let request = self.inner.media().upload(&mime_type, data);
+        let request = self.inner.media().upload(&mime_type, data, None);
 
         if let Some(progress_watcher) = progress_watcher {
             let mut subscriber = request.subscribe_to_send_progress();
@@ -669,12 +737,13 @@ impl Client {
         &self,
         media_source: Arc<MediaSource>,
     ) -> Result<Vec<u8>, ClientError> {
-        let source = (*media_source).clone();
+        let source = (*media_source).clone().media_source;
 
+        debug!(?source, "requesting media file");
         Ok(self
             .inner
             .media()
-            .get_media_content(&MediaRequest { source, format: MediaFormat::File }, true)
+            .get_media_content(&MediaRequestParameters { source, format: MediaFormat::File }, true)
             .await?)
     }
 
@@ -684,16 +753,16 @@ impl Client {
         width: u64,
         height: u64,
     ) -> Result<Vec<u8>, ClientError> {
-        let source = (*media_source).clone();
+        let source = (*media_source).clone().media_source;
 
+        debug!(?source, width, height, "requesting media thumbnail");
         Ok(self
             .inner
             .media()
             .get_media_content(
-                &MediaRequest {
+                &MediaRequestParameters {
                     source,
                     format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(
-                        Method::Scale,
                         UInt::new(width).unwrap(),
                         UInt::new(height).unwrap(),
                     )),
@@ -719,8 +788,11 @@ impl Client {
             .await?
             .context("Failed retrieving user identity")?;
 
-        let session_verification_controller =
-            SessionVerificationController::new(self.inner.encryption(), user_identity);
+        let session_verification_controller = SessionVerificationController::new(
+            self.inner.encryption(),
+            user_identity,
+            self.inner.account(),
+        );
 
         *self.session_verification_controller.write().await =
             Some(session_verification_controller.clone());
@@ -791,6 +863,21 @@ impl Client {
     /// The homeserver this client is configured to use.
     pub fn homeserver(&self) -> String {
         self.inner.homeserver().to_string()
+    }
+
+    /// The URL of the server.
+    ///
+    /// Not to be confused with the `Self::homeserver`. `server` is usually
+    /// the server part in a user ID, e.g. with `@mnt_io:matrix.org`, here
+    /// `matrix.org` is the server, whilst `matrix-client.matrix.org` is the
+    /// homeserver (at the time of writing — 2024-08-28).
+    ///
+    /// This value is optional depending on how the `Client` has been built.
+    /// If it's been built from a homeserver URL directly, we don't know the
+    /// server. However, if the `Client` has been built from a server URL or
+    /// name, then the homeserver has been discovered, and we know both.
+    pub fn server(&self) -> Option<String> {
+        self.inner.server().map(ToString::to_string)
     }
 
     pub fn rooms(&self) -> Vec<Arc<Room>> {
@@ -931,6 +1018,20 @@ impl Client {
         Ok(Arc::new(Room::new(room)))
     }
 
+    /// Knock on a room to join it using its ID or alias.
+    pub async fn knock(
+        &self,
+        room_id_or_alias: String,
+        reason: Option<String>,
+        server_names: Vec<String>,
+    ) -> Result<Arc<Room>, ClientError> {
+        let room_id = RoomOrAliasId::parse(&room_id_or_alias)?;
+        let server_names =
+            server_names.iter().map(ServerName::parse).collect::<Result<Vec<_>, _>>()?;
+        let room = self.inner.knock(room_id, reason, server_names).await?;
+        Ok(Arc::new(Room::new(room)))
+    }
+
     pub async fn get_recently_visited_rooms(&self) -> Result<Vec<String>, ClientError> {
         Ok(self
             .inner
@@ -953,10 +1054,22 @@ impl Client {
     pub async fn resolve_room_alias(
         &self,
         room_alias: String,
-    ) -> Result<ResolvedRoomAlias, ClientError> {
+    ) -> Result<Option<ResolvedRoomAlias>, ClientError> {
         let room_alias = RoomAliasId::parse(&room_alias)?;
-        let response = self.inner.resolve_room_alias(&room_alias).await?;
-        Ok(response.into())
+        match self.inner.resolve_room_alias(&room_alias).await {
+            Ok(response) => Ok(Some(response.into())),
+            Err(error) => match error.client_api_error_kind() {
+                // The room alias wasn't found, so we return None.
+                Some(ErrorKind::NotFound) => Ok(None),
+                // In any other case we just return the error, mapped.
+                _ => Err(error.into()),
+            },
+        }
+    }
+
+    /// Checks if a room alias exists in the current homeserver.
+    pub async fn room_alias_exists(&self, room_alias: String) -> Result<bool, ClientError> {
+        self.resolve_room_alias(room_alias).await.map(|ret| ret.is_some())
     }
 
     /// Given a room id, get the preview of a room, to interact with it.
@@ -968,7 +1081,7 @@ impl Client {
         &self,
         room_id: String,
         via_servers: Vec<String>,
-    ) -> Result<RoomPreview, ClientError> {
+    ) -> Result<Arc<RoomPreview>, ClientError> {
         let room_id = RoomId::parse(&room_id).context("room_id is not a valid room id")?;
 
         let via_servers = via_servers
@@ -981,16 +1094,16 @@ impl Client {
         // rustc win that one fight.
         let room_id: &RoomId = &room_id;
 
-        let sdk_room_preview = self.inner.get_room_preview(room_id.into(), via_servers).await?;
+        let room_preview = self.inner.get_room_preview(room_id.into(), via_servers).await?;
 
-        Ok(RoomPreview::from_sdk(sdk_room_preview))
+        Ok(Arc::new(RoomPreview::new(self.inner.clone(), room_preview)))
     }
 
     /// Given a room alias, get the preview of a room, to interact with it.
     pub async fn get_room_preview_from_room_alias(
         &self,
         room_alias: String,
-    ) -> Result<RoomPreview, ClientError> {
+    ) -> Result<Arc<RoomPreview>, ClientError> {
         let room_alias =
             RoomAliasId::parse(&room_alias).context("room_alias is not a valid room alias")?;
 
@@ -998,13 +1111,65 @@ impl Client {
         // rustc win that one fight.
         let room_alias: &RoomAliasId = &room_alias;
 
-        let sdk_room_preview = self.inner.get_room_preview(room_alias.into(), Vec::new()).await?;
+        let room_preview = self.inner.get_room_preview(room_alias.into(), Vec::new()).await?;
 
-        Ok(RoomPreview::from_sdk(sdk_room_preview))
+        Ok(Arc::new(RoomPreview::new(self.inner.clone(), room_preview)))
+    }
+
+    /// Waits until an at least partially synced room is received, and returns
+    /// it.
+    ///
+    /// **Note: this function will loop endlessly until either it finds the room
+    /// or an externally set timeout happens.**
+    pub async fn await_room_remote_echo(&self, room_id: String) -> Result<Arc<Room>, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+        Ok(Arc::new(Room::new(self.inner.await_room_remote_echo(&room_id).await)))
+    }
+
+    /// Lets the user know whether this is an `m.login.password` based
+    /// auth and if the account can actually be deactivated
+    pub fn can_deactivate_account(&self) -> bool {
+        matches!(self.inner.auth_api(), Some(AuthApi::Matrix(_)))
+    }
+
+    /// Deactivate this account definitively.
+    /// Similarly to `encryption::reset_identity` this
+    /// will only work with password-based authentication (`m.login.password`)
+    ///
+    /// # Arguments
+    ///
+    /// * `auth_data` - This request uses the [User-Interactive Authentication
+    ///   API][uiaa]. The first request needs to set this to `None` and will
+    ///   always fail and the same request needs to be made but this time with
+    ///   some `auth_data` provided.
+    pub async fn deactivate_account(
+        &self,
+        auth_data: Option<AuthData>,
+        erase_data: bool,
+    ) -> Result<(), ClientError> {
+        if let Some(auth_data) = auth_data {
+            _ = self.inner.account().deactivate(None, Some(auth_data.into()), erase_data).await?;
+        } else {
+            _ = self.inner.account().deactivate(None, None, erase_data).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Checks if a room alias is not in use yet.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the room alias is available.
+    /// - `Ok(false)` if it's not (the resolve alias request returned a `404`
+    ///   status code).
+    /// - An `Err` otherwise.
+    pub async fn is_room_alias_available(&self, alias: String) -> Result<bool, ClientError> {
+        let alias = RoomAliasId::parse(alias)?;
+        self.inner.is_room_alias_available(&alias).await.map_err(Into::into)
     }
 }
 
-#[uniffi::export(callback_interface)]
+#[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait IgnoredUsersListener: Sync + Send {
     fn call(&self, ignored_user_ids: Vec<String>);
 }
@@ -1225,16 +1390,25 @@ pub struct CreateRoomParameters {
     pub avatar: Option<String>,
     #[uniffi(default = None)]
     pub power_level_content_override: Option<PowerLevels>,
+    #[uniffi(default = None)]
+    pub join_rule_override: Option<JoinRule>,
+    #[uniffi(default = None)]
+    pub history_visibility_override: Option<RoomHistoryVisibility>,
+    #[uniffi(default = None)]
+    pub canonical_alias: Option<String>,
 }
 
-impl From<CreateRoomParameters> for create_room::v3::Request {
-    fn from(value: CreateRoomParameters) -> create_room::v3::Request {
+impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
+    type Error = ClientError;
+
+    fn try_from(value: CreateRoomParameters) -> Result<create_room::v3::Request, Self::Error> {
         let mut request = create_room::v3::Request::new();
         request.name = value.name;
         request.topic = value.topic;
         request.is_direct = value.is_direct;
         request.visibility = value.visibility.into();
         request.preset = Some(value.preset.into());
+        request.room_alias_name = value.canonical_alias;
         request.invite = match value.invite {
             Some(invite) => invite
                 .iter()
@@ -1262,6 +1436,18 @@ impl From<CreateRoomParameters> for create_room::v3::Request {
             content.url = Some(url.into());
             initial_state.push(InitialStateEvent::new(content).to_raw_any());
         }
+
+        if let Some(join_rule_override) = value.join_rule_override {
+            let content = RoomJoinRulesEventContent::new(join_rule_override.try_into()?);
+            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+        }
+
+        if let Some(history_visibility_override) = value.history_visibility_override {
+            let content =
+                RoomHistoryVisibilityEventContent::new(history_visibility_override.try_into()?);
+            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+        }
+
         request.initial_state = initial_state;
 
         if let Some(power_levels) = value.power_level_content_override {
@@ -1270,12 +1456,14 @@ impl From<CreateRoomParameters> for create_room::v3::Request {
                     request.power_level_content_override = Some(power_levels);
                 }
                 Err(e) => {
-                    error!("Failed to serialize power levels, error: {e}");
+                    return Err(ClientError::Generic {
+                        msg: format!("Failed to serialize power levels, error: {e}"),
+                    })
                 }
             }
         }
 
-        request
+        Ok(request)
     }
 }
 
@@ -1286,6 +1474,9 @@ pub enum RoomVisibility {
 
     /// Indicates that the room will not be shown in the published room list.
     Private,
+
+    /// A custom value that's not present in the spec.
+    Custom { value: String },
 }
 
 impl From<RoomVisibility> for Visibility {
@@ -1293,6 +1484,17 @@ impl From<RoomVisibility> for Visibility {
         match value {
             RoomVisibility::Public => Self::Public,
             RoomVisibility::Private => Self::Private,
+            RoomVisibility::Custom { value } => value.as_str().into(),
+        }
+    }
+}
+
+impl From<Visibility> for RoomVisibility {
+    fn from(value: Visibility) -> Self {
+        match value {
+            Visibility::Public => Self::Public,
+            Visibility::Private => Self::Private,
+            _ => Self::Custom { value: value.as_str().to_owned() },
         }
     }
 }
@@ -1356,10 +1558,13 @@ impl Session {
         match auth_api {
             // Build the session from the regular Matrix Auth Session.
             AuthApi::Matrix(a) => {
-                let matrix_sdk::matrix_auth::MatrixSession {
+                let matrix_sdk::authentication::matrix::MatrixSession {
                     meta: matrix_sdk::SessionMeta { user_id, device_id },
                     tokens:
-                        matrix_sdk::matrix_auth::MatrixSessionTokens { access_token, refresh_token },
+                        matrix_sdk::authentication::matrix::MatrixSessionTokens {
+                            access_token,
+                            refresh_token,
+                        },
                 } = a.session().context("Missing session")?;
 
                 Ok(Session {
@@ -1374,21 +1579,17 @@ impl Session {
             }
             // Build the session from the OIDC UserSession.
             AuthApi::Oidc(api) => {
-                let matrix_sdk::oidc::UserSession {
+                let matrix_sdk::authentication::oidc::UserSession {
                     meta: matrix_sdk::SessionMeta { user_id, device_id },
                     tokens:
-                        matrix_sdk::oidc::OidcSessionTokens {
+                        matrix_sdk::authentication::oidc::OidcSessionTokens {
                             access_token,
                             refresh_token,
                             latest_id_token,
                         },
                     issuer,
                 } = api.user_session().context("Missing session")?;
-                let client_id = api
-                    .client_credentials()
-                    .context("OIDC client credentials are missing.")?
-                    .client_id()
-                    .to_owned();
+                let client_id = api.client_id().context("OIDC client ID is missing.")?.0.clone();
                 let client_metadata =
                     api.client_metadata().context("OIDC client metadata is missing.")?.clone();
                 let oidc_data = OidcSessionData {
@@ -1438,12 +1639,12 @@ impl TryFrom<Session> for AuthSession {
                 .transpose()
                 .context("OIDC latest_id_token is invalid.")?;
 
-            let user_session = matrix_sdk::oidc::UserSession {
+            let user_session = matrix_sdk::authentication::oidc::UserSession {
                 meta: matrix_sdk::SessionMeta {
                     user_id: user_id.try_into()?,
                     device_id: device_id.into(),
                 },
-                tokens: matrix_sdk::oidc::OidcSessionTokens {
+                tokens: matrix_sdk::authentication::oidc::OidcSessionTokens {
                     access_token,
                     refresh_token,
                     latest_id_token,
@@ -1452,20 +1653,20 @@ impl TryFrom<Session> for AuthSession {
             };
 
             let session = OidcSession {
-                credentials: ClientCredentials::None { client_id: oidc_data.client_id },
+                client_id: ClientId(oidc_data.client_id),
                 metadata: oidc_data.client_metadata,
                 user: user_session,
             };
 
-            Ok(AuthSession::Oidc(session))
+            Ok(AuthSession::Oidc(session.into()))
         } else {
             // Create a regular Matrix Session.
-            let session = matrix_sdk::matrix_auth::MatrixSession {
+            let session = matrix_sdk::authentication::matrix::MatrixSession {
                 meta: matrix_sdk::SessionMeta {
                     user_id: user_id.try_into()?,
                     device_id: device_id.into(),
                 },
-                tokens: matrix_sdk::matrix_auth::MatrixSessionTokens {
+                tokens: matrix_sdk::authentication::matrix::MatrixSessionTokens {
                     access_token,
                     refresh_token,
                 },
@@ -1561,7 +1762,7 @@ impl From<AccountManagementAction> for AccountManagementActionFull {
     }
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 fn gen_transaction_id() -> String {
     TransactionId::new().to_string()
 }
@@ -1579,7 +1780,7 @@ impl MediaFileHandle {
     }
 }
 
-#[uniffi::export]
+#[matrix_sdk_ffi_macros::export]
 impl MediaFileHandle {
     /// Get the media file's path.
     pub fn path(&self) -> Result<String, ClientError> {
@@ -1616,7 +1817,6 @@ impl MediaFileHandle {
 #[derive(Clone, uniffi::Enum)]
 pub enum SlidingSyncVersion {
     None,
-    Proxy { url: String },
     Native,
 }
 
@@ -1624,7 +1824,6 @@ impl From<SdkSlidingSyncVersion> for SlidingSyncVersion {
     fn from(value: SdkSlidingSyncVersion) -> Self {
         match value {
             SdkSlidingSyncVersion::None => Self::None,
-            SdkSlidingSyncVersion::Proxy { url } => Self::Proxy { url: url.to_string() },
             SdkSlidingSyncVersion::Native => Self::Native,
         }
     }
@@ -1636,10 +1835,210 @@ impl TryFrom<SlidingSyncVersion> for SdkSlidingSyncVersion {
     fn try_from(value: SlidingSyncVersion) -> Result<Self, Self::Error> {
         Ok(match value {
             SlidingSyncVersion::None => Self::None,
-            SlidingSyncVersion::Proxy { url } => Self::Proxy {
-                url: Url::parse(&url).map_err(|e| ClientError::Generic { msg: e.to_string() })?,
-            },
             SlidingSyncVersion::Native => Self::Native,
         })
+    }
+}
+
+#[derive(Clone, uniffi::Enum)]
+pub enum OidcPrompt {
+    /// The Authorization Server must not display any authentication or consent
+    /// user interface pages.
+    None,
+
+    /// The Authorization Server should prompt the End-User for
+    /// reauthentication.
+    Login,
+
+    /// The Authorization Server should prompt the End-User for consent before
+    /// returning information to the Client.
+    Consent,
+
+    /// The Authorization Server should prompt the End-User to select a user
+    /// account.
+    ///
+    /// This enables an End-User who has multiple accounts at the Authorization
+    /// Server to select amongst the multiple accounts that they might have
+    /// current sessions for.
+    SelectAccount,
+
+    /// The Authorization Server should prompt the End-User to create a user
+    /// account.
+    ///
+    /// Defined in [Initiating User Registration via OpenID Connect](https://openid.net/specs/openid-connect-prompt-create-1_0.html).
+    Create,
+
+    /// An unknown value.
+    Unknown { value: String },
+}
+
+impl From<&SdkOidcPrompt> for OidcPrompt {
+    fn from(value: &SdkOidcPrompt) -> Self {
+        match value {
+            SdkOidcPrompt::None => Self::None,
+            SdkOidcPrompt::Login => Self::Login,
+            SdkOidcPrompt::Consent => Self::Consent,
+            SdkOidcPrompt::SelectAccount => Self::SelectAccount,
+            SdkOidcPrompt::Create => Self::Create,
+            SdkOidcPrompt::Unknown(value) => Self::Unknown { value: value.to_owned() },
+            _ => Self::Unknown { value: value.to_string() },
+        }
+    }
+}
+
+impl From<OidcPrompt> for SdkOidcPrompt {
+    fn from(value: OidcPrompt) -> Self {
+        match value {
+            OidcPrompt::None => Self::None,
+            OidcPrompt::Login => Self::Login,
+            OidcPrompt::Consent => Self::Consent,
+            OidcPrompt::SelectAccount => Self::SelectAccount,
+            OidcPrompt::Create => Self::Create,
+            OidcPrompt::Unknown { value } => Self::Unknown(value),
+        }
+    }
+}
+
+/// The rule used for users wishing to join this room.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum JoinRule {
+    /// Anyone can join the room without any prior action.
+    Public,
+
+    /// A user who wishes to join the room must first receive an invite to the
+    /// room from someone already inside of the room.
+    Invite,
+
+    /// Users can join the room if they are invited, or they can request an
+    /// invite to the room.
+    ///
+    /// They can be allowed (invited) or denied (kicked/banned) access.
+    Knock,
+
+    /// Reserved but not yet implemented by the Matrix specification.
+    Private,
+
+    /// Users can join the room if they are invited, or if they meet any of the
+    /// conditions described in a set of [`AllowRule`]s.
+    Restricted { rules: Vec<AllowRule> },
+
+    /// Users can join the room if they are invited, or if they meet any of the
+    /// conditions described in a set of [`AllowRule`]s, or they can request
+    /// an invite to the room.
+    KnockRestricted { rules: Vec<AllowRule> },
+
+    /// A custom join rule, up for interpretation by the consumer.
+    Custom {
+        /// The string representation for this custom rule.
+        repr: String,
+    },
+}
+
+/// An allow rule which defines a condition that allows joining a room.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum AllowRule {
+    /// Only a member of the `room_id` Room can join the one this rule is used
+    /// in.
+    RoomMembership { room_id: String },
+
+    /// A custom allow rule implementation, containing its JSON representation
+    /// as a `String`.
+    Custom { json: String },
+}
+
+impl TryFrom<JoinRule> for RumaJoinRule {
+    type Error = ClientError;
+
+    fn try_from(value: JoinRule) -> Result<Self, Self::Error> {
+        match value {
+            JoinRule::Public => Ok(Self::Public),
+            JoinRule::Invite => Ok(Self::Invite),
+            JoinRule::Knock => Ok(Self::Knock),
+            JoinRule::Private => Ok(Self::Private),
+            JoinRule::Restricted { rules } => {
+                let rules = ruma_allow_rules_from_ffi(rules)?;
+                Ok(Self::Restricted(ruma::events::room::join_rules::Restricted::new(rules)))
+            }
+            JoinRule::KnockRestricted { rules } => {
+                let rules = ruma_allow_rules_from_ffi(rules)?;
+                Ok(Self::KnockRestricted(ruma::events::room::join_rules::Restricted::new(rules)))
+            }
+            JoinRule::Custom { repr } => Ok(serde_json::from_str(&repr)?),
+        }
+    }
+}
+
+fn ruma_allow_rules_from_ffi(value: Vec<AllowRule>) -> Result<Vec<RumaAllowRule>, ClientError> {
+    let mut ret = Vec::with_capacity(value.len());
+    for rule in value {
+        let rule: Result<RumaAllowRule, ClientError> = rule.try_into();
+        match rule {
+            Ok(rule) => ret.push(rule),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(ret)
+}
+
+impl TryFrom<AllowRule> for RumaAllowRule {
+    type Error = ClientError;
+
+    fn try_from(value: AllowRule) -> Result<Self, Self::Error> {
+        match value {
+            AllowRule::RoomMembership { room_id } => {
+                let room_id = RoomId::parse(room_id)?;
+                Ok(Self::RoomMembership(ruma::events::room::join_rules::RoomMembership::new(
+                    room_id,
+                )))
+            }
+            AllowRule::Custom { json } => Ok(Self::_Custom(Box::new(serde_json::from_str(&json)?))),
+        }
+    }
+}
+
+impl TryFrom<RumaJoinRule> for JoinRule {
+    type Error = String;
+    fn try_from(value: RumaJoinRule) -> Result<Self, Self::Error> {
+        match value {
+            RumaJoinRule::Knock => Ok(JoinRule::Knock),
+            RumaJoinRule::Public => Ok(JoinRule::Public),
+            RumaJoinRule::Private => Ok(JoinRule::Private),
+            RumaJoinRule::KnockRestricted(restricted) => {
+                let rules = restricted.allow.into_iter().map(TryInto::try_into).collect::<Result<
+                    Vec<_>,
+                    Self::Error,
+                >>(
+                )?;
+                Ok(JoinRule::KnockRestricted { rules })
+            }
+            RumaJoinRule::Restricted(restricted) => {
+                let rules = restricted.allow.into_iter().map(TryInto::try_into).collect::<Result<
+                    Vec<_>,
+                    Self::Error,
+                >>(
+                )?;
+                Ok(JoinRule::Restricted { rules })
+            }
+            RumaJoinRule::Invite => Ok(JoinRule::Invite),
+            RumaJoinRule::_Custom(_) => Ok(JoinRule::Custom { repr: value.as_str().to_owned() }),
+            _ => Err(format!("Unknown JoinRule: {:?}", value)),
+        }
+    }
+}
+
+impl TryFrom<RumaAllowRule> for AllowRule {
+    type Error = String;
+    fn try_from(value: RumaAllowRule) -> Result<Self, Self::Error> {
+        match value {
+            RumaAllowRule::RoomMembership(membership) => {
+                Ok(AllowRule::RoomMembership { room_id: membership.room_id.to_string() })
+            }
+            RumaAllowRule::_Custom(repr) => {
+                let json = serde_json::to_string(&repr)
+                    .map_err(|e| format!("Couldn't serialize custom AllowRule: {e:?}"))?;
+                Ok(Self::Custom { json })
+            }
+            _ => Err(format!("Invalid AllowRule: {:?}", value)),
+        }
     }
 }

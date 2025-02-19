@@ -25,7 +25,7 @@ use matrix_sdk::{
     Client, Error,
 };
 use matrix_sdk_base::{
-    deserialized_responses::{ShieldStateCode, SyncTimelineEvent, SENT_IN_CLEAR},
+    deserialized_responses::{ShieldStateCode, SENT_IN_CLEAR},
     latest_event::LatestEvent,
 };
 use once_cell::sync::Lazy;
@@ -36,22 +36,26 @@ use ruma::{
     OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
 };
 use tracing::warn;
+use unicode_segmentation::UnicodeSegmentation;
 
 mod content;
 mod local;
 mod remote;
 
+pub(super) use self::{
+    content::{
+        extract_bundled_edit_event_json, extract_poll_edit_content, extract_room_msg_edit_content,
+    },
+    local::LocalEventTimelineItem,
+    remote::{RemoteEventOrigin, RemoteEventTimelineItem},
+};
 pub use self::{
     content::{
         AnyOtherFullStateEventContent, EncryptedMessage, InReplyToDetails, MemberProfileChange,
-        MembershipChange, Message, OtherState, RepliedToEvent, RoomMembershipChange,
-        RoomPinnedEventsChange, Sticker, TimelineItemContent,
+        MembershipChange, Message, OtherState, PollResult, PollState, RepliedToEvent,
+        RoomMembershipChange, RoomPinnedEventsChange, Sticker, TimelineItemContent,
     },
     local::EventSendState,
-};
-pub(super) use self::{
-    local::LocalEventTimelineItem,
-    remote::{RemoteEventOrigin, RemoteEventTimelineItem},
 };
 use super::{RepliedToInfo, ReplyContent, UnsupportedReplyItem};
 
@@ -66,8 +70,6 @@ pub struct EventTimelineItem {
     pub(super) sender: OwnedUserId,
     /// The sender's profile of the event.
     pub(super) sender_profile: TimelineDetails<Profile>,
-    /// All bundled reactions about the event.
-    pub(super) reactions: ReactionsByKeyBySender,
     /// The timestamp of the event.
     pub(super) timestamp: MilliSecondsSinceUnixEpoch,
     /// The content of the event.
@@ -76,9 +78,8 @@ pub struct EventTimelineItem {
     pub(super) kind: EventTimelineItemKind,
     /// Whether or not the event belongs to an encrypted room.
     ///
-    /// When `None` it is unknown if the room is encrypted and the item won't
-    /// return a ShieldState.
-    pub(super) is_room_encrypted: Option<bool>,
+    /// May be false when we don't know about the room encryption status yet.
+    pub(super) is_room_encrypted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -116,21 +117,22 @@ impl EventTimelineItem {
         timestamp: MilliSecondsSinceUnixEpoch,
         content: TimelineItemContent,
         kind: EventTimelineItemKind,
-        reactions: ReactionsByKeyBySender,
         is_room_encrypted: bool,
     ) -> Self {
-        let is_room_encrypted = Some(is_room_encrypted);
-        Self { sender, sender_profile, timestamp, content, reactions, kind, is_room_encrypted }
+        Self { sender, sender_profile, timestamp, content, kind, is_room_encrypted }
     }
 
-    /// If the supplied low-level `SyncTimelineEvent` is suitable for use as the
-    /// `latest_event` in a message preview, wrap it as an `EventTimelineItem`.
+    /// If the supplied low-level [`TimelineEvent`] is suitable for use as the
+    /// `latest_event` in a message preview, wrap it as an
+    /// `EventTimelineItem`.
     ///
     /// **Note:** Timeline items created via this constructor do **not** produce
     /// the correct ShieldState when calling
     /// [`get_shield`][EventTimelineItem::get_shield]. This is because they are
     /// intended for display in the room list which a) is unlikely to show
     /// shields and b) would incur a significant performance overhead.
+    ///
+    /// [`TimelineEvent`]: matrix_sdk::deserialized_responses::TimelineEvent
     pub async fn from_latest_event(
         client: Client,
         room_id: &RoomId,
@@ -141,8 +143,8 @@ impl EventTimelineItem {
         // potential footgun which could one day turn into a security issue.
         use super::traits::RoomDataProvider;
 
-        let SyncTimelineEvent { event: raw_sync_event, encryption_info, .. } =
-            latest_event.event().clone();
+        let raw_sync_event = latest_event.event().raw().clone();
+        let encryption_info = latest_event.event().encryption_info().cloned();
 
         let Ok(event) = raw_sync_event.deserialize_as::<AnySyncTimelineEvent>() else {
             warn!("Unable to deserialize latest_event as an AnySyncTimelineEvent!");
@@ -154,13 +156,18 @@ impl EventTimelineItem {
         let event_id = event.event_id().to_owned();
         let is_own = client.user_id().map(|uid| uid == sender).unwrap_or(false);
 
+        // Get the room's power levels for calculating the latest event
+        let power_levels = if let Some(room) = client.get_room(room_id) {
+            room.power_levels().await.ok()
+        } else {
+            None
+        };
+        let room_power_levels_info = client.user_id().zip(power_levels.as_ref());
+
         // If we don't (yet) know how to handle this type of message, return `None`
         // here. If we do, convert it into a `TimelineItemContent`.
-        let content = TimelineItemContent::from_latest_event_content(event)?;
-
-        // We don't currently bundle any reactions with the main event. This could
-        // conceivably be wanted in the message preview in future.
-        let reactions = ReactionsByKeyBySender::default();
+        let content =
+            TimelineItemContent::from_latest_event_content(event, room_power_levels_info)?;
 
         // The message preview probably never needs read receipts.
         let read_receipts = IndexMap::new();
@@ -202,26 +209,27 @@ impl EventTimelineItem {
             TimelineDetails::Unavailable
         };
 
-        Some(Self {
-            sender,
-            sender_profile,
-            timestamp,
-            content,
-            kind,
-            reactions,
-            is_room_encrypted: None,
-        })
+        Some(Self { sender, sender_profile, timestamp, content, kind, is_room_encrypted: false })
     }
 
     /// Check whether this item is a local echo.
     ///
     /// This returns `true` for events created locally, until the server echoes
     /// back the full event as part of a sync response.
+    ///
+    /// This is the opposite of [`Self::is_remote_event`].
     pub fn is_local_echo(&self) -> bool {
         matches!(self.kind, EventTimelineItemKind::Local(_))
     }
 
-    pub(super) fn is_remote_event(&self) -> bool {
+    /// Check whether this item is a remote event.
+    ///
+    /// This returns `true` only for events that have been echoed back from the
+    /// homeserver. A local echo sent but not echoed back yet will return
+    /// `false` here.
+    ///
+    /// This is the opposite of [`Self::is_local_echo`].
+    pub fn is_remote_event(&self) -> bool {
         matches!(self.kind, EventTimelineItemKind::Remote(_))
     }
 
@@ -246,12 +254,20 @@ impl EventTimelineItem {
         as_variant!(&self.kind, EventTimelineItemKind::Local(local) => &local.send_state)
     }
 
+    /// Get the time that the local event was pushed in the send queue at.
+    pub fn local_created_at(&self) -> Option<MilliSecondsSinceUnixEpoch> {
+        match &self.kind {
+            EventTimelineItemKind::Local(local) => local.send_handle.as_ref().map(|s| s.created_at),
+            EventTimelineItemKind::Remote(_) => None,
+        }
+    }
+
     /// Get the unique identifier of this item.
     ///
     /// Returns the transaction ID for a local echo item that has not been sent
     /// and the event ID for a local echo item that has been sent or a
     /// remote item.
-    pub(crate) fn identifier(&self) -> TimelineEventItemId {
+    pub fn identifier(&self) -> TimelineEventItemId {
         match &self.kind {
             EventTimelineItemKind::Local(local) => local.identifier(),
             EventTimelineItemKind::Remote(remote) => {
@@ -298,11 +314,6 @@ impl EventTimelineItem {
         &self.content
     }
 
-    /// Get the reactions of this item.
-    pub fn reactions(&self) -> &ReactionsByKeyBySender {
-        &self.reactions
-    }
-
     /// Get the read receipts of this item.
     ///
     /// The key is the ID of a room member and the value are details about the
@@ -346,7 +357,15 @@ impl EventTimelineItem {
 
         match self.content() {
             TimelineItemContent::Message(message) => {
-                matches!(message.msgtype(), MessageType::Text(_) | MessageType::Emote(_))
+                matches!(
+                    message.msgtype(),
+                    MessageType::Text(_)
+                        | MessageType::Emote(_)
+                        | MessageType::Audio(_)
+                        | MessageType::File(_)
+                        | MessageType::Image(_)
+                        | MessageType::Video(_)
+                )
             }
             TimelineItemContent::Poll(poll) => {
                 poll.response_data.is_empty() && poll.end_event_timestamp.is_none()
@@ -377,7 +396,12 @@ impl EventTimelineItem {
     /// Gets the [`ShieldState`] which can be used to decorate messages in the
     /// recommended way.
     pub fn get_shield(&self, strict: bool) -> Option<ShieldState> {
-        if self.is_room_encrypted != Some(true) || self.is_local_echo() {
+        if !self.is_room_encrypted || self.is_local_echo() {
+            return None;
+        }
+
+        // An unable-to-decrypt message has no authenticity shield.
+        if let TimelineItemContent::UnableToDecrypt(_) = self.content() {
             return None;
         }
 
@@ -457,16 +481,18 @@ impl EventTimelineItem {
         Self { kind: kind.into(), ..self.clone() }
     }
 
-    /// Clone the current event item, and update its `reactions`.
-    pub fn with_reactions(&self, reactions: ReactionsByKeyBySender) -> Self {
-        Self { reactions, ..self.clone() }
+    /// Clone the current event item, and update its content.
+    pub(super) fn with_content(&self, new_content: TimelineItemContent) -> Self {
+        let mut new = self.clone();
+        new.content = new_content;
+        new
     }
 
     /// Clone the current event item, and update its content.
     ///
     /// Optionally update `latest_edit_json` if the update is an edit received
     /// from the server.
-    pub(super) fn with_content(
+    pub(super) fn with_content_and_latest_edit(
         &self,
         new_content: TimelineItemContent,
         edit_json: Option<Raw<AnySyncTimelineEvent>>,
@@ -476,13 +502,22 @@ impl EventTimelineItem {
         if let EventTimelineItemKind::Remote(r) = &mut new.kind {
             r.latest_edit_json = edit_json;
         }
-
         new
     }
 
     /// Clone the current event item, and update its `sender_profile`.
     pub(super) fn with_sender_profile(&self, sender_profile: TimelineDetails<Profile>) -> Self {
         Self { sender_profile, ..self.clone() }
+    }
+
+    /// Clone the current event item, and update its `encryption_info`.
+    pub(super) fn with_encryption_info(&self, encryption_info: Option<EncryptionInfo>) -> Self {
+        let mut new = self.clone();
+        if let EventTimelineItemKind::Remote(r) = &mut new.kind {
+            r.encryption_info = encryption_info;
+        }
+
+        new
     }
 
     /// Create a clone of the current item, with content that's been redacted.
@@ -499,7 +534,6 @@ impl EventTimelineItem {
             content,
             kind,
             is_room_encrypted: self.is_room_encrypted,
-            reactions: ReactionsByKeyBySender::default(),
         }
     }
 
@@ -543,6 +577,74 @@ impl EventTimelineItem {
             EventTimelineItemKind::Remote(remote) => TimelineItemHandle::Remote(&remote.event_id),
         }
     }
+
+    /// For local echoes, return the associated send handle.
+    pub fn local_echo_send_handle(&self) -> Option<SendHandle> {
+        as_variant!(self.handle(), TimelineItemHandle::Local(handle) => handle.clone())
+    }
+
+    /// Some clients may want to know if a particular text message or media
+    /// caption contains only emojis so that they can render them bigger for
+    /// added effect.
+    ///
+    /// This function provides that feature with the following
+    /// behavior/limitations:
+    /// - ignores leading and trailing white spaces
+    /// - fails texts bigger than 5 graphemes for performance reasons
+    /// - checks the body only for [`MessageType::Text`]
+    /// - only checks the caption for [`MessageType::Audio`],
+    ///   [`MessageType::File`], [`MessageType::Image`], and
+    ///   [`MessageType::Video`] if present
+    /// - all other message types will not match
+    ///
+    /// # Examples
+    /// # fn render_timeline_item(timeline_item: TimelineItem) {
+    /// if timeline_item.contains_only_emojis() {
+    ///     // e.g. increase the font size
+    /// }
+    /// # }
+    ///
+    /// See `test_emoji_detection` for more examples.
+    pub fn contains_only_emojis(&self) -> bool {
+        let body = match self.content() {
+            TimelineItemContent::Message(msg) => match msg.msgtype() {
+                MessageType::Text(text) => Some(text.body.as_str()),
+                MessageType::Audio(audio) => audio.caption(),
+                MessageType::File(file) => file.caption(),
+                MessageType::Image(image) => image.caption(),
+                MessageType::Video(video) => video.caption(),
+                _ => None,
+            },
+            TimelineItemContent::RedactedMessage
+            | TimelineItemContent::Sticker(_)
+            | TimelineItemContent::UnableToDecrypt(_)
+            | TimelineItemContent::MembershipChange(_)
+            | TimelineItemContent::ProfileChange(_)
+            | TimelineItemContent::OtherState(_)
+            | TimelineItemContent::FailedToParseMessageLike { .. }
+            | TimelineItemContent::FailedToParseState { .. }
+            | TimelineItemContent::Poll(_)
+            | TimelineItemContent::CallInvite
+            | TimelineItemContent::CallNotify => None,
+        };
+
+        if let Some(body) = body {
+            // Collect the graphemes after trimming white spaces.
+            let graphemes = body.trim().graphemes(true).collect::<Vec<&str>>();
+
+            // Limit the check to 5 graphemes for performance and security
+            // reasons. This will probably be used for every new message so we
+            // want it to be fast and we don't want to allow a DoS attack by
+            // sending a huge message.
+            if graphemes.len() > 5 {
+                return false;
+            }
+
+            graphemes.iter().all(|g| emojis::get(g).is_some())
+        } else {
+            false
+        }
+    }
 }
 
 impl From<LocalEventTimelineItem> for EventTimelineItemKind {
@@ -579,7 +681,7 @@ pub struct Profile {
 /// [`sync_events`][ruma::api::client::sync::sync_events].
 #[derive(Clone, Debug)]
 pub enum TimelineDetails<T> {
-    /// The details are not available yet, and have not been request from the
+    /// The details are not available yet, and have not been requested from the
     /// server.
     Unavailable,
 
@@ -634,6 +736,8 @@ pub enum ReactionStatus {
     /// The handle is missing only in testing contexts.
     LocalToRemote(Option<SendHandle>),
     /// It's a remote reaction to a remote event.
+    ///
+    /// The event id is that of the reaction event (not the target event).
     RemoteToRemote(OwnedEventId),
 }
 
@@ -696,17 +800,21 @@ mod tests {
     use assert_matches2::assert_let;
     use matrix_sdk::test_utils::logged_in_client;
     use matrix_sdk_base::{
-        deserialized_responses::SyncTimelineEvent, latest_event::LatestEvent, sliding_sync::http,
-        MinimalStateEvent, OriginalMinimalStateEvent,
+        deserialized_responses::TimelineEvent, latest_event::LatestEvent, MinimalStateEvent,
+        OriginalMinimalStateEvent,
     };
-    use matrix_sdk_test::{async_test, sync_timeline_event};
+    use matrix_sdk_test::{
+        async_test, event_factory::EventFactory, sync_state_event, sync_timeline_event,
+    };
     use ruma::{
+        api::client::sync::sync_events::v5 as http,
+        event_id,
         events::{
             room::{
                 member::RoomMemberEventContent,
                 message::{MessageFormat, MessageType},
             },
-            AnySyncTimelineEvent,
+            AnySyncStateEvent, AnySyncTimelineEvent, BundledMessageLikeRelations,
         },
         room_id,
         serde::Raw,
@@ -714,7 +822,7 @@ mod tests {
     };
 
     use super::{EventTimelineItem, Profile};
-    use crate::timeline::TimelineDetails;
+    use crate::timeline::{MembershipChange, TimelineDetails, TimelineItemContent};
 
     #[async_test]
     async fn test_latest_message_event_can_be_wrapped_as_a_timeline_item() {
@@ -746,6 +854,168 @@ mod tests {
     }
 
     #[async_test]
+    async fn test_latest_knock_member_state_event_can_be_wrapped_as_a_timeline_item() {
+        // Given a sync knock member state event that is suitable to be used as a
+        // latest_event
+
+        let room_id = room_id!("!q:x.uk");
+        let user_id = user_id!("@t:o.uk");
+        let raw_event = member_event_as_state_event(
+            room_id,
+            user_id,
+            "knock",
+            "Alice Margatroid",
+            "mxc://e.org/SEs",
+        );
+        let client = logged_in_client(None).await;
+
+        // Add power levels state event, otherwise the knock state event can't be used
+        // as the latest event
+        let power_level_event = sync_state_event!({
+            "type": "m.room.power_levels",
+            "content": {},
+            "event_id": "$143278582443PhrSn:example.org",
+            "origin_server_ts": 143273581,
+            "room_id": room_id,
+            "sender": user_id,
+            "state_key": "",
+            "unsigned": {
+              "age": 1234
+            }
+        });
+        let mut room = http::response::Room::new();
+        room.required_state.push(power_level_event);
+
+        // And the room is stored in the client so it can be extracted when needed
+        let response = response_with_room(room_id, room);
+        client.process_sliding_sync_test_helper(&response).await.unwrap();
+
+        // When we construct a timeline event from it
+        let event = TimelineEvent::new(raw_event.cast());
+        let timeline_item =
+            EventTimelineItem::from_latest_event(client, room_id, LatestEvent::new(event))
+                .await
+                .unwrap();
+
+        // Then its properties correctly translate
+        assert_eq!(timeline_item.sender, user_id);
+        assert_matches!(timeline_item.sender_profile, TimelineDetails::Unavailable);
+        assert_eq!(timeline_item.timestamp.0, UInt::new(143273583).unwrap());
+        if let TimelineItemContent::MembershipChange(change) = timeline_item.content {
+            assert_eq!(change.user_id, user_id);
+            assert_matches!(change.change, Some(MembershipChange::Knocked));
+        } else {
+            panic!("Unexpected state event type");
+        }
+    }
+
+    #[async_test]
+    async fn test_latest_message_includes_bundled_edit() {
+        // Given a sync event that is suitable to be used as a latest_event, and
+        // contains a bundled edit,
+        let room_id = room_id!("!q:x.uk");
+        let user_id = user_id!("@t:o.uk");
+
+        let f = EventFactory::new();
+
+        let original_event_id = event_id!("$original");
+
+        let mut relations = BundledMessageLikeRelations::new();
+        relations.replace = Some(Box::new(
+            f.text_html(" * Updated!", " * <b>Updated!</b>")
+                .edit(
+                    original_event_id,
+                    MessageType::text_html("Updated!", "<b>Updated!</b>").into(),
+                )
+                .event_id(event_id!("$edit"))
+                .sender(user_id)
+                .into_raw_sync(),
+        ));
+
+        let event = f
+            .text_html("**My M**", "<b>My M</b>")
+            .sender(user_id)
+            .event_id(original_event_id)
+            .bundled_relations(relations)
+            .server_ts(42)
+            .into_event();
+
+        let client = logged_in_client(None).await;
+
+        // When we construct a timeline event from it,
+        let timeline_item =
+            EventTimelineItem::from_latest_event(client, room_id, LatestEvent::new(event))
+                .await
+                .unwrap();
+
+        // Then its properties correctly translate.
+        assert_eq!(timeline_item.sender, user_id);
+        assert_matches!(timeline_item.sender_profile, TimelineDetails::Unavailable);
+        assert_eq!(timeline_item.timestamp.0, UInt::new(42).unwrap());
+        if let MessageType::Text(txt) = timeline_item.content.as_message().unwrap().msgtype() {
+            assert_eq!(txt.body, "Updated!");
+            let formatted = txt.formatted.as_ref().unwrap();
+            assert_eq!(formatted.format, MessageFormat::Html);
+            assert_eq!(formatted.body, "<b>Updated!</b>");
+        } else {
+            panic!("Unexpected message type");
+        }
+    }
+
+    #[async_test]
+    async fn test_latest_poll_includes_bundled_edit() {
+        // Given a sync event that is suitable to be used as a latest_event, and
+        // contains a bundled edit,
+        let room_id = room_id!("!q:x.uk");
+        let user_id = user_id!("@t:o.uk");
+
+        let f = EventFactory::new();
+
+        let original_event_id = event_id!("$original");
+
+        let mut relations = BundledMessageLikeRelations::new();
+        relations.replace = Some(Box::new(
+            f.poll_edit(
+                original_event_id,
+                "It's one banana, Michael, how much could it cost?",
+                vec!["1 dollar", "10 dollars", "100 dollars"],
+            )
+            .event_id(event_id!("$edit"))
+            .sender(user_id)
+            .into_raw_sync(),
+        ));
+
+        let event = f
+            .poll_start(
+                "It's one avocado, Michael, how much could it cost? 10 dollars?",
+                "It's one avocado, Michael, how much could it cost?",
+                vec!["1 dollar", "10 dollars", "100 dollars"],
+            )
+            .event_id(original_event_id)
+            .bundled_relations(relations)
+            .sender(user_id)
+            .into_event();
+
+        let client = logged_in_client(None).await;
+
+        // When we construct a timeline event from it,
+        let timeline_item =
+            EventTimelineItem::from_latest_event(client, room_id, LatestEvent::new(event))
+                .await
+                .unwrap();
+
+        // Then its properties correctly translate.
+        assert_eq!(timeline_item.sender, user_id);
+
+        let poll = timeline_item.content().as_poll().unwrap();
+        assert!(poll.has_been_edited);
+        assert_eq!(
+            poll.start_event_content.poll_start.question.text,
+            "It's one banana, Michael, how much could it cost?"
+        );
+    }
+
+    #[async_test]
     async fn test_latest_message_event_can_be_wrapped_as_a_timeline_item_with_sender_from_the_storage(
     ) {
         // Given a sync event that is suitable to be used as a latest_event, and a room
@@ -757,7 +1027,13 @@ mod tests {
         let event = message_event(room_id, user_id, "**My M**", "<b>My M</b>", 122344);
         let client = logged_in_client(None).await;
         let mut room = http::response::Room::new();
-        room.timeline.push(member_event(room_id, user_id, "Alice Margatroid", "mxc://e.org/SEs"));
+        room.required_state.push(member_event_as_state_event(
+            room_id,
+            user_id,
+            "join",
+            "Alice Margatroid",
+            "mxc://e.org/SEs",
+        ));
 
         // And the room is stored in the client so it can be extracted when needed
         let response = response_with_room(room_id, room);
@@ -828,6 +1104,48 @@ mod tests {
         );
     }
 
+    #[async_test]
+    async fn test_emoji_detection() {
+        let room_id = room_id!("!q:x.uk");
+        let user_id = user_id!("@t:o.uk");
+        let client = logged_in_client(None).await;
+
+        let mut event = message_event(room_id, user_id, "🤷‍♂️ No boost 🤷‍♂️", "", 0);
+        let mut timeline_item =
+            EventTimelineItem::from_latest_event(client.clone(), room_id, LatestEvent::new(event))
+                .await
+                .unwrap();
+
+        assert!(!timeline_item.contains_only_emojis());
+
+        // Ignores leading and trailing white spaces
+        event = message_event(room_id, user_id, " 🚀 ", "", 0);
+        timeline_item =
+            EventTimelineItem::from_latest_event(client.clone(), room_id, LatestEvent::new(event))
+                .await
+                .unwrap();
+
+        assert!(timeline_item.contains_only_emojis());
+
+        // Too many
+        event = message_event(room_id, user_id, "👨‍👩‍👦1️⃣🚀👳🏾‍♂️🪩👍👍🏻🫱🏼‍🫲🏾🙂👋", "", 0);
+        timeline_item =
+            EventTimelineItem::from_latest_event(client.clone(), room_id, LatestEvent::new(event))
+                .await
+                .unwrap();
+
+        assert!(!timeline_item.contains_only_emojis());
+
+        // Works with combined emojis
+        event = message_event(room_id, user_id, "👨‍👩‍👦1️⃣👳🏾‍♂️👍🏻🫱🏼‍🫲🏾", "", 0);
+        timeline_item =
+            EventTimelineItem::from_latest_event(client.clone(), room_id, LatestEvent::new(event))
+                .await
+                .unwrap();
+
+        assert!(timeline_item.contains_only_emojis());
+    }
+
     fn member_event(
         room_id: &RoomId,
         user_id: &UserId,
@@ -854,6 +1172,32 @@ mod tests {
         })
     }
 
+    fn member_event_as_state_event(
+        room_id: &RoomId,
+        user_id: &UserId,
+        membership: &str,
+        display_name: &str,
+        avatar_url: &str,
+    ) -> Raw<AnySyncStateEvent> {
+        sync_state_event!({
+            "type": "m.room.member",
+            "content": {
+                "avatar_url": avatar_url,
+                "displayname": display_name,
+                "membership": membership,
+                "reason": ""
+            },
+            "event_id": "$143273582443PhrSn:example.org",
+            "origin_server_ts": 143273583,
+            "room_id": room_id,
+            "sender": user_id,
+            "state_key": user_id,
+            "unsigned": {
+              "age": 1234
+            }
+        })
+    }
+
     fn response_with_room(room_id: &RoomId, room: http::response::Room) -> http::Response {
         let mut response = http::Response::new("6".to_owned());
         response.rooms.insert(room_id.to_owned(), room);
@@ -866,8 +1210,8 @@ mod tests {
         body: &str,
         formatted_body: &str,
         ts: u64,
-    ) -> SyncTimelineEvent {
-        sync_timeline_event!({
+    ) -> TimelineEvent {
+        TimelineEvent::new(sync_timeline_event!({
             "event_id": "$eventid6",
             "sender": user_id,
             "origin_server_ts": ts,
@@ -879,7 +1223,6 @@ mod tests {
                 "formatted_body": formatted_body,
                 "msgtype": "m.text"
             },
-        })
-        .into()
+        }))
     }
 }

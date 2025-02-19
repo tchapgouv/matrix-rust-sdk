@@ -14,19 +14,20 @@
 
 //! Types and functions related to authentication in Matrix.
 
-// TODO:(pixlwave) Move AuthenticationService from the FFI into this module.
-// TODO:(poljar) Move the oidc and matrix_auth modules under this module.
+use std::sync::Arc;
 
 use as_variant::as_variant;
 use matrix_sdk_base::SessionMeta;
 use tokio::sync::{broadcast, Mutex, OnceCell};
 
+pub mod matrix;
 #[cfg(feature = "experimental-oidc")]
-use crate::oidc::{self, Oidc, OidcAuthData, OidcCtx};
-use crate::{
-    matrix_auth::{self, MatrixAuth, MatrixAuthData},
-    Client, RefreshTokenError, SessionChange,
-};
+pub mod oidc;
+
+use self::matrix::{MatrixAuth, MatrixAuthData};
+#[cfg(feature = "experimental-oidc")]
+use self::oidc::{Oidc, OidcAuthData, OidcCtx};
+use crate::{Client, RefreshTokenError, SessionChange};
 
 #[cfg(all(feature = "experimental-oidc", feature = "e2e-encryption", not(target_arch = "wasm32")))]
 pub mod qrcode;
@@ -34,8 +35,8 @@ pub mod qrcode;
 /// Session tokens, for any kind of authentication.
 #[allow(missing_debug_implementations, clippy::large_enum_variant)]
 pub enum SessionTokens {
-    /// Tokens for a [`matrix_auth`] session.
-    Matrix(matrix_auth::MatrixSessionTokens),
+    /// Tokens for a [`matrix`] session.
+    Matrix(matrix::MatrixSessionTokens),
     #[cfg(feature = "experimental-oidc")]
     /// Tokens for an [`oidc`] session.
     Oidc(oidc::OidcSessionTokens),
@@ -58,7 +59,7 @@ pub(crate) struct AuthCtx {
     pub(crate) handle_refresh_tokens: bool,
 
     /// Lock making sure we're only doing one token refresh at a time.
-    pub(crate) refresh_token_lock: Mutex<Result<(), RefreshTokenError>>,
+    pub(crate) refresh_token_lock: Arc<Mutex<Result<(), RefreshTokenError>>>,
 
     /// Session change publisher. Allows the subscriber to handle changes to the
     /// session such as logging out when the access token is invalid or
@@ -101,11 +102,11 @@ pub enum AuthApi {
 #[non_exhaustive]
 pub enum AuthSession {
     /// A session using the native Matrix authentication API.
-    Matrix(matrix_auth::MatrixSession),
+    Matrix(matrix::MatrixSession),
 
     /// A session using the OpenID Connect API.
     #[cfg(feature = "experimental-oidc")]
-    Oidc(oidc::OidcSession),
+    Oidc(Box<oidc::OidcSession>),
 }
 
 impl AuthSession {
@@ -146,8 +147,8 @@ impl AuthSession {
     }
 }
 
-impl From<matrix_auth::MatrixSession> for AuthSession {
-    fn from(session: matrix_auth::MatrixSession) -> Self {
+impl From<matrix::MatrixSession> for AuthSession {
+    fn from(session: matrix::MatrixSession) -> Self {
         Self::Matrix(session)
     }
 }
@@ -155,7 +156,7 @@ impl From<matrix_auth::MatrixSession> for AuthSession {
 #[cfg(feature = "experimental-oidc")]
 impl From<oidc::OidcSession> for AuthSession {
     fn from(session: oidc::OidcSession) -> Self {
-        Self::Oidc(session)
+        Self::Oidc(session.into())
     }
 }
 

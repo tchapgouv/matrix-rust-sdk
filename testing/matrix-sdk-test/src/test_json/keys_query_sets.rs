@@ -1,14 +1,316 @@
+use std::{collections::BTreeMap, default::Default};
+
+use insta::{assert_json_snapshot, with_settings};
 use ruma::{
-    api::client::keys::get_keys::v3::Response as KeyQueryResponse, device_id,
-    encryption::DeviceKeys, serde::Raw, user_id, DeviceId, OwnedDeviceId, UserId,
+    api::client::keys::get_keys::v3::Response as KeyQueryResponse,
+    device_id,
+    encryption::{CrossSigningKey, DeviceKeys, KeyUsage},
+    serde::Raw,
+    user_id, CanonicalJsonValue, CrossSigningKeyId, CrossSigningOrDeviceSignatures,
+    CrossSigningOrDeviceSigningKeyId, DeviceId, OwnedBase64PublicKey,
+    OwnedBase64PublicKeyOrDeviceId, OwnedDeviceId, OwnedUserId, SigningKeyAlgorithm, UserId,
 };
 use serde_json::{json, Value};
+use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature};
 
-use crate::ruma_response_from_json;
+use super::keys_query::{keys_query, master_keys, KeysQueryUser};
+use crate::{
+    ruma_response_from_json, ruma_response_to_json,
+    test_json::keys_query::{device_keys_payload, self_signing_keys},
+};
+
+/// A test helper for building test data sets for `/keys/query` response objects
+/// ([`KeyQueryResponse`]).
+///
+/// # Examples
+///
+/// A simple case with no cross-signing identity and a single device:
+///
+/// ```
+/// # use ruma::{device_id, owned_user_id};
+/// # use vodozemac::{Curve25519PublicKey, Ed25519SecretKey};
+/// # use matrix_sdk_test::test_json::keys_query_sets::{KeyQueryResponseTemplate, KeyQueryResponseTemplateDeviceOptions};
+///
+/// // Note that (almost) any 32-byte sequence can be used as a private Ed25519 or Curve25519 key.
+/// // You can also use an arbitrary 32-byte sequence as a *public* key though of course you will
+/// // not know the private key it corresponds to (if indeed there is one).
+///
+/// let template = KeyQueryResponseTemplate::new(owned_user_id!("@alice:localhost"))
+///     .with_device(
+///         device_id!("TESTDEVICE"),
+///         &Curve25519PublicKey::from(b"curvepubcurvepubcurvepubcurvepub".to_owned()),
+///         &Ed25519SecretKey::from_slice(b"device12device12device12device12"),
+///         KeyQueryResponseTemplateDeviceOptions::new(),
+///     );
+///
+/// let response = template.build_response();
+/// ```
+///
+/// A more complex case, with cross-signing keys and a signed device:
+///
+/// ```
+/// # use ruma::{device_id, owned_user_id, user_id};
+/// # use vodozemac::{Curve25519PublicKey, Ed25519SecretKey};
+/// # use matrix_sdk_test::test_json::keys_query_sets::{KeyQueryResponseTemplate, KeyQueryResponseTemplateDeviceOptions};
+///
+/// let template = KeyQueryResponseTemplate::new(owned_user_id!("@me:localhost"))
+///     // add cross-signing keys
+///     .with_cross_signing_keys(
+///         Ed25519SecretKey::from_slice(b"master12master12master12master12"),
+///         Ed25519SecretKey::from_slice(b"self1234self1234self1234self1234"),
+///         Ed25519SecretKey::from_slice(b"user1234user1234user1234user1234"),
+///     )
+///     // add verification from another user
+///     .with_user_verification_signature(
+///         user_id!("@them:localhost"),
+///         &Ed25519SecretKey::from_slice(b"otheruser12otheruser12otheruser1"),
+///     )
+///     // add signed device
+///     .with_device(
+///         device_id!("SECUREDEVICE"),
+///         &Curve25519PublicKey::from(b"curvepubcurvepubcurvepubcurvepub".to_owned()),
+///         &Ed25519SecretKey::from_slice(b"device12device12device12device12"),
+///         KeyQueryResponseTemplateDeviceOptions::new().verified(true),
+///     );
+///
+/// let response = template.build_response();
+/// ```
+pub struct KeyQueryResponseTemplate {
+    /// The User ID of the user that this test data is about.
+    user_id: OwnedUserId,
+
+    /// The user's private master cross-signing key, once it has been set via
+    /// [`KeyQueryResponseTemplate::with_cross_signing_keys`].
+    master_cross_signing_key: Option<Ed25519SecretKey>,
+
+    /// The user's private self-signing key, once it has been set via
+    /// [`KeyQueryResponseTemplate::with_cross_signing_keys`].
+    self_signing_key: Option<Ed25519SecretKey>,
+
+    /// The user's private user-signing key, once it has been set via
+    /// [`KeyQueryResponseTemplate::with_cross_signing_keys`].
+    user_signing_key: Option<Ed25519SecretKey>,
+
+    /// The structured representation of the user's public master cross-signing
+    /// key, ready for return in the `/keys/query` response.
+    ///
+    /// This starts off as `None`, but is populated with the correct
+    /// object when the master key is set. It accumulates additional
+    /// signatures when the key is cross-signed
+    /// via [`KeyQueryResponseTemplate::with_user_verification_signature`].
+    master_cross_signing_key_json: Option<CrossSigningKey>,
+
+    /// The JSON object containing the public, signed, device keys, added via
+    /// [`KeyQueryResponseTemplate::with_device`].
+    device_keys: BTreeMap<OwnedDeviceId, Raw<DeviceKeys>>,
+}
+
+impl KeyQueryResponseTemplate {
+    /// Create a new [`KeyQueryResponseTemplate`] for the given user.
+    pub fn new(user_id: OwnedUserId) -> Self {
+        KeyQueryResponseTemplate {
+            user_id,
+            master_cross_signing_key: None,
+            self_signing_key: None,
+            user_signing_key: None,
+            master_cross_signing_key_json: None,
+            device_keys: Default::default(),
+        }
+    }
+
+    /// Add a set of cross-signing keys to the data to be returned.
+    ///
+    /// The private keys must be provided here so that signatures can be
+    /// correctly calculated.
+    pub fn with_cross_signing_keys(
+        mut self,
+        master_cross_signing_key: Ed25519SecretKey,
+        self_signing_key: Ed25519SecretKey,
+        user_signing_key: Ed25519SecretKey,
+    ) -> Self {
+        let master_public_key = master_cross_signing_key.public_key();
+        self.master_cross_signing_key = Some(master_cross_signing_key);
+        self.self_signing_key = Some(self_signing_key);
+        self.user_signing_key = Some(user_signing_key);
+
+        // For the master key, we build the CrossSigningKey object upfront, so that we
+        // can start to accumulate signatures. For the other keys, we generate
+        // the JSON representation on-demand.
+        self.master_cross_signing_key_json =
+            Some(self.signed_cross_signing_key(&master_public_key, KeyUsage::Master));
+
+        self
+    }
+
+    /// Add a device to the data to be returned.
+    ///
+    /// As well as a device ID and public Curve25519 device key, the *private*
+    /// Ed25519 device key must be provided so that the signature can be
+    /// calculated.
+    ///
+    /// The device can optionally be signed by the self-signing key by calling
+    /// [`KeyResponseTemplateDeviceOptions::verified(true)`] on the `options`
+    /// object.
+    pub fn with_device(
+        mut self,
+        device_id: &DeviceId,
+        curve25519_public_key: &Curve25519PublicKey,
+        ed25519_secret_key: &Ed25519SecretKey,
+        options: KeyQueryResponseTemplateDeviceOptions,
+    ) -> Self {
+        let mut device_keys = json!({
+            "algorithms": [
+                "m.olm.v1.curve25519-aes-sha2",
+                "m.megolm.v1.aes-sha2"
+            ],
+            "device_id": device_id.to_owned(),
+            "keys": {
+                format!("curve25519:{device_id}"): curve25519_public_key.to_base64(),
+                format!("ed25519:{device_id}"): ed25519_secret_key.public_key().to_base64(),
+            },
+            "signatures": {},
+            "user_id": self.user_id.clone(),
+        });
+
+        if options.dehydrated {
+            device_keys["dehydrated"] = Value::Bool(true);
+        }
+
+        sign_json(&mut device_keys, ed25519_secret_key, &self.user_id, device_id.as_str());
+        if options.verified {
+            let ssk = self
+                .self_signing_key
+                .as_ref()
+                .expect("must call with_cross_signing_keys() before creating cross-signed device");
+            sign_json(&mut device_keys, ssk, &self.user_id, &ssk.public_key().to_base64());
+        }
+
+        let raw_device_keys = serde_json::from_value(device_keys).unwrap();
+        self.device_keys.insert(device_id.to_owned(), raw_device_keys);
+        self
+    }
+
+    /// Add the signature from another user to our master key, as would happen
+    /// if that user had verified us.
+    pub fn with_user_verification_signature(
+        mut self,
+        signing_user_id: &UserId,
+        signing_user_user_signing_key: &Ed25519SecretKey,
+    ) -> Self {
+        let master_key = self.master_cross_signing_key_json.as_mut().expect(
+            "must call with_cross_signing_key() before calling 'with_user_verification_signature'",
+        );
+        sign_cross_signing_key(master_key, signing_user_user_signing_key, signing_user_id);
+        self
+    }
+
+    /// Build a `/keys/query` response containing this user's data.
+    pub fn build_response(&self) -> KeyQueryResponse {
+        let mut response = KeyQueryResponse::default();
+
+        if !self.device_keys.is_empty() {
+            response.device_keys =
+                BTreeMap::from([(self.user_id.clone(), self.device_keys.clone())]);
+        }
+
+        if let Some(master_key) = &self.master_cross_signing_key_json {
+            response.master_keys.insert(
+                self.user_id.clone(),
+                Raw::new(master_key).expect("unable to serialize msk"),
+            );
+        }
+
+        if let Some(self_signing_key) = &self.self_signing_key {
+            let ssk = self
+                .signed_cross_signing_key(&self_signing_key.public_key(), KeyUsage::SelfSigning);
+            response
+                .self_signing_keys
+                .insert(self.user_id.clone(), Raw::new(&ssk).expect("unable to serialize ssk"));
+        }
+
+        if let Some(user_signing_key) = &self.user_signing_key {
+            let usk = self
+                .signed_cross_signing_key(&user_signing_key.public_key(), KeyUsage::UserSigning);
+            response
+                .user_signing_keys
+                .insert(self.user_id.clone(), Raw::new(&usk).expect("unable to serialize usk"));
+        }
+
+        response
+    }
+
+    /// Build a [`CrossSigningKey`] structure for part of a `/keys/query`
+    /// response.
+    ///
+    /// Such a structure represents one of the three public cross-signing keys,
+    /// and is always signed by (at least) our master key.
+    ///
+    /// # Arguments
+    ///
+    /// - `public_key`: the public Ed25519 key to be returned by `/keys/query`.
+    /// - `key_usage`: an indicator of whether this will be the master,
+    ///   user-signing, or self-signing key.
+    fn signed_cross_signing_key(
+        &self,
+        public_key: &Ed25519PublicKey,
+        key_usage: KeyUsage,
+    ) -> CrossSigningKey {
+        let public_key_base64 = OwnedBase64PublicKey::with_bytes(public_key.as_bytes());
+        let mut key = CrossSigningKey::new(
+            self.user_id.clone(),
+            vec![key_usage],
+            BTreeMap::from([(
+                CrossSigningKeyId::from_parts(SigningKeyAlgorithm::Ed25519, &public_key_base64),
+                public_key_base64.to_string(),
+            )]),
+            CrossSigningOrDeviceSignatures::new(),
+        );
+
+        // Sign with our master key.
+        let master_key = self
+            .master_cross_signing_key
+            .as_ref()
+            .expect("must set master key before calling `signed_cross_signing_key`");
+        sign_cross_signing_key(&mut key, master_key, &self.user_id);
+
+        key
+    }
+}
+
+/// Options which control the addition of a device to a
+/// [`KeyQueryResponseTemplate`], via [`KeyQueryResponseTemplate::with_device`].
+#[derive(Default)]
+pub struct KeyQueryResponseTemplateDeviceOptions {
+    verified: bool,
+    dehydrated: bool,
+}
+
+impl KeyQueryResponseTemplateDeviceOptions {
+    /// Creates a blank new set of options ready for configuration.
+    ///
+    /// All options are initially set to `false`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the option for whether the device will be verified (i.e., signed by
+    /// the self-signing key).
+    pub fn verified(mut self, verified: bool) -> Self {
+        self.verified = verified;
+        self
+    }
+
+    /// Sets the option for whether the device will be marked as "dehydrated",
+    /// as per [MSC3814].
+    ///
+    /// [MSC3814]: https://github.com/matrix-org/matrix-spec-proposals/pull/3814
+    pub fn dehydrated(mut self, dehydrated: bool) -> Self {
+        self.dehydrated = dehydrated;
+        self
+    }
+}
 
 /// This set of keys/query response was generated using a local synapse.
-/// Each users was created, device added according to needs and the payload
-/// of the keys query have been copy/pasted here.
 ///
 /// The current user is `@me:localhost`, the private part of the
 /// cross-signing keys have been exported using the console with the
@@ -32,7 +334,6 @@ use crate::ruma_response_from_json;
 ///   devices are properly signed by `@good` (i.e were self-verified by @good)
 pub struct KeyDistributionTestData {}
 
-#[allow(dead_code)]
 impl KeyDistributionTestData {
     pub const MASTER_KEY_PRIVATE_EXPORT: &'static str =
         "9kquJqAtEUoTXljh5W2QSsCm4FH9WvWzIkDkIMUsM2k";
@@ -41,246 +342,108 @@ impl KeyDistributionTestData {
     pub const USER_SIGNING_KEY_PRIVATE_EXPORT: &'static str =
         "zQSosK46giUFs2ACsaf32bA7drcIXbmViyEt+TLfloI";
 
-    /// Current user keys query response containing the cross-signing keys
-    pub fn me_keys_query_response() -> KeyQueryResponse {
-        let data = json!({
-            "master_keys": {
-                "@me:localhost": {
-                    "keys": {
-                        "ed25519:KOS8zz9SJnMOxpfPOx9LO2+abuEcnZP/lxDo5RsXao4": "KOS8zz9SJnMOxpfPOx9LO2+abuEcnZP/lxDo5RsXao4"
-                    },
-                    "signatures": {
-                        "@me:localhost": {
-                            "ed25519:KOS8zz9SJnMOxpfPOx9LO2+abuEcnZP/lxDo5RsXao4": "5G9+Ns28rzNd+2DvP73Y0orr8sxduRQcrJj0YB7ZygH7oeXshvGLeQn6mcNs7q7ZrMR5bYlXxopufKSWWoKpCg",
-                            "ed25519:YVKUSVBKWX": "ih1Kmj4dTB1AjjkwrLA2qIL3e/oPUFisP5Ic8kGp29wrpoHokasKKnkRl1zS7zq6iBcOL6aOZLPPX/ZHYCX5BQ"
-                        }
-                    },
-                    "usage": [
-                        "master"
-                    ],
-                    "user_id": "@me:localhost"
-                }
-            },
-            "self_signing_keys": {
-                "@me:localhost": {
-                    "keys": {
-                        "ed25519:9gXJQzvqZ+KQunfBTd0g9AkrulwEeFfspyWTSQFqqrw": "9gXJQzvqZ+KQunfBTd0g9AkrulwEeFfspyWTSQFqqrw"
-                    },
-                    "signatures": {
-                        "@me:localhost": {
-                            "ed25519:KOS8zz9SJnMOxpfPOx9LO2+abuEcnZP/lxDo5RsXao4": "amiKDLpWIwUQPzq+eov6KJsoskkWA1YzrGNb7HF3OcGV0nm4t7df0tUdZB/OpREtT5D78BKtzOPUipde2DxUAw"
-                        }
-                    },
-                    "usage": [
-                        "self_signing"
-                    ],
-                    "user_id": "@me:localhost"
-                }
-            },
-            "user_signing_keys": {
-                "@me:localhost": {
-                    "keys": {
-                        "ed25519:mvzOc2EuHoVfZTk1hX3y0hyjUs4MrfPv2V/PUFzMQJY": "mvzOc2EuHoVfZTk1hX3y0hyjUs4MrfPv2V/PUFzMQJY"
-                    },
-                    "signatures": {
-                        "@me:localhost": {
-                            "ed25519:KOS8zz9SJnMOxpfPOx9LO2+abuEcnZP/lxDo5RsXao4": "Cv56vTHAzRkvdcELleOlhECZQP0pXcikCdEZrnXbkjXQ/k0ZvVOJ1beG/SiH8xc6zh1bCIMYv96C9p8o+7VZCQ"
-                        }
-                    },
-                    "usage": [
-                        "user_signing"
-                    ],
-                    "user_id": "@me:localhost"
-                }
-            }
-        });
-
-        ruma_response_from_json(&data)
+    /// Current user's private user-signing key, as an [`Ed25519SecretKey`].
+    pub fn me_private_user_signing_key() -> Ed25519SecretKey {
+        Ed25519SecretKey::from_base64(Self::USER_SIGNING_KEY_PRIVATE_EXPORT).unwrap()
     }
 
-    /// Dan has cross-signing setup, one device is cross signed `JHPUERYQUW`,
-    /// but not the other one `FRGNMZVOKA`.
-    /// `@dan` identity is signed by `@me` identity (alice trust dan)
-    pub fn dan_keys_query_response() -> KeyQueryResponse {
-        let data: Value = json!({
-                "device_keys": {
-                    "@dan:localhost": {
-                        "JHPUERYQUW": {
-                            "algorithms": [
-                                "m.olm.v1.curve25519-aes-sha2",
-                                "m.megolm.v1.aes-sha2"
-                            ],
-                            "device_id": "JHPUERYQUW",
-                            "keys": {
-                                "curve25519:JHPUERYQUW": "PBo2nKbink/HxgzMrBftGPogsD0d47LlIMsViTpCRn4",
-                                "ed25519:JHPUERYQUW": "jZ5Ca/J5RXn3qnNWIHFz9EQBZ4637QI/9ExSiEcGC7I"
-                            },
-                            "signatures": {
-                                "@dan:localhost": {
-                                    "ed25519:JHPUERYQUW": "PaVfCE9QODgluq0gYMpjCarfDbraRXU71uRcUN5MoqtiJYlB0bjzY6bD5/qxugrsgcx4DZOgCLgiyoEZ/vW4DQ",
-                                    "ed25519:aX+O6rO/RxzkygPd7XXilKM07aSFK4gSPK1Zxenr6ak": "2sZcF5aSyEuryTfWgsw3rNDevnZisH2Df6fCO5pmGwweiaD+n6+pyrzB75mvA1sOwzm9jfTsjv/2+Uj1CNOTBA"
-                                }
-                            },
-                            "user_id": "@dan:localhost",
-                        },
-                        "FRGNMZVOKA": {
-                            "algorithms": [
-                                "m.olm.v1.curve25519-aes-sha2",
-                                "m.megolm.v1.aes-sha2"
-                            ],
-                            "device_id": "FRGNMZVOKA",
-                            "keys": {
-                                "curve25519:FRGNMZVOKA": "Hc/BC/xyQIEnScyZkEk+ilDMfOARxHMFoEcggPqqRw4",
-                                "ed25519:FRGNMZVOKA": "jVroR0JoRemjF0vJslY3HirJgwfX5gm5DCM64hZgkI0"
-                            },
-                            "signatures": {
-                                "@dan:localhost": {
-                                    "ed25519:FRGNMZVOKA": "+row23EcWR2D8EKgwzZmy3dWz/l5DHvEHR6jHKnBohphEIsBl0o3Cp9rIztFpStFGRPSAa3xEqfMVW2dIaKkCg"
-                                }
-                            },
-                            "user_id": "@dan:localhost",
-                        },
-                    }
-                },
-                "failures": {},
-                "master_keys": {
-                    "@dan:localhost": {
-                        "keys": {
-                            "ed25519:Nj4qZEmWplA8tofkjcR+YOvRCYMRLDKY71BT9GFO32k": "Nj4qZEmWplA8tofkjcR+YOvRCYMRLDKY71BT9GFO32k"
-                        },
-                        "signatures": {
-                            "@dan:localhost": {
-                                "ed25519:Nj4qZEmWplA8tofkjcR+YOvRCYMRLDKY71BT9GFO32k": "DI/zpWA/wG1tdK9aLof1TGBHtihtQZQ+7e62QRSBbo+RAHlQ+akGcaVskLbtLdEKbcJEt61F+Auol+XVGlCEBA",
-                                "ed25519:SNEBMNPLHN": "5Y8byBteGZo1SvPf8QM88pvThJu+2mJ4020YsTLPhCQ4DfdalHWTPOvE7gw09cCONhX/cKY7YHMyH8R26Yd9DA"
-                            },
-                            "@me:localhost": {
-                                "ed25519:mvzOc2EuHoVfZTk1hX3y0hyjUs4MrfPv2V/PUFzMQJY": "vg2MLJx36Usti4NfsbOfk0ipW7koOoTlBibZkQNrPTMX88V+geTgDjvIMEU/OAyEsgsDHjg3C+2t/yUUDE7hBA"
-                            }
-                        },
-                        "usage": [
-                            "master"
-                        ],
-                        "user_id": "@dan:localhost"
-                    }
-                },
-                "self_signing_keys": {
-                    "@dan:localhost": {
-                        "keys": {
-                            "ed25519:aX+O6rO/RxzkygPd7XXilKM07aSFK4gSPK1Zxenr6ak": "aX+O6rO/RxzkygPd7XXilKM07aSFK4gSPK1Zxenr6ak"
-                        },
-                        "signatures": {
-                            "@dan:localhost": {
-                                "ed25519:Nj4qZEmWplA8tofkjcR+YOvRCYMRLDKY71BT9GFO32k": "vxUCzOO4EGwLp+tzfoFbPOVicynvmWgxVx/bv/3fG/Xfl7piJVmeHP+1qDstOewiREuO4W+ti/tYkOXd7GgoAw"
-                            }
-                        },
-                        "usage": [
-                            "self_signing"
-                        ],
-                        "user_id": "@dan:localhost"
-                    }
-                },
-                "user_signing_keys": {
-                    "@dan:localhost": {
-                        "keys": {
-                            "ed25519:N4y+jN6GctRXyNDa1CFRdjofTTxHkNK9t430jE9DxrU": "N4y+jN6GctRXyNDa1CFRdjofTTxHkNK9t430jE9DxrU"
-                        },
-                        "signatures": {
-                            "@dan:localhost": {
-                                "ed25519:Nj4qZEmWplA8tofkjcR+YOvRCYMRLDKY71BT9GFO32k": "gbcD579EGVDRePnKV9j6YNwGhssgFeJWhF1NRJhFNAcpbGL8911cW54jyiFKFCev89QemfqyFFljldFLfyN9DA"
-                            }
-                        },
-                        "usage": [
-                            "user_signing"
-                        ],
-                        "user_id": "@dan:localhost"
-                    }
-                }
-        });
+    /// Current user keys query response containing the cross-signing keys
+    pub fn me_keys_query_response() -> KeyQueryResponse {
+        let builder = KeyQueryResponseTemplate::new(Self::me_id().to_owned())
+            .with_cross_signing_keys(
+                Ed25519SecretKey::from_base64(Self::MASTER_KEY_PRIVATE_EXPORT).unwrap(),
+                Ed25519SecretKey::from_base64(Self::SELF_SIGNING_KEY_PRIVATE_EXPORT).unwrap(),
+                Self::me_private_user_signing_key(),
+            );
 
-        ruma_response_from_json(&data)
+        let response = builder.build_response();
+        with_settings!({sort_maps => true}, {
+            assert_json_snapshot!(
+                "KeyDistributionTestData__me_keys_query_response",
+                ruma_response_to_json(response.clone()),
+            );
+        });
+        response
+    }
+
+    /// Dan's (base64-encoded) private master cross-signing key.
+    const DAN_PRIVATE_MASTER_CROSS_SIGNING_KEY: &'static str =
+        "QGZo39k199RM0NYvPvFNXBspc5llftHWKKHqEi25q0U";
+
+    /// Dan's (base64-encoded) private self-signing key.
+    const DAN_PRIVATE_SELF_SIGNING_KEY: &'static str =
+        "0ES1HO5VXpy/BsXxadwsk6QcwH/ci99KkV9ZlPakHlU";
+
+    /// Dan's (base64-encoded) private user-signing key.
+    const DAN_PRIVATE_USER_SIGNING_KEY: &'static str =
+        "vSdfrHJO8sZH/54r1uCg8BE0CdcDVGkPQNOu7Ej8BBs";
+
+    /// Dan has cross-signing set up; one device is cross-signed (`JHPUERYQUW`),
+    /// but not the other one (`FRGNMZVOKA`).
+    ///
+    /// `@dan`'s identity is signed by `@me`'s identity (Alice trusts Dan).
+    pub fn dan_keys_query_response() -> KeyQueryResponse {
+        let response = Self::dan_keys_query_response_common();
+        with_settings!({sort_maps => true}, {
+            assert_json_snapshot!(
+                "KeyDistributionTestData__dan_keys_query_response",
+                ruma_response_to_json(response.clone()),
+            );
+        });
+        response
     }
 
     /// Same as `dan_keys_query_response` but `FRGNMZVOKA` was removed.
     pub fn dan_keys_query_response_device_loggedout() -> KeyQueryResponse {
-        let data = json!({
-                "device_keys": {
-                    "@dan:localhost": {
-                        "JHPUERYQUW": {
-                            "algorithms": [
-                                "m.olm.v1.curve25519-aes-sha2",
-                                "m.megolm.v1.aes-sha2"
-                            ],
-                            "device_id": "JHPUERYQUW",
-                            "keys": {
-                                "curve25519:JHPUERYQUW": "PBo2nKbink/HxgzMrBftGPogsD0d47LlIMsViTpCRn4",
-                                "ed25519:JHPUERYQUW": "jZ5Ca/J5RXn3qnNWIHFz9EQBZ4637QI/9ExSiEcGC7I"
-                            },
-                            "signatures": {
-                                "@dan:localhost": {
-                                    "ed25519:JHPUERYQUW": "PaVfCE9QODgluq0gYMpjCarfDbraRXU71uRcUN5MoqtiJYlB0bjzY6bD5/qxugrsgcx4DZOgCLgiyoEZ/vW4DQ",
-                                    "ed25519:aX+O6rO/RxzkygPd7XXilKM07aSFK4gSPK1Zxenr6ak": "2sZcF5aSyEuryTfWgsw3rNDevnZisH2Df6fCO5pmGwweiaD+n6+pyrzB75mvA1sOwzm9jfTsjv/2+Uj1CNOTBA"
-                                }
-                            },
-                            "user_id": "@dan:localhost",
-                        },
-                    }
-                },
-                "failures": {},
-                "master_keys": {
-                    "@dan:localhost": {
-                        "keys": {
-                            "ed25519:Nj4qZEmWplA8tofkjcR+YOvRCYMRLDKY71BT9GFO32k": "Nj4qZEmWplA8tofkjcR+YOvRCYMRLDKY71BT9GFO32k"
-                        },
-                        "signatures": {
-                            "@dan:localhost": {
-                                "ed25519:Nj4qZEmWplA8tofkjcR+YOvRCYMRLDKY71BT9GFO32k": "DI/zpWA/wG1tdK9aLof1TGBHtihtQZQ+7e62QRSBbo+RAHlQ+akGcaVskLbtLdEKbcJEt61F+Auol+XVGlCEBA",
-                                "ed25519:SNEBMNPLHN": "5Y8byBteGZo1SvPf8QM88pvThJu+2mJ4020YsTLPhCQ4DfdalHWTPOvE7gw09cCONhX/cKY7YHMyH8R26Yd9DA"
-                            },
-                            "@me:localhost": {
-                                "ed25519:mvzOc2EuHoVfZTk1hX3y0hyjUs4MrfPv2V/PUFzMQJY": "vg2MLJx36Usti4NfsbOfk0ipW7koOoTlBibZkQNrPTMX88V+geTgDjvIMEU/OAyEsgsDHjg3C+2t/yUUDE7hBA"
-                            }
-                        },
-                        "usage": [
-                            "master"
-                        ],
-                        "user_id": "@dan:localhost"
-                    }
-                },
-                "self_signing_keys": {
-                    "@dan:localhost": {
-                        "keys": {
-                            "ed25519:aX+O6rO/RxzkygPd7XXilKM07aSFK4gSPK1Zxenr6ak": "aX+O6rO/RxzkygPd7XXilKM07aSFK4gSPK1Zxenr6ak"
-                        },
-                        "signatures": {
-                            "@dan:localhost": {
-                                "ed25519:Nj4qZEmWplA8tofkjcR+YOvRCYMRLDKY71BT9GFO32k": "vxUCzOO4EGwLp+tzfoFbPOVicynvmWgxVx/bv/3fG/Xfl7piJVmeHP+1qDstOewiREuO4W+ti/tYkOXd7GgoAw"
-                            }
-                        },
-                        "usage": [
-                            "self_signing"
-                        ],
-                        "user_id": "@dan:localhost"
-                    }
-                },
-                "user_signing_keys": {
-                    "@dan:localhost": {
-                        "keys": {
-                            "ed25519:N4y+jN6GctRXyNDa1CFRdjofTTxHkNK9t430jE9DxrU": "N4y+jN6GctRXyNDa1CFRdjofTTxHkNK9t430jE9DxrU"
-                        },
-                        "signatures": {
-                            "@dan:localhost": {
-                                "ed25519:Nj4qZEmWplA8tofkjcR+YOvRCYMRLDKY71BT9GFO32k": "gbcD579EGVDRePnKV9j6YNwGhssgFeJWhF1NRJhFNAcpbGL8911cW54jyiFKFCev89QemfqyFFljldFLfyN9DA"
-                            }
-                        },
-                        "usage": [
-                            "user_signing"
-                        ],
-                        "user_id": "@dan:localhost"
-                    }
-                }
-        });
+        let mut response = Self::dan_keys_query_response_common();
+        response
+            .device_keys
+            .get_mut(Self::dan_id())
+            .unwrap()
+            .remove(Self::dan_unsigned_device_id());
 
-        ruma_response_from_json(&data)
+        with_settings!({sort_maps => true}, {
+            assert_json_snapshot!(
+                "KeyDistributionTestData__dan_keys_query_response_device_loggedout",
+                ruma_response_to_json(response.clone()),
+            );
+        });
+        response
+    }
+
+    /// Common helper for [`Self::dan_keys_query_response`] and
+    /// [`Self::dan_keys_query_response_device_loggedout`].
+    ///
+    /// Returns the full response, including both devices, without writing the
+    /// snapshot.
+    fn dan_keys_query_response_common() -> KeyQueryResponse {
+        let builder = KeyQueryResponseTemplate::new(Self::dan_id().to_owned())
+            .with_cross_signing_keys(
+                Ed25519SecretKey::from_base64(Self::DAN_PRIVATE_MASTER_CROSS_SIGNING_KEY).unwrap(),
+                Ed25519SecretKey::from_base64(Self::DAN_PRIVATE_SELF_SIGNING_KEY).unwrap(),
+                Ed25519SecretKey::from_base64(Self::DAN_PRIVATE_USER_SIGNING_KEY).unwrap(),
+            )
+            .with_user_verification_signature(Self::me_id(), &Self::me_private_user_signing_key());
+
+        // Add signed device JHPUERYQUW
+        let builder = builder.with_device(
+            Self::dan_signed_device_id(),
+            &Curve25519PublicKey::from_base64("PBo2nKbink/HxgzMrBftGPogsD0d47LlIMsViTpCRn4")
+                .unwrap(),
+            &Ed25519SecretKey::from_base64("yzj53Kccfqx2yx9lcTwaRfPZX+7jU19harsDWWu5YnM").unwrap(),
+            KeyQueryResponseTemplateDeviceOptions::new().verified(true),
+        );
+
+        // Add unsigned device FRGNMZVOKA
+        let builder = builder.with_device(
+            Self::dan_unsigned_device_id(),
+            &Curve25519PublicKey::from_base64("Hc/BC/xyQIEnScyZkEk+ilDMfOARxHMFoEcggPqqRw4")
+                .unwrap(),
+            &Ed25519SecretKey::from_base64("/SlFtNKxTPN+i4pHzSPWZ1Oc6ymMB33sS32GXZkaLos").unwrap(),
+            KeyQueryResponseTemplateDeviceOptions::new(),
+        );
+
+        builder.build_response()
     }
 
     /// Dave is a user that has not enabled cross-signing
@@ -447,216 +610,74 @@ impl KeyDistributionTestData {
 /// For user @bob, several payloads with no identities then identity A and B.
 pub struct IdentityChangeDataSet {}
 
-#[allow(dead_code)]
 impl IdentityChangeDataSet {
     pub fn user_id() -> &'static UserId {
-        user_id!("@bob:localhost")
+        // All 3 bobs have the same user id
+        assert_eq!(KeysQueryUser::bob_a().user_id, KeysQueryUser::bob_b().user_id);
+        assert_eq!(KeysQueryUser::bob_a().user_id, KeysQueryUser::bob_c().user_id);
+
+        KeysQueryUser::bob_a().user_id
     }
 
-    pub fn first_device_id() -> &'static DeviceId {
-        device_id!("GYKSNAWLVK")
+    pub fn device_a() -> &'static DeviceId {
+        KeysQueryUser::bob_a().device_id
     }
 
-    pub fn second_device_id() -> &'static DeviceId {
-        device_id!("ATWKQFSFRN")
+    pub fn device_b() -> &'static DeviceId {
+        KeysQueryUser::bob_b().device_id
     }
 
-    pub fn third_device_id() -> &'static DeviceId {
-        device_id!("OPABMDDXGX")
+    pub fn device_c() -> &'static DeviceId {
+        KeysQueryUser::bob_c().device_id
     }
 
-    fn device_keys_payload_1_signed_by_a() -> Value {
-        json!({
-            "algorithms": [
-                "m.olm.v1.curve25519-aes-sha2",
-                "m.megolm.v1.aes-sha2"
-            ],
-            "device_id": "GYKSNAWLVK",
-            "keys": {
-                "curve25519:GYKSNAWLVK": "dBcZBzQaiQYWf6rBPh2QypIOB/dxSoTeyaFaxNNbeHs",
-                "ed25519:GYKSNAWLVK": "6melQNnhoI9sT2b4VzNPAwa8aB179ym45fON8Yo7kVk"
-            },
-            "signatures": {
-                "@bob:localhost": {
-                    "ed25519:GYKSNAWLVK": "Fk45zHAbrd+1j9wZXLjL2Y/+DU/Mnz9yuvlfYBOOT7qExN2Jdud+5BAuNs8nZ/caS4wTF39Kg3zQpzaGERoCBg",
-                    "ed25519:dO4gmBNW7WC0bXBK81j8uh4me6085fP+keoOm0pH3gw": "md0Pa1MYlneFb1fp6KCsvZpi2ySb6/G+ULoCbQDWBeDxNEcoNMzf7PEKY04UToCZKUU4LifvRWmiWFDanOlkCQ"
-                }
-            },
-            "user_id": "@bob:localhost",
-        })
+    pub fn master_signing_keys_a() -> Value {
+        master_keys(&KeysQueryUser::bob_a())
     }
 
-    fn msk_a() -> Value {
-        json!({
-            "@bob:localhost": {
-                "keys": {
-                    "ed25519:/mULSzYNTdHJOBWnBmsvDHhqdHQcWnXRHHmqwzwC7DY": "/mULSzYNTdHJOBWnBmsvDHhqdHQcWnXRHHmqwzwC7DY"
-                },
-                "signatures": {
-                    "@bob:localhost": {
-                        "ed25519:/mULSzYNTdHJOBWnBmsvDHhqdHQcWnXRHHmqwzwC7DY": "6vGDbPO5XzlcwbU3aV+kcck+iHHEBtX85ow2gW5U05/DZdtda/JNVa5Nn7B9lQHNnnrMqt1sX00y/JrIkSS1Aw",
-                        "ed25519:GYKSNAWLVK": "jLxmUPr0Ny2Ai9+NGKGhed9BAuKikOc7r6gr7MQVawePYS95w8NJ8Tzaq9zFFOmIiojACNdQ/ksy3QAdwD6vBQ"
-                    }
-                },
-                "usage": [
-                    "master"
-                ],
-                "user_id": "@bob:localhost"
-            }
-        })
+    pub fn self_signing_keys_a() -> Value {
+        self_signing_keys(&KeysQueryUser::bob_a())
     }
-    fn ssk_a() -> Value {
-        json!({
-            "@bob:localhost": {
-                "keys": {
-                    "ed25519:dO4gmBNW7WC0bXBK81j8uh4me6085fP+keoOm0pH3gw": "dO4gmBNW7WC0bXBK81j8uh4me6085fP+keoOm0pH3gw"
-                },
-                "signatures": {
-                    "@bob:localhost": {
-                        "ed25519:/mULSzYNTdHJOBWnBmsvDHhqdHQcWnXRHHmqwzwC7DY": "7md6mwjUK8zjintmffJ0+kImC59/Y8PdySy99EZz5Neu+VMX3LT7txhKO2gC/hmDduRw+JGfGXIiDxR7GmQqDw"
-                    }
-                },
-                "usage": [
-                    "self_signing"
-                ],
-                "user_id": "@bob:localhost"
-            }
-        })
-    }
+
     /// A key query with an identity (Ia), and a first device `GYKSNAWLVK`
     /// signed by Ia.
     pub fn key_query_with_identity_a() -> KeyQueryResponse {
-        let data = json!({
-            "device_keys": {
-                "@bob:localhost": {
-                    "GYKSNAWLVK": Self::device_keys_payload_1_signed_by_a()
-                }
-            },
-            "failures": {},
-            "master_keys": Self::msk_a(),
-            "self_signing_keys": Self::ssk_a(),
-            "user_signing_keys": {}
-        });
-        ruma_response_from_json(&data)
+        keys_query(&KeysQueryUser::bob_a(), &[])
     }
 
-    pub fn msk_b() -> Value {
-        json!({
-            "@bob:localhost": {
-                "keys": {
-                    "ed25519:NmI78hY54kE7OZsIjbRE/iCox59t4nzScCNEO6fvtY4": "NmI78hY54kE7OZsIjbRE/iCox59t4nzScCNEO6fvtY4"
-                },
-                "signatures": {
-                    "@bob:localhost": {
-                        "ed25519:ATWKQFSFRN": "MBOzCKYPQLQMpBY2lFZJ4c8451xJfQCdhPBb1AHlTUSxKFiWi6V+k1oRRnhQein/PjkIY7ZO+HoOrIeOtbRMAw",
-                        "ed25519:NmI78hY54kE7OZsIjbRE/iCox59t4nzScCNEO6fvtY4": "xqLhC3sIUci1W2CNVW7HZWXreQApgjv2RDwB0WPiMd1P4vbZ/qJM0KWqK2piGPWliPi8YVREMrg216KXM3IhCA"
-                    }
-                },
-                "usage": [
-                    "master"
-                ],
-                "user_id": "@bob:localhost"
-            }
-        })
+    pub fn master_signing_keys_b() -> Value {
+        master_keys(&KeysQueryUser::bob_b())
     }
 
-    pub fn ssk_b() -> Value {
-        json!({
-            "@bob:localhost": {
-                "keys": {
-                    "ed25519:At1ai1VUZrCncCI7V7fEAJmBShfpqZ30xRzqcEjTjdc": "At1ai1VUZrCncCI7V7fEAJmBShfpqZ30xRzqcEjTjdc"
-                },
-                "signatures": {
-                    "@bob:localhost": {
-                        "ed25519:NmI78hY54kE7OZsIjbRE/iCox59t4nzScCNEO6fvtY4": "Ls6CeoA4LoPCHuSwG96kbhd1dEV09TgdMROIZi6vFz/MT9Wtik6joQi/tQ3zCwIZCSR53ksLO4jG1DD31AiBAA"
-                    }
-                },
-                "usage": [
-                    "self_signing"
-                ],
-                "user_id": "@bob:localhost"
-            }
-        })
+    pub fn self_signing_keys_b() -> Value {
+        self_signing_keys(&KeysQueryUser::bob_b())
     }
 
     pub fn device_keys_payload_2_signed_by_b() -> Value {
-        json!({
-            "algorithms": [
-                "m.olm.v1.curve25519-aes-sha2",
-                "m.megolm.v1.aes-sha2"
-            ],
-            "device_id": "ATWKQFSFRN",
-            "keys": {
-                "curve25519:ATWKQFSFRN": "CY0TWVK1/Kj3ZADuBcGe3UKvpT+IKAPMUsMeJhSDqno",
-                "ed25519:ATWKQFSFRN": "TyTQqd6j2JlWZh97r+kTYuCbvqnPoNwO6EGovYsjY00"
-            },
-            "signatures": {
-                "@bob:localhost": {
-                    "ed25519:ATWKQFSFRN": "BQ9Gp0p+6srF+c8OyruqKKd9R4yaub3THYAyyBB/7X/rG8BwcAqFynzl1aGyFYun4Q+087a5OSiglCXI+/kQAA",
-                    "ed25519:At1ai1VUZrCncCI7V7fEAJmBShfpqZ30xRzqcEjTjdc": "TWmDPaG7t0rZ6luauonELD3dmBDTIRryqXhgsIQRiGint2rJdic8RVyZ6a61bgu6mtBjfvU3prqMNp6sVi16Cg"
-                }
-            },
-            "user_id": "@bob:localhost",
-        })
+        device_keys_payload(&KeysQueryUser::bob_b())
     }
+
     /// A key query with a new identity (Ib) and a new device `ATWKQFSFRN`.
     /// `ATWKQFSFRN` is signed with the new identity but `GYKSNAWLVK` is still
     /// signed by the old identity (Ia).
     pub fn key_query_with_identity_b() -> KeyQueryResponse {
-        let data = json!({
-            "device_keys": {
-                "@bob:localhost": {
-                    "ATWKQFSFRN": Self::device_keys_payload_2_signed_by_b(),
-                    "GYKSNAWLVK": Self::device_keys_payload_1_signed_by_a(),
-                }
-            },
-            "failures": {},
-            "master_keys": Self::msk_b(),
-            "self_signing_keys": Self::ssk_b(),
-        });
-        ruma_response_from_json(&data)
+        keys_query(&KeysQueryUser::bob_b(), &[KeysQueryUser::bob_a()])
     }
 
     /// A key query with no identity and a new device `OPABMDDXGX` (not
     /// cross-signed).
     pub fn key_query_with_identity_no_identity() -> KeyQueryResponse {
-        let data = json!({
-            "device_keys": {
-                "@bob:localhost": {
-                    "ATWKQFSFRN": Self::device_keys_payload_2_signed_by_b(),
-                    "GYKSNAWLVK": Self::device_keys_payload_1_signed_by_a(),
-                    "OPABMDDXGX": {
-                        "algorithms": [
-                            "m.olm.v1.curve25519-aes-sha2",
-                            "m.megolm.v1.aes-sha2"
-                        ],
-                        "device_id": "OPABMDDXGX",
-                        "keys": {
-                            "curve25519:OPABMDDXGX": "O6bwa9Op0E+PQPCrbTOfdYwU+j95RRPhXIHuNpe94ns",
-                            "ed25519:OPABMDDXGX": "DvjkSNOM9XrR1gWrr2YSDvTnwnLIgKDMRr5v8HgMKak"
-                        },
-                        "signatures": {
-                            "@bob:localhost": {
-                                "ed25519:OPABMDDXGX": "o+BBnw/SIJWxSf799Adq6jEl9X3lwCg5MJkS8GlfId+pW3ReEETK0l+9bhCAgBsNSKRtB/fmZQBhjMx4FJr+BA"
-                            }
-                        },
-                        "user_id": "@bob:localhost",
-                    }
-                }
-            },
-            "failures": {},
-        });
-        ruma_response_from_json(&data)
+        keys_query(&KeysQueryUser::bob_c(), &[KeysQueryUser::bob_a(), KeysQueryUser::bob_b()])
     }
 }
 
 /// A set of `/keys/query` responses that were initially created to simulate
 /// when a user that was verified reset his keys and became unverified.
 ///
-/// The local user (as returned by [`PreviouslyVerifiedTestData::own_id`]) is
+/// The local user (as returned by [`VerificationViolationTestData::own_id`]) is
 /// `@alice:localhost`. There are 2 other users: `@bob:localhost` (returned by
-/// [`PreviouslyVerifiedTestData::bob_id`]), and `@carol:localhost` (returned by
-/// [`PreviouslyVerifiedTestData::carol_id`]).
+/// [`VerificationViolationTestData::bob_id`]), and `@carol:localhost` (returned
+/// by [`VerificationViolationTestData::carol_id`]).
 ///
 /// We provide two `/keys/query` responses for each of Bob and Carol: one signed
 /// by Alice, and one not signed.
@@ -665,10 +686,9 @@ impl IdentityChangeDataSet {
 /// another one not cross-signed.
 ///
 /// The `/keys/query` responses were generated using a local synapse.
-pub struct PreviouslyVerifiedTestData {}
+pub struct VerificationViolationTestData {}
 
-#[allow(dead_code)]
-impl PreviouslyVerifiedTestData {
+impl VerificationViolationTestData {
     /// Secret part of Alice's master cross-signing key.
     ///
     /// Exported from Element-Web with the following console snippet:
@@ -719,59 +739,21 @@ impl PreviouslyVerifiedTestData {
     /// `/keys/query` response for Alice, containing the public cross-signing
     /// keys.
     pub fn own_keys_query_response_1() -> KeyQueryResponse {
-        let data = json!({
-            "master_keys": {
-                "@alice:localhost": {
-                    "keys": {
-                        "ed25519:EPVg/QLG9+FmNvKjNXfycZEpQLtfHDaTN+rENAURZSk": "EPVg/QLG9+FmNvKjNXfycZEpQLtfHDaTN+rENAURZSk"
-                    },
-                    "signatures": {
-                        "@alice:localhost": {
-                            "ed25519:EPVg/QLG9+FmNvKjNXfycZEpQLtfHDaTN+rENAURZSk": "FX+srrw9SRmi12fexYHH1jrlEIWgOfre1aPNzDZWcAlaP9WKRdhcQGh70/3F9hk/PGr51I+ux62YgU4xnRTqAA",
-                            "ed25519:PWVCNMMGCT": "teLq0rCYKX9h8WXu6kH8UE6HPKAtkF/DwCncxJGvVBCyZRtLHD8W1yYEzJXjTNynn+4fibQZBhR3th1RGLn4Ag"
-                        }
-                    },
-                    "usage": [
-                        "master"
-                    ],
-                    "user_id": "@alice:localhost"
-                }
-            },
-            "self_signing_keys": {
-                "@alice:localhost": {
-                    "keys": {
-                        "ed25519:WXLer0esHUanp8DCeu2Be0xB5ms9aKFFBrCFl50COjw": "WXLer0esHUanp8DCeu2Be0xB5ms9aKFFBrCFl50COjw"
-                    },
-                    "signatures": {
-                        "@alice:localhost": {
-                            "ed25519:EPVg/QLG9+FmNvKjNXfycZEpQLtfHDaTN+rENAURZSk": "lCV9R1xjD34arzq/CAuej1XBv+Ip4dFfAGHfe7znbW7rnwKDaX5PaX3MHk+EIC7nXvUYEAn502WcUFme5c0cCQ"
-                        }
-                    },
-                    "usage": [
-                        "self_signing"
-                    ],
-                    "user_id": "@alice:localhost"
-                }
-            },
-            "user_signing_keys": {
-                "@alice:localhost": {
-                    "keys": {
-                        "ed25519:MXob/N/bYI7U2655O1/AI9NOX1245RnE03Nl4Hvf+u0": "MXob/N/bYI7U2655O1/AI9NOX1245RnE03Nl4Hvf+u0"
-                    },
-                    "signatures": {
-                        "@alice:localhost": {
-                            "ed25519:EPVg/QLG9+FmNvKjNXfycZEpQLtfHDaTN+rENAURZSk": "A73QfZ5Dzhh7abdal/sEaq1bfgxzPFU8Bvwa9Y5TIe/a5jTmLVubNmsMSsO5tOT+b6aVJg1G4FtId0Q/cb1aAA"
-                        }
-                    },
-                    "usage": [
-                        "user_signing"
-                    ],
-                    "user_id": "@alice:localhost"
-                }
-            }
-        });
+        let builder = KeyQueryResponseTemplate::new(Self::own_id().to_owned())
+            .with_cross_signing_keys(
+                Ed25519SecretKey::from_base64(Self::MASTER_KEY_PRIVATE_EXPORT).unwrap(),
+                Ed25519SecretKey::from_base64(Self::SELF_SIGNING_KEY_PRIVATE_EXPORT).unwrap(),
+                Ed25519SecretKey::from_base64(Self::USER_SIGNING_KEY_PRIVATE_EXPORT).unwrap(),
+            );
 
-        ruma_response_from_json(&data)
+        let response = builder.build_response();
+        with_settings!({sort_maps => true}, {
+            assert_json_snapshot!(
+                "VerificationViolationTestData__own_keys_query_response_1",
+                ruma_response_to_json(response.clone()),
+            );
+        });
+        response
     }
 
     /// A second `/keys/query` response for Alice, containing a *different* set
@@ -1262,4 +1244,241 @@ impl PreviouslyVerifiedTestData {
 
         ruma_response_from_json(&data)
     }
+}
+
+/// A set of keys query to test identity changes,
+/// For user @malo, that performed an identity change with the same device.
+pub struct MaloIdentityChangeDataSet {}
+
+impl MaloIdentityChangeDataSet {
+    pub fn user_id() -> &'static UserId {
+        user_id!("@malo:localhost")
+    }
+
+    pub fn device_id() -> &'static DeviceId {
+        device_id!("NZFSPBRLDO")
+    }
+
+    /// @malo's keys before their identity change
+    pub fn initial_key_query() -> KeyQueryResponse {
+        let data = json!({
+            "device_keys": {
+                "@malo:localhost": {
+                    "NZFSPBRLDO": {
+                        "algorithms": [
+                            "m.olm.v1.curve25519-aes-sha2",
+                            "m.megolm.v1.aes-sha2"
+                        ],
+                        "device_id": "NZFSPBRLDO",
+                        "keys": {
+                            "curve25519:NZFSPBRLDO": "L3jdbw42+9i+K7LPjAY+kmqG9nr2n/U0ow8hEbLCoCs",
+                            "ed25519:NZFSPBRLDO": "VDJt3xI4SzrgQkuE3sEIauluaXawx3wWoWOynPI8Zko"
+                        },
+                        "signatures": {
+                            "@malo:localhost": {
+                                "ed25519:NZFSPBRLDO": "lmtbdrJ5xBweo677Fg2qrSHsRi4R3x2WNlvSNJY6Zbg0R5lJS9syN2HZw/irL9PA644GYm4QM/t+DX0grnn+BQ",
+                                "ed25519:+wbxNfSuDrch1jKuydQmEf4qlA4u4NgwqNXNuLVwug8": "Ql1fq+SvVDx+8mjNMzSaR0hBCEkdPirbs2+BK0gwsIH1zkuMADnBoNWP7LJiKo/EO9gnpiCzyQQgI4e9pIVPDA"
+                            }
+                        },
+                        "user_id": "@malo:localhost",
+                        "unsigned": {}
+                    }
+                }
+            },
+            "failures": {},
+            "master_keys": {
+                "@malo:localhost": {
+                    "keys": {
+                        "ed25519:WBxliSP29guYr4ux0MW6otRe3V/wOLXXElpOcOmpdlE": "WBxliSP29guYr4ux0MW6otRe3V/wOLXXElpOcOmpdlE"
+                    },
+                    "signatures": {
+                        "@malo:localhost": {
+                            "ed25519:NZFSPBRLDO": "crJcXqFpEHRM8KNUw419XrVFaHoM8/kV4ebgpuuIiD9wfX0AhHE2iGRGpKzsrVCqne9k181/uN0sgDMpK2y4Aw",
+                            "ed25519:WBxliSP29guYr4ux0MW6otRe3V/wOLXXElpOcOmpdlE": "/xwFF5AC3GhkpvJ449Srh8kNQS6CXAxQMmBpQvPEHx5BHPXJ08u2ZDd1EPYY4zk4QsePk+tEYu8gDnB0bggHCA"
+                        }
+                    },
+                    "usage": [
+                        "master"
+                    ],
+                    "user_id": "@malo:localhost"
+                }
+            },
+            "self_signing_keys": {
+                "@malo:localhost": {
+                    "keys": {
+                        "ed25519:+wbxNfSuDrch1jKuydQmEf4qlA4u4NgwqNXNuLVwug8": "+wbxNfSuDrch1jKuydQmEf4qlA4u4NgwqNXNuLVwug8"
+                    },
+                    "signatures": {
+                        "@malo:localhost": {
+                            "ed25519:WBxliSP29guYr4ux0MW6otRe3V/wOLXXElpOcOmpdlE": "sSGQ6ny6aXtIvgKPGOYJzcmnNDSkbaJFVRe9wekOry7EaiWf2l28MkGTUBt4cPoRiMkNjuRBupNEARqHF72sAQ"
+                        }
+                    },
+                    "usage": [
+                        "self_signing"
+                    ],
+                    "user_id": "@malo:localhost"
+                }
+            },
+            "user_signing_keys": {},
+        });
+
+        ruma_response_from_json(&data)
+    }
+
+    /// @malo's keys after their identity change
+    pub fn updated_key_query() -> KeyQueryResponse {
+        let data = json!({
+            "device_keys": {
+                "@malo:localhost": {
+                    "NZFSPBRLDO": {
+                        "algorithms": [
+                            "m.olm.v1.curve25519-aes-sha2",
+                            "m.megolm.v1.aes-sha2"
+                        ],
+                        "device_id": "NZFSPBRLDO",
+                        "keys": {
+                            "curve25519:NZFSPBRLDO": "L3jdbw42+9i+K7LPjAY+kmqG9nr2n/U0ow8hEbLCoCs",
+                            "ed25519:NZFSPBRLDO": "VDJt3xI4SzrgQkuE3sEIauluaXawx3wWoWOynPI8Zko"
+                        },
+                        "signatures": {
+                            "@malo:localhost": {
+                                "ed25519:NZFSPBRLDO": "lmtbdrJ5xBweo677Fg2qrSHsRi4R3x2WNlvSNJY6Zbg0R5lJS9syN2HZw/irL9PA644GYm4QM/t+DX0grnn+BQ",
+                                "ed25519:+wbxNfSuDrch1jKuydQmEf4qlA4u4NgwqNXNuLVwug8": "Ql1fq+SvVDx+8mjNMzSaR0hBCEkdPirbs2+BK0gwsIH1zkuMADnBoNWP7LJiKo/EO9gnpiCzyQQgI4e9pIVPDA",
+                                "ed25519:8my6+zgnzEP0ZqmQFyvscJh7isHlf8lxBmHg+fzdJkE": "OvqDE7C2mrHxjwNyMIEz+m/AO6I6lM5HoPYY2bvLjrJJDOF5sJOtw4JoYiCWyt90ZIWsbEqmfbazrblLD50tCg"
+                            }
+                        },
+                        "user_id": "@malo:localhost",
+                        "unsigned": {}
+                    }
+                }
+            },
+            "failures": {},
+            "master_keys": {
+                "@malo:localhost": {
+                    "keys": {
+                        "ed25519:dv2Mk7bFlRtP/0oSZpB01Ouc5frCXKfG8Bn9YrFxbxU": "dv2Mk7bFlRtP/0oSZpB01Ouc5frCXKfG8Bn9YrFxbxU"
+                    },
+                    "signatures": {
+                        "@malo:localhost": {
+                            "ed25519:NZFSPBRLDO": "2Ye96l4srBSWskNQszuMpea1r97rFoUyfNqegvu/hGeP47w0OVvqYuNtZRNwqb7TMS7aPEn6l9lhWEk7v06wCg",
+                            "ed25519:dv2Mk7bFlRtP/0oSZpB01Ouc5frCXKfG8Bn9YrFxbxU": "btkxAJpJeVtc9wgBmeHUI9QDpojd6ddLxK11E3403KoTQtP6Mnr5GsVdQr1HJToG7PG4k4eEZGWxVZr1GPndAA"
+                        }
+                    },
+                    "usage": [
+                        "master"
+                    ],
+                    "user_id": "@malo:localhost"
+                }
+            },
+            "self_signing_keys": {
+                "@malo:localhost": {
+                    "keys": {
+                        "ed25519:8my6+zgnzEP0ZqmQFyvscJh7isHlf8lxBmHg+fzdJkE": "8my6+zgnzEP0ZqmQFyvscJh7isHlf8lxBmHg+fzdJkE"
+                    },
+                    "signatures": {
+                        "@malo:localhost": {
+                            "ed25519:dv2Mk7bFlRtP/0oSZpB01Ouc5frCXKfG8Bn9YrFxbxU": "KJt0y1p8v8RGLGk2wUyCMbX1irXJqup/mdRuG/cxJxs24BZhDMyIzyGrGXnWq2gx3I4fKIMtFPi/ecxf92ePAQ"
+                        }
+                    },
+                    "usage": [
+                        "self_signing"
+                    ],
+                    "user_id": "@malo:localhost"
+                }
+            },
+            "user_signing_keys": {}
+        });
+
+        ruma_response_from_json(&data)
+    }
+}
+
+/// Calculate the signature for a JSON object, without adding that signature to
+/// the object.
+///
+/// # Arguments
+///
+/// * `value` - the JSON object to be signed.
+/// * `signing_key` - the Ed25519 key to sign with.
+fn calculate_json_signature(mut value: Value, signing_key: &Ed25519SecretKey) -> Ed25519Signature {
+    // strip `unsigned` and any existing signatures
+    let json_object = value.as_object_mut().expect("value must be object");
+    json_object.remove("signatures");
+    json_object.remove("unsigned");
+
+    let canonical_json: CanonicalJsonValue =
+        value.try_into().expect("could not convert to canonicaljson");
+
+    // do the signing
+    signing_key.sign(canonical_json.to_string().as_ref())
+}
+
+/// Add a signature to a JSON object, following the Matrix JSON-signing spec (https://spec.matrix.org/v1.12/appendices/#signing-details).
+///
+/// # Arguments
+///
+/// * `value` - the JSON object to be signed.
+/// * `signing_key` - the Ed25519 key to sign with.
+/// * `user_id` - the user doing the signing. This will be used to add the
+///   signature to the object.
+/// * `key_identifier` - the name of the key being used to sign with,
+///   *excluding* the `ed25519` prefix.
+///
+/// # Panics
+///
+/// If the JSON value passed in is not an object, or contains a non-object
+/// `signatures` property.
+fn sign_json(
+    value: &mut Value,
+    signing_key: &Ed25519SecretKey,
+    user_id: &UserId,
+    key_identifier: &str,
+) {
+    let signature = calculate_json_signature(value.clone(), signing_key);
+
+    let value_obj = value.as_object_mut().expect("value must be object");
+
+    let signatures_obj = value_obj
+        .entry("signatures")
+        .or_insert_with(|| serde_json::Map::new().into())
+        .as_object_mut()
+        .expect("signatures key must be object");
+
+    let user_signatures_obj = signatures_obj
+        .entry(user_id.to_string())
+        .or_insert_with(|| serde_json::Map::new().into())
+        .as_object_mut()
+        .expect("signatures keys must be object");
+
+    user_signatures_obj.insert(format!("ed25519:{key_identifier}"), signature.to_base64().into());
+}
+
+/// Add a signature to a [`CrossSigningKey`] object.
+///
+/// This is similar to [`sign_json`], but operates on the deserialized
+/// [`CrossSigningKey`] object rather than the serialized JSON.
+///
+/// # Arguments
+///
+/// * `value` - the [`CrossSigningKey`] object to be signed.
+/// * `signing_key` - the Ed25519 key to sign with.
+/// * `user_id` - the user doing the signing. This will be used to add the
+///   signature to the object.
+fn sign_cross_signing_key(
+    value: &mut CrossSigningKey,
+    signing_key: &Ed25519SecretKey,
+    user_id: &UserId,
+) {
+    let key_json = serde_json::to_value(value.clone()).unwrap();
+    let signature = calculate_json_signature(key_json, signing_key);
+
+    // Poke the signature into the struct
+    let signing_key_id: OwnedBase64PublicKeyOrDeviceId =
+        OwnedBase64PublicKey::with_bytes(signing_key.public_key().as_bytes()).into();
+
+    value.signatures.insert_signature(
+        user_id.to_owned(),
+        CrossSigningOrDeviceSigningKeyId::from_parts(SigningKeyAlgorithm::Ed25519, &signing_key_id),
+        signature.to_base64(),
+    );
 }

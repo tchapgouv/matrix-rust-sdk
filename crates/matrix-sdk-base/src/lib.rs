@@ -15,6 +15,7 @@
 
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 #![warn(missing_docs, missing_debug_implementations)]
 
 pub use matrix_sdk_common::*;
@@ -27,15 +28,15 @@ mod client;
 pub mod debug;
 pub mod deserialized_responses;
 mod error;
-pub mod event_cache_store;
+pub mod event_cache;
 pub mod latest_event;
 pub mod media;
 pub mod notification_settings;
+mod response_processors;
 mod rooms;
 
 pub mod read_receipts;
 pub use read_receipts::PreviousEventsProvider;
-#[cfg(feature = "experimental-sliding-sync")]
 pub mod sliding_sync;
 
 pub mod store;
@@ -54,12 +55,12 @@ pub use http;
 pub use matrix_sdk_crypto as crypto;
 pub use once_cell;
 pub use rooms::{
-    DisplayName, Room, RoomCreateWithCreatorEventContent, RoomHero, RoomInfo,
-    RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomMember, RoomMemberships, RoomState,
-    RoomStateFilter,
+    apply_redaction, Room, RoomCreateWithCreatorEventContent, RoomDisplayName, RoomHero, RoomInfo,
+    RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomMember, RoomMembersUpdate,
+    RoomMemberships, RoomState, RoomStateFilter,
 };
 pub use store::{
-    ComposerDraft, ComposerDraftType, StateChanges, StateStore, StateStoreDataKey,
+    ComposerDraft, ComposerDraftType, QueueWedgeError, StateChanges, StateStore, StateStoreDataKey,
     StateStoreDataValue, StoreError,
 };
 pub use utils::{

@@ -16,10 +16,10 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use matrix_sdk_common::{debug::DebugRawEvent, deserialized_responses::SyncTimelineEvent};
+use matrix_sdk_common::{debug::DebugRawEvent, deserialized_responses::TimelineEvent};
 use ruma::{
     api::client::sync::sync_events::{
-        v3::InvitedRoom as InvitedRoomUpdate,
+        v3::{InvitedRoom as InvitedRoomUpdate, KnockedRoom as KnockedRoomUpdate},
         UnreadNotificationsCount as RumaUnreadNotificationsCount,
     },
     events::{
@@ -33,7 +33,7 @@ use ruma::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    debug::{DebugInvitedRoom, DebugListOfRawEvents, DebugListOfRawEventsNoId},
+    debug::{DebugInvitedRoom, DebugKnockedRoom, DebugListOfRawEvents, DebugListOfRawEventsNoId},
     deserialized_responses::{AmbiguityChange, RawAnySyncOrStrippedTimelineEvent},
     store::Store,
 };
@@ -77,6 +77,8 @@ pub struct RoomUpdates {
     pub join: BTreeMap<OwnedRoomId, JoinedRoomUpdate>,
     /// The rooms that the user has been invited to.
     pub invite: BTreeMap<OwnedRoomId, InvitedRoomUpdate>,
+    /// The rooms that the user has knocked on.
+    pub knocked: BTreeMap<OwnedRoomId, KnockedRoomUpdate>,
 }
 
 impl RoomUpdates {
@@ -89,6 +91,7 @@ impl RoomUpdates {
             .keys()
             .chain(self.join.keys())
             .chain(self.invite.keys())
+            .chain(self.knocked.keys())
             .filter_map(|room_id| store.room(room_id))
         {
             let _ = room.compute_display_name().await;
@@ -99,10 +102,11 @@ impl RoomUpdates {
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for RoomUpdates {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Rooms")
+        f.debug_struct("RoomUpdates")
             .field("leave", &self.leave)
             .field("join", &self.join)
             .field("invite", &DebugInvitedRoomUpdates(&self.invite))
+            .field("knocked", &DebugKnockedRoomUpdates(&self.knocked))
             .finish()
     }
 }
@@ -134,7 +138,7 @@ pub struct JoinedRoomUpdate {
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for JoinedRoomUpdate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("JoinedRoom")
+        f.debug_struct("JoinedRoomUpdate")
             .field("unread_notifications", &self.unread_notifications)
             .field("timeline", &self.timeline)
             .field("state", &DebugListOfRawEvents(&self.state))
@@ -211,7 +215,7 @@ impl LeftRoomUpdate {
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for LeftRoomUpdate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("JoinedRoom")
+        f.debug_struct("LeftRoomUpdate")
             .field("timeline", &self.timeline)
             .field("state", &DebugListOfRawEvents(&self.state))
             .field("account_data", &DebugListOfRawEventsNoId(&self.account_data))
@@ -232,7 +236,7 @@ pub struct Timeline {
     pub prev_batch: Option<String>,
 
     /// A list of events.
-    pub events: Vec<SyncTimelineEvent>,
+    pub events: Vec<TimelineEvent>,
 }
 
 impl Timeline {
@@ -244,9 +248,18 @@ impl Timeline {
 struct DebugInvitedRoomUpdates<'a>(&'a BTreeMap<OwnedRoomId, InvitedRoomUpdate>);
 
 #[cfg(not(tarpaulin_include))]
-impl<'a> fmt::Debug for DebugInvitedRoomUpdates<'a> {
+impl fmt::Debug for DebugInvitedRoomUpdates<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map().entries(self.0.iter().map(|(k, v)| (k, DebugInvitedRoom(v)))).finish()
+    }
+}
+
+struct DebugKnockedRoomUpdates<'a>(&'a BTreeMap<OwnedRoomId, KnockedRoomUpdate>);
+
+#[cfg(not(tarpaulin_include))]
+impl fmt::Debug for DebugKnockedRoomUpdates<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.0.iter().map(|(k, v)| (k, DebugKnockedRoom(v)))).finish()
     }
 }
 

@@ -1,18 +1,24 @@
 //! Utilities for working with events to decide whether they are suitable for
 //! use as a [crate::Room::latest_event].
 
-#![cfg(any(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
-
-use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
+use matrix_sdk_common::deserialized_responses::TimelineEvent;
 #[cfg(feature = "e2e-encryption")]
-use ruma::events::{
-    call::{invite::SyncCallInviteEvent, notify::SyncCallNotifyEvent},
-    poll::unstable_start::SyncUnstablePollStartEvent,
-    relation::RelationType,
-    room::message::SyncRoomMessageEvent,
-    AnySyncMessageLikeEvent, AnySyncTimelineEvent,
+use ruma::{
+    events::{
+        call::{invite::SyncCallInviteEvent, notify::SyncCallNotifyEvent},
+        poll::unstable_start::SyncUnstablePollStartEvent,
+        relation::RelationType,
+        room::{
+            member::{MembershipState, SyncRoomMemberEvent},
+            message::{MessageType, SyncRoomMessageEvent},
+            power_levels::RoomPowerLevels,
+        },
+        sticker::SyncStickerEvent,
+        AnySyncMessageLikeEvent, AnySyncStateEvent, AnySyncTimelineEvent,
+    },
+    UserId,
 };
-use ruma::{events::sticker::SyncStickerEvent, MxcUri, OwnedEventId};
+use ruma::{MxcUri, OwnedEventId};
 use serde::{Deserialize, Serialize};
 
 use crate::MinimalRoomMemberEvent;
@@ -37,6 +43,10 @@ pub enum PossibleLatestEvent<'a> {
     /// This message is suitable - it's a call notification
     YesCallNotify(&'a SyncCallNotifyEvent),
 
+    /// This state event is suitable - it's a knock membership change
+    /// that can be handled by the current user.
+    YesKnockedStateEvent(&'a SyncRoomMemberEvent),
+
     // Later: YesState(),
     // Later: YesReaction(),
     /// Not suitable - it's a state event
@@ -50,14 +60,22 @@ pub enum PossibleLatestEvent<'a> {
 /// Decide whether an event could be stored as the latest event in a room.
 /// Returns a LatestEvent representing our decision.
 #[cfg(feature = "e2e-encryption")]
-pub fn is_suitable_for_latest_event(event: &AnySyncTimelineEvent) -> PossibleLatestEvent<'_> {
+pub fn is_suitable_for_latest_event<'a>(
+    event: &'a AnySyncTimelineEvent,
+    power_levels_info: Option<(&'a UserId, &'a RoomPowerLevels)>,
+) -> PossibleLatestEvent<'a> {
     match event {
         // Suitable - we have an m.room.message that was not redacted or edited
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(message)) => {
-            // Check if this is a replacement for another message. If it is, ignore it
             if let Some(original_message) = message.as_original() {
+                // Don't show incoming verification requests
+                if let MessageType::VerificationRequest(_) = original_message.content.msgtype {
+                    return PossibleLatestEvent::NoUnsupportedMessageLikeType;
+                }
+
+                // Check if this is a replacement for another message. If it is, ignore it
                 let is_replacement =
-                    original_message.content.relates_to.as_ref().map_or(false, |relates_to| {
+                    original_message.content.relates_to.as_ref().is_some_and(|relates_to| {
                         if let Some(relation_type) = relates_to.rel_type() {
                             relation_type == RelationType::Replacement
                         } else {
@@ -66,13 +84,13 @@ pub fn is_suitable_for_latest_event(event: &AnySyncTimelineEvent) -> PossibleLat
                     });
 
                 if is_replacement {
-                    return PossibleLatestEvent::NoUnsupportedMessageLikeType;
+                    PossibleLatestEvent::NoUnsupportedMessageLikeType
                 } else {
-                    return PossibleLatestEvent::YesRoomMessage(message);
+                    PossibleLatestEvent::YesRoomMessage(message)
                 }
+            } else {
+                PossibleLatestEvent::YesRoomMessage(message)
             }
-
-            return PossibleLatestEvent::YesRoomMessage(message);
         }
 
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::UnstablePollStart(poll)) => {
@@ -103,8 +121,29 @@ pub fn is_suitable_for_latest_event(event: &AnySyncTimelineEvent) -> PossibleLat
         // suitable
         AnySyncTimelineEvent::MessageLike(_) => PossibleLatestEvent::NoUnsupportedMessageLikeType,
 
-        // We don't currently support state events
-        AnySyncTimelineEvent::State(_) => PossibleLatestEvent::NoUnsupportedEventType,
+        // We don't currently support most state events
+        AnySyncTimelineEvent::State(state) => {
+            // But we make an exception for knocked state events *if* the current user
+            // can either accept or decline them
+            if let AnySyncStateEvent::RoomMember(member) = state {
+                if matches!(member.membership(), MembershipState::Knock) {
+                    let can_accept_or_decline_knocks = match power_levels_info {
+                        Some((own_user_id, room_power_levels)) => {
+                            room_power_levels.user_can_invite(own_user_id)
+                                || room_power_levels.user_can_kick(own_user_id)
+                        }
+                        _ => false,
+                    };
+
+                    // The current user can act on the knock changes, so they should be
+                    // displayed
+                    if can_accept_or_decline_knocks {
+                        return PossibleLatestEvent::YesKnockedStateEvent(member);
+                    }
+                }
+            }
+            PossibleLatestEvent::NoUnsupportedEventType
+        }
     }
 }
 
@@ -130,7 +169,7 @@ pub fn is_suitable_for_latest_event(event: &AnySyncTimelineEvent) -> PossibleLat
 #[derive(Clone, Debug, Serialize)]
 pub struct LatestEvent {
     /// The actual event.
-    event: SyncTimelineEvent,
+    event: TimelineEvent,
 
     /// The member profile of the event' sender.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,7 +183,7 @@ pub struct LatestEvent {
 #[derive(Deserialize)]
 struct SerializedLatestEvent {
     /// The actual event.
-    event: SyncTimelineEvent,
+    event: TimelineEvent,
 
     /// The member profile of the event' sender.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -177,7 +216,7 @@ impl<'de> Deserialize<'de> for LatestEvent {
             Err(err) => variant_errors.push(err),
         }
 
-        match serde_json::from_str::<SyncTimelineEvent>(raw.get()) {
+        match serde_json::from_str::<TimelineEvent>(raw.get()) {
             Ok(value) => {
                 return Ok(LatestEvent {
                     event: value,
@@ -196,13 +235,13 @@ impl<'de> Deserialize<'de> for LatestEvent {
 
 impl LatestEvent {
     /// Create a new [`LatestEvent`] without the sender's profile.
-    pub fn new(event: SyncTimelineEvent) -> Self {
+    pub fn new(event: TimelineEvent) -> Self {
         Self { event, sender_profile: None, sender_name_is_ambiguous: None }
     }
 
     /// Create a new [`LatestEvent`] with maybe the sender's profile.
     pub fn new_with_sender_details(
-        event: SyncTimelineEvent,
+        event: TimelineEvent,
         sender_profile: Option<MinimalRoomMemberEvent>,
         sender_name_is_ambiguous: Option<bool>,
     ) -> Self {
@@ -210,17 +249,17 @@ impl LatestEvent {
     }
 
     /// Transform [`Self`] into an event.
-    pub fn into_event(self) -> SyncTimelineEvent {
+    pub fn into_event(self) -> TimelineEvent {
         self.event
     }
 
     /// Get a reference to the event.
-    pub fn event(&self) -> &SyncTimelineEvent {
+    pub fn event(&self) -> &TimelineEvent {
         &self.event
     }
 
     /// Get a mutable reference to the event.
-    pub fn event_mut(&mut self) -> &mut SyncTimelineEvent {
+    pub fn event_mut(&mut self) -> &mut TimelineEvent {
         &mut self.event
     }
 
@@ -260,11 +299,16 @@ impl LatestEvent {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "e2e-encryption")]
     use std::collections::BTreeMap;
 
+    #[cfg(feature = "e2e-encryption")]
     use assert_matches::assert_matches;
+    #[cfg(feature = "e2e-encryption")]
     use assert_matches2::assert_let;
-    use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
+    use matrix_sdk_common::deserialized_responses::TimelineEvent;
+    use ruma::serde::Raw;
+    #[cfg(feature = "e2e-encryption")]
     use ruma::{
         events::{
             call::{
@@ -302,14 +346,16 @@ mod tests {
             RedactedSyncMessageLikeEvent, RedactedUnsigned, StateUnsigned, SyncMessageLikeEvent,
             UnsignedRoomRedactionEvent,
         },
-        owned_event_id, owned_mxc_uri, owned_user_id,
-        serde::Raw,
-        MilliSecondsSinceUnixEpoch, UInt, VoipVersionId,
+        owned_event_id, owned_mxc_uri, owned_user_id, MilliSecondsSinceUnixEpoch, UInt,
+        VoipVersionId,
     };
     use serde_json::json;
 
-    use crate::latest_event::{is_suitable_for_latest_event, LatestEvent, PossibleLatestEvent};
+    use super::LatestEvent;
+    #[cfg(feature = "e2e-encryption")]
+    use super::{is_suitable_for_latest_event, PossibleLatestEvent};
 
+    #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_room_messages_are_suitable() {
         let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
@@ -328,12 +374,13 @@ mod tests {
         ));
         assert_let!(
             PossibleLatestEvent::YesRoomMessage(SyncMessageLikeEvent::Original(m)) =
-                is_suitable_for_latest_event(&event)
+                is_suitable_for_latest_event(&event, None)
         );
 
         assert_eq!(m.content.msgtype.msgtype(), "m.image");
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_polls_are_suitable() {
         let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::UnstablePollStart(
@@ -351,12 +398,13 @@ mod tests {
         ));
         assert_let!(
             PossibleLatestEvent::YesPoll(SyncMessageLikeEvent::Original(m)) =
-                is_suitable_for_latest_event(&event)
+                is_suitable_for_latest_event(&event, None)
         );
 
         assert_eq!(m.content.poll_start().question.text, "do you like rust?");
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_call_invites_are_suitable() {
         let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::CallInvite(
@@ -375,10 +423,11 @@ mod tests {
         ));
         assert_let!(
             PossibleLatestEvent::YesCallInvite(SyncMessageLikeEvent::Original(_)) =
-                is_suitable_for_latest_event(&event)
+                is_suitable_for_latest_event(&event, None)
         );
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_call_notifications_are_suitable() {
         let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::CallNotify(
@@ -397,10 +446,11 @@ mod tests {
         ));
         assert_let!(
             PossibleLatestEvent::YesCallNotify(SyncMessageLikeEvent::Original(_)) =
-                is_suitable_for_latest_event(&event)
+                is_suitable_for_latest_event(&event, None)
         );
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_stickers_are_suitable() {
         let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Sticker(
@@ -418,11 +468,12 @@ mod tests {
         ));
 
         assert_matches!(
-            is_suitable_for_latest_event(&event),
+            is_suitable_for_latest_event(&event, None),
             PossibleLatestEvent::YesSticker(SyncStickerEvent::Original(_))
         );
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_different_types_of_messagelike_are_unsuitable() {
         let event =
@@ -440,11 +491,12 @@ mod tests {
             ));
 
         assert_matches!(
-            is_suitable_for_latest_event(&event),
+            is_suitable_for_latest_event(&event, None),
             PossibleLatestEvent::NoUnsupportedMessageLikeType
         );
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_redacted_messages_are_suitable() {
         // Ruma does not allow constructing UnsignedRoomRedactionEvent instances.
@@ -468,11 +520,12 @@ mod tests {
         ));
 
         assert_matches!(
-            is_suitable_for_latest_event(&event),
+            is_suitable_for_latest_event(&event, None),
             PossibleLatestEvent::YesRoomMessage(SyncMessageLikeEvent::Redacted(_))
         );
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_encrypted_messages_are_unsuitable() {
         let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
@@ -490,9 +543,13 @@ mod tests {
             }),
         ));
 
-        assert_matches!(is_suitable_for_latest_event(&event), PossibleLatestEvent::NoEncrypted);
+        assert_matches!(
+            is_suitable_for_latest_event(&event, None),
+            PossibleLatestEvent::NoEncrypted
+        );
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_state_events_are_unsuitable() {
         let event = AnySyncTimelineEvent::State(AnySyncStateEvent::RoomTopic(
@@ -507,11 +564,12 @@ mod tests {
         ));
 
         assert_matches!(
-            is_suitable_for_latest_event(&event),
+            is_suitable_for_latest_event(&event, None),
             PossibleLatestEvent::NoUnsupportedEventType
         );
     }
 
+    #[cfg(feature = "e2e-encryption")]
     #[test]
     fn test_replacement_events_are_unsuitable() {
         let mut event_content = RoomMessageEventContent::text_plain("Bye bye, world!");
@@ -531,8 +589,36 @@ mod tests {
         ));
 
         assert_matches!(
-            is_suitable_for_latest_event(&event),
+            is_suitable_for_latest_event(&event, None),
             PossibleLatestEvent::NoUnsupportedMessageLikeType
+        );
+    }
+
+    #[cfg(feature = "e2e-encryption")]
+    #[test]
+    fn test_verification_requests_are_unsuitable() {
+        use ruma::{device_id, events::room::message::KeyVerificationRequestEventContent, user_id};
+
+        let event = AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+            SyncRoomMessageEvent::Original(OriginalSyncMessageLikeEvent {
+                content: RoomMessageEventContent::new(MessageType::VerificationRequest(
+                    KeyVerificationRequestEventContent::new(
+                        "body".to_owned(),
+                        vec![],
+                        device_id!("device_id").to_owned(),
+                        user_id!("@user_id:example.com").to_owned(),
+                    ),
+                )),
+                event_id: owned_event_id!("$1"),
+                sender: owned_user_id!("@a:b.c"),
+                origin_server_ts: MilliSecondsSinceUnixEpoch(UInt::new(123).unwrap()),
+                unsigned: MessageLikeUnsigned::new(),
+            }),
+        ));
+
+        assert_let!(
+            PossibleLatestEvent::NoUnsupportedMessageLikeType =
+                is_suitable_for_latest_event(&event, None)
         );
     }
 
@@ -543,7 +629,7 @@ mod tests {
             latest_event: LatestEvent,
         }
 
-        let event = SyncTimelineEvent::new(
+        let event = TimelineEvent::new(
             Raw::from_json_string(json!({ "event_id": "$1" }).to_string()).unwrap(),
         );
 
@@ -562,9 +648,12 @@ mod tests {
             json!({
                 "latest_event": {
                     "event": {
-                        "encryption_info": null,
-                        "event": {
-                            "event_id": "$1"
+                        "kind": {
+                            "PlainText": {
+                                "event": {
+                                    "event_id": "$1"
+                                }
+                            }
                         }
                     },
                 }
@@ -578,6 +667,23 @@ mod tests {
         assert!(deserialized.latest_event.sender_name_is_ambiguous.is_none());
 
         // The previous format can also be deserialized.
+        let serialized = json!({
+                "latest_event": {
+                    "event": {
+                        "encryption_info": null,
+                        "event": {
+                            "event_id": "$1"
+                        }
+                    },
+                }
+        });
+
+        let deserialized: TestStruct = serde_json::from_value(serialized).unwrap();
+        assert_eq!(deserialized.latest_event.event().event_id().unwrap(), "$1");
+        assert!(deserialized.latest_event.sender_profile.is_none());
+        assert!(deserialized.latest_event.sender_name_is_ambiguous.is_none());
+
+        // The even older format can also be deserialized.
         let serialized = json!({
             "latest_event": event
         });

@@ -43,13 +43,14 @@ use std::{
     fmt::Debug,
     ops::Deref,
     pin::pin,
-    sync::{atomic::Ordering, Arc, RwLock as StdRwLock},
+    sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 
 use as_variant::as_variant;
 use futures_core::Stream;
 use futures_util::StreamExt;
+use matrix_sdk_common::locks::RwLock as StdRwLock;
 use ruma::{
     encryption::KeyUsage, events::secret::request::SecretName, DeviceId, OwnedDeviceId,
     OwnedRoomId, OwnedUserId, UserId,
@@ -57,6 +58,7 @@ use ruma::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex, MutexGuard, Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::{info, warn};
 use vodozemac::{base64_encode, megolm::SessionOrdering, Curve25519PublicKey};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -65,7 +67,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::{backups::BackupMachine, identities::OwnUserIdentity};
 use crate::{
     gossiping::GossippedSecret,
-    identities::{user::UserIdentities, Device, DeviceData, UserDevices, UserIdentityData},
+    identities::{user::UserIdentity, Device, DeviceData, UserDevices, UserIdentityData},
     olm::{
         Account, ExportedRoomKey, InboundGroupSession, OlmMessageHash, OutboundGroupSession,
         PrivateCrossSigningIdentity, Session, StaticAccountData,
@@ -96,7 +98,10 @@ use matrix_sdk_common::{store_locks::CrossProcessStoreLock, timeout::timeout};
 pub use memorystore::MemoryStore;
 pub use traits::{CryptoStore, DynCryptoStore, IntoCryptoStore};
 
-pub use crate::gossiping::{GossipRequest, SecretInfo};
+pub use crate::{
+    dehydrated_devices::DehydrationError,
+    gossiping::{GossipRequest, SecretInfo},
+};
 
 /// A wrapper for our CryptoStore trait object.
 ///
@@ -151,7 +156,7 @@ impl KeyQueryManager {
         let tracked_users = cache.store.load_tracked_users().await?;
 
         let mut query_users_lock = self.users_for_key_query.lock().await;
-        let mut tracked_users_cache = cache.tracked_users.write().unwrap();
+        let mut tracked_users_cache = cache.tracked_users.write();
         for user in tracked_users {
             tracked_users_cache.insert(user.user_id.to_owned());
 
@@ -215,7 +220,7 @@ impl KeyQueryManager {
             Err(_) => {
                 warn!(
                     user_id = ?user,
-                    "The user has a pending `/key/query` request which did \
+                    "The user has a pending `/keys/query` request which did \
                     not finish yet, some devices might be missing."
                 );
 
@@ -231,7 +236,7 @@ pub(crate) struct SyncedKeyQueryManager<'a> {
     manager: &'a KeyQueryManager,
 }
 
-impl<'a> SyncedKeyQueryManager<'a> {
+impl SyncedKeyQueryManager<'_> {
     /// Add entries to the list of users being tracked for device changes
     ///
     /// Any users not already on the list are flagged as awaiting a key query.
@@ -241,7 +246,7 @@ impl<'a> SyncedKeyQueryManager<'a> {
         let mut key_query_lock = self.manager.users_for_key_query.lock().await;
 
         {
-            let mut tracked_users = self.cache.tracked_users.write().unwrap();
+            let mut tracked_users = self.cache.tracked_users.write();
             for user_id in users {
                 if tracked_users.insert(user_id.to_owned()) {
                     key_query_lock.insert_user(user_id);
@@ -267,7 +272,7 @@ impl<'a> SyncedKeyQueryManager<'a> {
         let mut key_query_lock = self.manager.users_for_key_query.lock().await;
 
         {
-            let tracked_users = &self.cache.tracked_users.read().unwrap();
+            let tracked_users = &self.cache.tracked_users.read();
             for user_id in users {
                 if tracked_users.contains(user_id) {
                     key_query_lock.insert_user(user_id);
@@ -293,7 +298,7 @@ impl<'a> SyncedKeyQueryManager<'a> {
         let mut key_query_lock = self.manager.users_for_key_query.lock().await;
 
         {
-            let tracked_users = self.cache.tracked_users.read().unwrap();
+            let tracked_users = self.cache.tracked_users.read();
             for user_id in users {
                 if tracked_users.contains(user_id) {
                     let clean = key_query_lock.maybe_remove_user(user_id, sequence_number);
@@ -326,7 +331,7 @@ impl<'a> SyncedKeyQueryManager<'a> {
 
     /// See the docs for [`crate::OlmMachine::tracked_users()`].
     pub fn tracked_users(&self) -> HashSet<OwnedUserId> {
-        self.cache.tracked_users.read().unwrap().iter().cloned().collect()
+        self.cache.tracked_users.read().iter().cloned().collect()
     }
 
     /// Mark the given user as being tracked for device lists, and mark that it
@@ -336,7 +341,7 @@ impl<'a> SyncedKeyQueryManager<'a> {
     /// next time [`Store::users_for_key_query()`] is called.
     pub async fn mark_user_as_changed(&self, user: &UserId) -> Result<()> {
         self.manager.users_for_key_query.lock().await.insert_user(user);
-        self.cache.tracked_users.write().unwrap().insert(user.to_owned());
+        self.cache.tracked_users.write().insert(user.to_owned());
 
         self.cache.store.save_tracked_users(&[(user, true)]).await
     }
@@ -351,6 +356,10 @@ pub(crate) struct StoreCache {
 }
 
 impl StoreCache {
+    pub(crate) fn store_wrapper(&self) -> &CryptoStoreWrapper {
+        self.store.as_ref()
+    }
+
     /// Returns a reference to the `Account`.
     ///
     /// Either load the account from the cache, or the store if missing from
@@ -514,6 +523,7 @@ pub struct Changes {
     pub private_identity: Option<PrivateCrossSigningIdentity>,
     pub backup_version: Option<String>,
     pub backup_decryption_key: Option<BackupDecryptionKey>,
+    pub dehydrated_device_pickle_key: Option<DehydratedDeviceKey>,
     pub sessions: Vec<Session>,
     pub message_hashes: Vec<OlmMessageHash>,
     pub inbound_group_sessions: Vec<InboundGroupSession>,
@@ -546,6 +556,7 @@ impl Changes {
         self.private_identity.is_none()
             && self.backup_version.is_none()
             && self.backup_decryption_key.is_none()
+            && self.dehydrated_device_pickle_key.is_none()
             && self.sessions.is_empty()
             && self.message_hashes.is_empty()
             && self.inbound_group_sessions.is_empty()
@@ -687,7 +698,7 @@ pub struct DeviceUpdates {
     pub changed: BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, Device>>,
 }
 
-/// Updates about [`UserIdentities`] which got received over the `/keys/query`
+/// Updates about [`UserIdentity`]s which got received over the `/keys/query`
 /// endpoint.
 #[derive(Clone, Debug, Default)]
 pub struct IdentityUpdates {
@@ -696,11 +707,11 @@ pub struct IdentityUpdates {
     /// A identity being in this list does not necessarily mean that the
     /// identity was just created, it just means that it's the first time
     /// we're seeing this identity.
-    pub new: BTreeMap<OwnedUserId, UserIdentities>,
+    pub new: BTreeMap<OwnedUserId, UserIdentity>,
     /// The list of changed identities.
-    pub changed: BTreeMap<OwnedUserId, UserIdentities>,
+    pub changed: BTreeMap<OwnedUserId, UserIdentity>,
     /// The list of unchanged identities.
-    pub unchanged: BTreeMap<OwnedUserId, UserIdentities>,
+    pub unchanged: BTreeMap<OwnedUserId, UserIdentity>,
 }
 
 /// The private part of a backup key.
@@ -742,6 +753,76 @@ impl BackupDecryptionKey {
 impl Debug for BackupDecryptionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("BackupDecryptionKey").field(&"...").finish()
+    }
+}
+
+/// The pickle key used to safely store the dehydrated device pickle.
+///
+/// This input key material will be expanded using HKDF into an AES key, MAC
+/// key, and an initialization vector (IV).
+#[derive(Clone, Zeroize, ZeroizeOnDrop, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct DehydratedDeviceKey {
+    pub(crate) inner: Box<[u8; DehydratedDeviceKey::KEY_SIZE]>,
+}
+
+impl DehydratedDeviceKey {
+    /// The number of bytes the encryption key will hold.
+    pub const KEY_SIZE: usize = 32;
+
+    /// Generates a new random pickle key.
+    pub fn new() -> Result<Self, rand::Error> {
+        let mut rng = rand::thread_rng();
+
+        let mut key = Box::new([0u8; Self::KEY_SIZE]);
+        rand::Fill::try_fill(key.as_mut_slice(), &mut rng)?;
+
+        Ok(Self { inner: key })
+    }
+
+    /// Creates a new dehydration pickle key from the given slice.
+    ///
+    /// Fail if the slice length is not 32.
+    pub fn from_slice(slice: &[u8]) -> Result<Self, DehydrationError> {
+        if slice.len() == 32 {
+            let mut key = Box::new([0u8; 32]);
+            key.copy_from_slice(slice);
+            Ok(DehydratedDeviceKey { inner: key })
+        } else {
+            Err(DehydrationError::PickleKeyLength(slice.len()))
+        }
+    }
+
+    /// Creates a dehydration pickle key from the given bytes.
+    pub fn from_bytes(raw_key: &[u8; 32]) -> Self {
+        let mut inner = Box::new([0u8; Self::KEY_SIZE]);
+        inner.copy_from_slice(raw_key);
+
+        Self { inner }
+    }
+
+    /// Export the [`DehydratedDeviceKey`] as a base64 encoded string.
+    pub fn to_base64(&self) -> String {
+        base64_encode(self.inner.as_slice())
+    }
+}
+
+impl From<&[u8; 32]> for DehydratedDeviceKey {
+    fn from(value: &[u8; 32]) -> Self {
+        DehydratedDeviceKey { inner: Box::new(*value) }
+    }
+}
+
+impl From<DehydratedDeviceKey> for Vec<u8> {
+    fn from(key: DehydratedDeviceKey) -> Self {
+        key.inner.to_vec()
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+impl Debug for DehydratedDeviceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DehydratedDeviceKey").field(&"...").finish()
     }
 }
 
@@ -1208,7 +1289,7 @@ impl Store {
     }
 
     ///  Get the Identity of `user_id`
-    pub(crate) async fn get_identity(&self, user_id: &UserId) -> Result<Option<UserIdentities>> {
+    pub(crate) async fn get_identity(&self, user_id: &UserId) -> Result<Option<UserIdentity>> {
         let own_identity = self
             .inner
             .store
@@ -1217,7 +1298,7 @@ impl Store {
             .and_then(as_variant!(UserIdentityData::Own));
 
         Ok(self.inner.store.get_user_identity(user_id).await?.map(|i| {
-            UserIdentities::new(
+            UserIdentity::new(
                 self.clone(),
                 i,
                 self.inner.verification_machine.to_owned(),
@@ -1514,12 +1595,14 @@ impl Store {
     /// the stream. Updates that happen at the same time are batched into a
     /// [`Vec`].
     ///
-    /// If the reader of the stream lags too far behind, a warning will be
-    /// logged and items will be dropped.
+    /// If the reader of the stream lags too far behind an error will be sent to
+    /// the reader.
     ///
     /// The stream will terminate once all references to the underlying
     /// `CryptoStoreWrapper` are dropped.
-    pub fn room_keys_received_stream(&self) -> impl Stream<Item = Vec<RoomKeyInfo>> {
+    pub fn room_keys_received_stream(
+        &self,
+    ) -> impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>> {
         self.inner.store.room_keys_received_stream()
     }
 
@@ -1577,7 +1660,7 @@ impl Store {
             let map_identity = |(user_id, identity)| {
                 (
                     user_id,
-                    UserIdentities::new(
+                    UserIdentity::new(
                         this.clone(),
                         identity,
                         verification_machine.to_owned(),
@@ -1921,14 +2004,14 @@ pub struct LockableCryptoStore(Arc<dyn CryptoStore<Error = CryptoStoreError>>);
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl matrix_sdk_common::store_locks::BackingStore for LockableCryptoStore {
-    type Error = CryptoStoreError;
+    type LockError = CryptoStoreError;
 
     async fn try_lock(
         &self,
         lease_duration_ms: u32,
         key: &str,
         holder: &str,
-    ) -> std::result::Result<bool, Self::Error> {
+    ) -> std::result::Result<bool, Self::LockError> {
         self.0.try_take_leased_lock(lease_duration_ms, key, holder).await
     }
 }
@@ -1941,7 +2024,10 @@ mod tests {
     use matrix_sdk_test::async_test;
     use ruma::{room_id, user_id};
 
-    use crate::{machine::test_helpers::get_machine_pair, types::EventEncryptionAlgorithm};
+    use crate::{
+        machine::test_helpers::get_machine_pair, store::DehydratedDeviceKey,
+        types::EventEncryptionAlgorithm,
+    };
 
     #[async_test]
     async fn test_import_room_keys_notifies_stream() {
@@ -1961,7 +2047,8 @@ mod tests {
             .next()
             .now_or_never()
             .flatten()
-            .expect("We should have received an update of room key infos");
+            .expect("We should have received an update of room key infos")
+            .unwrap();
         assert_eq!(room_keys.len(), 1);
         assert_eq!(room_keys[0].room_id, "!room1:localhost");
     }
@@ -2077,5 +2164,30 @@ mod tests {
         assert!(identity.is_verified(), "The public identity should be marked as verified.");
 
         assert!(status.is_complete(), "We should have imported all the cross-signing keys");
+    }
+
+    #[async_test]
+    async fn test_create_dehydrated_device_key() {
+        let pickle_key = DehydratedDeviceKey::new()
+            .expect("Should be able to create a random dehydrated device key");
+
+        let to_vec = pickle_key.inner.to_vec();
+        let pickle_key_from_slice = DehydratedDeviceKey::from_slice(to_vec.as_slice())
+            .expect("Should be able to create a dehydrated device key from slice");
+
+        assert_eq!(pickle_key_from_slice.to_base64(), pickle_key.to_base64());
+    }
+
+    #[async_test]
+    async fn test_create_dehydrated_errors() {
+        let too_small = [0u8; 22];
+        let pickle_key = DehydratedDeviceKey::from_slice(&too_small);
+
+        assert!(pickle_key.is_err());
+
+        let too_big = [0u8; 40];
+        let pickle_key = DehydratedDeviceKey::from_slice(&too_big);
+
+        assert!(pickle_key.is_err());
     }
 }

@@ -24,17 +24,11 @@ The rust-sdk consists of multiple crates that can be picked at your convenience:
 - **matrix-sdk-crypto** - No (network) IO encryption state machine that can be
   used to add Matrix E2EE support to your client or client library.
 
-## Minimum Supported Rust Version (MSRV)
-
-These crates are built with the Rust language version 2021 and require a minimum compiler version of `1.70`.
-
 ## Status
 
-The library is in an alpha state, things that are implemented generally work but
-the API will change in breaking ways.
+The library is considered production ready and backs multiple client implementations such as Element X [[1]](https://github.com/element-hq/element-x-ios) [[2]](https://github.com/element-hq/element-x-android) and [Fractal](https://gitlab.gnome.org/World/fractal). Client developers should feel confident to build upon it.
 
-If you are interested in using the matrix-sdk now is the time to try it out and
-provide feedback.
+Development of the SDK has been primarily sponsored by Element though accepts contributions from all.
 
 ## Bindings
 

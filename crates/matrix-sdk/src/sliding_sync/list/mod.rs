@@ -11,8 +11,7 @@ use std::{
 
 use eyeball::{Observable, SharedObservable, Subscriber};
 use futures_core::Stream;
-use matrix_sdk_base::sliding_sync::http;
-use ruma::{assign, TransactionId};
+use ruma::{api::client::sync::sync_events::v5 as http, assign, TransactionId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::Sender;
 use tracing::{instrument, warn};
@@ -132,13 +131,13 @@ impl SlidingSyncList {
     }
 
     /// Get the timeline limit.
-    pub fn timeline_limit(&self) -> Option<Bound> {
-        self.inner.sticky.read().unwrap().data().timeline_limit()
+    pub fn timeline_limit(&self) -> Bound {
+        *self.inner.timeline_limit.read().unwrap()
     }
 
     /// Set timeline limit.
-    pub fn set_timeline_limit(&self, timeline: Option<Bound>) {
-        self.inner.sticky.write().unwrap().data_mut().set_timeline_limit(timeline);
+    pub fn set_timeline_limit(&self, timeline: Bound) {
+        *self.inner.timeline_limit.write().unwrap() = timeline;
     }
 
     /// Get the maximum number of rooms. See [`Self::maximum_number_of_rooms`]
@@ -204,19 +203,17 @@ impl SlidingSyncList {
     pub(super) fn invalidate_sticky_data(&self) {
         let _ = self.inner.sticky.write().unwrap().data_mut();
     }
-}
-
-#[cfg(any(test, feature = "testing"))]
-#[allow(dead_code)]
-impl SlidingSyncList {
-    /// Set the maximum number of rooms.
-    pub(super) fn set_maximum_number_of_rooms(&self, maximum_number_of_rooms: Option<u32>) {
-        self.inner.maximum_number_of_rooms.set(maximum_number_of_rooms);
-    }
 
     /// Get the sync-mode.
+    #[cfg(feature = "testing")]
     pub fn sync_mode(&self) -> SlidingSyncMode {
         self.inner.sync_mode.read().unwrap().clone()
+    }
+
+    /// Set the maximum number of rooms.
+    #[cfg(test)]
+    pub(super) fn set_maximum_number_of_rooms(&self, maximum_number_of_rooms: Option<u32>) {
+        self.inner.maximum_number_of_rooms.set(maximum_number_of_rooms);
     }
 }
 
@@ -232,6 +229,9 @@ pub(super) struct SlidingSyncListInner {
     /// the connection is dropped or the server invalidates what the client
     /// knows).
     sticky: StdRwLock<SlidingSyncStickyManager<SlidingSyncListStickyParameters>>,
+
+    /// The maximum number of timeline events to query for.
+    timeline_limit: StdRwLock<Bound>,
 
     /// The total number of rooms that is possible to interact with for the
     /// given list.
@@ -307,12 +307,11 @@ impl SlidingSyncListInner {
     /// request generator.
     #[instrument(skip(self), fields(name = self.name))]
     fn request(&self, ranges: Ranges, txn_id: &mut LazyTransactionId) -> http::request::List {
-        use ruma::UInt;
-
-        let ranges =
-            ranges.into_iter().map(|r| (UInt::from(*r.start()), UInt::from(*r.end()))).collect();
+        let ranges = ranges.into_iter().map(|r| ((*r.start()).into(), (*r.end()).into())).collect();
 
         let mut request = assign!(http::request::List::default(), { ranges });
+        request.room_details.timeline_limit = (*self.timeline_limit.read().unwrap()).into();
+
         {
             let mut sticky = self.sticky.write().unwrap();
             sticky.maybe_apply(&mut request, txn_id);
@@ -594,13 +593,10 @@ mod tests {
             .timeline_limit(7)
             .build(sender);
 
-        assert_eq!(list.inner.sticky.read().unwrap().data().timeline_limit(), Some(7));
+        assert_eq!(list.timeline_limit(), 7);
 
-        list.set_timeline_limit(Some(42));
-        assert_eq!(list.inner.sticky.read().unwrap().data().timeline_limit(), Some(42));
-
-        list.set_timeline_limit(None);
-        assert_eq!(list.inner.sticky.read().unwrap().data().timeline_limit(), None);
+        list.set_timeline_limit(42);
+        assert_eq!(list.timeline_limit(), 42);
     }
 
     macro_rules! assert_ranges {

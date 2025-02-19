@@ -20,10 +20,13 @@ use std::{
     time::Duration,
 };
 
+use hkdf::Hkdf;
 use js_option::JsOption;
+#[cfg(test)]
+use ruma::api::client::dehydrated_device::DehydratedDeviceV1;
 use ruma::{
     api::client::{
-        dehydrated_device::{DehydratedDeviceData, DehydratedDeviceV1},
+        dehydrated_device::{DehydratedDeviceData, DehydratedDeviceV2},
         keys::{
             upload_keys,
             upload_signatures::v3::{Request as SignatureUploadRequest, SignedKeys},
@@ -31,8 +34,9 @@ use ruma::{
     },
     events::AnyToDeviceEvent,
     serde::Raw,
-    DeviceId, DeviceKeyAlgorithm, DeviceKeyId, MilliSecondsSinceUnixEpoch, OwnedDeviceId,
-    OwnedDeviceKeyId, OwnedUserId, RoomId, SecondsSinceUnixEpoch, UInt, UserId,
+    DeviceId, DeviceKeyAlgorithm, DeviceKeyId, MilliSecondsSinceUnixEpoch, OneTimeKeyAlgorithm,
+    OneTimeKeyId, OwnedDeviceId, OwnedDeviceKeyId, OwnedOneTimeKeyId, OwnedUserId, RoomId,
+    SecondsSinceUnixEpoch, UInt, UserId,
 };
 use serde::{de::Error, Deserialize, Serialize};
 use serde_json::{
@@ -62,7 +66,6 @@ use crate::{
     error::{EventError, OlmResult, SessionCreationError},
     identities::DeviceData,
     olm::SenderData,
-    requests::UploadSigningKeysRequest,
     store::{Changes, DeviceChanges, Store},
     types::{
         events::{
@@ -72,6 +75,7 @@ use crate::{
                 ToDeviceEncryptedEventContent,
             },
         },
+        requests::UploadSigningKeysRequest,
         CrossSigningKey, DeviceKeys, EventEncryptionAlgorithm, MasterPubkey, OneTimeKey, SignedKey,
     },
     OlmError, SignatureError,
@@ -403,7 +407,7 @@ impl fmt::Debug for Account {
     }
 }
 
-pub type OneTimeKeys = BTreeMap<OwnedDeviceKeyId, Raw<ruma::encryption::OneTimeKey>>;
+pub type OneTimeKeys = BTreeMap<OwnedOneTimeKeyId, Raw<ruma::encryption::OneTimeKey>>;
 pub type FallbackKeys = OneTimeKeys;
 
 impl Account {
@@ -521,10 +525,10 @@ impl Account {
 
     pub(crate) fn update_key_counts(
         &mut self,
-        one_time_key_counts: &BTreeMap<DeviceKeyAlgorithm, UInt>,
-        unused_fallback_keys: Option<&[DeviceKeyAlgorithm]>,
+        one_time_key_counts: &BTreeMap<OneTimeKeyAlgorithm, UInt>,
+        unused_fallback_keys: Option<&[OneTimeKeyAlgorithm]>,
     ) {
-        if let Some(count) = one_time_key_counts.get(&DeviceKeyAlgorithm::SignedCurve25519) {
+        if let Some(count) = one_time_key_counts.get(&OneTimeKeyAlgorithm::SignedCurve25519) {
             let count: u64 = (*count).into();
             let old_count = self.uploaded_key_count();
 
@@ -691,12 +695,15 @@ impl Account {
     }
 
     pub(crate) fn dehydrate(&self, pickle_key: &[u8; 32]) -> Raw<DehydratedDeviceData> {
-        let device_pickle = self
+        let dehydration_result = self
             .inner
-            .to_libolm_pickle(pickle_key)
+            .to_dehydrated_device(pickle_key)
             .expect("We should be able to convert a freshly created Account into a libolm pickle");
 
-        let data = DehydratedDeviceData::V1(DehydratedDeviceV1::new(device_pickle));
+        let data = DehydratedDeviceData::V2(DehydratedDeviceV2::new(
+            dehydration_result.ciphertext,
+            dehydration_result.nonce,
+        ));
         Raw::from_json(to_raw_value(&data).expect("Couldn't serialize our dehydrated device data"))
     }
 
@@ -710,7 +717,14 @@ impl Account {
 
         match data {
             DehydratedDeviceData::V1(d) => {
-                let account = InnerAccount::from_libolm_pickle(&d.device_pickle, pickle_key)?;
+                let pickle_key = expand_legacy_pickle_key(pickle_key, device_id);
+                let account =
+                    InnerAccount::from_libolm_pickle(&d.device_pickle, pickle_key.as_ref())?;
+                Ok(Self::new_helper(account, user_id, device_id))
+            }
+            DehydratedDeviceData::V2(d) => {
+                let account =
+                    InnerAccount::from_dehydrated_device(&d.device_pickle, &d.nonce, pickle_key)?;
                 Ok(Self::new_helper(account, user_id, device_id))
             }
             _ => Err(DehydrationError::Json(serde_json::Error::custom(format!(
@@ -718,6 +732,20 @@ impl Account {
                 data.algorithm()
             )))),
         }
+    }
+
+    /// Produce a dehydrated device using a format described in an older version
+    /// of MSC3814.
+    #[cfg(test)]
+    pub(crate) fn legacy_dehydrate(&self, pickle_key: &[u8; 32]) -> Raw<DehydratedDeviceData> {
+        let pickle_key = expand_legacy_pickle_key(pickle_key, &self.device_id);
+        let device_pickle = self
+            .inner
+            .to_libolm_pickle(pickle_key.as_ref())
+            .expect("We should be able to convert a freshly created Account into a libolm pickle");
+
+        let data = DehydratedDeviceData::V1(DehydratedDeviceV1::new(device_pickle));
+        Raw::from_json(to_raw_value(&data).expect("Couldn't serialize our dehydrated device data"))
     }
 
     /// Restore an account from a previously pickled one.
@@ -827,9 +855,7 @@ impl Account {
     /// Sign and prepare one-time keys to be uploaded.
     ///
     /// If no one-time keys need to be uploaded, returns an empty `BTreeMap`.
-    pub fn signed_one_time_keys(
-        &self,
-    ) -> BTreeMap<OwnedDeviceKeyId, Raw<ruma::encryption::OneTimeKey>> {
+    pub fn signed_one_time_keys(&self) -> OneTimeKeys {
         let one_time_keys = self.one_time_keys();
 
         if one_time_keys.is_empty() {
@@ -842,9 +868,7 @@ impl Account {
     /// Sign and prepare fallback keys to be uploaded.
     ///
     /// If no fallback keys need to be uploaded returns an empty BTreeMap.
-    pub fn signed_fallback_keys(
-        &self,
-    ) -> BTreeMap<OwnedDeviceKeyId, Raw<ruma::encryption::OneTimeKey>> {
+    pub fn signed_fallback_keys(&self) -> FallbackKeys {
         let fallback_key = self.fallback_key();
 
         if fallback_key.is_empty() {
@@ -858,15 +882,15 @@ impl Account {
         &self,
         keys: HashMap<KeyId, Curve25519PublicKey>,
         fallback: bool,
-    ) -> BTreeMap<OwnedDeviceKeyId, Raw<ruma::encryption::OneTimeKey>> {
+    ) -> OneTimeKeys {
         let mut keys_map = BTreeMap::new();
 
         for (key_id, key) in keys {
             let signed_key = self.sign_key(key, fallback);
 
             keys_map.insert(
-                DeviceKeyId::from_parts(
-                    DeviceKeyAlgorithm::SignedCurve25519,
+                OneTimeKeyId::from_parts(
+                    OneTimeKeyAlgorithm::SignedCurve25519,
                     key_id.to_base64().as_str().into(),
                 ),
                 signed_key.into_raw(),
@@ -949,7 +973,7 @@ impl Account {
     )]
     fn find_pre_key_bundle(
         device: &DeviceData,
-        key_map: &BTreeMap<OwnedDeviceKeyId, Raw<ruma::encryption::OneTimeKey>>,
+        key_map: &OneTimeKeys,
     ) -> Result<PrekeyBundle, SessionCreationError> {
         let mut keys = key_map.iter();
 
@@ -965,10 +989,6 @@ impl Account {
 
         let result = match first_key {
             OneTimeKey::SignedKey(key) => Ok(PrekeyBundle::Olm3DH { key }),
-            _ => Err(SessionCreationError::OneTimeKeyUnknown(
-                device.user_id().to_owned(),
-                device.device_id().into(),
-            )),
         };
 
         trace!(?result, "Finished searching for a valid pre-key bundle");
@@ -994,7 +1014,7 @@ impl Account {
     pub fn create_outbound_session(
         &self,
         device: &DeviceData,
-        key_map: &BTreeMap<OwnedDeviceKeyId, Raw<ruma::encryption::OneTimeKey>>,
+        key_map: &OneTimeKeys,
         our_device_keys: DeviceKeys,
     ) -> Result<Session, SessionCreationError> {
         let pre_key_bundle = Self::find_pre_key_bundle(device, key_map)?;
@@ -1480,7 +1500,7 @@ impl Account {
     /// that we don't want the inner state to be shared.
     #[doc(hidden)]
     pub fn deep_clone(&self) -> Self {
-        // `vodozemac::Account` isn't really clonable, but... Don't tell anyone.
+        // `vodozemac::Account` isn't really cloneable, but... Don't tell anyone.
         Self::from_pickle(self.pickle()).unwrap()
     }
 }
@@ -1489,6 +1509,34 @@ impl PartialEq for Account {
     fn eq(&self, other: &Self) -> bool {
         self.identity_keys() == other.identity_keys() && self.shared() == other.shared()
     }
+}
+
+/// Expand the pickle key for an older version of dehydrated devices
+///
+/// The `org.matrix.msc3814.v1.olm` variant of dehydrated devices used the
+/// libolm Account pickle format for the dehydrated device. The libolm pickle
+/// encryption scheme uses HKDF to deterministically expand an input key
+/// material, usually 32 bytes, into a AES key, MAC key, and the initialization
+/// vector (IV).
+///
+/// This means that the same input key material will always end up producing the
+/// same AES key, and IV.
+///
+/// This encryption scheme is used in the Olm double ratchet and was designed to
+/// minimize the size of the ciphertext. As a tradeof, it requires a unique
+/// input key material for each plaintext that gets encrypted, otherwise IV
+/// reuse happens.
+///
+/// To combat the IV reuse, we're going to create a per-dehydrated-device unique
+/// pickle key by expanding the key itself with the device ID used as the salt.
+fn expand_legacy_pickle_key(key: &[u8; 32], device_id: &DeviceId) -> Box<[u8; 32]> {
+    let kdf: Hkdf<Sha256> = Hkdf::new(Some(device_id.as_bytes()), key);
+    let mut key = Box::new([0u8; 32]);
+
+    kdf.expand(b"dehydrated-device-pickle-key", key.as_mut_slice())
+        .expect("We should be able to expand the 32 byte pickle key");
+
+    key
 }
 
 #[cfg(test)]
@@ -1502,8 +1550,8 @@ mod tests {
     use anyhow::Result;
     use matrix_sdk_test::async_test;
     use ruma::{
-        device_id, user_id, DeviceId, DeviceKeyAlgorithm, DeviceKeyId, MilliSecondsSinceUnixEpoch,
-        UserId,
+        device_id, user_id, DeviceId, MilliSecondsSinceUnixEpoch, OneTimeKeyAlgorithm,
+        OneTimeKeyId, UserId,
     };
     use serde_json::json;
 
@@ -1532,12 +1580,12 @@ mod tests {
         let (_, second_one_time_keys, _) = account.keys_for_upload();
         assert!(!second_one_time_keys.is_empty());
 
-        let device_key_ids: BTreeSet<&DeviceKeyId> =
+        let one_time_key_ids: BTreeSet<&OneTimeKeyId> =
             one_time_keys.keys().map(Deref::deref).collect();
-        let second_device_key_ids: BTreeSet<&DeviceKeyId> =
+        let second_one_time_key_ids: BTreeSet<&OneTimeKeyId> =
             second_one_time_keys.keys().map(Deref::deref).collect();
 
-        assert_eq!(device_key_ids, second_device_key_ids);
+        assert_eq!(one_time_key_ids, second_one_time_key_ids);
 
         account.mark_keys_as_published();
         account.update_uploaded_key_count(50);
@@ -1552,10 +1600,10 @@ mod tests {
         let (_, fourth_one_time_keys, _) = account.keys_for_upload();
         assert!(!fourth_one_time_keys.is_empty());
 
-        let fourth_device_key_ids: BTreeSet<&DeviceKeyId> =
+        let fourth_one_time_key_ids: BTreeSet<&OneTimeKeyId> =
             fourth_one_time_keys.keys().map(Deref::deref).collect();
 
-        assert_ne!(device_key_ids, fourth_device_key_ids);
+        assert_ne!(one_time_key_ids, fourth_one_time_key_ids);
         Ok(())
     }
 
@@ -1573,7 +1621,7 @@ mod tests {
             "We should not upload fallback keys until we know if the server supports them."
         );
 
-        let one_time_keys = BTreeMap::from([(DeviceKeyAlgorithm::SignedCurve25519, 50u8.into())]);
+        let one_time_keys = BTreeMap::from([(OneTimeKeyAlgorithm::SignedCurve25519, 50u8.into())]);
 
         // A `None` here means that the server doesn't support fallback keys, no
         // fallback key gets uploaded.
