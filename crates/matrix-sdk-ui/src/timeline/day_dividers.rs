@@ -130,7 +130,9 @@ impl DayDividerAdjuster {
                     latest_event_ts = Some(ts);
                 }
 
-                TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker) => {
+                TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker)
+                // BWI-specific code
+                | TimelineItemKind::Virtual(VirtualTimelineItem::ScanStateChanged(_, _)) => {
                     // Nothing to do.
                 }
             }
@@ -219,7 +221,8 @@ impl DayDividerAdjuster {
                 return true;
             }
 
-            TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker) => {
+            TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker)
+            | TimelineItemKind::Virtual(VirtualTimelineItem::ScanStateChanged(_, _)) => {
                 // Nothing to do for read markers.
             }
         }
@@ -278,7 +281,8 @@ impl DayDividerAdjuster {
                 }
             }
 
-            TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker) => {
+            TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker)
+            | TimelineItemKind::Virtual(VirtualTimelineItem::ScanStateChanged(_, _)) => {
                 // Nothing to do.
             }
         }
@@ -517,7 +521,7 @@ struct DayDividerInvariantsReport<'a, 'o> {
     errors: Vec<DayDividerInsertError>,
 }
 
-impl<'a, 'o> Display for DayDividerInvariantsReport<'a, 'o> {
+impl Display for DayDividerInvariantsReport<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Write all the items of a slice of timeline items.
         fn write_items(

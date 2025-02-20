@@ -2,6 +2,7 @@
 #![allow(unused)]
 
 use std::{
+    collections::BTreeMap,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
@@ -21,6 +22,7 @@ use matrix_sdk::{
             room::create_room::v3::{Request as CreateRoomRequest, RoomPreset},
         },
         assign,
+        directory::PublicRoomsChunkInit,
         events::{
             receipt::ReceiptThread,
             room::{
@@ -30,14 +32,19 @@ use matrix_sdk::{
             },
             AnySyncMessageLikeEvent, InitialStateEvent, Mentions, StateEventType,
         },
-        mxc_uri,
+        mxc_uri, owned_server_name, room_id,
         space::SpaceRoomJoinRule,
-        RoomId,
+        uint, RoomId,
     },
     sliding_sync::VersionBuilder,
+    test_utils::{logged_in_client_with_server, mocks::MatrixMockServer},
     Client, RoomInfo, RoomMemberships, RoomState, SlidingSyncList, SlidingSyncMode,
 };
-use matrix_sdk_base::sliding_sync::http;
+use matrix_sdk_base::{
+    ruma::{owned_room_id, room_alias_id},
+    sliding_sync::http,
+};
+use matrix_sdk_test::async_test;
 use matrix_sdk_ui::{
     room_list_service::filters::new_filter_all, sync_service::SyncService, timeline::RoomExt,
     RoomListService,
@@ -103,10 +110,13 @@ async fn test_left_room() -> Result<()> {
 
     // Peter creates a room and invites Steven.
     let peter_room = peter
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![steven.user_id().unwrap().to_owned()],
-            is_direct: true,
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![steven.user_id().unwrap().to_owned()],
+                is_direct: true,
+            }),
+            false,
+        )
         .await?;
 
     // Steven joins it.
@@ -188,7 +198,7 @@ async fn test_room_avatar_group_conversation() -> Result<()> {
         .create_room(assign!(CreateRoomRequest::new(), {
             invite: vec![bob.user_id().unwrap().to_owned(), celine.user_id().unwrap().to_owned()],
             is_direct: true,
-        }))
+        }), false)
         .await?;
 
     sleep(Duration::from_secs(1)).await;
@@ -275,10 +285,13 @@ async fn test_joined_user_can_create_push_context_with_room_list_service() -> Re
 
     // Alice creates a room and invites Bob.
     let alice_room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![bob.user_id().unwrap().to_owned()],
-            is_direct: false,
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![bob.user_id().unwrap().to_owned()],
+                is_direct: false,
+            }),
+            false,
+        )
         .await?;
 
     sleep(Duration::from_secs(1)).await;
@@ -455,10 +468,13 @@ async fn test_room_notification_count() -> Result<()> {
 
     // Alice creates a room and invites Bob.
     let room_id = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![bob.user_id().unwrap().to_owned()],
-            is_direct: true,
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![bob.user_id().unwrap().to_owned()],
+                is_direct: true,
+            }),
+            false,
+        )
         .await?
         .room_id()
         .to_owned();
@@ -744,11 +760,14 @@ async fn test_delayed_decryption_latest_event() -> Result<()> {
 
     // Alice creates a room and invites Bob.
     let room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![bob.user_id().unwrap().to_owned()],
-            is_direct: true,
-            preset: Some(RoomPreset::TrustedPrivateChat),
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![bob.user_id().unwrap().to_owned()],
+                is_direct: true,
+                preset: Some(RoomPreset::TrustedPrivateChat),
+            }),
+            false,
+        )
         .await?;
 
     // Room is created by Alice. Let's enable encryption.
@@ -841,11 +860,14 @@ async fn test_delayed_invite_response_and_sent_message_decryption() -> Result<()
 
     // alice creates a room and invites bob.
     let alice_room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![],
-            is_direct: true,
-            preset: Some(RoomPreset::PrivateChat),
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![],
+                is_direct: true,
+                preset: Some(RoomPreset::PrivateChat),
+            }),
+            false,
+        )
         .await?;
     alice_room.enable_encryption().await?;
 
@@ -924,11 +946,14 @@ async fn test_room_info_notable_update_deduplication() -> Result<()> {
 
     // alice creates a room and invites bob.
     let alice_room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![bob.user_id().unwrap().to_owned()],
-            is_direct: true,
-            preset: Some(RoomPreset::TrustedPrivateChat),
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![bob.user_id().unwrap().to_owned()],
+                is_direct: true,
+                preset: Some(RoomPreset::TrustedPrivateChat),
+            }),
+            false,
+        )
         .await?;
 
     alice_room.enable_encryption().await.unwrap();
@@ -1042,7 +1067,7 @@ async fn test_room_preview() -> Result<()> {
                 InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(HistoryVisibility::WorldReadable)).to_raw_any(),
                 InitialStateEvent::new(RoomJoinRulesEventContent::new(JoinRule::Invite)).to_raw_any(),
             ],
-        }))
+        }), false)
         .await?;
 
     room.set_avatar_url(mxc_uri!("mxc://localhost/alice"), None).await?;
@@ -1055,7 +1080,7 @@ async fn test_room_preview() -> Result<()> {
                 InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(HistoryVisibility::Shared)).to_raw_any(),
                 InitialStateEvent::new(RoomJoinRulesEventContent::new(JoinRule::Public)).to_raw_any(),
             ],
-        }))
+        }), false)
         .await?;
 
     let room_id = room.room_id();
@@ -1084,12 +1109,109 @@ async fn test_room_preview() -> Result<()> {
         // Dummy test for `Client::get_room_preview` which may call one or the other
         // methods.
         info!("Alice gets a preview of the public room using any method");
-        let preview = alice.get_room_preview(room_id.into(), Vec::new()).await.unwrap();
+        let preview = alice.get_room_preview(room_id.into(), Vec::new()).await?;
         assert_room_preview(&preview, &room_alias);
         assert_eq!(preview.state, Some(RoomState::Joined));
+        assert!(preview.heroes.is_some());
     }
 
     Ok(())
+}
+
+#[async_test]
+async fn test_room_preview_with_room_directory_search_and_room_alias_only() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_alias = room_alias_id!("#a-room:matrix.org");
+    let expected_room_id = room_id!("!a-room:matrix.org");
+
+    // Allow resolving the room via the room directory
+    server
+        .mock_room_directory_resolve_alias()
+        .ok(expected_room_id.as_ref(), Vec::new())
+        .mock_once()
+        .mount()
+        .await;
+
+    // Given a successful public room search
+    let chunks = vec![PublicRoomsChunkInit {
+        num_joined_members: uint!(0),
+        room_id: expected_room_id.to_owned(),
+        world_readable: true,
+        guest_can_join: true,
+    }
+    .into()];
+    server.mock_public_rooms().ok(chunks, None, None, Some(1)).mock_once().mount().await;
+
+    // The room preview is found
+    let preview = client
+        .get_room_preview(room_alias.into(), Vec::new())
+        .await
+        .expect("room preview couldn't be retrieved");
+    assert_eq!(preview.room_id, expected_room_id);
+    assert!(preview.heroes.is_none());
+}
+
+#[async_test]
+async fn test_room_preview_with_room_directory_search_and_room_alias_only_in_several_homeservers() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_alias = room_alias_id!("#a-room:matrix.org");
+    let expected_room_id = room_id!("!a-room:matrix.org");
+
+    // Allow resolving the room via the room directory
+    server
+        .mock_room_directory_resolve_alias()
+        .ok(expected_room_id.as_ref(), Vec::new())
+        .mock_once()
+        .mount()
+        .await;
+
+    let via_1 = owned_server_name!("server1.com");
+    let via_2 = owned_server_name!("server2.com");
+
+    // Given a couple of successful public room search responses
+    let via_map = BTreeMap::from_iter(vec![
+        (
+            via_1.to_owned(),
+            // The actual room we want
+            vec![PublicRoomsChunkInit {
+                num_joined_members: uint!(0),
+                room_id: expected_room_id.to_owned(),
+                world_readable: true,
+                guest_can_join: true,
+            }
+            .into()],
+        ),
+        (
+            via_2.to_owned(),
+            // Some other room
+            vec![PublicRoomsChunkInit {
+                num_joined_members: uint!(1),
+                room_id: owned_room_id!("!some-other-room:matrix.org"),
+                world_readable: true,
+                guest_can_join: true,
+            }
+            .into()],
+        ),
+    ]);
+    server
+        .mock_public_rooms()
+        .ok_with_via_params(via_map)
+        // Expect this to be called once for every server in the `via_map`
+        .expect(2)
+        .mount()
+        .await;
+
+    // The room preview is found in the first response
+    let preview = client
+        .get_room_preview(room_alias.into(), vec![via_1, via_2])
+        .await
+        .expect("room preview couldn't be retrieved");
+    assert_eq!(preview.room_id, expected_room_id);
+    assert!(preview.heroes.is_none());
 }
 
 fn assert_room_preview(preview: &RoomPreview, room_alias: &str) {
@@ -1100,7 +1222,7 @@ fn assert_room_preview(preview: &RoomPreview, room_alias: &str) {
     assert_eq!(preview.num_joined_members, 1);
     assert!(preview.room_type.is_none());
     assert_eq!(preview.join_rule, SpaceRoomJoinRule::Invite);
-    assert!(preview.is_world_readable);
+    assert!(preview.is_world_readable.unwrap());
 }
 
 async fn get_room_preview_with_room_state(
@@ -1115,6 +1237,7 @@ async fn get_room_preview_with_room_state(
     let preview = RoomPreview::from_state_events(alice, room_id).await.unwrap();
     assert_room_preview(&preview, room_alias);
     assert_eq!(preview.state, Some(RoomState::Joined));
+    assert!(preview.heroes.is_some());
 
     // Bob definitely doesn't know about the room, but they can get a preview of the
     // room too.
@@ -1122,6 +1245,7 @@ async fn get_room_preview_with_room_state(
     let preview = RoomPreview::from_state_events(bob, room_id).await.unwrap();
     assert_room_preview(&preview, room_alias);
     assert!(preview.state.is_none());
+    assert!(preview.heroes.is_some());
 
     // Bob can't preview the second room, because its history visibility is neither
     // world-readable, nor have they joined the room before.
@@ -1146,6 +1270,7 @@ async fn get_room_preview_with_room_summary(
 
     assert_room_preview(&preview, room_alias);
     assert_eq!(preview.state, Some(RoomState::Joined));
+    assert!(preview.heroes.is_some());
 
     // The preview also works when using the room alias parameter.
     info!("Alice gets a preview of the public room from msc3266 using the room alias");
@@ -1161,6 +1286,7 @@ async fn get_room_preview_with_room_summary(
 
     assert_room_preview(&preview, room_alias);
     assert_eq!(preview.state, Some(RoomState::Joined));
+    assert!(preview.heroes.is_some());
 
     // Bob definitely doesn't know about the room, but they can get a preview of the
     // room too.
@@ -1171,6 +1297,7 @@ async fn get_room_preview_with_room_summary(
             .unwrap();
     assert_room_preview(&preview, room_alias);
     assert!(preview.state.is_none());
+    assert!(preview.heroes.is_none());
 
     // Bob can preview the second room with the room summary (because its join rule
     // is set to public, or because Alice is a member of that room).
@@ -1185,4 +1312,5 @@ async fn get_room_preview_with_room_summary(
     .unwrap();
     assert_eq!(preview.name.unwrap(), "Alice's Room 2");
     assert!(preview.state.is_none());
+    assert!(preview.heroes.is_none());
 }

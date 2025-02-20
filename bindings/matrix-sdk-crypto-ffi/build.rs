@@ -1,5 +1,5 @@
-use std::{env, error::Error};
-
+use std::env;
+use std::error::Error;
 use vergen::EmitBuilder;
 
 /// Adds a temporary workaround for an issue with the Rust compiler and Android
@@ -31,10 +31,8 @@ fn setup_x86_64_android_workaround() {
         println!("cargo:rustc-link-lib=static=clang_rt.builtins-x86_64-android");
     }
 }
-
 fn main() -> Result<(), Box<dyn Error>> {
     setup_x86_64_android_workaround();
-
     EmitBuilder::builder().git_sha(true).git_describe(true, false, None).emit()?;
 
     Ok(())

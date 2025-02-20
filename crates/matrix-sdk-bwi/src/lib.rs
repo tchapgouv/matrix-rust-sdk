@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 BWI GmbH
+ * Copyright (c) 2025 BWI GmbH
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,5 +14,7 @@
  * limitations under the License.
  */
 
+pub mod content_scanner;
+pub mod federation;
 pub mod password_evaluator;
 pub mod regulatory;

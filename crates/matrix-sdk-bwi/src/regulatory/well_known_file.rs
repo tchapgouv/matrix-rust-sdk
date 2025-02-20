@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 BWI GmbH
+ * Copyright (c) 2025 BWI GmbH
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,11 +17,16 @@
 use crate::regulatory::data_privacy::{BWIDataPrivacy, BWIDataPrivacySource};
 use crate::regulatory::imprint::{BWIImprint, BWIImprintSource};
 use anyhow::Result;
+use matrix_sdk_base_bwi::http_client::HttpClient;
 use reqwest::Url;
 use serde::Deserialize;
 
+pub(crate) trait BWIWellKnownFileSource {
+    fn get_wellknown_file(&self) -> Result<BWIWellKnownFile>;
+}
+
 #[derive(Clone)]
-pub(crate) struct BWIWellKnownFileSource {
+pub(crate) struct BWIWellKnownFileSourceImpl {
     well_known_file: BWIWellKnownFile,
 }
 
@@ -40,40 +45,53 @@ pub struct BWIWellKnownFile {
 }
 
 impl BWIWellKnownFile {
-    async fn get_from_homeserver(homeserver_url: Url) -> Result<BWIWellKnownFile> {
-        let res = reqwest::get(homeserver_url).await?.json::<BWIWellKnownFile>().await?;
+    async fn get_from_homeserver(
+        homeserver_url: Url,
+        http_client: Box<dyn HttpClient>,
+    ) -> Result<BWIWellKnownFile> {
+        let res = http_client.get(homeserver_url).await?.json::<BWIWellKnownFile>().await?;
 
         Ok(res)
     }
 }
 
-impl BWIWellKnownFileSource {
-    pub async fn new(homeserver_url: Url) -> Result<BWIWellKnownFileSource> {
-        let well_known_file = BWIWellKnownFile::get_from_homeserver(homeserver_url).await?;
+impl BWIWellKnownFileSourceImpl {
+    pub async fn new(
+        homeserver_url: Url,
+        http_client: Box<dyn HttpClient>,
+    ) -> Result<BWIWellKnownFileSourceImpl> {
+        let well_known_file =
+            BWIWellKnownFile::get_from_homeserver(homeserver_url, http_client).await?;
 
-        Ok(BWIWellKnownFileSource { well_known_file })
+        Ok(BWIWellKnownFileSourceImpl { well_known_file })
     }
 }
 
-impl BWIImprintSource for BWIWellKnownFileSource {
+impl BWIWellKnownFileSource for BWIWellKnownFileSourceImpl {
+    fn get_wellknown_file(&self) -> Result<BWIWellKnownFile> {
+        Ok(self.well_known_file.clone())
+    }
+}
+
+impl BWIImprintSource for BWIWellKnownFileSourceImpl {
     fn get_imprint(&self) -> BWIImprint {
-        BWIImprint::new(&self.well_known_file.bwi_extension.imprint_url)
+        BWIImprint::new(&self.get_wellknown_file().unwrap().bwi_extension.imprint_url)
     }
 }
 
-impl BWIDataPrivacySource for BWIWellKnownFileSource {
+impl BWIDataPrivacySource for BWIWellKnownFileSourceImpl {
     fn get_data_privacy(&self) -> BWIDataPrivacy {
-        BWIDataPrivacy::new(&self.well_known_file.bwi_extension.privacy_policy_url)
+        BWIDataPrivacy::new(&self.get_wellknown_file().unwrap().bwi_extension.privacy_policy_url)
     }
 }
 
+#[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+    use matrix_sdk_base_bwi::http_client::{HttpClient, HttpError};
+    use url::Url;
 
-    #[test]
-    fn parse_well_known_file() {
-        use crate::regulatory::well_known_file::{BWIWellKnownFile, BWIWellKnownFileExtension};
-
-        const EXAMPLE_WELL_KNOWN: &str = "{
+    const EXAMPLE_WELL_KNOWN: &str = "{
             \"m.homeserver\": {
                 \"base_url\": \"https://example.com\"
             },
@@ -105,14 +123,38 @@ mod tests {
             }
         }";
 
+    struct MockHttpClient {}
+
+    #[async_trait]
+    impl HttpClient for MockHttpClient {
+        async fn get(&self, url: Url) -> Result<reqwest::Response, HttpError> {
+            match url.as_str() {
+                "https://www.bwi.de/.well-known/matrix/client" => {
+                    Ok(reqwest::Response::from(::http::Response::new(EXAMPLE_WELL_KNOWN)))
+                }
+                _ => Err(HttpError::NotFound),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_fetched_well_known_file() {
+        use crate::regulatory::well_known_file::BWIWellKnownFile;
+
+        // Arrange
+        // todo don't require full well known path for fetching
+        let homeserver_url = Url::parse("https://www.bwi.de/.well-known/matrix/client").unwrap();
+        let mock_client: Box<dyn HttpClient> = Box::from(MockHttpClient {});
+
         // Act
-        let well_known: BWIWellKnownFile = serde_json::from_str(EXAMPLE_WELL_KNOWN).unwrap();
-        let bwi_well_known_extension: BWIWellKnownFileExtension = well_known.bwi_extension;
+        let well_known = BWIWellKnownFile::get_from_homeserver(homeserver_url, mock_client)
+            .await
+            .expect("Could not parse well-known");
 
         // Assert
-        assert_eq!(bwi_well_known_extension.imprint_url, "https://www.bwi.de/impressum");
+        assert_eq!(well_known.bwi_extension.imprint_url, "https://www.bwi.de/impressum");
         assert_eq!(
-            bwi_well_known_extension.privacy_policy_url,
+            well_known.bwi_extension.privacy_policy_url,
             "https://messenger.bwi.de/datenschutz-bundesmessenger"
         );
     }

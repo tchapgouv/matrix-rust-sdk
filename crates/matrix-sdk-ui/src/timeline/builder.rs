@@ -14,6 +14,15 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
+use super::{
+    controller::{TimelineController, TimelineSettings},
+    to_device::{handle_forwarded_room_key_event, handle_room_key_event},
+    Error, Timeline, TimelineDropHandle, TimelineFocus,
+};
+use crate::{
+    timeline::{controller::TimelineNewItemPosition, event_item::RemoteEventOrigin},
+    unable_to_decrypt_hook::UtdHookManager,
+};
 use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
     encryption::backups::BackupState,
@@ -24,16 +33,6 @@ use matrix_sdk::{
 use ruma::{events::AnySyncTimelineEvent, RoomVersionId};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, info_span, trace, warn, Instrument, Span};
-
-use super::{
-    controller::{TimelineController, TimelineSettings},
-    to_device::{handle_forwarded_room_key_event, handle_room_key_event},
-    Error, Timeline, TimelineDropHandle, TimelineFocus,
-};
-use crate::{
-    timeline::{controller::TimelineEnd, event_item::RemoteEventOrigin},
-    unable_to_decrypt_hook::UtdHookManager,
-};
 
 /// Builder that allows creating and configuring various parts of a
 /// [`Timeline`].
@@ -160,12 +159,18 @@ impl TimelineBuilder {
         let is_pinned_events = matches!(focus, TimelineFocus::PinnedEvents { .. });
         let is_room_encrypted = room.is_encrypted().await.ok();
 
+        // BWI-specific
+        let client = room.client();
+        let content_scanner = client.content_scanner();
+        // end BWI-specific
+
         let controller = TimelineController::new(
             room,
             focus.clone(),
             internal_id_prefix.clone(),
             unable_to_decrypt_hook,
             is_room_encrypted,
+            content_scanner.to_owned(),
         )
         .with_settings(settings);
 
@@ -183,7 +188,7 @@ impl TimelineBuilder {
                         if let Ok(events) = inner.reload_pinned_events().await {
                             inner
                                 .replace_with_initial_remote_events(
-                                    events,
+                                    events.into_iter(),
                                     RemoteEventOrigin::Pagination,
                                 )
                                 .await;
@@ -238,7 +243,7 @@ impl TimelineBuilder {
                             // current timeline.
                             match room_event_cache.subscribe().await {
                                 Ok((events, _)) => {
-                                    inner.replace_with_initial_remote_events(events, RemoteEventOrigin::Sync).await;
+                                    inner.replace_with_initial_remote_events(events.into_iter(), RemoteEventOrigin::Sync).await;
                                 }
                                 Err(err) => {
                                     warn!("Error when re-inserting initial events into the timeline: {err}");
@@ -272,10 +277,10 @@ impl TimelineBuilder {
                             trace!("Received new timeline events.");
 
                             inner.add_events_at(
-                                events,
-                                TimelineEnd::Back,
-                                match origin {
-                                    EventsOrigin::Sync => RemoteEventOrigin::Sync,
+                                events.into_iter(),
+                                TimelineNewItemPosition::End {                                    origin: match origin {
+                                        EventsOrigin::Sync => RemoteEventOrigin::Sync,
+                                    }
                                 }
                             ).await;
                         }

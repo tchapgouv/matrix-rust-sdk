@@ -17,9 +17,23 @@
 use std::{
     collections::{BTreeMap, HashMap},
     future::ready,
+    ops::Sub,
     sync::Arc,
+    time::{Duration, SystemTime},
 };
 
+use super::{
+    controller::{TimelineNewItemPosition, TimelineSettings},
+    event_handler::TimelineEventKind,
+    event_item::RemoteEventOrigin,
+    traits::RoomDataProvider,
+    util::rfind_event_by_item_id,
+    EventTimelineItem, Profile, TimelineController, TimelineEventItemId, TimelineFocus,
+    TimelineItem,
+};
+use crate::{
+    timeline::pinned_events_loader::PinnedEventsRoom, unable_to_decrypt_hook::UtdHookManager,
+};
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
@@ -29,13 +43,18 @@ use matrix_sdk::{
     config::RequestConfig,
     deserialized_responses::{SyncTimelineEvent, TimelineEvent},
     event_cache::paginator::{PaginableRoom, PaginatorError},
+    reqwest,
     room::{EventWithContextResponse, Messages, MessagesOptions},
     send_queue::RoomSendQueueUpdate,
-    test_utils::events::EventFactory,
     BoxFuture,
 };
-use matrix_sdk_base::{latest_event::LatestEvent, RoomInfo, RoomState};
-use matrix_sdk_test::{EventBuilder, ALICE, BOB, DEFAULT_TEST_ROOM_ID};
+use matrix_sdk_base::{
+    crypto::types::events::CryptoContextInfo, latest_event::LatestEvent, RoomInfo, RoomState,
+};
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
+use matrix_sdk_test::{
+    event_factory::EventFactory, EventBuilder, ALICE, BOB, DEFAULT_TEST_ROOM_ID,
+};
 use ruma::{
     event_id,
     events::{
@@ -55,19 +74,6 @@ use ruma::{
 };
 use tokio::sync::RwLock;
 
-use super::{
-    controller::{TimelineEnd, TimelineSettings},
-    event_handler::TimelineEventKind,
-    event_item::RemoteEventOrigin,
-    traits::RoomDataProvider,
-    util::rfind_event_by_item_id,
-    EventTimelineItem, Profile, TimelineController, TimelineEventItemId, TimelineFocus,
-    TimelineItem,
-};
-use crate::{
-    timeline::pinned_events_loader::PinnedEventsRoom, unable_to_decrypt_hook::UtdHookManager,
-};
-
 mod basic;
 mod echo;
 mod edit;
@@ -80,6 +86,14 @@ mod read_receipts;
 mod redaction;
 mod shields;
 mod virt;
+
+// BWI-specific
+fn create_dummy_content_scanner() -> Arc<BWIContentScanner> {
+    Arc::from(
+        BWIContentScanner::new_with_url_as_str(reqwest::Client::default(), "example.com").unwrap(),
+    )
+}
+// end BWI-specific
 
 struct TestTimeline {
     controller: TimelineController<TestRoomDataProvider>,
@@ -107,6 +121,9 @@ impl TestTimeline {
                 Some(prefix),
                 None,
                 Some(false),
+                // BWI-specific
+                create_dummy_content_scanner(),
+                // end BWI-specific
             ),
             event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
@@ -121,6 +138,9 @@ impl TestTimeline {
                 None,
                 None,
                 Some(false),
+                // BWI-specific
+                create_dummy_content_scanner(),
+                // end BWI-specific
             ),
             event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
@@ -135,6 +155,9 @@ impl TestTimeline {
                 None,
                 Some(hook),
                 Some(true),
+                // BWI-specific
+                create_dummy_content_scanner(),
+                // end BWI-specific
             ),
             event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
@@ -150,6 +173,9 @@ impl TestTimeline {
                 None,
                 None,
                 Some(encrypted),
+                // BWI-specific
+                create_dummy_content_scanner(),
+                // end BWI-specific
             ),
             event_builder: EventBuilder::new(),
             factory: EventFactory::new(),
@@ -236,7 +262,10 @@ impl TestTimeline {
     async fn handle_live_event(&self, event: impl Into<SyncTimelineEvent>) {
         let event = event.into();
         self.controller
-            .add_events_at(vec![event], TimelineEnd::Back, RemoteEventOrigin::Sync)
+            .add_events_at(
+                [event].into_iter(),
+                TimelineNewItemPosition::End { origin: RemoteEventOrigin::Sync },
+            )
             .await;
     }
 
@@ -255,7 +284,10 @@ impl TestTimeline {
     async fn handle_back_paginated_event(&self, event: Raw<AnyTimelineEvent>) {
         let timeline_event = TimelineEvent::new(event.cast());
         self.controller
-            .add_events_at(vec![timeline_event], TimelineEnd::Front, RemoteEventOrigin::Pagination)
+            .add_events_at(
+                [timeline_event].into_iter(),
+                TimelineNewItemPosition::Start { origin: RemoteEventOrigin::Pagination },
+            )
             .await;
     }
 
@@ -367,6 +399,17 @@ impl RoomDataProvider for TestRoomDataProvider {
 
     fn room_version(&self) -> RoomVersionId {
         RoomVersionId::V10
+    }
+
+    fn crypto_context_info(&self) -> BoxFuture<'_, CryptoContextInfo> {
+        ready(CryptoContextInfo {
+            device_creation_ts: MilliSecondsSinceUnixEpoch::from_system_time(
+                SystemTime::now().sub(Duration::from_secs(60 * 3)),
+            )
+            .unwrap_or(MilliSecondsSinceUnixEpoch::now()),
+            is_backup_configured: false,
+        })
+        .boxed()
     }
 
     fn profile_from_user_id<'a>(&'a self, _user_id: &'a UserId) -> BoxFuture<'a, Option<Profile>> {

@@ -17,12 +17,13 @@
 use std::{
     collections::{btree_map, BTreeMap},
     fmt::{self, Debug},
-    future::Future,
+    future::{ready, Future},
     pin::Pin,
     sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak},
 };
 
 use self::futures::SendRequest;
+use crate::event_handler::{EventHandlerContext, ObservableEventHandler};
 #[cfg(feature = "experimental-oidc")]
 use crate::oidc::Oidc;
 #[cfg(feature = "experimental-sliding-sync")]
@@ -61,29 +62,33 @@ use imbl::Vector;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::store::LockableCryptoStore;
 use matrix_sdk_base::{
-    event_cache_store::EventCacheStoreLock,
+    event_cache::store::EventCacheStoreLock,
     store::{DynStateStore, ServerCapabilities},
     sync::{Notification, RoomUpdates},
     BaseClient, RoomInfoNotableUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
     StateStoreDataKey, StateStoreDataValue, SyncOutsideWasm,
 };
 use matrix_sdk_base_bwi::room_alias::BWIRoomAlias;
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
+use matrix_sdk_bwi::federation::BWIFederationHandler;
 use ruma::events::room::history_visibility::{
     HistoryVisibility, RoomHistoryVisibilityEventContent,
 };
+use ruma::events::room::server_acl::RoomServerAclEventContent;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{room::encryption::RoomEncryptionEventContent, InitialStateEvent};
 use ruma::{
     api::{
         client::{
             account::whoami,
-            alias::get_alias,
+            alias::{create_alias, get_alias},
             device::{delete_devices, get_devices, update_device},
             directory::{get_public_rooms, get_public_rooms_filtered},
             discovery::{
                 get_capabilities::{self, Capabilities},
                 get_supported_versions,
             },
+            error::ErrorKind,
             filter::{create_filter::v3::Request as FilterUploadRequest, FilterDefinition},
             knock::knock_room,
             membership::{join_room_by_id, join_room_by_id_or_alias},
@@ -265,8 +270,11 @@ pub(crate) struct ClientInner {
     /// The underlying HTTP client.
     pub(crate) http_client: HttpClient,
 
+    // BWI-specific
+    pub(crate) content_scanner: Arc<BWIContentScanner>,
+    // end BWI-specific
     /// User session data.
-    base_client: BaseClient,
+    pub(super) base_client: BaseClient,
 
     /// Server capabilities, either prefilled during building or fetched from
     /// the server.
@@ -276,6 +284,17 @@ pub(crate) struct ClientInner {
     /// to ensure that only a single call to a method happens at once or to
     /// deduplicate multiple calls to a method.
     pub(crate) locks: ClientLocks,
+
+    /// The cross-process store locks holder name.
+    ///
+    /// The SDK provides cross-process store locks (see
+    /// [`matrix_sdk_common::store_locks::CrossProcessStoreLock`]). The
+    /// `holder_name` is the value used for all cross-process store locks
+    /// used by this `Client`.
+    ///
+    /// If multiple `Client`s are running in different processes, this
+    /// value MUST be different for each `Client`.
+    cross_process_store_locks_holder_name: String,
 
     /// A mapping of the times at which the current user sent typing notices,
     /// keyed by room.
@@ -337,12 +356,16 @@ impl ClientInner {
         homeserver: Url,
         #[cfg(feature = "experimental-sliding-sync")] sliding_sync_version: SlidingSyncVersion,
         http_client: HttpClient,
+        // BWI-specific
+        content_scanner: Arc<BWIContentScanner>,
+        // end BWI-specific
         base_client: BaseClient,
         server_capabilities: ClientServerCapabilities,
         respect_login_well_known: bool,
         event_cache: OnceCell<EventCache>,
         send_queue: Arc<SendQueueData>,
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
+        cross_process_store_locks_holder_name: String,
     ) -> Arc<Self> {
         let client = Self {
             server,
@@ -351,8 +374,10 @@ impl ClientInner {
             #[cfg(feature = "experimental-sliding-sync")]
             sliding_sync_version: StdRwLock::new(sliding_sync_version),
             http_client,
+            content_scanner,
             base_client,
             locks: Default::default(),
+            cross_process_store_locks_holder_name,
             server_capabilities: RwLock::new(server_capabilities),
             typing_notice_times: Default::default(),
             event_handlers: Default::default(),
@@ -423,8 +448,25 @@ impl Client {
         &self.inner.http_client.inner
     }
 
+    // BWI-specific
+    /// The content scanner
+    pub fn content_scanner(&self) -> &Arc<BWIContentScanner> {
+        &self.inner.content_scanner
+    }
+    // end BWI-specific
+
     pub(crate) fn locks(&self) -> &ClientLocks {
         &self.inner.locks
+    }
+
+    /// The cross-process store locks holder name.
+    ///
+    /// The SDK provides cross-process store locks (see
+    /// [`matrix_sdk_common::store_locks::CrossProcessStoreLock`]). The
+    /// `holder_name` is the value used for all cross-process store locks
+    /// used by this `Client`.
+    pub fn cross_process_store_locks_holder_name(&self) -> &str {
+        &self.inner.cross_process_store_locks_holder_name
     }
 
     /// Change the homeserver URL used by this client.
@@ -660,8 +702,6 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
-    /// # use url::Url;
-    /// # let homeserver = Url::parse("http://localhost:8080").unwrap();
     /// use matrix_sdk::{
     ///     deserialized_responses::EncryptionInfo,
     ///     event_handler::Ctx,
@@ -678,14 +718,7 @@ impl Client {
     /// };
     /// use serde::{Deserialize, Serialize};
     ///
-    /// # futures_executor::block_on(async {
-    /// # let client = matrix_sdk::Client::builder()
-    /// #     .homeserver_url(homeserver)
-    /// #     .server_versions([ruma::api::MatrixVersion::V1_0])
-    /// #     .build()
-    /// #     .await
-    /// #     .unwrap();
-    /// #
+    /// # async fn example(client: Client) {
     /// client.add_event_handler(
     ///     |ev: SyncRoomMessageEvent, room: Room, client: Client| async move {
     ///         // Common usage: Room event plus room and client.
@@ -751,11 +784,11 @@ impl Client {
     /// client.add_event_handler(move |ev: SyncRoomMessageEvent | async move {
     ///     println!("Calling the handler with identifier {data}");
     /// });
-    /// # });
+    /// # }
     /// ```
     pub fn add_event_handler<Ev, Ctx, H>(&self, handler: H) -> EventHandlerHandle
     where
-        Ev: SyncEvent + DeserializeOwned + Send + 'static,
+        Ev: SyncEvent + DeserializeOwned + SendOutsideWasm + 'static,
         H: EventHandler<Ev, Ctx>,
     {
         self.add_event_handler_impl(handler, None)
@@ -777,10 +810,139 @@ impl Client {
         handler: H,
     ) -> EventHandlerHandle
     where
-        Ev: SyncEvent + DeserializeOwned + Send + 'static,
+        Ev: SyncEvent + DeserializeOwned + SendOutsideWasm + 'static,
         H: EventHandler<Ev, Ctx>,
     {
         self.add_event_handler_impl(handler, Some(room_id.to_owned()))
+    }
+
+    /// Observe a specific event type.
+    ///
+    /// `Ev` represents the kind of event that will be observed. `Ctx`
+    /// represents the context that will come with the event. It relies on the
+    /// same mechanism as [`Client::add_event_handler`]. The main difference is
+    /// that it returns an [`ObservableEventHandler`] and doesn't require a
+    /// user-defined closure. It is possible to subscribe to the
+    /// [`ObservableEventHandler`] to get an [`EventHandlerSubscriber`], which
+    /// implements a [`Stream`]. The `Stream::Item` will be of type `(Ev,
+    /// Ctx)`.
+    ///
+    /// Be careful that only the most recent value can be observed. Subscribers
+    /// are notified when a new value is sent, but there is no guarantee
+    /// that they will see all values.
+    ///
+    /// # Example
+    ///
+    /// Let's see a classical usage:
+    ///
+    /// ```
+    /// use futures_util::StreamExt as _;
+    /// use matrix_sdk::{
+    ///     ruma::{events::room::message::SyncRoomMessageEvent, push::Action},
+    ///     Client, Room,
+    /// };
+    ///
+    /// # async fn example(client: Client) -> Option<()> {
+    /// let observer =
+    ///     client.observe_events::<SyncRoomMessageEvent, (Room, Vec<Action>)>();
+    ///
+    /// let mut subscriber = observer.subscribe();
+    ///
+    /// let (event, (room, push_actions)) = subscriber.next().await?;
+    /// # Some(())
+    /// # }
+    /// ```
+    ///
+    /// Now let's see how to get several contexts that can be useful for you:
+    ///
+    /// ```
+    /// use matrix_sdk::{
+    ///     deserialized_responses::EncryptionInfo,
+    ///     ruma::{
+    ///         events::room::{
+    ///             message::SyncRoomMessageEvent, topic::SyncRoomTopicEvent,
+    ///         },
+    ///         push::Action,
+    ///     },
+    ///     Client, Room,
+    /// };
+    ///
+    /// # async fn example(client: Client) {
+    /// // Observe `SyncRoomMessageEvent` and fetch `Room` + `Client`.
+    /// let _ = client.observe_events::<SyncRoomMessageEvent, (Room, Client)>();
+    ///
+    /// // Observe `SyncRoomMessageEvent` and fetch `Room` + `EncryptionInfo`
+    /// // to distinguish between unencrypted events and events that were decrypted
+    /// // by the SDK.
+    /// let _ = client
+    ///     .observe_events::<SyncRoomMessageEvent, (Room, Option<EncryptionInfo>)>(
+    ///     );
+    ///
+    /// // Observe `SyncRoomMessageEvent` and fetch `Room` + push actions.
+    /// // For example, an event with `Action::SetTweak(Tweak::Highlight(true))`
+    /// // should be highlighted in the timeline.
+    /// let _ =
+    ///     client.observe_events::<SyncRoomMessageEvent, (Room, Vec<Action>)>();
+    ///
+    /// // Observe `SyncRoomTopicEvent` and fetch nothing else.
+    /// let _ = client.observe_events::<SyncRoomTopicEvent, ()>();
+    /// # }
+    /// ```
+    ///
+    /// [`EventHandlerSubscriber`]: crate::event_handler::EventHandlerSubscriber
+    pub fn observe_events<Ev, Ctx>(&self) -> ObservableEventHandler<(Ev, Ctx)>
+    where
+        Ev: SyncEvent + DeserializeOwned + SendOutsideWasm + SyncOutsideWasm + 'static,
+        Ctx: EventHandlerContext + SendOutsideWasm + SyncOutsideWasm + 'static,
+    {
+        self.observe_room_events_impl(None)
+    }
+
+    /// Observe a specific room, and event type.
+    ///
+    /// This method works the same way as [`Client::observe_events`], except
+    /// that the observability will only be applied for events in the room with
+    /// the specified ID. See that method for more details.
+    ///
+    /// Be careful that only the most recent value can be observed. Subscribers
+    /// are notified when a new value is sent, but there is no guarantee
+    /// that they will see all values.
+    pub fn observe_room_events<Ev, Ctx>(
+        &self,
+        room_id: &RoomId,
+    ) -> ObservableEventHandler<(Ev, Ctx)>
+    where
+        Ev: SyncEvent + DeserializeOwned + SendOutsideWasm + SyncOutsideWasm + 'static,
+        Ctx: EventHandlerContext + SendOutsideWasm + SyncOutsideWasm + 'static,
+    {
+        self.observe_room_events_impl(Some(room_id.to_owned()))
+    }
+
+    /// Shared implementation for `Client::observe_events` and
+    /// `Client::observe_room_events`.
+    fn observe_room_events_impl<Ev, Ctx>(
+        &self,
+        room_id: Option<OwnedRoomId>,
+    ) -> ObservableEventHandler<(Ev, Ctx)>
+    where
+        Ev: SyncEvent + DeserializeOwned + SendOutsideWasm + SyncOutsideWasm + 'static,
+        Ctx: EventHandlerContext + SendOutsideWasm + SyncOutsideWasm + 'static,
+    {
+        // The default value is `None`. It becomes `Some((Ev, Ctx))` once it has a
+        // new value.
+        let shared_observable = SharedObservable::new(None);
+
+        ObservableEventHandler::new(
+            shared_observable.clone(),
+            self.event_handler_drop_guard(self.add_event_handler_impl(
+                move |event: Ev, context: Ctx| {
+                    shared_observable.set(Some((event, context)));
+
+                    ready(())
+                },
+                room_id,
+            )),
+        )
     }
 
     /// Remove the event handler associated with the handle.
@@ -1008,8 +1170,8 @@ impl Client {
         self.base_client().get_room(room_id).map(|room| Room::new(self.clone(), room))
     }
 
-    /// Gets the preview of a room, whether the current user knows it (because
-    /// they've joined/left/been invited to it) or not.
+    /// Gets the preview of a room, whether the current user has joined it or
+    /// not.
     pub async fn get_room_preview(
         &self,
         room_or_alias_id: &RoomOrAliasId,
@@ -1021,10 +1183,16 @@ impl Client {
         };
 
         if let Some(room) = self.get_room(&room_id) {
-            return Ok(RoomPreview::from_known(&room).await);
+            // The cached data can only be trusted if the room is joined: for invite and
+            // knock rooms, no updates will be received for the rooms after the invite/knock
+            // action took place so we may have very out to date data for important fields
+            // such as `join_rule`
+            if room.state() == RoomState::Joined {
+                return Ok(RoomPreview::from_joined(&room).await);
+            }
         }
 
-        RoomPreview::from_unknown(self, room_id, room_or_alias_id, via).await
+        RoomPreview::from_not_joined(self, room_id, room_or_alias_id, via).await
     }
 
     /// Resolve a room alias to a room id and a list of servers which know
@@ -1039,6 +1207,34 @@ impl Client {
     ) -> HttpResult<get_alias::v3::Response> {
         let request = get_alias::v3::Request::new(room_alias.to_owned());
         self.send(request, None).await
+    }
+
+    /// Checks if a room alias is not in use yet.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the room alias is available.
+    /// - `Ok(false)` if it's not (the resolve alias request returned a `404`
+    ///   status code).
+    /// - An `Err` otherwise.
+    pub async fn is_room_alias_available(&self, alias: &RoomAliasId) -> HttpResult<bool> {
+        match self.resolve_room_alias(alias).await {
+            // The room alias was resolved, so it's already in use.
+            Ok(_) => Ok(false),
+            Err(error) => {
+                match error.client_api_error_kind() {
+                    // The room alias wasn't found, so it's available.
+                    Some(ErrorKind::NotFound) => Ok(true),
+                    _ => Err(error),
+                }
+            }
+        }
+    }
+
+    /// Creates a new room alias associated with a room.
+    pub async fn create_room_alias(&self, alias: &RoomAliasId, room_id: &RoomId) -> HttpResult<()> {
+        let request = create_alias::v3::Request::new(alias.to_owned(), room_id.to_owned());
+        self.send(request, None).await?;
+        Ok(())
     }
 
     /// Update the homeserver from the login response well-known if needed.
@@ -1072,7 +1268,7 @@ impl Client {
         match session {
             AuthSession::Matrix(s) => Box::pin(self.matrix_auth().restore_session(s)).await,
             #[cfg(feature = "experimental-oidc")]
-            AuthSession::Oidc(s) => Box::pin(self.oidc().restore_session(s)).await,
+            AuthSession::Oidc(s) => Box::pin(self.oidc().restore_session(*s)).await,
         }
     }
 
@@ -1291,27 +1487,30 @@ impl Client {
     /// # let homeserver = Url::parse("http://example.com").unwrap();
     /// let request = CreateRoomRequest::new();
     /// let client = Client::new(homeserver).await.unwrap();
-    /// assert!(client.create_room(request).await.is_ok());
+    /// assert!(client.create_room(request, false).await.is_ok());
     /// # };
     /// ```
-    pub async fn create_room(&self, mut request: create_room::v3::Request) -> Result<Room> {
+    pub async fn create_room(
+        &self,
+        mut request: create_room::v3::Request,
+        is_federated: bool,
+    ) -> Result<Room> {
         let invite = request.invite.clone();
         let is_direct_room = request.is_direct;
 
-        // BWI specific: create room alias
         if !is_direct_room {
-            if let Some(room_name) = &request.name {
-                request.room_alias_name = Some(BWIRoomAlias::alias_for_room_name(room_name));
-            }
+            // BWI specific: create room alias
+            Client::add_room_alias(&mut request);
+            // END BWI specific
+
+            // BWI specific: add acl initial state event
+            self.add_acl_initial_state_event(&mut request, is_federated);
+            // END #6880 BWI specific
         }
 
         // BWI specific: #5991 create room with HistoryVisibility set to invite
-        request.initial_state.push(
-            InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(
-                HistoryVisibility::Invited,
-            ))
-            .to_raw_any(),
-        );
+        Client::add_history_visibility_initial_state_event(&mut request);
+        // END #5991 BWI specific
 
         let response = self.send(request, None).await?;
         let base_room = self.base_client().get_or_create_room(&response.room_id, RoomState::Joined);
@@ -1329,6 +1528,47 @@ impl Client {
 
         Ok(joined_room)
     }
+
+    // BWI specific: create room alias
+    pub(self) fn add_room_alias(request: &mut create_room::v3::Request) {
+        if let Some(room_name) = &request.name {
+            request.room_alias_name = Some(BWIRoomAlias::alias_for_room_name(room_name));
+        }
+    }
+    // END BWI specific
+
+    // BWI specific: #5991 create room with HistoryVisibility set to invite
+    pub(self) fn add_history_visibility_initial_state_event(
+        request: &mut create_room::v3::Request,
+    ) {
+        request.initial_state.push(
+            InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(
+                HistoryVisibility::Invited,
+            ))
+            .to_raw_any(),
+        );
+    }
+    // END #5991 BWI specific
+
+    // BWI specific: #6880 add acl initial state event
+    pub(self) fn add_acl_initial_state_event(
+        &self,
+        request: &mut create_room::v3::Request,
+        is_federated: bool,
+    ) {
+        let federation_handler =
+            BWIFederationHandler::for_user_id(self.user_id().expect("Server should be set"));
+
+        request.initial_state.push(
+            InitialStateEvent::new(RoomServerAclEventContent::new(
+                false,
+                federation_handler.create_server_acl(is_federated),
+                Vec::new(),
+            ))
+            .to_raw_any(),
+        );
+    }
+    // END #6880 BWI specific
 
     /// Create a DM room.
     ///
@@ -1358,7 +1598,7 @@ impl Client {
             initial_state,
         });
 
-        self.create_room(request).await
+        self.create_room(request, false).await
     }
 
     /// Search the homeserver's directory for public rooms with a filter.
@@ -2219,7 +2459,15 @@ impl Client {
     }
 
     /// Create a new specialized `Client` that can process notifications.
-    pub async fn notification_client(&self) -> Result<Client> {
+    ///
+    /// See [`CrossProcessStoreLock::new`] to learn more about
+    /// `cross_process_store_locks_holder_name`.
+    ///
+    /// [`CrossProcessStoreLock::new`]: matrix_sdk_common::store_locks::CrossProcessStoreLock::new
+    pub async fn notification_client(
+        &self,
+        cross_process_store_locks_holder_name: String,
+    ) -> Result<Client> {
         let client = Client {
             inner: ClientInner::new(
                 self.inner.auth_ctx.clone(),
@@ -2228,13 +2476,18 @@ impl Client {
                 #[cfg(feature = "experimental-sliding-sync")]
                 self.sliding_sync_version(),
                 self.inner.http_client.clone(),
-                self.inner.base_client.clone_with_in_memory_state_store().await?,
+                self.inner.content_scanner.clone(),
+                self.inner
+                    .base_client
+                    .clone_with_in_memory_state_store(&cross_process_store_locks_holder_name)
+                    .await?,
                 self.inner.server_capabilities.read().await.clone(),
                 self.inner.respect_login_well_known,
                 self.inner.event_cache.clone(),
                 self.inner.send_queue_data.clone(),
                 #[cfg(feature = "e2e-encryption")]
                 self.inner.e2ee.encryption_settings,
+                cross_process_store_locks_holder_name,
             )
             .await,
         };
@@ -2346,7 +2599,7 @@ pub(crate) mod tests {
         api::{client::room::create_room::v3::Request as CreateRoomRequest, MatrixVersion},
         assign,
         events::ignored_user_list::IgnoredUserListEventContent,
-        owned_room_id, room_id, RoomId, ServerName, UserId,
+        owned_room_id, room_alias_id, room_id, RoomId, ServerName, UserId,
     };
     use serde_json::json;
     use tokio::{
@@ -2364,8 +2617,8 @@ pub(crate) mod tests {
         client::WeakClient,
         config::{RequestConfig, SyncSettings},
         test_utils::{
-            logged_in_client, no_retry_test_client, set_client_session, test_client_builder,
-            test_client_builder_with_server,
+            logged_in_client, mocks::MatrixMockServer, no_retry_test_client, set_client_session,
+            test_client_builder, test_client_builder_with_server,
         },
         Error,
     };
@@ -2760,7 +3013,10 @@ pub(crate) mod tests {
         let memory_store = Arc::new(MemoryStore::new());
         let client = Client::builder()
             .insecure_server_name_no_tls(server_name)
-            .store_config(StoreConfig::new().state_store(memory_store.clone()))
+            .store_config(
+                StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
+                    .state_store(memory_store.clone()),
+            )
             // BWI-specific
             .without_server_jwt_token_validation()
             // end BWI-specific
@@ -2782,7 +3038,10 @@ pub(crate) mod tests {
 
         let client = Client::builder()
             .insecure_server_name_no_tls(server_name)
-            .store_config(StoreConfig::new().state_store(memory_store.clone()))
+            .store_config(
+                StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
+                    .state_store(memory_store.clone()),
+            )
             // BWI-specific
             .without_server_jwt_token_validation()
             // end BWI-specific
@@ -2823,10 +3082,14 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_no_network_doesnt_cause_infinite_retries() {
+        let server = MockServer::start().await;
         // Note: not `no_retry_test_client` or `logged_in_client` which uses the former,
         // since we want infinite retries for transient errors.
-        let client =
-            test_client_builder(None).request_config(RequestConfig::new()).build().await.unwrap();
+        let client = test_client_builder(Some(server.uri().clone()))
+            .request_config(RequestConfig::new())
+            .build()
+            .await
+            .unwrap();
         set_client_session(&client).await;
 
         // We don't define a mock server on purpose here, so that the error is really a
@@ -2930,10 +3193,13 @@ pub(crate) mod tests {
 
         // Create a room in the internal store
         let room = client
-            .create_room(assign!(CreateRoomRequest::new(), {
-                invite: vec![],
-                is_direct: false,
-            }))
+            .create_room(
+                assign!(CreateRoomRequest::new(), {
+                    invite: vec![],
+                    is_direct: false,
+                }),
+                false,
+            )
             .await
             .unwrap();
 
@@ -2941,5 +3207,59 @@ pub(crate) mod tests {
         timeout(Duration::from_secs(1), client.await_room_remote_echo(room.room_id()))
             .await
             .unwrap_err();
+    }
+
+    #[async_test]
+    async fn test_is_room_alias_available_if_alias_is_not_resolved() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_room_directory_resolve_alias().not_found().expect(1).mount().await;
+
+        let ret = client.is_room_alias_available(room_alias_id!("#some_alias:matrix.org")).await;
+        assert_matches!(ret, Ok(true));
+    }
+
+    #[async_test]
+    async fn test_is_room_alias_available_if_alias_is_resolved() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server
+            .mock_room_directory_resolve_alias()
+            .ok("!some_room_id:matrix.org", Vec::new())
+            .expect(1)
+            .mount()
+            .await;
+
+        let ret = client.is_room_alias_available(room_alias_id!("#some_alias:matrix.org")).await;
+        assert_matches!(ret, Ok(false));
+    }
+
+    #[async_test]
+    async fn test_is_room_alias_available_if_error_found() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_room_directory_resolve_alias().error500().expect(1).mount().await;
+
+        let ret = client.is_room_alias_available(room_alias_id!("#some_alias:matrix.org")).await;
+        assert_matches!(ret, Err(_));
+    }
+
+    #[async_test]
+    async fn test_create_room_alias() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_create_room_alias().ok().expect(1).mount().await;
+
+        let ret = client
+            .create_room_alias(
+                room_alias_id!("#some_alias:matrix.org"),
+                room_id!("!some_room:matrix.org"),
+            )
+            .await;
+        assert_matches!(ret, Ok(()));
     }
 }

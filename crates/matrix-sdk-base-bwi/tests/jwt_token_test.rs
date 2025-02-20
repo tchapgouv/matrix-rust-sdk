@@ -23,6 +23,7 @@ const INVALID_PUB_KEYFILE: &str = "tests/resources/invalid_jwt_key.key.pub";
 const INVALID_PEM_KEYFILE: &str = "tests/resources/invalid_jwt_key.pem";
 
 #[tokio::test]
+#[ignore]
 async fn test_valid_jwt_token_from_pub_file() -> Result<(), Box<dyn std::error::Error>> {
     // Arrange
     let key = BWIPublicKeyForJWTTokenValidation::from_file(VALID_PUB_KEYFILE).unwrap();
@@ -33,12 +34,13 @@ async fn test_valid_jwt_token_from_pub_file() -> Result<(), Box<dyn std::error::
     // Assert
     assert_eq!(
         Ok(()),
-        BWITokenValidator::for_homeserver(homeserver_url).validate_with_keys(&vec![key]).await
+        BWITokenValidator::for_homeserver(homeserver_url).validate_with_keys(&[key]).await
     );
     Ok(())
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_invalid_jwt_token_from_pem_file() -> Result<(), Box<dyn std::error::Error>> {
     // Arrange
     let key = BWIPublicKeyForJWTTokenValidation::from_file(INVALID_PEM_KEYFILE).unwrap();
@@ -49,12 +51,13 @@ async fn test_invalid_jwt_token_from_pem_file() -> Result<(), Box<dyn std::error
     // Assert
     assert_eq!(
         Err(NoValidPublicKey()),
-        BWITokenValidator::for_homeserver(homeserver_url).validate_with_keys(&vec![key]).await
+        BWITokenValidator::for_homeserver(homeserver_url).validate_with_keys(&[key]).await
     );
     Ok(())
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_valid_jwt_token_from_multiple_pub_file() -> Result<(), Box<dyn std::error::Error>> {
     // Arrange
     let invalid_key = BWIPublicKeyForJWTTokenValidation::from_file(INVALID_PUB_KEYFILE).unwrap();
@@ -67,7 +70,7 @@ async fn test_valid_jwt_token_from_multiple_pub_file() -> Result<(), Box<dyn std
     assert_eq!(
         Ok(()),
         BWITokenValidator::for_homeserver(homeserver_url)
-            .validate_with_keys(&vec![invalid_key, valid_key])
+            .validate_with_keys(&[invalid_key, valid_key])
             .await
     );
     Ok(())

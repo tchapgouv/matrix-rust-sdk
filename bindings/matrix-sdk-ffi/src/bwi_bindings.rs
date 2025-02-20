@@ -17,6 +17,8 @@ use crate::bwi_bindings::PasswordStrength::{Medium, Strong, Weak};
 use crate::error::ClientError;
 use crate::error::ClientError::Generic;
 use matrix_sdk_bwi::password_evaluator::{BWIPasswordEvaluator, BWIPasswordStrength};
+use matrix_sdk_bwi::regulatory::data_privacy::BWIDataPrivacySource;
+use matrix_sdk_bwi::regulatory::imprint::BWIImprintSource;
 use matrix_sdk_bwi::regulatory::organization::BWIOrganization;
 
 #[uniffi::export(async_runtime = "tokio")]

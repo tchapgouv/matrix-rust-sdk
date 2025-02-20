@@ -17,16 +17,15 @@
 use core::fmt;
 use std::{ops::Deref, sync::Arc};
 
-use async_once_cell::OnceCell as AsyncOnceCell;
-use matrix_sdk::SlidingSync;
-use ruma::RoomId;
-use tracing::info;
-
 use super::Error;
 use crate::{
     timeline::{EventTimelineItem, TimelineBuilder},
     Timeline,
 };
+use async_once_cell::OnceCell as AsyncOnceCell;
+use matrix_sdk::SlidingSync;
+use ruma::RoomId;
+use tracing::info;
 
 /// A room in the room list.
 ///
@@ -110,9 +109,25 @@ impl Room {
                 .get_or_try_init(async { Ok(Arc::new(builder.build().await?)) })
                 .await
                 .map_err(Error::InitializingTimeline)?;
+
+            // BWI-specific: set up the hook for starting the content scanner
+            // not part of the timeline builder, as this would have a greater impact
+            self.setup_content_scanner_hook().await;
+            // end BWI-specific
             Ok(())
         }
     }
+
+    // BWI-specific
+    async fn setup_content_scanner_hook(&self) {
+        self.inner
+            .timeline
+            .get()
+            .expect("Timeline should be initialized")
+            .setup_content_scanner_hook()
+            .await;
+    }
+    // end BWI-specific
 
     /// Get the latest event in the timeline.
     ///

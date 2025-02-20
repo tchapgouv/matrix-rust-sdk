@@ -77,9 +77,12 @@ async fn test_toggling_reaction() -> Result<()> {
     debug!("Creating room…");
     let user_id = alice.user_id().unwrap().to_owned();
     let room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            is_direct: true,
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                is_direct: true,
+            }),
+            false,
+        )
         .await?;
 
     // Send a first message and then wait for the remote echo.
@@ -219,9 +222,12 @@ async fn test_stale_local_echo_time_abort_edit() {
 
     debug!("Creating room…");
     let room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            is_direct: true,
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                is_direct: true,
+            }),
+            false,
+        )
         .await
         .unwrap();
 
@@ -358,7 +364,7 @@ async fn test_enabling_backups_retries_decryption() {
             is_direct: true,
             initial_state,
             preset: Some(matrix_sdk::ruma::api::client::room::create_room::v3::RoomPreset::PrivateChat)
-        }))
+        }), false)
         .await
         .unwrap();
 

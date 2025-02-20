@@ -25,6 +25,7 @@ use eyeball::SharedObservable;
 use futures_util::future::try_join;
 pub use matrix_sdk_base::media::*;
 use mime::Mime;
+use ruma::events::room::EncryptedFile;
 use ruma::{
     api::{
         client::{authenticated_media, error::ErrorKind, media},
@@ -39,8 +40,10 @@ use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::{fs::File as TokioFile, io::AsyncWriteExt};
 
+use crate::Error::UnknownError;
 use crate::{
-    attachment::Thumbnail, futures::SendRequest, Client, Error, Result, TransmissionProgress,
+    attachment::Thumbnail, config::RequestConfig, futures::SendRequest, Client, Error, Result,
+    TransmissionProgress,
 };
 
 /// A conservative upload speed of 1Mbps
@@ -144,8 +147,11 @@ impl Media {
     /// * `content_type` - The type of the media, this will be used as the
     ///   content-type header.
     ///
-    /// * `reader` - A `Reader` that will be used to fetch the raw bytes of the
-    ///   media.
+    /// * `data` - Vector of bytes to be uploaded to the server.
+    ///
+    /// * `request_config` - Optional request configuration for the HTTP client,
+    ///   overriding the default. If not provided, a reasonable timeout value is
+    ///   inferred.
     ///
     /// # Examples
     ///
@@ -159,23 +165,36 @@ impl Media {
     /// # let mut client = Client::new(homeserver).await?;
     /// let image = fs::read("/home/example/my-cat.jpg")?;
     ///
-    /// let response = client.media().upload(&mime::IMAGE_JPEG, image).await?;
+    /// let response =
+    ///     client.media().upload(&mime::IMAGE_JPEG, image, None).await?;
     ///
     /// println!("Cat URI: {}", response.content_uri);
     /// # anyhow::Ok(()) };
     /// ```
-    pub fn upload(&self, content_type: &Mime, data: Vec<u8>) -> SendUploadRequest {
-        let timeout = std::cmp::max(
-            Duration::from_secs(data.len() as u64 / DEFAULT_UPLOAD_SPEED),
-            MIN_UPLOAD_REQUEST_TIMEOUT,
-        );
+    pub fn upload(
+        &self,
+        content_type: &Mime,
+        data: Vec<u8>,
+        request_config: Option<RequestConfig>,
+    ) -> SendUploadRequest {
+        let request_config = request_config.unwrap_or_else(|| {
+            self.client.request_config().timeout(Self::reasonable_upload_timeout(&data))
+        });
 
         let request = assign!(media::create_content::v3::Request::new(data), {
             content_type: Some(content_type.essence_str().to_owned()),
         });
 
-        let request_config = self.client.request_config().timeout(timeout);
         self.client.send(request, Some(request_config))
+    }
+
+    /// Returns a reasonable upload timeout for an upload, based on the size of
+    /// the data to be uploaded.
+    pub(crate) fn reasonable_upload_timeout(data: &[u8]) -> Duration {
+        std::cmp::max(
+            Duration::from_secs(data.len() as u64 / DEFAULT_UPLOAD_SPEED),
+            MIN_UPLOAD_REQUEST_TIMEOUT,
+        )
     }
 
     /// Preallocates an MXC URI for a media that will be uploaded soon.
@@ -407,15 +426,13 @@ impl Media {
 
         let content: Vec<u8> = match &request.source {
             MediaSource::Encrypted(file) => {
-                let content = if use_auth {
-                    let request =
-                        authenticated_media::get_content::v1::Request::from_uri(&file.url)?;
-                    self.client.send(request, request_config).await?.file
-                } else {
-                    #[allow(deprecated)]
-                    let request = media::get_content::v3::Request::from_url(&file.url)?;
-                    self.client.send(request, None).await?.file
-                };
+                let content = self
+                    .fetch_encrypted_media_via_content_scanner(
+                        use_auth,
+                        request_config,
+                        file.clone(),
+                    )
+                    .await?;
 
                 #[cfg(feature = "e2e-encryption")]
                 let content = {
@@ -440,39 +457,9 @@ impl Media {
 
             MediaSource::Plain(uri) => {
                 if let MediaFormat::Thumbnail(settings) = &request.format {
-                    if use_auth {
-                        let mut request =
-                            authenticated_media::get_content_thumbnail::v1::Request::from_uri(
-                                uri,
-                                settings.width,
-                                settings.height,
-                            )?;
-                        request.method = Some(settings.method.clone());
-                        request.animated = Some(settings.animated);
-
-                        self.client.send(request, request_config).await?.file
-                    } else {
-                        #[allow(deprecated)]
-                        let request = {
-                            let mut request = media::get_content_thumbnail::v3::Request::from_url(
-                                uri,
-                                settings.width,
-                                settings.height,
-                            )?;
-                            request.method = Some(settings.method.clone());
-                            request.animated = Some(settings.animated);
-                            request
-                        };
-
-                        self.client.send(request, None).await?.file
-                    }
-                } else if use_auth {
-                    let request = authenticated_media::get_content::v1::Request::from_uri(uri)?;
-                    self.client.send(request, request_config).await?.file
+                    self.fetch_thumbnail(use_auth, request_config, uri, settings).await?
                 } else {
-                    #[allow(deprecated)]
-                    let request = media::get_content::v3::Request::from_url(uri)?;
-                    self.client.send(request, None).await?.file
+                    self.fetch_media(use_auth, request_config, uri).await?
                 }
             }
         };
@@ -488,6 +475,108 @@ impl Media {
 
         Ok(content)
     }
+
+    async fn fetch_encrypted_media_via_content_scanner(
+        &self,
+        use_auth: bool,
+        request_config: Option<RequestConfig>,
+        file: Box<EncryptedFile>,
+    ) -> Result<Vec<u8>, Error> {
+        let request_config = match use_auth {
+            true => request_config,
+            false => None,
+        };
+        let request = self
+            .client
+            .content_scanner()
+            .download_authenticated_media_request(file)
+            .await
+            .map_err(|e| UnknownError(Box::new(e)))?;
+        let content = self.client.send(request, request_config).await?.file;
+        Ok(content)
+    }
+
+    // BWI-specific
+    async fn fetch_thumbnail(
+        &self,
+        use_auth: bool,
+        request_config: Option<RequestConfig>,
+        uri: &OwnedMxcUri,
+        settings: &MediaThumbnailSettings,
+    ) -> Result<Vec<u8>, Error> {
+        Ok(if use_auth {
+            self.fetch_thumbnail_authenticated(request_config, uri, settings).await?
+        } else {
+            #[allow(deprecated)]
+            self.fetch_thumbnail_unauthenticated(uri, settings).await?
+        })
+    }
+
+    async fn fetch_thumbnail_authenticated(
+        &self,
+        request_config: Option<RequestConfig>,
+        uri: &OwnedMxcUri,
+        settings: &MediaThumbnailSettings,
+    ) -> Result<Vec<u8>, Error> {
+        let mut request = authenticated_media::get_content_thumbnail::v1::Request::from_uri(
+            uri,
+            settings.width,
+            settings.height,
+        )?;
+        request.method = Some(settings.method.clone());
+        request.animated = Some(settings.animated);
+
+        Ok(self.client.send(request, request_config).await?.file)
+    }
+
+    #[deprecated]
+    async fn fetch_thumbnail_unauthenticated(
+        &self,
+        uri: &OwnedMxcUri,
+        settings: &MediaThumbnailSettings,
+    ) -> Result<Vec<u8>, Error> {
+        #[allow(deprecated)]
+        {
+            let mut request = media::get_content_thumbnail::v3::Request::from_url(
+                uri,
+                settings.width,
+                settings.height,
+            )?;
+            request.method = Some(settings.method.clone());
+            request.animated = Some(settings.animated);
+
+            Ok(self.client.send(request, None).await?.file)
+        }
+    }
+
+    async fn fetch_media(
+        &self,
+        use_auth: bool,
+        request_config: Option<RequestConfig>,
+        uri: &OwnedMxcUri,
+    ) -> Result<Vec<u8>, Error> {
+        Ok(if use_auth {
+            self.fetch_authenticated_media(request_config, uri).await?
+        } else {
+            self.fetch_unauthenticated_media(uri).await?
+        })
+    }
+
+    async fn fetch_unauthenticated_media(&self, uri: &OwnedMxcUri) -> Result<Vec<u8>, Error> {
+        #[allow(deprecated)]
+        let request = media::get_content::v3::Request::from_url(uri)?;
+        Ok(self.client.send(request, None).await?.file)
+    }
+
+    async fn fetch_authenticated_media(
+        &self,
+        request_config: Option<RequestConfig>,
+        uri: &OwnedMxcUri,
+    ) -> Result<Vec<u8>, Error> {
+        let request = authenticated_media::get_content::v1::Request::from_uri(uri)?;
+        Ok(self.client.send(request, request_config).await?.file)
+    }
+    // end BWI-specific
 
     /// Remove a media file's content from the store.
     ///
@@ -630,7 +719,7 @@ impl Media {
         let upload_thumbnail = self.upload_thumbnail(thumbnail, send_progress.clone());
 
         let upload_attachment = async move {
-            self.upload(content_type, data)
+            self.upload(content_type, data, None)
                 .with_send_progress_observable(send_progress)
                 .await
                 .map_err(Error::from)
@@ -652,20 +741,14 @@ impl Media {
             return Ok(None);
         };
 
+        let (data, content_type, thumbnail_info) = thumbnail.into_parts();
+
         let response = self
-            .upload(&thumbnail.content_type, thumbnail.data)
+            .upload(&content_type, data, None)
             .with_send_progress_observable(send_progress)
             .await?;
         let url = response.content_uri;
 
-        let thumbnail_info = assign!(
-            thumbnail.info
-                .as_ref()
-                .map(|info| ThumbnailInfo::from(info.clone()))
-                .unwrap_or_default(),
-            { mimetype: Some(thumbnail.content_type.as_ref().to_owned()) }
-        );
-
-        Ok(Some((MediaSource::Plain(url), Box::new(thumbnail_info))))
+        Ok(Some((MediaSource::Plain(url), thumbnail_info)))
     }
 }

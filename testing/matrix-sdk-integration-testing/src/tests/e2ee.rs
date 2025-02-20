@@ -60,7 +60,7 @@ async fn test_mutual_sas_verification() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room(request, false).await?;
     alice_room.enable_encryption().await?;
     let room_id = alice_room.room_id();
 
@@ -322,7 +322,7 @@ async fn test_mutual_qrcode_verification() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room(request, false).await?;
     alice_room.enable_encryption().await?;
     let room_id = alice_room.room_id();
 
@@ -546,7 +546,7 @@ async fn test_encryption_missing_member_keys() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room(request, false).await?;
     alice_room.enable_encryption().await?;
     alice.sync_once().await?;
 
@@ -664,7 +664,7 @@ async fn test_failed_members_response() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room(request, false).await?;
     alice_room.enable_encryption().await?;
     alice.sync_once().await?;
 
@@ -672,11 +672,14 @@ async fn test_failed_members_response() -> Result<()> {
 
     bob.sync_once().await?;
 
-    // Cause a failure of a sync_members request by asking for members before
-    // joining. Since this is a private DM room, it will fail with a 401, as
-    // we're not authorized to look at state history.
+    // Although we haven't joined the room yet, logic in `sync_members` looks at the
+    // room's visibility first; since it may be unknown for this room, from the
+    // point of view of Bob, it'll be assumed to be the default, aka shared. As
+    // a result, `sync_members()` doesn't even spawn a network request, and
+    // silently ignores the request.
+
     let result = bob.get_room(alice_room.room_id()).unwrap().sync_members().await;
-    assert!(result.is_err());
+    assert!(result.is_ok());
 
     bob.get_room(alice_room.room_id()).unwrap().join().await?;
 
@@ -798,7 +801,7 @@ async fn test_secret_gossip_after_interactive_verification() -> Result<()> {
     let user_id = first_client.user_id().expect("We should have access to the user id now");
 
     let request = CreateRoomRequest::new();
-    let room_first_client = first_client.create_room(request).await?;
+    let room_first_client = first_client.create_room(request, false).await?;
     room_first_client.enable_encryption().await?;
     first_client.sync_once().await?;
 

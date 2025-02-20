@@ -1,5 +1,5 @@
-use std::{env, error::Error};
-
+use std::env;
+use std::error::Error;
 use vergen::EmitBuilder;
 
 /// Adds a temporary workaround for an issue with the Rust compiler and Android

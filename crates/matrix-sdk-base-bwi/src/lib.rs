@@ -13,5 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+pub mod content_scanner;
+pub mod http_client;
 pub mod jwt_token;
 pub mod room_alias;

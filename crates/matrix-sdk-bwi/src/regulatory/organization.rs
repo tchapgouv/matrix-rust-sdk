@@ -17,41 +17,53 @@
 use crate::regulatory::data_privacy::{BWIDataPrivacy, BWIDataPrivacySource};
 use crate::regulatory::imprint::{BWIImprint, BWIImprintSource};
 use crate::regulatory::organization::url_helper::BWIUrlHelper;
-use crate::regulatory::well_known_file::BWIWellKnownFileSource;
+use crate::regulatory::well_known_file::BWIWellKnownFileSourceImpl;
 use anyhow::Result;
+use matrix_sdk_base_bwi::http_client::HttpClient;
 
 pub struct BWIOrganization {
     data_privacy_source: Box<dyn BWIDataPrivacySource>,
     imprint_source: Box<dyn BWIImprintSource>,
 }
 
+impl BWIImprintSource for BWIOrganization {
+    fn get_imprint(&self) -> BWIImprint {
+        self.imprint_source.get_imprint()
+    }
+}
+
+impl BWIDataPrivacySource for BWIOrganization {
+    fn get_data_privacy(&self) -> BWIDataPrivacy {
+        self.data_privacy_source.get_data_privacy()
+    }
+}
+
 impl BWIOrganization {
     pub fn new(
-        privacy_policy_source: Box<dyn BWIDataPrivacySource>,
+        data_privacy_source: Box<dyn BWIDataPrivacySource>,
         imprint_source: Box<dyn BWIImprintSource>,
     ) -> Self {
-        BWIOrganization { data_privacy_source: privacy_policy_source, imprint_source }
+        BWIOrganization { data_privacy_source, imprint_source }
     }
 
     pub async fn from_homeserver_url(homeserver_url_as_str: &str) -> Result<Self> {
         let homeserver_url =
             BWIUrlHelper::with_base_url(homeserver_url_as_str)?.for_well_known_file().get_url();
 
-        let well_known_source = BWIWellKnownFileSource::new(homeserver_url).await?;
+        let http_client = create_default_http_client();
+
+        let well_known_source =
+            BWIWellKnownFileSourceImpl::new(homeserver_url, http_client).await?;
 
         let imprint_source = Box::from(well_known_source.clone());
         let privacy_policy_source = Box::from(well_known_source);
 
         Ok(BWIOrganization::new(privacy_policy_source, imprint_source))
     }
+}
 
-    pub fn get_imprint(&self) -> BWIImprint {
-        self.imprint_source.get_imprint()
-    }
-
-    pub fn get_data_privacy(&self) -> BWIDataPrivacy {
-        self.data_privacy_source.get_data_privacy()
-    }
+fn create_default_http_client() -> Box<dyn HttpClient> {
+    Box::new(reqwest::ClientBuilder::default().build().unwrap())
 }
 
 mod url_helper {
@@ -107,11 +119,11 @@ mod url_helper {
             let parsed_url = Url::parse("https://example.com/.well-known/matrix/client")?;
 
             // Act
-            let built_url =
-                BWIUrlHelper::with_base_url(valid_url).unwrap().for_well_known_file().get_url();
+            let built_url = BWIUrlHelper::with_base_url(valid_url)?.for_well_known_file().get_url();
 
             // Assert
-            Ok(assert_eq!(built_url, parsed_url))
+            assert_eq!(built_url, parsed_url);
+            Ok(())
         }
 
         #[test]
@@ -124,7 +136,8 @@ mod url_helper {
                 BWIUrlHelper::with_base_url(valid_url).unwrap().for_well_known_file().get_url();
 
             // Assert
-            Ok(assert_eq!(built_url, parsed_url))
+            assert_eq!(built_url, parsed_url);
+            Ok(())
         }
     }
 }
