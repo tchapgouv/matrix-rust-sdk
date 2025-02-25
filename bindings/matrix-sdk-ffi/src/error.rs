@@ -260,6 +260,10 @@ pub enum RoomError {
     InvalidThumbnailData,
     #[error("Failed sending attachment")]
     FailedSendingAttachment,
+    // BWI-specific
+    #[error("Attachment is not allowed as it exceeded the file size limit")]
+    AttachmentSizeExceededUploadLimit,
+    // end BWI-specific
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]

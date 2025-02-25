@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 - Do not use the encrypted original file's content type as the encrypted
   thumbnail's content type.
   ([#ecf4434](https://github.com/matrix-org/matrix-rust-sdk/commit/ecf44348cf6a872b843fb7d7af1a88f724c58c3e))
+
 ### Features
 
 - Enable persistent storage for the `EventCache`. This allows events received
@@ -46,24 +47,22 @@ All notable changes to this project will be documented in this file.
 
 - Improve documentation of `Client::observe_events`.
 
-
 ### Features
-
 
 - Add `create_room_alias` function.
 
 - `Client::cross_process_store_locks_holder_name` is used everywhere:
- - `StoreConfig::new()` now takes a
-   `cross_process_store_locks_holder_name` argument.
- - `StoreConfig` no longer implements `Default`.
- - `BaseClient::new()` has been removed.
- - `BaseClient::clone_with_in_memory_state_store()` now takes a
-   `cross_process_store_locks_holder_name` argument.
- - `BaseClient` no longer implements `Default`.
- - `EventCacheStoreLock::new()` no longer takes a `key` argument.
- - `BuilderStoreConfig` no longer has
-   `cross_process_store_locks_holder_name` field for `Sqlite` and
-   `IndexedDb`.
+- `StoreConfig::new()` now takes a
+  `cross_process_store_locks_holder_name` argument.
+- `StoreConfig` no longer implements `Default`.
+- `BaseClient::new()` has been removed.
+- `BaseClient::clone_with_in_memory_state_store()` now takes a
+  `cross_process_store_locks_holder_name` argument.
+- `BaseClient` no longer implements `Default`.
+- `EventCacheStoreLock::new()` no longer takes a `key` argument.
+- `BuilderStoreConfig` no longer has
+  `cross_process_store_locks_holder_name` field for `Sqlite` and
+  `IndexedDb`.
 
 - `EncryptionSyncService` and `Notification` are using `Client::cross_process_store_locks_holder_name`.
 
@@ -79,23 +78,24 @@ All notable changes to this project will be documented in this file.
 
  ```rust
  // Get an observer.
- let observer =
-     client.observe_events::<SyncRoomMessageEvent, (Room, Vec<Action>)>();
+let observer =
+client.observe_events::<SyncRoomMessageEvent, (Room, Vec<Action>) > ();
 
- // Subscribe to the observer.
- let mut subscriber = observer.subscribe();
+// Subscribe to the observer.
+let mut subscriber = observer.subscribe();
 
- // Use the subscriber as a `Stream`.
- let (message_event, (room, push_actions)) = subscriber.next().await.unwrap();
+// Use the subscriber as a `Stream`.
+let (message_event, (room, push_actions)) = subscriber.next().await.unwrap();
  ```
 
- When calling `observe_events`, one has to specify the type of event (in the
- example, `SyncRoomMessageEvent`) and a context (in the example, `(Room,
+When calling `observe_events`, one has to specify the type of event (in the
+example, `SyncRoomMessageEvent`) and a context (in the example, `(Room,
  Vec<Action>)`, respectively for the room and the push actions).
 
 - Implement unwedging for media uploads.
 
-- Send state from state sync and not from timeline to widget ([#4254](https://github.com/matrix-org/matrix-rust-sdk/pull/4254))
+- Send state from state sync and not from timeline to
+  widget ([#4254](https://github.com/matrix-org/matrix-rust-sdk/pull/4254))
 
 - Allow aborting media uploads.
 
@@ -128,8 +128,8 @@ All notable changes to this project will be documented in this file.
 - Implement proper redact handling in the widget driver. This allows the Rust
   SDK widget driver to support widgets that rely on redacting.
 
-
 ### Refactor
+
 - [**breaking**] Rename `DisplayName` to `RoomDisplayName`.
 
 - Improve `is_room_alias_format_valid` so it's more strict.
@@ -210,34 +210,34 @@ Breaking changes:
   the `Client::sync_once()` method instead ([#1216](https://github.com/matrix-org/matrix-rust-sdk/pull/1216)).
 - `Common::members` and `Common::members_no_sync` take a `RoomMemberships` to be able to filter the
   results by any membership state.
-  - `Common::active_members(_no_sync)` and `Common::joined_members(_no_sync)` are deprecated.
+    - `Common::active_members(_no_sync)` and `Common::joined_members(_no_sync)` are deprecated.
 - `matrix-sdk-sqlite` is the new default store implementation outside of WASM, behind the `sqlite` feature.
-  - The `sled` feature was removed. The `matrix-sdk-sled` crate is deprecated and no longer maintained.
+    - The `sled` feature was removed. The `matrix-sdk-sled` crate is deprecated and no longer maintained.
 - Replace `Client::authentication_issuer` with `Client::authentication_server_info` that contains
   all the fields discovered from the homeserver for authenticating with OIDC
 - Remove `HttpSend` trait in favor of allowing a custom `reqwest::Client` instance to be supplied
 - Move all the types and methods using the native Matrix login and registration APIs from `Client`
   to the new `matrix_auth::MatrixAuth` API that is accessible via `Client::matrix_auth()`.
 - Move `Session` and `SessionTokens` to the `matrix_auth` module.
-  - Move the session methods on `Client` to the `MatrixAuth` API.
-  - Split `Session`'s content into several types. Its (de)serialization is still backwards
-    compatible.
+    - Move the session methods on `Client` to the `MatrixAuth` API.
+    - Split `Session`'s content into several types. Its (de)serialization is still backwards
+      compatible.
 - The room API has been simplified
-  - Removed the previous `Room`, `Joined`, `Invited` and `Left` types
-  - Merged all of the functionality from `Joined`, `Invited` and `Left` into `room::Common`
-  - Renamed `room::Common` to just `Room` and made it accessible as `matrix_sdk::Room`
+    - Removed the previous `Room`, `Joined`, `Invited` and `Left` types
+    - Merged all of the functionality from `Joined`, `Invited` and `Left` into `room::Common`
+    - Renamed `room::Common` to just `Room` and made it accessible as `matrix_sdk::Room`
 - Event handler closures now need to implement `FnOnce` + `Clone` instead of `Fn`
-  - As a consequence, you no longer need to explicitly need to `clone` variables they capture
-    before constructing an `async move {}` block inside
+    - As a consequence, you no longer need to explicitly need to `clone` variables they capture
+      before constructing an `async move {}` block inside
 - `Room::sync_members` doesn't return the underlying Ruma response anymore. If you need to get the
   room members, you can use `Room::members` or `Room::get_member` which will make sure that the
   members are up to date.
 - The `transaction_id` parameter of `Room::{send, send_raw}` was removed
-  - Instead, both methods now return types that implement `IntoFuture` (so can be awaited like
-    before) and have a `with_transaction_id` builder-style method
+    - Instead, both methods now return types that implement `IntoFuture` (so can be awaited like
+      before) and have a `with_transaction_id` builder-style method
 - The parameter order of `Room::{send_raw, send_state_event_raw}` has changed, `content` is now last
-  - The parameter type of `content` has also changed to a generic; `serde_json::Value` arguments
-    are still allowed, but so are other types like `Box<serde_json::value::RawValue>`
+    - The parameter type of `content` has also changed to a generic; `serde_json::Value` arguments
+      are still allowed, but so are other types like `Box<serde_json::value::RawValue>`
 - All "named futures" (structs implementing `IntoFuture`) are now exported from modules named
   `futures` instead of directly in the respective parent module
 - `Verification` is non-exhaustive, to make the `qrcode` cargo feature additive

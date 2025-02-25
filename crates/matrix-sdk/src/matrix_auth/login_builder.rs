@@ -24,9 +24,10 @@ use ruma::{
     assign,
     serde::JsonObject,
 };
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use super::MatrixAuth;
+use crate::bwi_extensions::client::BWIClientSetupExt;
 use crate::{config::RequestConfig, Result};
 
 /// The login method.
@@ -190,6 +191,12 @@ impl LoginBuilder {
                 Some(login_info),
             )
             .await?;
+
+        // BWI-specific
+        if let Err(err) = client.sync_settings().await {
+            warn!("###BWI### Sync settings failed with error: {}", err)
+        }
+        // end BWI-specific
 
         Ok(response)
     }

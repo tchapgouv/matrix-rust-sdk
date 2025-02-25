@@ -1,3 +1,23 @@
+Changes in BWI project 0.8.0 (2024-11-12)
+
+Upstream merge ✨:
+- 0.8.0
+
+Features ✨:
+- MESSENGER-6966 take the configured maximal file size into account when uploading a file
+
+Improvements 🙌:
+
+Bugfix 🐛:
+
+Translations 🗣:
+
+SDK API changes ⚠️:
+
+Build 🧱:
+
+Other changes:
+
 Changes in BWI project 0.6.0 (2025-02-18)
 
 Upstream merge ✨:

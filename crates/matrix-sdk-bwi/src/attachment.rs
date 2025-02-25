@@ -13,10 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+use crate::settings_cache::BWISetting;
 
-pub mod attachment;
-pub mod content_scanner;
-pub mod federation;
-pub mod password_evaluator;
-pub mod regulatory;
-pub mod settings_cache;
+pub const FILE_SIZE_LIMIT: BWISetting<'static, u64> = BWISetting::new("BWI_FILE_SIZE_LIMIT");

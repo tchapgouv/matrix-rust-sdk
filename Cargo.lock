@@ -2956,7 +2956,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-sdk-bwi"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3341,17 +3341,6 @@ dependencies = [
  "uniffi",
  "url",
  "wiremock",
-]
-
-[[package]]
-name = "media_content-scanner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "matrix-sdk",
- "tokio",
- "tracing-subscriber",
- "url",
 ]
 
 [[package]]

@@ -28,11 +28,11 @@ use matrix_sdk::{
     },
     deserialized_responses::{ShieldState as SdkShieldState, ShieldStateCode},
     room::edit::EditedContent as SdkEditedContent,
-    Error,
+    Error as MatrixSdkError,
 };
 use matrix_sdk_ui::timeline::{
-    self, EventItemOrigin, LiveBackPaginationStatus, Profile, RepliedToEvent, TimelineDetails,
-    TimelineUniqueId as SdkTimelineUniqueId,
+    self, Error, EventItemOrigin, LiveBackPaginationStatus, Profile, RepliedToEvent,
+    TimelineDetails, TimelineUniqueId as SdkTimelineUniqueId,
 };
 use mime::Mime;
 use ruma::{
@@ -81,6 +81,7 @@ use crate::{
 mod content;
 
 pub use content::MessageContent;
+use matrix_sdk::bwi_extensions::attachment::ClientAttachmentExt;
 use matrix_sdk::utils::formatted_body_from;
 
 use crate::client::BWIScanState;
@@ -129,7 +130,13 @@ impl Timeline {
             });
         }
 
-        request.await.map_err(|_| RoomError::FailedSendingAttachment)?;
+        // BWI-specific
+        request.await.map_err(|e| match e {
+            Error::AttachmentSizeExceededLimit => RoomError::AttachmentSizeExceededUploadLimit,
+            Error::AttachmentSizeNotAvailable => RoomError::FailedSendingAttachment,
+            _ => RoomError::FailedSendingAttachment,
+        })?;
+        // end BWI-specific
         Ok(())
     }
 }
@@ -268,6 +275,20 @@ impl Timeline {
         self.inner.mark_as_read(receipt_type.into()).await?;
         Ok(())
     }
+
+    // BWI-specific
+    pub async fn get_file_size_limit_for_file_upload(
+        &self,
+    ) -> std::result::Result<u64, ClientError> {
+        self.inner
+            .room()
+            .client()
+            .get_size_limit_for_file_upload()
+            .await
+            .map(|size| size.0)
+            .ok_or(ClientError::Generic { msg: "File size limit not synced".to_string() })
+    }
+    // end BWI-specific
 
     /// Queues an event in the room's send queue so it's processed for
     /// sending later.
@@ -676,7 +697,7 @@ impl Timeline {
     ) -> Result<Arc<InReplyToDetails>, ClientError> {
         let event_id = EventId::parse(&event_id_str)?;
 
-        let replied_to: Result<RepliedToEvent, Error> =
+        let replied_to: Result<RepliedToEvent, MatrixSdkError> =
             if let Some(event) = self.inner.item_by_event_id(&event_id).await {
                 Ok(RepliedToEvent::from_timeline_item(&event))
             } else {

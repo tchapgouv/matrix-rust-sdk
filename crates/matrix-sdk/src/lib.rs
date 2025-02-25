@@ -35,6 +35,9 @@ pub use reqwest;
 
 mod account;
 pub mod attachment;
+
+pub mod bwi_extensions;
+
 pub mod authentication;
 mod client;
 pub mod config;
