@@ -5,7 +5,25 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use super::{room::Room, session_verification::SessionVerificationController, RUNTIME};
+use crate::client::BWIScanState::Infected;
+use crate::{
+    authentication::{HomeserverLoginDetails, OidcConfiguration, OidcError, SsoError, SsoHandler},
+    client,
+    encryption::Encryption,
+    notification::NotificationClient,
+    notification_settings::NotificationSettings,
+    room_directory_search::RoomDirectorySearch,
+    room_preview::RoomPreview,
+    ruma::{AuthData, MediaSource},
+    sync_service::{SyncService, SyncServiceBuilder},
+    task_handle::TaskHandle,
+    utils::AsyncRuntimeDropped,
+    ClientError,
+};
 use anyhow::{anyhow, Context as _};
+use matrix_sdk::bwi_extensions::attachment::ClientAttachmentExt;
+use matrix_sdk::bwi_extensions::client::BWIClientSetupExt;
 use matrix_sdk::{
     media::{
         MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequestParameters,
@@ -41,6 +59,7 @@ use matrix_sdk::{
     sliding_sync::Version as SdkSlidingSyncVersion,
     AuthApi, AuthSession, Client as MatrixClient, HttpError, SessionChange, SessionTokens,
 };
+use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState as SDKScanState;
 use matrix_sdk_ui::notification_client::{
     NotificationClient as MatrixNotificationClient,
     NotificationProcessSetup as MatrixNotificationProcessSetup,
@@ -67,26 +86,8 @@ use ruma::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use url::Url;
-
-use super::{room::Room, session_verification::SessionVerificationController, RUNTIME};
-use crate::client::BWIScanState::Infected;
-use crate::{
-    authentication::{HomeserverLoginDetails, OidcConfiguration, OidcError, SsoError, SsoHandler},
-    client,
-    encryption::Encryption,
-    notification::NotificationClient,
-    notification_settings::NotificationSettings,
-    room_directory_search::RoomDirectorySearch,
-    room_preview::RoomPreview,
-    ruma::{AuthData, MediaSource},
-    sync_service::{SyncService, SyncServiceBuilder},
-    task_handle::TaskHandle,
-    utils::AsyncRuntimeDropped,
-    ClientError,
-};
-use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState as SDKScanState;
 
 #[derive(Clone, uniffi::Record)]
 pub struct PusherIdentifiers {
@@ -513,6 +514,12 @@ impl Client {
         self.restore_session_inner(auth_session).await?;
         self.inner.set_sliding_sync_version(sliding_sync_version.try_into()?);
 
+        // BWI-specific
+        if let Err(err) = self.inner.sync_settings().await {
+            warn!("###BWI### Sync settings failed with error: {}", err)
+        }
+        // end BWI-specific
+
         Ok(())
     }
 
@@ -743,6 +750,16 @@ impl Client {
         self.inner.account().set_account_data_raw(event_type.into(), raw_content).await?;
         Ok(())
     }
+
+    // BWI-specific
+    pub async fn get_file_size_limit_for_file_upload(&self) -> Result<u64, ClientError> {
+        self.inner
+            .get_size_limit_for_file_upload()
+            .await
+            .map(|size| size.0)
+            .ok_or(ClientError::Generic { msg: "File size limit not synced".to_string() })
+    }
+    // end BWI-specific
 
     pub async fn upload_media(
         &self,

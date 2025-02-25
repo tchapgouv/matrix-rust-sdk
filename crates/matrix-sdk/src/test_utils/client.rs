@@ -23,6 +23,9 @@ use crate::{
     Client, ClientBuilder,
 };
 
+/// The Bearer token for tests
+pub const TEST_BEARER_TOKEN: &str = "1234";
+
 /// An augmented [`ClientBuilder`] that also allows for handling session login.
 #[allow(missing_debug_implementations)]
 pub struct MockClientBuilder {
@@ -74,7 +77,7 @@ impl MockClientBuilder {
                         device_id: device_id!("DEVICEID").to_owned(),
                     },
                     tokens: MatrixSessionTokens {
-                        access_token: "1234".to_owned(),
+                        access_token: TEST_BEARER_TOKEN.to_owned(),
                         refresh_token: None,
                     },
                 })

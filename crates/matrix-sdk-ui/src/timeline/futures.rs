@@ -1,12 +1,13 @@
 use std::{fs, future::IntoFuture, path::PathBuf};
 
+use super::{Error, Timeline};
+use crate::timeline::Error::{AttachmentSizeExceededLimit, AttachmentSizeNotAvailable};
 use eyeball::{SharedObservable, Subscriber};
+use matrix_sdk::bwi_extensions::attachment::ClientAttachmentExt;
 use matrix_sdk::{attachment::AttachmentConfig, TransmissionProgress};
 use matrix_sdk_base::boxed_into_future;
 use mime::Mime;
 use tracing::{Instrument as _, Span};
-
-use super::{Error, Timeline};
 
 pub struct SendAttachment<'a> {
     timeline: &'a Timeline,
@@ -65,6 +66,18 @@ impl<'a> IntoFuture for SendAttachment<'a> {
             self;
 
         let fut = async move {
+            // BWI-specific
+            let file_size_limit_for_file_upload = timeline
+                .room()
+                .client()
+                .get_size_limit_for_file_upload()
+                .await
+                .ok_or(AttachmentSizeNotAvailable)?;
+            config
+                .assert_valid_file_size(file_size_limit_for_file_upload)
+                .map_err(|_| AttachmentSizeExceededLimit)?;
+            // end BWI-specific
+
             let filename = path
                 .file_name()
                 .ok_or(Error::InvalidAttachmentFileName)?
