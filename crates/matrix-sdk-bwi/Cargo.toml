@@ -1,6 +1,6 @@
 [package]
 name = "matrix-sdk-bwi"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version.workspace = true
 
@@ -15,8 +15,11 @@ async-trait = { workspace = true }
 http = { workspace = true }
 matrix-sdk-base = { workspace = true, features = ["e2e-encryption"] }
 matrix-sdk-base-bwi = { workspace = true }
+matrix-sdk-bwi-test = { workspace = true }
+matrix-sdk-test = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 reqwest = { workspace = true, features = ["json"] }
+rstest = { workspace = true }
 ruma = { workspace = true, features = ["rand", "unstable-msc2448", "unstable-msc2965", "unstable-msc3930", "unstable-msc3245-v1-compat", "unstable-msc2867"] }
 ruma-common = { workspace = true, features = ["api"] }
 serde_json = { workspace = true }

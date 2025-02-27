@@ -24,6 +24,7 @@ use crate::{
     unable_to_decrypt_hook::UtdHookManager,
 };
 use futures_util::{pin_mut, StreamExt};
+use matrix_sdk::bwi_content_scanner::BWIContentScannerWrapper;
 use matrix_sdk::{
     encryption::backups::BackupState,
     event_cache::{EventsOrigin, RoomEventCacheUpdate},
@@ -161,7 +162,7 @@ impl TimelineBuilder {
 
         // BWI-specific
         let client = room.client();
-        let content_scanner = client.content_scanner();
+        let content_scanner = BWIContentScannerWrapper::new(client);
         // end BWI-specific
 
         let controller = TimelineController::new(

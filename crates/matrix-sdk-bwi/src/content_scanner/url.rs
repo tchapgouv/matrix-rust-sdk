@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use crate::content_scanner::url::content_scanner_api::Endpoint::{PublicKeyEndpoint, ScanEndpoint};
+use crate::content_scanner::url::content_scanner_api::Endpoint::PublicKeyEndpoint;
 use url::Url;
 
 pub(crate) mod content_scanner_api {
@@ -22,7 +22,6 @@ pub(crate) mod content_scanner_api {
 
     pub enum Endpoint {
         PublicKeyEndpoint,
-        ScanEndpoint,
     }
 
     impl From<Endpoint> for String {
@@ -31,7 +30,6 @@ pub(crate) mod content_scanner_api {
                 Endpoint::PublicKeyEndpoint => {
                     "/_matrix/media_proxy/unstable/public_key".to_owned()
                 }
-                Endpoint::ScanEndpoint => "/_matrix/media_proxy/unstable/scan_encrypted".to_owned(),
             }
         }
     }
@@ -77,10 +75,6 @@ impl BWIContentScannerUrl {
 
     pub fn get_public_key_url(&self) -> Url {
         self.get_url_for_endpoint(PublicKeyEndpoint)
-    }
-
-    pub fn get_scan_url(&self) -> Url {
-        self.get_url_for_endpoint(ScanEndpoint)
     }
 }
 

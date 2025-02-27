@@ -39,11 +39,11 @@ use eyeball_im::VectorDiff;
 use futures_core::Stream;
 use futures_util::FutureExt as _;
 use indexmap::IndexMap;
+use matrix_sdk::bwi_content_scanner::BWIContentScannerWrapper;
 use matrix_sdk::{
     config::RequestConfig,
     deserialized_responses::{SyncTimelineEvent, TimelineEvent},
     event_cache::paginator::{PaginableRoom, PaginatorError},
-    reqwest,
     room::{EventWithContextResponse, Messages, MessagesOptions},
     send_queue::RoomSendQueueUpdate,
     BoxFuture,
@@ -51,7 +51,6 @@ use matrix_sdk::{
 use matrix_sdk_base::{
     crypto::types::events::CryptoContextInfo, latest_event::LatestEvent, RoomInfo, RoomState,
 };
-use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use matrix_sdk_test::{
     event_factory::EventFactory, EventBuilder, ALICE, BOB, DEFAULT_TEST_ROOM_ID,
 };
@@ -88,10 +87,8 @@ mod shields;
 mod virt;
 
 // BWI-specific
-fn create_dummy_content_scanner() -> Arc<BWIContentScanner> {
-    Arc::from(
-        BWIContentScanner::new_with_url_as_str(reqwest::Client::default(), "example.com").unwrap(),
-    )
+fn create_dummy_content_scanner() -> BWIContentScannerWrapper {
+    BWIContentScannerWrapper::test_wrapper()
 }
 // end BWI-specific
 

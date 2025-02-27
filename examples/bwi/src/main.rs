@@ -3,6 +3,7 @@ use clap::Parser;
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt};
 use log::{debug, info};
+use matrix_sdk::attachment::AttachmentConfig;
 use matrix_sdk::encryption::backups::BackupState;
 use matrix_sdk::encryption::secret_storage::SecretStore;
 use matrix_sdk::media::{MediaEventContent, MediaFormat, MediaRequestParameters};
@@ -10,6 +11,7 @@ use matrix_sdk::ruma::events::room::message::{ImageMessageEventContent, MessageT
 use matrix_sdk::ruma::push::ComparisonOperator::Le;
 use matrix_sdk::{config::SyncSettings, ruma::OwnedRoomId, Client, Room};
 use matrix_sdk_ui::timeline::{RoomExt, TimelineItem, TimelineItemContent, TimelineItemKind};
+use std::fs;
 use std::path::{absolute, Path};
 use std::sync::Arc;
 use tracing::Level;
@@ -193,10 +195,30 @@ async fn main() -> Result<()> {
         }
     });
 
+    tokio::spawn(async move {
+        for _ in 0..5 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            send_image(&room).await;
+        }
+    });
+
     // Sync forever
     client.sync(sync_settings).await?;
 
     Ok(())
+}
+
+async fn send_image(room: &Room) {
+    let image_path = Path::new("./examples/bwi/ressources/image.png");
+    let image = fs::read(&image_path).expect("Can't open image file.");
+    room.send_attachment(
+        "image.png",
+        &mime::IMAGE_PNG,
+        image,
+        AttachmentConfig::new().caption(Some("my pretty cat".to_owned())),
+    )
+    .await
+    .expect("###BWI### could not send image");
 }
 
 fn setup_logging(verbose: bool) {

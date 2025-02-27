@@ -21,11 +21,19 @@ use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::{fmt, fs::File, path::Path};
 
+use crate::bwi_content_scanner::BWIDownloadMediaExt;
+use crate::Error::BWIError;
+use crate::{
+    attachment::Thumbnail, config::RequestConfig, futures::SendRequest, Client, Error, Result,
+    TransmissionProgress,
+};
 use eyeball::SharedObservable;
 use futures_util::future::try_join;
 pub use matrix_sdk_base::media::*;
 use mime::Mime;
 use ruma::events::room::EncryptedFile;
+use ruma::serde::base64::Standard;
+use ruma::serde::Base64;
 use ruma::{
     api::{
         client::{authenticated_media, media},
@@ -39,12 +47,7 @@ use ruma::{
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::{fs::File as TokioFile, io::AsyncWriteExt};
-
-use crate::Error::UnknownError;
-use crate::{
-    attachment::Thumbnail, config::RequestConfig, futures::SendRequest, Client, Error, Result,
-    TransmissionProgress,
-};
+use tracing::log::debug;
 
 /// A conservative upload speed of 1Mbps
 const DEFAULT_UPLOAD_SPEED: u64 = 125_000;
@@ -304,18 +307,10 @@ impl Media {
 
         // Use the authenticated endpoints when the server supports Matrix 1.11 or the
         // authenticated media stable feature.
-        const AUTHENTICATED_MEDIA_STABLE_FEATURE: &str = "org.matrix.msc3916.stable";
-
         let (use_auth, request_config) =
             if self.client.server_versions().await?.contains(&MatrixVersion::V1_11) {
                 (true, None)
-            } else if self
-                .client
-                .unstable_features()
-                .await?
-                .get(AUTHENTICATED_MEDIA_STABLE_FEATURE)
-                .is_some_and(|is_supported| *is_supported)
-            {
+            } else if self.is_unstable_authenticated_media_enabled().await? {
                 // We need to force the use of the stable endpoint with the Matrix version
                 // because Ruma does not handle stable features.
                 let request_config = self.client.request_config();
@@ -326,13 +321,15 @@ impl Media {
 
         let content: Vec<u8> = match &request.source {
             MediaSource::Encrypted(file) => {
-                let content = self
-                    .fetch_encrypted_media_via_content_scanner(
-                        use_auth,
-                        request_config,
-                        file.clone(),
-                    )
-                    .await?;
+                let content = match use_auth {
+                    true => {
+                        self.download_authenticated_media_via_content_scanner(request_config, file)
+                            .await
+                    }
+                    false => self.download_unauthenticated_media_via_content_scanner(file).await,
+                }?;
+
+                debug!("###BWI### received content {:?}", Base64::<Standard>::new(content.clone()));
 
                 #[cfg(feature = "e2e-encryption")]
                 let content = {
@@ -376,27 +373,44 @@ impl Media {
         Ok(content)
     }
 
-    async fn fetch_encrypted_media_via_content_scanner(
-        &self,
-        use_auth: bool,
-        request_config: Option<RequestConfig>,
-        file: Box<EncryptedFile>,
-    ) -> Result<Vec<u8>, Error> {
-        let request_config = match use_auth {
-            true => request_config,
-            false => None,
-        };
-        let request = self
+    async fn is_unstable_authenticated_media_enabled(&self) -> Result<bool, Error> {
+        const AUTHENTICATED_MEDIA_STABLE_FEATURE: &str = "org.matrix.msc3916.stable";
+
+        Ok(self
             .client
-            .content_scanner()
-            .download_authenticated_media_request(file)
-            .await
-            .map_err(|e| UnknownError(Box::new(e)))?;
-        let content = self.client.send(request, request_config).await?.file;
-        Ok(content)
+            .unstable_features()
+            .await?
+            .get(AUTHENTICATED_MEDIA_STABLE_FEATURE)
+            .is_some_and(|is_supported| *is_supported))
     }
 
     // BWI-specific
+    async fn download_authenticated_media_via_content_scanner(
+        &self,
+        request_config: Option<RequestConfig>,
+        file: &EncryptedFile,
+    ) -> Result<Vec<u8>, Error> {
+        let content = self
+            .client
+            .download_authenticated_media(file, request_config)
+            .await
+            .map_err(|e| BWIError(Box::new(e)))?;
+        Ok(content.value())
+    }
+
+    async fn download_unauthenticated_media_via_content_scanner(
+        &self,
+        file: &EncryptedFile,
+    ) -> Result<Vec<u8>, Error> {
+        #[allow(deprecated)]
+        let content = self
+            .client
+            .download_unauthenticated_media(file)
+            .await
+            .map_err(|e| BWIError(Box::new(e)))?;
+        Ok(content.value())
+    }
+
     async fn fetch_thumbnail(
         &self,
         use_auth: bool,
