@@ -20,7 +20,7 @@ use std::fmt::{Display, Formatter};
 use thiserror::Error;
 use url::Url;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Eq, PartialEq)]
 pub enum HttpError {
     NotFound,
     Failed(u16),

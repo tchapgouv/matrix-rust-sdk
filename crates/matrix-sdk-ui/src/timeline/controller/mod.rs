@@ -46,6 +46,7 @@ use eyeball_im::{ObservableVectorEntry, VectorDiff};
 use eyeball_im_util::vector::VectorObserverExt;
 use futures_core::Stream;
 use imbl::Vector;
+use matrix_sdk::bwi_content_scanner::{BWIContentScannerWrapper, BWIScanMediaExt};
 #[cfg(test)]
 use matrix_sdk::crypto::OlmMachine;
 use matrix_sdk::{
@@ -58,7 +59,6 @@ use matrix_sdk::{
 };
 use matrix_sdk_base::media::MediaEventContent;
 use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState;
-use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use ruma::events::room::MediaSource;
 use ruma::{
     api::client::receipt::create_receipt::v3::ReceiptType as SendReceiptType,
@@ -124,7 +124,7 @@ pub(super) struct TimelineController<P: RoomDataProvider = Room> {
 
     // BWI-specific
     /// the used ContentScanner
-    content_scanner: Arc<BWIContentScanner>,
+    content_scanner: BWIContentScannerWrapper,
     // end BWI-specific
 }
 
@@ -253,7 +253,7 @@ impl<P: RoomDataProvider> TimelineController<P> {
         unable_to_decrypt_hook: Option<Arc<UtdHookManager>>,
         is_room_encrypted: Option<bool>,
         // BWI-specific
-        content_scanner: Arc<BWIContentScanner>,
+        content_scanner: BWIContentScannerWrapper,
         // end BWI-specific
     ) -> Self {
         let (focus_data, focus_kind) = match focus {
@@ -1548,12 +1548,23 @@ impl TimelineController {
 
     // BWI-specific
     pub(crate) async fn handle_single_timeline_item(&self, diff: &Arc<TimelineItem>) {
-        if let Some(source) = self.filter_for_media_events(diff) {
-            debug!("###BWI###: Stated Scan for Timeline Item with id {}", diff.internal_id.0);
-            let scan_state = self.content_scanner.scan_attachment(source).await;
-            debug!("###BWI###: Finished Scan: Scan state is: {:?}", scan_state);
-            self.finish_content_scan_for_item_with_state(diff.internal_id.clone(), scan_state)
-                .await;
+        match self.filter_for_media_events(diff) {
+            Some(MediaSource::Encrypted(encrypted)) => {
+                match self.content_scanner.scan_media(&encrypted).await {
+                    Ok(scan_state) => {
+                        self.finish_content_scan_for_item_with_state(
+                            diff.internal_id.clone(),
+                            scan_state,
+                        )
+                        .await
+                    }
+                    Err(err) => {
+                        error!("###BWI### ContentScanner failed: {:?}", err)
+                    }
+                }
+            }
+            Some(MediaSource::Plain(_)) => { /* nothing to do as local echo*/ }
+            None => { /* nothing to do */ }
         }
     }
 

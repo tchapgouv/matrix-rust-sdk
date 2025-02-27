@@ -13,6 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+use crate::content_scanner::request::scan_encrypted::v1::Response;
+use crate::content_scanner::BWIContentScannerError;
+use http::StatusCode;
 use matrix_sdk_base::crypto::vodozemac::pk_encryption::{Message, PkEncryption};
 use matrix_sdk_base::crypto::vodozemac::Curve25519PublicKey;
 use matrix_sdk_base::ruma::events::room::EncryptedFile;
@@ -43,15 +46,42 @@ pub struct BWIPublicKeyDto {
     pub public_key: String,
 }
 
-#[derive(Deserialize)]
+pub enum BWIScanStateResult {
+    Success(BWIScanStateResultDto),
+    Error(StatusCode, BWIScanErrorResultDto),
+}
+
+impl TryFrom<Response> for BWIScanStateResult {
+    type Error = BWIContentScannerError;
+
+    fn try_from(value: Response) -> Result<Self, BWIContentScannerError> {
+        match value {
+            Response { clean: Some(clean), reason: None, info } => {
+                Ok(BWIScanStateResult::Success(BWIScanStateResultDto { clean, info }))
+            }
+            Response { clean: None, reason: Some(reason), info } => Ok(BWIScanStateResult::Error(
+                StatusCode::FORBIDDEN,
+                BWIScanErrorResultDto { reason, info },
+            )),
+            Response { clean: Some(_), reason: Some(_), info: _ }
+            | Response { clean: None, reason: None, info: _ } => mark_inconsistent_state(),
+        }
+    }
+}
+
+fn mark_inconsistent_state() -> Result<BWIScanStateResult, BWIContentScannerError> {
+    Err(BWIContentScannerError::ScanFailed)
+}
+
+#[derive(Deserialize, Debug)]
 pub struct BWIScanStateResultDto {
     pub clean: bool,
     #[allow(dead_code)]
     pub info: String,
 }
 
-#[derive(Deserialize)]
-pub struct BWIScanStateForbiddenResultDto {
+#[derive(Deserialize, Debug)]
+pub struct BWIScanErrorResultDto {
     pub reason: String,
     #[allow(dead_code)]
     pub info: String,
@@ -103,8 +133,8 @@ impl From<Message> for EncryptedMetadata {
 pub struct EncryptedMetadataRequestBuilder(BWIEncryptedFileDto);
 
 impl EncryptedMetadataRequestBuilder {
-    pub fn for_encrypted_file(file: EncryptedFile) -> Self {
-        Self(BWIEncryptedFileDto::new(file))
+    pub fn for_encrypted_file(file: &EncryptedFile) -> Self {
+        Self(BWIEncryptedFileDto::new(file.to_owned()))
     }
 
     pub fn build_encrypted_request(
