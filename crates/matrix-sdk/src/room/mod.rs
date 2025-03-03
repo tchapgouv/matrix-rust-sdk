@@ -2279,6 +2279,28 @@ impl Room {
     
     /// Get the access rules for this room.
     pub async fn get_access_rules(&self) -> Result<AccessRule, Error> {
+        Err(Error::InsufficientData)
+        /*
+        let t = self
+            .store
+            .get_state_event_static::<RoomAccessRulesEventContent>(self.room_id())
+            .await?
+            .ok_or(Error::InsufficientData)?
+            .deserialize()?;
+
+            match t {
+                SyncOrStrippedState::Sync(SyncStateEvent::Original(e)) => {
+                    return Ok(e.content.access_rule.clone());
+                },
+                SyncOrStrippedState::Sync(SyncStateEvent::Redacted(e)) => {
+                    return Err(Error::InsufficientData);
+                },
+                SyncOrStrippedState::Stripped(e) => {
+                    return Err(Error::InsufficientData);
+                },
+            }
+            */
+            
         /* 
         self
             .get_state_event_static::<RoomAccessRulesEventContent>()
@@ -2288,26 +2310,26 @@ impl Room {
             .access_rules()
             .ok_or(Error::InsufficientData)
             */
-            Err(Error::InsufficientData)
+
+            // Err(Error::InsufficientData)
     }
 
 
-/*
        /// Load pinned state events for a room from the `/state` endpoint in the
     /// home server.
-    pub async fn load_access_rules(&self) -> Result<Option<RoomAccessRules>> {
+    pub async fn load_access_rules(&self) -> Result<Option<AccessRule>> {
         let response = self
             .client
             .send(get_state_events_for_key::v3::Request::new(
                 self.room_id().to_owned(),
-                StateEventType::RoomAccessRules,
+                StateEventType::RoomJoinRules,
                 "".to_owned(),
             ))
             .await;
 
         match response {
             Ok(response) => {
-                Ok(Some(response.content.deserialize_as::<RoomAccessRulesEventContent>()?.rule))
+                Ok(Some(response.content.deserialize_as::<RoomAccessRulesEventContent>()?.access_rule))
             }
             Err(http_error) => match http_error.as_client_api_error() {
                 Some(error) if error.status_code == StatusCode::NOT_FOUND => Ok(None),
@@ -2315,7 +2337,7 @@ impl Room {
             },
         }
     }
-*/
+
 
 
 

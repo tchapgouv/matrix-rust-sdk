@@ -86,6 +86,7 @@ pub enum StateEventContent {
     RoomTopic,
     SpaceChild,
     SpaceParent,
+    RoomAccessRule { rule: String }
 }
 
 impl TryFrom<AnySyncStateEvent> for StateEventContent {
