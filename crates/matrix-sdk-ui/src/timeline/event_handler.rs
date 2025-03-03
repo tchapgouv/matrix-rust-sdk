@@ -17,10 +17,7 @@ use std::{ops::ControlFlow, sync::Arc};
 use as_variant::as_variant;
 use indexmap::IndexMap;
 use matrix_sdk::{
-    crypto::types::events::UtdCause,
-    deserialized_responses::{EncryptionInfo, UnableToDecryptInfo},
-    ring_buffer::RingBuffer,
-    send_queue::SendHandle,
+    crypto::types::events::UtdCause, deserialized_responses::{EncryptionInfo, UnableToDecryptInfo}, ring_buffer::RingBuffer, room::access_rules::RoomAccessRulesEventContent, send_queue::SendHandle
 };
 use ruma::{
     events::{
@@ -31,11 +28,7 @@ use ruma::{
                 NewUnstablePollStartEventContent, NewUnstablePollStartEventContentWithoutRelation,
                 UnstablePollStartEventContent,
             },
-        },
-        reaction::ReactionEventContent,
-        receipt::Receipt,
-        relation::Replacement,
-        room::{
+        }, reaction::ReactionEventContent, receipt::Receipt, relation::Replacement, room::{
             encrypted::RoomEncryptedEventContent,
             member::RoomMemberEventContent,
             message::{Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
@@ -248,9 +241,31 @@ impl TimelineEventKind {
                         sender: ev.sender,
                     },
                 },
-                ev => Self::OtherState {
-                    state_key: ev.state_key().to_owned(),
-                    content: AnyOtherFullStateEventContent::with_event_content(ev.content()),
+                ev => {
+                    let ev_content = ev.content();
+                    let event_type_str = ev_content.event_type().to_string();
+                    match event_type_str.as_str() {
+                        "im.vector.room.access_rules" => {
+                            // let t: StateEventContent<RoomAccessRulesEventContent> = ev.into();
+                            // let src_event: RoomAccessRulesEventContent = ev.into();
+                            debug!("im.vector.room.access_rules - ev: {:?}", ev);
+                            
+                            debug!("im.vector.room.access_rules - ev_content: {:?}", ev_content);
+                            
+
+                            Self::OtherState {
+                                state_key: ev.state_key().to_owned(),
+                                content: AnyOtherFullStateEventContent::with_event_content(ev_content, Some("my-own-value".to_string()))
+                        }
+                    },
+                        _ => {
+                                Self::OtherState {
+                                state_key: ev.state_key().to_owned(),
+                                content: AnyOtherFullStateEventContent::with_event_content(ev_content, None)
+                            }
+                        }
+                    }
+                    
                 },
             },
         }
