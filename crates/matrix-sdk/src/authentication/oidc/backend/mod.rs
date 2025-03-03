@@ -17,7 +17,7 @@
 //! Used mostly for testing purposes.
 
 use mas_oidc_client::{
-    requests::authorization_code::{AuthorizationRequestData, AuthorizationValidationData},
+    requests::authorization_code::AuthorizationValidationData,
     types::{
         client_credentials::ClientCredentials,
         iana::oauth::OAuthTokenTypeHint,
@@ -28,7 +28,7 @@ use mas_oidc_client::{
 };
 use url::Url;
 
-use super::{AuthorizationCode, OidcError, OidcSessionTokens};
+use super::{AuthorizationCode, OauthDiscoveryError, OidcError, OidcSessionTokens};
 
 pub(crate) mod server;
 
@@ -44,9 +44,8 @@ pub(super) struct RefreshedSessionTokens {
 pub(super) trait OidcBackend: std::fmt::Debug + Send + Sync {
     async fn discover(
         &self,
-        issuer: &str,
         insecure: bool,
-    ) -> Result<VerifiedProviderMetadata, OidcError>;
+    ) -> Result<VerifiedProviderMetadata, OauthDiscoveryError>;
 
     async fn register_client(
         &self,
@@ -73,14 +72,6 @@ pub(super) trait OidcBackend: std::fmt::Debug + Send + Sync {
         latest_id_token: Option<IdToken<'static>>,
     ) -> Result<RefreshedSessionTokens, OidcError>;
 
-    async fn build_par_authorization_url(
-        &self,
-        client_credentials: ClientCredentials,
-        par_endpoint: &Url,
-        authorization_endpoint: Url,
-        authorization_data: AuthorizationRequestData,
-    ) -> Result<(Url, AuthorizationValidationData), OidcError>;
-
     async fn revoke_token(
         &self,
         client_credentials: ClientCredentials,
@@ -88,4 +79,29 @@ pub(super) trait OidcBackend: std::fmt::Debug + Send + Sync {
         token: String,
         token_type_hint: Option<OAuthTokenTypeHint>,
     ) -> Result<(), OidcError>;
+
+    #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+    async fn request_device_authorization(
+        &self,
+        device_authorization_endpoint: Url,
+        client_id: oauth2::ClientId,
+        scopes: Vec<oauth2::Scope>,
+    ) -> Result<
+        oauth2::StandardDeviceAuthorizationResponse,
+        oauth2::basic::BasicRequestTokenError<oauth2::HttpClientError<reqwest::Error>>,
+    >;
+
+    #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+    async fn exchange_device_code(
+        &self,
+        token_endpoint: Url,
+        client_id: oauth2::ClientId,
+        device_authorization_response: &oauth2::StandardDeviceAuthorizationResponse,
+    ) -> Result<
+        OidcSessionTokens,
+        oauth2::RequestTokenError<
+            oauth2::HttpClientError<reqwest::Error>,
+            oauth2::DeviceCodeErrorResponse,
+        >,
+    >;
 }

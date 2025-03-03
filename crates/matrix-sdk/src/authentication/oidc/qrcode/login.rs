@@ -17,28 +17,28 @@ use std::future::IntoFuture;
 use eyeball::SharedObservable;
 use futures_core::Stream;
 use mas_oidc_client::types::{
-    client_credentials::ClientCredentials, registration::VerifiedClientMetadata,
+    registration::VerifiedClientMetadata,
+    scope::{MatrixApiScopeToken, ScopeToken},
 };
 use matrix_sdk_base::{
     boxed_into_future,
     crypto::types::qr_login::{QrCodeData, QrCodeMode},
     SessionMeta,
 };
-use openidconnect::DeviceCodeErrorResponseType;
+use oauth2::{DeviceCodeErrorResponseType, Scope, StandardDeviceAuthorizationResponse};
 use ruma::OwnedDeviceId;
 use tracing::trace;
-use vodozemac::ecies::CheckCode;
+use vodozemac::{ecies::CheckCode, Curve25519PublicKey};
 
 use super::{
-    messages::LoginFailureReason, oidc_client::OidcClient, DeviceAuhorizationOidcError,
-    SecureChannelError,
+    messages::{LoginFailureReason, QrAuthMessage},
+    secure_channel::EstablishedSecureChannel,
+    DeviceAuthorizationOauthError, QRCodeLoginError, SecureChannelError,
 };
 #[cfg(doc)]
 use crate::authentication::oidc::Oidc;
 use crate::{
-    authentication::qrcode::{
-        messages::QrAuthMessage, secure_channel::EstablishedSecureChannel, QRCodeLoginError,
-    },
+    authentication::oidc::{OidcError, OidcSessionTokens},
     Client,
 };
 
@@ -66,11 +66,13 @@ pub enum LoginProgress {
         /// The check code we need to, out of band, send to the other device.
         check_code: CheckCode,
     },
-    /// We're waiting for the OIDC provider to give us the access token. This
-    /// will only happen if the other device allows the OIDC provider to so.
+    /// We're waiting for the OAuth 2.0 authorization server to give us the
+    /// access token. This will only happen if the other device allows the
+    /// OAuth 2.0 authorization server to do so.
     WaitingForToken {
-        /// The user code the OIDC provider has given us, the OIDC provider
-        /// might ask the other device to enter this code.
+        /// The user code the OAuth 2.0 authorization server has given us, the
+        /// OAuth 2.0 authorization server might ask the other device to
+        /// enter this code.
         user_code: String,
     },
     /// The login process has completed.
@@ -115,9 +117,9 @@ impl<'a> IntoFuture for LoginWithQrCode<'a> {
             let check_code = channel.check_code().to_owned();
             self.state.set(LoginProgress::EstablishingSecureChannel { check_code });
 
-            // Register the client with the OIDC provider.
-            trace!("Registering the client with the OIDC provider.");
-            let oidc_client = self.register_client().await?;
+            // Register the client with the OAuth 2.0 authorization server.
+            trace!("Registering the client with the OAuth 2.0 authorization server.");
+            self.register_client().await?;
 
             // We want to use the Curve25519 public key for the device ID, so let's generate
             // a new vodozemac `Account` now.
@@ -125,10 +127,10 @@ impl<'a> IntoFuture for LoginWithQrCode<'a> {
             let public_key = account.identity_keys().curve25519;
             let device_id = public_key;
 
-            // Let's tell the OIDC provider that we want to log in using the device
-            // authorization grant described in [RFC8628](https://datatracker.ietf.org/doc/html/rfc8628).
+            // Let's tell the OAuth 2.0 authorization server that we want to log in using
+            // the device authorization grant described in [RFC8628](https://datatracker.ietf.org/doc/html/rfc8628).
             trace!("Requesting device authorization.");
-            let auth_grant_response = oidc_client.request_device_authorization(device_id).await?;
+            let auth_grant_response = self.request_device_authorization(device_id).await?;
 
             // Now we need to inform the other device of the login protocols we picked and
             // the URL they should use to log us in.
@@ -155,17 +157,17 @@ impl<'a> IntoFuture for LoginWithQrCode<'a> {
                 }
             }
 
-            // The OIDC provider may or may not show this user code to double check that
-            // we're talking to the right OIDC provider. Let us display this, so
+            // The OAuth 2.0 authorization server may or may not show this user code to
+            // double check that we're talking to the right server. Let us display this, so
             // the other device can double check this as well.
             let user_code = auth_grant_response.user_code();
             self.state
                 .set(LoginProgress::WaitingForToken { user_code: user_code.secret().to_owned() });
 
-            // Let's now wait for the access token to be provided to use by the OIDC
-            // provider.
-            trace!("Waiting for the OIDC provider to give us the access token.");
-            let session_tokens = match oidc_client.wait_for_tokens(&auth_grant_response).await {
+            // Let's now wait for the access token to be provided to use by the OAuth 2.0
+            // authorization server.
+            trace!("Waiting for the OAuth 2.0 authorization server to give us the access token.");
+            let session_tokens = match self.wait_for_tokens(&auth_grant_response).await {
                 Ok(t) => t,
                 Err(e) => {
                     // If we received an error, and it's one of the ones we should report to the
@@ -192,11 +194,11 @@ impl<'a> IntoFuture for LoginWithQrCode<'a> {
             };
             self.client.oidc().set_session_tokens(session_tokens);
 
-            // We only received an access token from the OIDC provider, we have no clue who
-            // we are, so we need to figure out our user ID now.
-            // TODO: This snippet is almost the same as the Oidc::finish_login_method(), why
-            // is that method even a public method and not called as part of the set session
-            // tokens method.
+            // We only received an access token from the OAuth 2.0 authorization server, we
+            // have no clue who we are, so we need to figure out our user ID
+            // now. TODO: This snippet is almost the same as the
+            // Oidc::finish_login_method(), why is that method even a public
+            // method and not called as part of the set session tokens method.
             trace!("Discovering our own user id.");
             let whoami_response =
                 self.client.whoami().await.map_err(QRCodeLoginError::UserIdDiscovery)?;
@@ -290,69 +292,78 @@ impl<'a> LoginWithQrCode<'a> {
         Ok(channel)
     }
 
-    async fn register_client(&self) -> Result<OidcClient, DeviceAuhorizationOidcError> {
-        // Let's figure out the OIDC issuer, this fetches the info from the homeserver.
-        let issuer = self
-            .client
-            .oidc()
-            .fetch_authentication_issuer()
-            .await
-            .map_err(DeviceAuhorizationOidcError::AuthenticationIssuer)?;
+    /// Register the client with the OAuth 2.0 authorization server.
+    async fn register_client(&self) -> Result<(), DeviceAuthorizationOauthError> {
+        let oidc = self.client.oidc();
+        oidc.register_client(self.client_metadata.clone(), None).await?;
+        Ok(())
+    }
 
-        // Now we register the client with the OIDC provider.
-        let registration_response =
-            self.client.oidc().register_client(&issuer, self.client_metadata.clone(), None).await?;
+    async fn request_device_authorization(
+        &self,
+        device_id: Curve25519PublicKey,
+    ) -> Result<StandardDeviceAuthorizationResponse, DeviceAuthorizationOauthError> {
+        let scopes = [
+            ScopeToken::MatrixApi(MatrixApiScopeToken::Full),
+            ScopeToken::try_with_matrix_device(device_id.to_base64()).expect(
+                "We should be able to create a scope token from a \
+                 Curve25519 public key encoded as base64",
+            ),
+        ]
+        .into_iter()
+        .map(|scope| Scope::new(scope.to_string()))
+        .collect();
 
-        // Now we need to put the relevant data we got from the regustration response
-        // into the `Client`.
-        // TODO: Why isn't `oidc().register_client()` doing this automatically?
-        self.client.oidc().restore_registered_client(
-            issuer.clone(),
-            self.client_metadata.clone(),
-            ClientCredentials::None { client_id: registration_response.client_id.clone() },
-        );
+        let oidc = self.client.oidc();
+        let client_id =
+            oauth2::ClientId::new(oidc.client_id().ok_or(OidcError::NotRegistered)?.0.clone());
+        let server_metadata = oidc.provider_metadata().await.map_err(OidcError::from)?;
+        let device_authorization_endpoint =
+            server_metadata
+                .device_authorization_endpoint
+                .clone()
+                .ok_or(DeviceAuthorizationOauthError::NoDeviceAuthorizationEndpoint)?;
 
-        // We're now switching to the openidconnect crate, it has a bit of a strange API
-        // where you need to provide the HTTP client in every call you make.
-        let http_client = self.client.inner.http_client.clone();
+        let response = oidc
+            .backend
+            .request_device_authorization(device_authorization_endpoint, client_id, scopes)
+            .await?;
+        Ok(response)
+    }
 
-        OidcClient::new(
-            registration_response.client_id,
-            issuer,
-            http_client,
-            registration_response.client_secret.as_deref(),
-        )
-        .await
+    async fn wait_for_tokens(
+        &self,
+        auth_response: &StandardDeviceAuthorizationResponse,
+    ) -> Result<OidcSessionTokens, DeviceAuthorizationOauthError> {
+        let oidc = self.client.oidc();
+        let client_id =
+            oauth2::ClientId::new(oidc.client_id().ok_or(OidcError::NotRegistered)?.0.clone());
+        let server_metadata = oidc.provider_metadata().await.map_err(OidcError::from)?;
+        let token_endpoint = server_metadata.token_endpoint().clone();
+
+        let tokens =
+            oidc.backend.exchange_device_code(token_endpoint, client_id, auth_response).await?;
+        Ok(tokens)
     }
 }
 
 #[cfg(test)]
 mod test {
-    use assert_matches2::assert_let;
+    use assert_matches2::{assert_let, assert_matches};
     use futures_util::{join, StreamExt};
-    use mas_oidc_client::types::{
-        iana::oauth::OAuthClientAuthenticationMethod,
-        oidc::ApplicationType,
-        registration::{ClientMetadata, Localized},
-        requests::GrantType,
-    };
     use matrix_sdk_base::crypto::types::{qr_login::QrCodeModeData, SecretsBundle};
-    use matrix_sdk_test::{async_test, test_json};
-    use serde_json::{json, Value};
-    use url::Url;
-    use wiremock::{
-        matchers::{header, method, path},
-        Mock, MockServer, ResponseTemplate,
-    };
+    use matrix_sdk_test::async_test;
+    use serde_json::json;
 
     use super::*;
     use crate::{
-        authentication::qrcode::{
+        authentication::oidc::qrcode::{
             messages::LoginProtocolType,
             secure_channel::{test::MockedRendezvousServer, SecureChannel},
         },
         config::RequestConfig,
         http_client::HttpClient,
+        test_utils::{client::oauth::mock_client_metadata, mocks::MatrixMockServer},
     };
 
     enum AliceBehaviour {
@@ -363,202 +374,11 @@ mod test {
         RefuseSecrets,
     }
 
-    fn client_metadata() -> VerifiedClientMetadata {
-        let client_uri = Url::parse("https://github.com/matrix-org/matrix-rust-sdk")
-            .expect("Couldn't parse client URI");
-
-        ClientMetadata {
-            application_type: Some(ApplicationType::Native),
-            redirect_uris: None,
-            grant_types: Some(vec![GrantType::DeviceCode]),
-            token_endpoint_auth_method: Some(OAuthClientAuthenticationMethod::None),
-            client_name: Some(Localized::new("test-matrix-rust-sdk-qrlogin".to_owned(), [])),
-            contacts: Some(vec!["root@127.0.0.1".to_owned()]),
-            client_uri: Some(Localized::new(client_uri.clone(), [])),
-            policy_uri: Some(Localized::new(client_uri.clone(), [])),
-            tos_uri: Some(Localized::new(client_uri, [])),
-            ..Default::default()
-        }
-        .validate()
-        .unwrap()
-    }
-
-    fn open_id_configuration(server: &MockServer) -> Value {
-        let issuer_url =
-            Url::parse(&server.uri()).expect("We should be able to parse the example homeserver");
-        let account_management_uri = issuer_url.join("account").unwrap();
-        let authorization_endpoint = issuer_url.join("authorize").unwrap();
-        let device_authorization_endpoint = issuer_url.join("oauth2/device").unwrap();
-        let jwks_url = issuer_url.join("oauth2/keys.json").unwrap();
-        let registration_endpoint = issuer_url.join("oauth2/registration").unwrap();
-        let token_endpoint = issuer_url.join("oauth2/token").unwrap();
-
-        json!({
-            "account_management_actions_supported": [
-                "org.matrix.profile",
-                "org.matrix.sessions_list",
-                "org.matrix.session_view",
-                "org.matrix.session_end",
-                "org.matrix.cross_signing_reset"
-            ],
-            "account_management_uri": account_management_uri,
-            "authorization_endpoint": authorization_endpoint,
-            "claim_types_supported": [
-                "normal"
-            ],
-            "claims_parameter_supported": false,
-            "claims_supported": [
-                "iss",
-                "sub",
-                "aud",
-                "iat",
-                "exp",
-                "nonce",
-                "auth_time",
-                "at_hash",
-                "c_hash"
-            ],
-            "code_challenge_methods_supported": [
-                "plain",
-                "S256"
-            ],
-            "device_authorization_endpoint": device_authorization_endpoint,
-            "display_values_supported": [
-                "page"
-            ],
-            "grant_types_supported": [
-                "authorization_code",
-                "refresh_token",
-                "client_credentials",
-                "urn:ietf:params:oauth:grant-type:device_code"
-            ],
-            "id_token_signing_alg_values_supported": [
-                "RS256",
-                "RS384",
-                "RS512",
-                "ES256",
-                "ES384",
-                "PS256",
-                "PS384",
-                "PS512",
-                "ES256K"
-            ],
-            "issuer": issuer_url.to_string().trim_end_matches("/"),
-            "jwks_uri": jwks_url,
-            "prompt_values_supported": [
-                "none",
-                "login",
-                "create"
-            ],
-            "registration_endpoint": registration_endpoint,
-            "request_parameter_supported": false,
-            "request_uri_parameter_supported": false,
-            "response_modes_supported": [
-                "form_post",
-                "query",
-                "fragment"
-            ],
-            "response_types_supported": [
-                "code",
-                "id_token",
-                "code id_token"
-            ],
-            "scopes_supported": [
-                "openid",
-                "email"
-            ],
-            "subject_types_supported": [
-                "public"
-            ],
-            "token_endpoint": token_endpoint,
-            "token_endpoint_auth_methods_supported": [
-                "client_secret_basic",
-                "client_secret_post",
-                "client_secret_jwt",
-                "private_key_jwt",
-                "none"
-            ],
-        })
-    }
-
-    fn keys_json() -> Value {
-        json!({
-            "keys": [
-                {
-                    "e": "AQAB",
-                    "kid": "hxdHWoF9mn",
-                    "kty": "RSA",
-                    "n": "u4op7tDV41j-f_-DqsqjjCObiySB0q2CGS1JVjJXbV5jctHP6Wp_oMb2aIImMdHDcnTvxaID\
-                        WwuKA8o-0SBfkHFifMHHRvePz_l7NxxUMyGX8Bfu_EVkECe50BXpFydcEEl1eIIsPW-F0WJKFYR\
-                        5cscmBgRX3zv_w7WFbaOLh711S9DNu21epdSvFSrKRe9oG_FbeOFfDl-YU7BLGFvEozg9Z3hKF\
-                        SomOlz-t3ABvRUweGuLCpHFKsI6yhGCoqPyS7o5gpfenizdfHLqq-l7kgyr7lSbW_mTSyYutby\
-                        DpQ_HM98Lt-4a9zwlGfiqPS3svkH6KSd1mBcayCI0Cm9FuQ",
-                    "use": "sig"
-                },
-                {
-                    "crv": "P-256",
-                    "kid": "IRbxoGCBjs",
-                    "kty": "EC",
-                    "use": "sig",
-                    "x": "1AYfsklcgvscvJiNZ1Og7vQePzIBf-flJKlANWJ7D4g",
-                    "y": "L4b-jMZVZlnLhXCpV0EOc6zdEz1e6ONgKQZVE3jOBhY"
-                },
-                {
-                    "crv": "P-384",
-                    "kid": "FjEZp4JjqW",
-                    "kty": "EC",
-                    "use": "sig",
-                    "x": "bZP2bPUEQGeGaDICINswZSTCHdoVmDD3LIJE1Szxw27ruCJBW-sy_lY3dhA2FjWm",
-                    "y": "3HMgAu___-4JG9IXZFXwzr5nU_GUPvmWJHqgS7vzK1S91s0v1GXiqQMHwYA0keYG"
-                },
-                {
-                    "crv": "secp256k1",
-                    "kid": "7ohCuHzgqB",
-                    "kty": "EC",
-                    "use": "sig",
-                    "x": "80KXhBY8JBy8qO9-wMBaGtgOgtagowHJ4dDGfVr4eVw",
-                    "y": "0ALeT-J40AjdIS4S1YDgMrPkyE_rnw9wVm7Dvz_9Np4"
-                }
-            ]
-        })
-    }
-
-    fn device_code(server: &MockServer) -> Value {
-        let issuer_url =
-            Url::parse(&server.uri()).expect("We should be able to parse the example homeserver");
-        let verification_uri = issuer_url.join("link").unwrap();
-        let mut verification_uri_complete = issuer_url.join("link").unwrap();
-        verification_uri_complete.set_query(Some("code=N32YVC"));
-
-        json!({
-            "device_code": "N8NAYD9fOhMulpm37mSthx0xSw2p7vdR",
-            "expires_in": 1200,
-            "interval": 5,
-            "user_code": "N32YVC",
-            "verification_uri": verification_uri,
-            "verification_uri_complete": verification_uri_complete,
-        })
-    }
-
-    fn token() -> Value {
-        json!({
-            "access_token": "mat_z65RpDAbvR5aTr7MzD0aPw40xFbwch_09xTgn",
-            "expires_in": 300,
-            "id_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6Imh4ZEhXb0Y5bW4ifQ.eyJhdWQiOiIwMUhZRlpEQ1\
-                BTV1dCREVWWkQyRlRBUVlFViIsInN1YiI6IjAxSFYxNzNTSjQxUDBGMFgxQ0FRU1lBVENQIiwiaWF0IjoxN\
-                zE2Mzc1NzIwLCJpc3MiOiJodHRwczovL2F1dGgtb2lkYy5sYWIuZWxlbWVudC5kZXYvIiwiZXhwIjoxNzE2\
-                Mzc5MzIwLCJhdF9oYXNoIjoieGZIS21qQW83cEVCRmUwTkM5ODJEQSJ9.HQs7Si5gU_5tm2hYaCa3jg0kPO\
-                MXGNdpV88MWzG6N9x3yXK0ZGgn58i38HiQTbiyPuhw8OH6baMSjbcVP-KXSDpsSPZbkmp7Ozb50dC0eIebD\
-                aVK0EyZ35KQRVc5BFPQBPbq0r_TrcUgjoLRKpoexvdmjfEb2dE-kKse25jfs-bTHKP6jeAyFgR9Emn0RfVx\
-                32He32-bRP1NfkBnPNnJse32tF1o8gs7zG-cm7kSUx1wiQbvfSGfETx_mJ-aFGABbVGKQlTrCe32HUTvNbp\
-                tT2WXa1t7d3eDuEV_6hZS9LFRdIXhgEcGIZMz_ss3WQsSOKN8Yq2NC8_bNxRAQ-1J3A",
-            "refresh_token": "mar_CHFh124AMHsdishuHgLSx1svdKMVQA_080gj2",
-            "scope": "openid \
-                urn:matrix:org.matrix.msc2967.client:api:* \
-                urn:matrix:org.matrix.msc2967.client:device:\
-                lKa+6As0PSFtqOMKALottO6hlt3gCpZtaVfHanSUnEE",
-            "token_type": "Bearer"
-        })
+    /// The possible token responses.
+    enum TokenResponse {
+        Ok,
+        AccessDenied,
+        ExpiredToken,
     }
 
     fn secrets_bundle() -> SecretsBundle {
@@ -625,90 +445,28 @@ mod test {
         alice.send_json(message).await.unwrap();
     }
 
-    async fn mock_oidc_provider(server: &MockServer, token_response: ResponseTemplate) {
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/unstable/org.matrix.msc2965/auth_issuer"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "issuer": server.uri(),
-
-            })))
-            .expect(1)
-            .mount(server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/.well-known/openid-configuration"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(open_id_configuration(server)))
-            .expect(1..)
-            .mount(server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/oauth2/registration"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "client_id": "01HYFZDCPSWWBDEVZD2FTAQYEV",
-                "client_id_issued_at": 1716375696
-            })))
-            .expect(1)
-            .mount(server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/oauth2/keys.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(keys_json()))
-            .expect(1)
-            .mount(server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/oauth2/device"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(device_code(server)))
-            .expect(1)
-            .mount(server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/oauth2/token"))
-            .respond_with(token_response)
-            .mount(server)
-            .await;
-    }
-
     #[async_test]
     async fn test_qr_login() {
-        let server = MockServer::start().await;
-        let rendezvous_server = MockedRendezvousServer::new(&server, "abcdEFG12345").await;
+        let server = MatrixMockServer::new().await;
+        let rendezvous_server = MockedRendezvousServer::new(server.server(), "abcdEFG12345").await;
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
-        mock_oidc_provider(&server, ResponseTemplate::new(200).set_body_json(token())).await;
-
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/r0/account/whoami"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::WHOAMI))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/versions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/_matrix/client/r0/keys/upload"))
-            .and(header("authorization", "Bearer mat_z65RpDAbvR5aTr7MzD0aPw40xFbwch_09xTgn"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::KEYS_UPLOAD))
+        let oauth_server = server.oauth();
+        oauth_server.mock_server_metadata().ok().expect(1..).named("server_metadata").mount().await;
+        oauth_server.mock_registration().ok().expect(1).named("registration").mount().await;
+        oauth_server
+            .mock_device_authorization()
+            .ok()
             .expect(1)
-            .mount(&server)
+            .named("device_authorization")
+            .mount()
             .await;
+        oauth_server.mock_token().ok().expect(1).named("token").mount().await;
 
-        Mock::given(method("POST"))
-            .and(path("/_matrix/client/r0/keys/query"))
-            .and(header("authorization", "Bearer mat_z65RpDAbvR5aTr7MzD0aPw40xFbwch_09xTgn"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-            .expect(1)
-            .mount(&server)
-            .await;
+        server.mock_versions().ok().expect(1..).named("versions").mount().await;
+        server.mock_who_am_i().ok().expect(1).named("whoami").mount().await;
+        server.mock_upload_keys().ok().expect(1).named("upload_keys").mount().await;
+        server.mock_query_keys().ok().expect(1).named("query_keys").mount().await;
 
         let client = HttpClient::new(reqwest::Client::new(), Default::default());
         let alice = SecureChannel::new(client, &rendezvous_server.homeserver_url)
@@ -727,7 +485,7 @@ mod test {
         let qr_code = alice.qr_code_data().clone();
 
         let oidc = bob.oidc();
-        let login_bob = oidc.login_with_qr_code(&qr_code, client_metadata());
+        let login_bob = oidc.login_with_qr_code(&qr_code, mock_client_metadata());
         let mut updates = login_bob.subscribe_to_progress();
 
         let updates_task = tokio::spawn(async move {
@@ -768,26 +526,34 @@ mod test {
     }
 
     async fn test_failure(
-        token_response: ResponseTemplate,
+        token_response: TokenResponse,
         alice_behavior: AliceBehaviour,
     ) -> Result<(), QRCodeLoginError> {
-        let server = MockServer::start().await;
-        let rendezvous_server = MockedRendezvousServer::new(&server, "abcdEFG12345").await;
+        let server = MatrixMockServer::new().await;
+        let rendezvous_server = MockedRendezvousServer::new(server.server(), "abcdEFG12345").await;
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
-        mock_oidc_provider(&server, token_response).await;
-
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/r0/account/whoami"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::WHOAMI))
-            .mount(&server)
+        let oauth_server = server.oauth();
+        oauth_server.mock_server_metadata().ok().expect(1..).named("server_metadata").mount().await;
+        oauth_server.mock_registration().ok().expect(1).named("registration").mount().await;
+        oauth_server
+            .mock_device_authorization()
+            .ok()
+            .expect(1)
+            .named("device_authorization")
+            .mount()
             .await;
 
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/versions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
-            .mount(&server)
-            .await;
+        let token_mock = oauth_server.mock_token();
+        let token_mock = match token_response {
+            TokenResponse::Ok => token_mock.ok(),
+            TokenResponse::AccessDenied => token_mock.access_denied(),
+            TokenResponse::ExpiredToken => token_mock.expired_token(),
+        };
+        token_mock.named("token").mount().await;
+
+        server.mock_versions().ok().named("versions").mount().await;
+        server.mock_who_am_i().ok().named("whoami").mount().await;
 
         let client = HttpClient::new(reqwest::Client::new(), Default::default());
         let alice = SecureChannel::new(client, &rendezvous_server.homeserver_url)
@@ -806,7 +572,7 @@ mod test {
         let qr_code = alice.qr_code_data().clone();
 
         let oidc = bob.oidc();
-        let login_bob = oidc.login_with_qr_code(&qr_code, client_metadata());
+        let login_bob = oidc.login_with_qr_code(&qr_code, mock_client_metadata());
         let mut updates = login_bob.subscribe_to_progress();
 
         let _updates_task = tokio::spawn(async move {
@@ -833,15 +599,9 @@ mod test {
 
     #[async_test]
     async fn test_qr_login_refused_access_token() {
-        let result = test_failure(
-            ResponseTemplate::new(400).set_body_json(json!({
-                "error": "access_denied",
-            })),
-            AliceBehaviour::HappyPath,
-        )
-        .await;
+        let result = test_failure(TokenResponse::AccessDenied, AliceBehaviour::HappyPath).await;
 
-        assert_let!(Err(QRCodeLoginError::Oidc(e)) = result);
+        assert_let!(Err(QRCodeLoginError::Oauth(e)) = result);
         assert_eq!(
             e.as_request_token_error(),
             Some(&DeviceCodeErrorResponseType::AccessDenied),
@@ -851,15 +611,9 @@ mod test {
 
     #[async_test]
     async fn test_qr_login_expired_token() {
-        let result = test_failure(
-            ResponseTemplate::new(400).set_body_json(json!({
-                "error": "expired_token",
-            })),
-            AliceBehaviour::HappyPath,
-        )
-        .await;
+        let result = test_failure(TokenResponse::ExpiredToken, AliceBehaviour::HappyPath).await;
 
-        assert_let!(Err(QRCodeLoginError::Oidc(e)) = result);
+        assert_let!(Err(QRCodeLoginError::Oauth(e)) = result);
         assert_eq!(
             e.as_request_token_error(),
             Some(&DeviceCodeErrorResponseType::ExpiredToken),
@@ -869,11 +623,7 @@ mod test {
 
     #[async_test]
     async fn test_qr_login_declined_protocol() {
-        let result = test_failure(
-            ResponseTemplate::new(200).set_body_json(token()),
-            AliceBehaviour::DeclinedProtocol,
-        )
-        .await;
+        let result = test_failure(TokenResponse::Ok, AliceBehaviour::DeclinedProtocol).await;
 
         assert_let!(Err(QRCodeLoginError::LoginFailure { reason, .. }) = result);
         assert_eq!(
@@ -885,11 +635,7 @@ mod test {
 
     #[async_test]
     async fn test_qr_login_unexpected_message() {
-        let result = test_failure(
-            ResponseTemplate::new(200).set_body_json(token()),
-            AliceBehaviour::UnexpectedMessage,
-        )
-        .await;
+        let result = test_failure(TokenResponse::Ok, AliceBehaviour::UnexpectedMessage).await;
 
         assert_let!(Err(QRCodeLoginError::UnexpectedMessage { expected, .. }) = result);
         assert_eq!(expected, "m.login.protocol_accepted");
@@ -897,11 +643,9 @@ mod test {
 
     #[async_test]
     async fn test_qr_login_unexpected_message_instead_of_secrets() {
-        let result = test_failure(
-            ResponseTemplate::new(200).set_body_json(token()),
-            AliceBehaviour::UnexpectedMessageInsteadOfSecrets,
-        )
-        .await;
+        let result =
+            test_failure(TokenResponse::Ok, AliceBehaviour::UnexpectedMessageInsteadOfSecrets)
+                .await;
 
         assert_let!(Err(QRCodeLoginError::UnexpectedMessage { expected, .. }) = result);
         assert_eq!(expected, "m.login.secrets");
@@ -909,13 +653,77 @@ mod test {
 
     #[async_test]
     async fn test_qr_login_refuse_secrets() {
-        let result = test_failure(
-            ResponseTemplate::new(200).set_body_json(token()),
-            AliceBehaviour::RefuseSecrets,
-        )
-        .await;
+        let result = test_failure(TokenResponse::Ok, AliceBehaviour::RefuseSecrets).await;
 
         assert_let!(Err(QRCodeLoginError::LoginFailure { reason, .. }) = result);
         assert_eq!(reason, LoginFailureReason::DeviceNotFound);
+    }
+
+    #[async_test]
+    async fn test_device_authorization_endpoint_missing() {
+        let server = MatrixMockServer::new().await;
+        let rendezvous_server = MockedRendezvousServer::new(server.server(), "abcdEFG12345").await;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+
+        let oauth_server = server.oauth();
+        oauth_server
+            .mock_server_metadata()
+            .ok_without_device_authorization()
+            .expect(1..)
+            .named("server_metadata")
+            .mount()
+            .await;
+        oauth_server.mock_registration().ok().expect(1).named("registration").mount().await;
+
+        server.mock_versions().ok().named("versions").mount().await;
+        server.mock_who_am_i().ok().named("whoami").mount().await;
+
+        let client = HttpClient::new(reqwest::Client::new(), Default::default());
+        let alice = SecureChannel::new(client, &rendezvous_server.homeserver_url)
+            .await
+            .expect("Alice should be able to create a secure channel.");
+
+        assert_let!(QrCodeModeData::Reciprocate { server_name } = &alice.qr_code_data().mode_data);
+
+        let bob = Client::builder()
+            .server_name_or_homeserver_url(server_name)
+            .request_config(RequestConfig::new().disable_retry())
+            .build()
+            .await
+            .expect("We should be able to build the Client object from the URL in the QR code");
+
+        let qr_code = alice.qr_code_data().clone();
+
+        let oidc = bob.oidc();
+        let login_bob = oidc.login_with_qr_code(&qr_code, mock_client_metadata());
+        let mut updates = login_bob.subscribe_to_progress();
+
+        let _updates_task = tokio::spawn(async move {
+            let mut sender = Some(sender);
+
+            while let Some(update) = updates.next().await {
+                match update {
+                    LoginProgress::EstablishingSecureChannel { check_code } => {
+                        sender
+                                .take()
+                                .expect("The establishing secure channel update should be received only once")
+                                .send(check_code)
+                                .expect("Bob should be able to send the check code to Alice");
+                    }
+                    LoginProgress::Done => break,
+                    _ => (),
+                }
+            }
+        });
+        let _alice_task =
+            tokio::spawn(
+                async move { grant_login(alice, receiver, AliceBehaviour::HappyPath).await },
+            );
+        let error = login_bob.await.unwrap_err();
+
+        assert_matches!(
+            error,
+            QRCodeLoginError::Oauth(DeviceAuthorizationOauthError::NoDeviceAuthorizationEndpoint)
+        );
     }
 }

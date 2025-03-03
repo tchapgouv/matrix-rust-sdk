@@ -74,7 +74,7 @@ use ruma::{
         read_marker::set_read_marker,
         receipt::create_receipt,
         redact::redact_event,
-        room::{get_room_event, report_content},
+        room::{get_room_event, report_content, report_room},
         state::{get_state_events_for_key, send_state_event},
         tag::{create_tag, delete_tag},
         typing::create_typing_event::{self, v3::Typing},
@@ -85,6 +85,7 @@ use ruma::{
         beacon_info::BeaconInfoEventContent,
         call::notify::{ApplicationType, CallNotifyEventContent, NotifyType},
         direct::DirectEventContent,
+        macros::EventContent,
         marked_unread::{MarkedUnreadEventContent, UnstableMarkedUnreadEventContent},
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
@@ -121,6 +122,7 @@ use ruma::{
     OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
@@ -2970,11 +2972,14 @@ impl Room {
     ///
     /// This communicates to the homeserver that it should forget the room.
     ///
-    /// Only left rooms can be forgotten.
+    /// Only left or banned-from rooms can be forgotten.
     pub async fn forget(&self) -> Result<()> {
         let state = self.state();
-        if state != RoomState::Left {
-            return Err(Error::WrongRoomState(WrongRoomState::new("Left", state)));
+        match state {
+            RoomState::Joined | RoomState::Invited | RoomState::Knocked => {
+                return Err(Error::WrongRoomState(WrongRoomState::new("Left / Banned", state)));
+            }
+            RoomState::Left | RoomState::Banned => {}
         }
 
         let request = forget_room::v3::Request::new(self.inner.room_id().to_owned());
@@ -3089,6 +3094,23 @@ impl Room {
             score.map(Into::into),
             reason,
         );
+        Ok(self.client.send(request).await?)
+    }
+
+    /// Reports a room as inappropriate to the server.
+    /// The caller is not required to be joined to the room to report it.
+    ///
+    /// # Arguments
+    ///
+    /// * `reason` - The reason the room is being reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the room is not found or on rate limit
+    pub async fn report_room(&self, reason: Option<String>) -> Result<report_room::v3::Response> {
+        let mut request = report_room::v3::Request::new(self.inner.room_id().to_owned());
+        request.reason = reason;
+
         Ok(self.client.send(request).await?)
     }
 
@@ -3770,6 +3792,24 @@ impl TryFrom<Int> for ReportedContentScore {
 #[derive(Debug, Clone, Error)]
 #[error("out of range conversion attempted")]
 pub struct TryFromReportedContentScoreError(());
+
+/// RoomAccessRules custom StateEvent:
+#[derive(Clone, Debug, Deserialize, Serialize, EventContent)]
+#[ruma_event(
+    type = "im.vector.room.access_rules",
+    kind = State,
+    state_key_type = EmptyStateKey,
+)]
+pub struct RoomAccessRulesEventContent {
+    /// The rule value.
+    pub rule: String,
+}
+impl RoomAccessRulesEventContent {
+    /// Creates a new `RoomAccessRulesEventContent` with the given rule.
+    pub fn new(rule: String) -> Self {
+        Self { rule }
+    }
+}
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {

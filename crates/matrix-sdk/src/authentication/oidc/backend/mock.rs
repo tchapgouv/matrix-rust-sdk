@@ -19,17 +19,15 @@ use std::sync::{Arc, Mutex};
 use http::StatusCode;
 use mas_oidc_client::{
     error::{
-        DiscoveryError,
-        Error::{self as OidcClientError, Discovery},
-        ErrorBody as OidcErrorBody, HttpError as OidcHttpError, TokenRefreshError,
-        TokenRequestError,
+        DiscoveryError as OidcDiscoveryError, Error as OidcClientError, ErrorBody as OidcErrorBody,
+        HttpError as OidcHttpError, TokenRefreshError, TokenRequestError,
     },
-    requests::authorization_code::{AuthorizationRequestData, AuthorizationValidationData},
+    requests::authorization_code::AuthorizationValidationData,
     types::{
         client_credentials::ClientCredentials,
         errors::ClientErrorCode,
         iana::oauth::OAuthTokenTypeHint,
-        oidc::{ProviderMetadata, ProviderMetadataVerificationError, VerifiedProviderMetadata},
+        oidc::{ProviderMetadataVerificationError, VerifiedProviderMetadata},
         registration::{ClientRegistrationResponse, VerifiedClientMetadata},
         IdToken,
     },
@@ -37,30 +35,18 @@ use mas_oidc_client::{
 use url::Url;
 
 use super::{OidcBackend, OidcError, RefreshedSessionTokens};
-use crate::authentication::oidc::{AuthorizationCode, OidcSessionTokens};
+use crate::{
+    authentication::oidc::{AuthorizationCode, OauthDiscoveryError, OidcSessionTokens},
+    test_utils::mocks::oauth::MockServerMetadataBuilder,
+};
 
 pub(crate) const ISSUER_URL: &str = "https://oidc.example.com/issuer";
-pub(crate) const AUTHORIZATION_URL: &str = "https://oidc.example.com/authorization";
-pub(crate) const REVOCATION_URL: &str = "https://oidc.example.com/revocation";
-pub(crate) const TOKEN_URL: &str = "https://oidc.example.com/token";
-pub(crate) const JWKS_URL: &str = "https://oidc.example.com/jwks";
+pub(crate) const CLIENT_ID: &str = "test_client_id";
 
 #[derive(Debug)]
 pub(crate) struct MockImpl {
     /// Must be an HTTPS URL.
     issuer: String,
-
-    /// Must be an HTTPS URL.
-    authorization_endpoint: String,
-
-    /// Must be an HTTPS URL.
-    token_endpoint: String,
-
-    /// Must be an HTTPS URL.
-    jwks_uri: String,
-
-    /// Must be an HTTPS URL.
-    revocation_endpoint: String,
 
     /// The next session tokens that will be returned by a login or refresh.
     next_session_tokens: Option<OidcSessionTokens>,
@@ -82,10 +68,6 @@ impl MockImpl {
     pub fn new() -> Self {
         Self {
             issuer: ISSUER_URL.to_owned(),
-            authorization_endpoint: AUTHORIZATION_URL.to_owned(),
-            token_endpoint: TOKEN_URL.to_owned(),
-            jwks_uri: JWKS_URL.to_owned(),
-            revocation_endpoint: REVOCATION_URL.to_owned(),
             next_session_tokens: None,
             expected_refresh_token: None,
             num_refreshes: Default::default(),
@@ -114,31 +96,22 @@ impl MockImpl {
 impl OidcBackend for MockImpl {
     async fn discover(
         &self,
-        issuer: &str,
         insecure: bool,
-    ) -> Result<VerifiedProviderMetadata, OidcError> {
+    ) -> Result<VerifiedProviderMetadata, OauthDiscoveryError> {
         if insecure != self.is_insecure {
-            return Err(OidcError::Oidc(Discovery(DiscoveryError::Validation(
+            return Err(OidcDiscoveryError::Validation(
                 ProviderMetadataVerificationError::UrlNonHttpsScheme(
                     "mocking backend",
                     Url::parse(&self.issuer).unwrap(),
                 ),
-            ))));
+            )
+            .into());
         }
 
-        Ok(ProviderMetadata {
-            issuer: Some(self.issuer.clone()),
-            authorization_endpoint: Some(Url::parse(&self.authorization_endpoint).unwrap()),
-            revocation_endpoint: Some(Url::parse(&self.revocation_endpoint).unwrap()),
-            token_endpoint: Some(Url::parse(&self.token_endpoint).unwrap()),
-            jwks_uri: Some(Url::parse(&self.jwks_uri).unwrap()),
-            response_types_supported: Some(vec![]),
-            subject_types_supported: Some(vec![]),
-            id_token_signing_alg_values_supported: Some(vec![]),
-            ..Default::default()
-        }
-        .validate(issuer)
-        .map_err(DiscoveryError::from)?)
+        Ok(MockServerMetadataBuilder::new(&self.issuer)
+            .build()
+            .validate(&self.issuer)
+            .expect("server metadata should pass validation"))
     }
 
     async fn trade_authorization_code_for_tokens(
@@ -162,17 +135,12 @@ impl OidcBackend for MockImpl {
         _client_metadata: VerifiedClientMetadata,
         _software_statement: Option<String>,
     ) -> Result<ClientRegistrationResponse, OidcError> {
-        unimplemented!()
-    }
-
-    async fn build_par_authorization_url(
-        &self,
-        _client_credentials: ClientCredentials,
-        _par_endpoint: &Url,
-        _authorization_endpoint: Url,
-        _authorization_data: AuthorizationRequestData,
-    ) -> Result<(Url, AuthorizationValidationData), OidcError> {
-        unimplemented!()
+        Ok(ClientRegistrationResponse {
+            client_id: CLIENT_ID.to_owned(),
+            client_secret: None,
+            client_id_issued_at: None,
+            client_secret_expires_at: None,
+        })
     }
 
     async fn revoke_token(
@@ -212,5 +180,34 @@ impl OidcBackend for MockImpl {
                 refresh_token: next_tokens.refresh_token,
             })
         }
+    }
+
+    #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+    async fn request_device_authorization(
+        &self,
+        _device_authorization_endpoint: Url,
+        _client_id: oauth2::ClientId,
+        _scopes: Vec<oauth2::Scope>,
+    ) -> Result<
+        oauth2::StandardDeviceAuthorizationResponse,
+        oauth2::basic::BasicRequestTokenError<oauth2::HttpClientError<reqwest::Error>>,
+    > {
+        unimplemented!()
+    }
+
+    #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
+    async fn exchange_device_code(
+        &self,
+        _token_endpoint: Url,
+        _client_id: oauth2::ClientId,
+        _device_authorization_response: &oauth2::StandardDeviceAuthorizationResponse,
+    ) -> Result<
+        OidcSessionTokens,
+        oauth2::RequestTokenError<
+            oauth2::HttpClientError<reqwest::Error>,
+            oauth2::DeviceCodeErrorResponse,
+        >,
+    > {
+        unimplemented!()
     }
 }

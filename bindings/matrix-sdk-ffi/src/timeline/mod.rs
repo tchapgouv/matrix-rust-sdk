@@ -25,11 +25,12 @@ use matrix_sdk::{
         BaseVideoInfo, Thumbnail,
     },
     deserialized_responses::{ShieldState as SdkShieldState, ShieldStateCode},
+    event_cache::RoomPaginationStatus,
     room::edit::EditedContent as SdkEditedContent,
     Error,
 };
 use matrix_sdk_ui::timeline::{
-    self, EventItemOrigin, LiveBackPaginationStatus, Profile, RepliedToEvent, TimelineDetails,
+    self, EventItemOrigin, Profile, RepliedToEvent, TimelineDetails,
     TimelineUniqueId as SdkTimelineUniqueId,
 };
 use mime::Mime;
@@ -757,7 +758,7 @@ pub trait TimelineListener: Sync + Send {
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait PaginationStatusListener: Sync + Send {
-    fn on_update(&self, status: LiveBackPaginationStatus);
+    fn on_update(&self, status: RoomPaginationStatus);
 }
 
 #[derive(Clone, uniffi::Object)]
@@ -1040,6 +1041,7 @@ pub struct EventTimelineItem {
 impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
     fn from(item: matrix_sdk_ui::timeline::EventTimelineItem) -> Self {
         let reactions = item
+            .content()
             .reactions()
             .iter()
             .map(|(k, v)| Reaction {
