@@ -3793,23 +3793,6 @@ impl TryFrom<Int> for ReportedContentScore {
 #[error("out of range conversion attempted")]
 pub struct TryFromReportedContentScoreError(());
 
-/// RoomAccessRules custom StateEvent:
-#[derive(Clone, Debug, Deserialize, Serialize, EventContent)]
-#[ruma_event(
-    type = "im.vector.room.access_rules",
-    kind = State,
-    state_key_type = EmptyStateKey,
-)]
-pub struct RoomAccessRulesEventContent {
-    /// The rule value.
-    pub rule: String,
-}
-impl RoomAccessRulesEventContent {
-    /// Creates a new `RoomAccessRulesEventContent` with the given rule.
-    pub fn new(rule: String) -> Self {
-        Self { rule }
-    }
-}
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
