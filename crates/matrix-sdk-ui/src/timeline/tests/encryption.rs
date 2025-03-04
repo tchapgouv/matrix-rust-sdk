@@ -30,7 +30,7 @@ use matrix_sdk::{
     crypto::{decrypt_room_key_export, types::events::UtdCause, OlmMachine},
     test_utils::test_client_builder,
 };
-use matrix_sdk_base::deserialized_responses::{SyncTimelineEvent, UnableToDecryptReason};
+use matrix_sdk_base::deserialized_responses::{TimelineEvent, UnableToDecryptReason};
 use matrix_sdk_test::{async_test, ALICE, BOB};
 use ruma::{
     assign, event_id,
@@ -48,7 +48,9 @@ use tokio::time::sleep;
 
 use super::TestTimeline;
 use crate::{
-    timeline::{EncryptedMessage, TimelineDetails, TimelineItemContent},
+    timeline::{
+        tests::TestTimelineBuilder, EncryptedMessage, TimelineDetails, TimelineItemContent,
+    },
     unable_to_decrypt_hook::{UnableToDecryptHook, UnableToDecryptInfo, UtdHookManager},
 };
 
@@ -84,7 +86,7 @@ async fn test_retry_message_decryption() {
     let client = test_client_builder(None).build().await.unwrap();
     let utd_hook = Arc::new(UtdHookManager::new(hook.clone(), client));
 
-    let timeline = TestTimeline::with_unable_to_decrypt_hook(utd_hook.clone());
+    let timeline = TestTimelineBuilder::new().unable_to_decrypt_hook(utd_hook.clone()).build();
     let mut stream = timeline.subscribe().await;
 
     let f = &timeline.factory;
@@ -127,7 +129,7 @@ async fn test_retry_message_decryption() {
     assert_eq!(session_id, SESSION_ID);
 
     assert_next_matches!(stream, VectorDiff::PushFront { value } => {
-        assert!(value.is_day_divider());
+        assert!(value.is_date_divider());
     });
 
     {
@@ -185,7 +187,7 @@ async fn test_false_positive_late_decryption_regression() {
     let utd_hook =
         Arc::new(UtdHookManager::new(hook.clone(), client).with_max_delay(Duration::from_secs(1)));
 
-    let timeline = TestTimeline::with_unable_to_decrypt_hook(utd_hook.clone());
+    let timeline = TestTimelineBuilder::new().unable_to_decrypt_hook(utd_hook.clone()).build();
 
     let f = &timeline.factory;
     timeline
@@ -348,6 +350,7 @@ async fn test_retry_edit_decryption() {
     let item = items[1].as_event().unwrap();
 
     assert_matches!(item.encryption_info(), Some(_));
+    assert_matches!(item.latest_edit_json(), Some(_));
     assert_let!(TimelineItemContent::Message(msg) = item.content());
     assert!(msg.is_edited());
     assert_eq!(msg.body(), "This is Error");
@@ -451,11 +454,10 @@ async fn test_retry_edit_and_more() {
 
     let timeline_items = timeline.controller.items().await;
     assert_eq!(timeline_items.len(), 3);
-    assert!(timeline_items[0].is_day_divider());
-    assert_eq!(
-        timeline_items[1].as_event().unwrap().content().as_message().unwrap().body(),
-        "edited"
-    );
+    assert!(timeline_items[0].is_date_divider());
+    let timeline_event = timeline_items[1].as_event().unwrap();
+    assert!(timeline_event.latest_edit_json().is_some());
+    assert_eq!(timeline_event.content().as_message().unwrap().body(), "edited");
     assert_eq!(
         timeline_items[2].as_event().unwrap().content().as_message().unwrap().body(),
         "Another message"
@@ -520,8 +522,8 @@ async fn test_retry_message_decryption_highlighted() {
     );
     assert_eq!(session_id, SESSION_ID);
 
-    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
-    assert!(day_divider.is_day_divider());
+    let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(date_divider.is_date_divider());
 
     let own_user_id = user_id!("@example:matrix.org");
     let exported_keys = decrypt_room_key_export(Cursor::new(SESSION_KEY), "1234").unwrap();
@@ -750,7 +752,7 @@ async fn test_retry_decryption_updates_response() {
     }
 }
 
-fn utd_event_with_unsigned(unsigned: serde_json::Value) -> SyncTimelineEvent {
+fn utd_event_with_unsigned(unsigned: serde_json::Value) -> TimelineEvent {
     let raw = Raw::from_json(
         to_raw_value(&json!({
             "event_id": "$myevent",
@@ -770,7 +772,7 @@ fn utd_event_with_unsigned(unsigned: serde_json::Value) -> SyncTimelineEvent {
         .unwrap(),
     );
 
-    SyncTimelineEvent::new_utd_event(
+    TimelineEvent::new_utd_event(
         raw,
         matrix_sdk::deserialized_responses::UnableToDecryptInfo {
             session_id: Some("SESSION_ID".into()),

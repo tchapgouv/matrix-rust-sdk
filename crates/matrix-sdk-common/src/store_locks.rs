@@ -46,11 +46,12 @@ use std::{
     time::Duration,
 };
 
-use tokio::{sync::Mutex, time::sleep};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, trace};
 
 use crate::{
     executor::{spawn, JoinHandle},
+    sleep::sleep,
     SendOutsideWasm,
 };
 
@@ -500,10 +501,9 @@ mod tests {
 /// Some code that is shared by almost all `MemoryStore` implementations out
 /// there.
 pub mod memory_store_helper {
-    use std::{
-        collections::{hash_map::Entry, HashMap},
-        time::{Duration, Instant},
-    };
+    use std::collections::{hash_map::Entry, HashMap};
+
+    use ruma::time::{Duration, Instant};
 
     pub fn try_take_leased_lock(
         leases: &mut HashMap<String, (String, Instant)>,

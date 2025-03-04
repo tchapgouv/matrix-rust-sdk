@@ -1,7 +1,7 @@
 use matrix_sdk::bwi_content_scanner::BWIScanMediaExt;
 use matrix_sdk::{
+    authentication::matrix::{MatrixSession, MatrixSessionTokens},
     config::RequestConfig,
-    matrix_auth::{MatrixSession, MatrixSessionTokens},
     media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
     test_utils::logged_in_client_with_server,
     Client, SessionMeta,

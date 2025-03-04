@@ -17,13 +17,13 @@ use std::sync::{Arc, Mutex};
 use assert_matches2::assert_let;
 use futures_util::StreamExt;
 use matrix_sdk::{
+    authentication::matrix::{MatrixSession, MatrixSessionTokens},
     config::RequestConfig,
     encryption::{
         backups::BackupState,
         recovery::{EnableProgress, RecoveryState},
         BackupDownloadStrategy, CrossSigningResetAuthType,
     },
-    matrix_auth::{MatrixSession, MatrixSessionTokens},
     test_utils::{no_retry_test_client_with_server, test_client_builder_with_server},
     Client,
 };
@@ -643,8 +643,16 @@ async fn test_recovery_disabling() {
                 ResponseTemplate::new(404)
             }
         })
-        .expect(2)
+        .expect(3)
         .named("m.secret_storage.default_key account data GET")
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path(format!("_matrix/client/r0/user/{user_id}/account_data/m.megolm_backup.v1",)))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1..)
         .mount(&server)
         .await;
 

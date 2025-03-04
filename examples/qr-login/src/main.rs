@@ -4,12 +4,14 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use futures_util::StreamExt;
 use matrix_sdk::{
-    authentication::qrcode::{LoginProgress, QrCodeData, QrCodeModeData},
-    oidc::types::{
-        iana::oauth::OAuthClientAuthenticationMethod,
-        oidc::ApplicationType,
-        registration::{ClientMetadata, Localized, VerifiedClientMetadata},
-        requests::GrantType,
+    authentication::oidc::{
+        qrcode::{LoginProgress, QrCodeData, QrCodeModeData},
+        types::{
+            iana::oauth::OAuthClientAuthenticationMethod,
+            oidc::ApplicationType,
+            registration::{ClientMetadata, Localized, VerifiedClientMetadata},
+            requests::GrantType,
+        },
     },
     Client,
 };

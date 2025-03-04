@@ -171,7 +171,7 @@ impl<'a> SenderDataFinder<'a> {
         room_key_event: &'a DecryptedRoomKeyEvent,
     ) -> Result<SenderData, SessionDeviceKeysCheckError> {
         // Does the to-device message contain the device_keys property from MSC4147?
-        if let Some(sender_device_keys) = &room_key_event.device_keys {
+        if let Some(sender_device_keys) = &room_key_event.sender_device_keys {
             // Yes: use the device keys to continue.
 
             // Validate the signature of the DeviceKeys supplied.
@@ -861,6 +861,7 @@ mod tests {
                 SenderData::unknown(),
                 EventEncryptionAlgorithm::MegolmV1AesSha2,
                 None,
+                false,
             )
             .unwrap();
             if options.session_is_imported {
@@ -1083,6 +1084,7 @@ mod tests {
                 room_id.to_owned(),
                 "mysession".to_owned(),
                 clone_session_key(session_key),
+                false,
             ))),
         )
     }

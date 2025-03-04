@@ -177,7 +177,7 @@ impl RoomList {
                         Box::new(new_sorter_recency()),
                         Box::new(new_sorter_name())
                     ]))
-                    .dynamic_limit_with_initial_value(page_size, limit_stream.clone());
+                    .dynamic_head_with_initial_value(page_size, limit_stream.clone());
 
                 // Clearing the stream before chaining with the real stream.
                 yield stream::once(ready(vec![VectorDiff::Reset { values }]))
@@ -254,7 +254,7 @@ fn merge_stream_and_receiver(
 /// When a [`RoomList`] is displayed to the user, it can be in various states.
 /// This enum tries to represent those states with a correct level of
 /// abstraction.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RoomListLoadingState {
     /// The [`RoomList`] has not been loaded yet, i.e. a sync might run
     /// or not run at all, there is nothing to show in this `RoomList` yet.

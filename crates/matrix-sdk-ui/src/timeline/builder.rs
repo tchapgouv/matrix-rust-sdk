@@ -14,14 +14,22 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
+use futures_util::{pin_mut, StreamExt};
+use matrix_sdk::{
+    encryption::backups::BackupState,
+    event_cache::{EventsOrigin, RoomEventCacheUpdate},
+    executor::spawn,
+    Room,
+};
+use ruma::{events::AnySyncTimelineEvent, RoomVersionId};
+use tokio::sync::broadcast::error::RecvError;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tracing::{info, info_span, trace, warn, Instrument, Span};
+
 use super::{
     controller::{TimelineController, TimelineSettings},
     to_device::{handle_forwarded_room_key_event, handle_room_key_event},
-    Error, Timeline, TimelineDropHandle, TimelineFocus,
-};
-use crate::{
-    timeline::{controller::TimelineNewItemPosition, event_item::RemoteEventOrigin},
-    unable_to_decrypt_hook::UtdHookManager,
+    DateDividerMode, Error, Timeline, TimelineDropHandle, TimelineFocus,
 };
 use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::bwi_content_scanner::BWIContentScannerWrapper;
@@ -34,6 +42,7 @@ use matrix_sdk::{
 use ruma::{events::AnySyncTimelineEvent, RoomVersionId};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{info, info_span, trace, warn, Instrument, Span};
+use crate::{timeline::event_item::RemoteEventOrigin, unable_to_decrypt_hook::UtdHookManager};
 
 /// Builder that allows creating and configuring various parts of a
 /// [`Timeline`].
@@ -86,6 +95,13 @@ impl TimelineBuilder {
     /// timeline IDs for this timeline.
     pub fn with_internal_id_prefix(mut self, prefix: String) -> Self {
         self.internal_id_prefix = Some(prefix);
+        self
+    }
+
+    /// Chose when to insert the date separators, either in between each day
+    /// or each month.
+    pub fn with_date_divider_mode(mut self, mode: DateDividerMode) -> Self {
+        self.settings.date_divider_mode = mode;
         self
     }
 
@@ -155,10 +171,11 @@ impl TimelineBuilder {
         event_cache.subscribe()?;
 
         let (room_event_cache, event_cache_drop) = room.event_cache().await?;
-        let (_, mut event_subscriber) = room_event_cache.subscribe().await?;
+        let (_, mut event_subscriber) = room_event_cache.subscribe().await;
 
+        let is_live = matches!(focus, TimelineFocus::Live);
         let is_pinned_events = matches!(focus, TimelineFocus::PinnedEvents { .. });
-        let is_room_encrypted = room.is_encrypted().await.ok();
+        let is_room_encrypted = room.is_encrypted().await.ok().unwrap_or_default();
 
         // BWI-specific
         let client = room.client();
@@ -242,15 +259,14 @@ impl TimelineBuilder {
                             //
                             // If we can't get a handle on the room cache's events, just clear the
                             // current timeline.
-                            match room_event_cache.subscribe().await {
-                                Ok((events, _)) => {
-                                    inner.replace_with_initial_remote_events(events.into_iter(), RemoteEventOrigin::Sync).await;
-                                }
-                                Err(err) => {
-                                    warn!("Error when re-inserting initial events into the timeline: {err}");
-                                    inner.clear().await;
-                                }
-                            }
+                            let (initial_events, _stream) = room_event_cache.subscribe().await;
+
+                            inner
+                                .replace_with_initial_remote_events(
+                                    initial_events.into_iter(),
+                                    RemoteEventOrigin::Sync,
+                                )
+                                .await;
 
                             continue;
                         }
@@ -262,28 +278,26 @@ impl TimelineBuilder {
                             inner.handle_fully_read_marker(event_id).await;
                         }
 
-                        RoomEventCacheUpdate::Clear => {
-                            if !inner.is_live().await {
-                                // Ignore a clear for a timeline not in the live mode; the
-                                // focused-on-event mode doesn't add any new items to the timeline
-                                // anyways.
+                        RoomEventCacheUpdate::UpdateTimelineEvents { diffs, origin } => {
+                            trace!("Received new timeline events diffs");
+
+                            // We shouldn't use the general way of adding events to timelines to
+                            // non-live timelines, such as pinned events or focused timeline.
+                            // These timelines should handle any live updates by themselves.
+                            if !is_live {
                                 continue;
                             }
 
-                            trace!("Clearing the timeline.");
-                            inner.clear().await;
-                        }
-
-                        RoomEventCacheUpdate::AddTimelineEvents { events, origin } => {
-                            trace!("Received new timeline events.");
-
-                            inner.add_events_at(
-                                events.into_iter(),
-                                TimelineNewItemPosition::End {                                    origin: match origin {
+                            inner
+                                .handle_remote_events_with_diffs(
+                                    diffs,
+                                    match origin {
                                         EventsOrigin::Sync => RemoteEventOrigin::Sync,
-                                    }
-                                }
-                            ).await;
+                                        EventsOrigin::Pagination => RemoteEventOrigin::Pagination,
+                                        EventsOrigin::Cache => RemoteEventOrigin::Cache,
+                                    },
+                                )
+                                .await;
                         }
 
                         RoomEventCacheUpdate::AddEphemeralEvents { events } => {
@@ -432,6 +446,47 @@ impl TimelineBuilder {
             })
         };
 
+        // TODO: Technically, this should be the only stream we need to listen to get
+        // notified when we should retry to decrypt an event. We sadly can't do that,
+        // since the cross-process support kills the `OlmMachine` which then in
+        // turn kills this stream. Once this is solved remove all the other ways we
+        // listen for room keys.
+        let room_keys_received_join_handle = {
+            let inner = controller.clone();
+            let stream = client.encryption().room_keys_received_stream().await.expect(
+                "We should be logged in by now, so we should have access to an OlmMachine \
+                 to be able to listen to this stream",
+            );
+
+            spawn(async move {
+                pin_mut!(stream);
+
+                while let Some(room_keys) = stream.next().await {
+                    let session_ids = match room_keys {
+                        Ok(room_keys) => {
+                            let session_ids: BTreeSet<String> = room_keys
+                                .into_iter()
+                                .filter(|info| info.room_id == inner.room().room_id())
+                                .map(|info| info.session_id)
+                                .collect();
+
+                            Some(session_ids)
+                        }
+                        Err(BroadcastStreamRecvError::Lagged(missed_updates)) => {
+                            // We lagged, let's retry to decrypt anything we have, maybe something
+                            // was received.
+                            warn!(missed_updates, "The room keys stream has lagged, retrying to decrypt the whole timeline");
+
+                            None
+                        }
+                    };
+
+                    let room = inner.room();
+                    inner.retry_event_decryption(room, session_ids).await;
+                }
+            })
+        };
+
         let timeline = Timeline {
             controller,
             event_cache: room_event_cache,
@@ -442,6 +497,7 @@ impl TimelineBuilder {
                 pinned_events_join_handle,
                 room_key_from_backups_join_handle,
                 room_key_backup_enabled_join_handle,
+                room_keys_received_join_handle,
                 local_echo_listener_handle,
                 _event_cache_drop_handle: event_cache_drop,
                 encryption_changes_handle,

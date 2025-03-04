@@ -4,11 +4,9 @@ use std::{
 };
 
 use eyeball_im::Vector;
-use matrix_sdk_base::{deserialized_responses::SyncTimelineEvent, sliding_sync::http};
-use ruma::{OwnedRoomId, RoomId};
+use matrix_sdk_base::deserialized_responses::TimelineEvent;
+use ruma::{api::client::sync::sync_events::v5 as http, OwnedRoomId, RoomId};
 use serde::{Deserialize, Serialize};
-
-use crate::Client;
 
 /// The state of a [`SlidingSyncRoom`].
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -40,14 +38,12 @@ pub struct SlidingSyncRoom {
 impl SlidingSyncRoom {
     /// Create a new `SlidingSyncRoom`.
     pub fn new(
-        client: Client,
         room_id: OwnedRoomId,
         prev_batch: Option<String>,
-        timeline: Vec<SyncTimelineEvent>,
+        timeline: Vec<TimelineEvent>,
     ) -> Self {
         Self {
             inner: Arc::new(SlidingSyncRoomInner {
-                client,
                 room_id,
                 state: RwLock::new(SlidingSyncRoomState::NotLoaded),
                 prev_batch: RwLock::new(prev_batch),
@@ -70,19 +66,14 @@ impl SlidingSyncRoom {
     ///
     /// Note: This API only exists temporarily, it *will* be removed in the
     /// future.
-    pub fn timeline_queue(&self) -> Vector<SyncTimelineEvent> {
+    pub fn timeline_queue(&self) -> Vector<TimelineEvent> {
         self.inner.timeline_queue.read().unwrap().clone()
-    }
-
-    /// Get a clone of the associated client.
-    pub fn client(&self) -> Client {
-        self.inner.client.clone()
     }
 
     pub(super) fn update(
         &mut self,
         room_data: http::response::Room,
-        timeline_updates: Vec<SyncTimelineEvent>,
+        timeline_updates: Vec<TimelineEvent>,
     ) {
         let http::response::Room { prev_batch, limited, .. } = room_data;
 
@@ -129,12 +120,11 @@ impl SlidingSyncRoom {
         *state = SlidingSyncRoomState::Loaded;
     }
 
-    pub(super) fn from_frozen(frozen_room: FrozenSlidingSyncRoom, client: Client) -> Self {
+    pub(super) fn from_frozen(frozen_room: FrozenSlidingSyncRoom) -> Self {
         let FrozenSlidingSyncRoom { room_id, prev_batch, timeline_queue } = frozen_room;
 
         Self {
             inner: Arc::new(SlidingSyncRoomInner {
-                client,
                 room_id,
                 prev_batch: RwLock::new(prev_batch),
                 state: RwLock::new(SlidingSyncRoomState::Preloaded),
@@ -157,9 +147,6 @@ impl SlidingSyncRoom {
 
 #[derive(Debug)]
 struct SlidingSyncRoomInner {
-    /// The client, used to fetch [`Room`][crate::Room].
-    client: Client,
-
     /// The room ID.
     room_id: OwnedRoomId,
 
@@ -178,7 +165,7 @@ struct SlidingSyncRoomInner {
     ///
     /// When persisting the room, this queue is truncated to keep only the last
     /// N events.
-    timeline_queue: RwLock<Vector<SyncTimelineEvent>>,
+    timeline_queue: RwLock<Vector<TimelineEvent>>,
 }
 
 /// A “frozen” [`SlidingSyncRoom`], i.e. that can be written into, or read from
@@ -189,7 +176,7 @@ pub(super) struct FrozenSlidingSyncRoom {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) prev_batch: Option<String>,
     #[serde(rename = "timeline")]
-    pub(super) timeline_queue: Vector<SyncTimelineEvent>,
+    pub(super) timeline_queue: Vector<TimelineEvent>,
 }
 
 /// Number of timeline events to keep when [`SlidingSyncRoom`] is saved in the
@@ -227,18 +214,13 @@ impl From<&SlidingSyncRoom> for FrozenSlidingSyncRoom {
 #[cfg(test)]
 mod tests {
     use imbl::vector;
-    use matrix_sdk_base::deserialized_responses::TimelineEvent;
-    use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
+    use matrix_sdk_common::deserialized_responses::TimelineEvent;
     use matrix_sdk_test::async_test;
     use ruma::{events::room::message::RoomMessageEventContent, room_id, serde::Raw, RoomId};
     use serde_json::json;
-    use wiremock::MockServer;
 
     use super::{http, NUMBER_OF_TIMELINE_EVENTS_TO_KEEP_FOR_THE_CACHE};
-    use crate::{
-        sliding_sync::{FrozenSlidingSyncRoom, SlidingSyncRoom, SlidingSyncRoomState},
-        test_utils::logged_in_client,
-    };
+    use crate::sliding_sync::{FrozenSlidingSyncRoom, SlidingSyncRoom, SlidingSyncRoomState};
 
     macro_rules! room_response {
         ( $( $json:tt )+ ) => {
@@ -248,24 +230,21 @@ mod tests {
         };
     }
 
-    async fn new_room(room_id: &RoomId, inner: http::response::Room) -> SlidingSyncRoom {
-        new_room_with_timeline(room_id, inner, vec![]).await
+    fn new_room(room_id: &RoomId, inner: http::response::Room) -> SlidingSyncRoom {
+        new_room_with_timeline(room_id, inner, vec![])
     }
 
-    async fn new_room_with_timeline(
+    fn new_room_with_timeline(
         room_id: &RoomId,
         inner: http::response::Room,
-        timeline: Vec<SyncTimelineEvent>,
+        timeline: Vec<TimelineEvent>,
     ) -> SlidingSyncRoom {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
-
-        SlidingSyncRoom::new(client, room_id.to_owned(), inner.prev_batch, timeline)
+        SlidingSyncRoom::new(room_id.to_owned(), inner.prev_batch, timeline)
     }
 
     #[async_test]
     async fn test_state_from_not_loaded() {
-        let mut room = new_room(room_id!("!foo:bar.org"), room_response!({})).await;
+        let mut room = new_room(room_id!("!foo:bar.org"), room_response!({}));
 
         assert_eq!(room.state(), SlidingSyncRoomState::NotLoaded);
 
@@ -277,7 +256,7 @@ mod tests {
 
     #[async_test]
     async fn test_state_from_preloaded() {
-        let mut room = new_room(room_id!("!foo:bar.org"), room_response!({})).await;
+        let mut room = new_room(room_id!("!foo:bar.org"), room_response!({}));
 
         room.set_state(SlidingSyncRoomState::Preloaded);
 
@@ -290,7 +269,7 @@ mod tests {
     #[async_test]
     async fn test_room_room_id() {
         let room_id = room_id!("!foo:bar.org");
-        let room = new_room(room_id, room_response!({})).await;
+        let room = new_room(room_id, room_response!({}));
 
         assert_eq!(room.room_id(), room_id);
     }
@@ -299,7 +278,7 @@ mod tests {
     async fn test_prev_batch() {
         // Default value.
         {
-            let room = new_room(room_id!("!foo:bar.org"), room_response!({})).await;
+            let room = new_room(room_id!("!foo:bar.org"), room_response!({}));
 
             assert_eq!(room.prev_batch(), None);
         }
@@ -307,15 +286,14 @@ mod tests {
         // Some value when initializing.
         {
             let room =
-                new_room(room_id!("!foo:bar.org"), room_response!({"prev_batch": "t111_222_333"}))
-                    .await;
+                new_room(room_id!("!foo:bar.org"), room_response!({"prev_batch": "t111_222_333"}));
 
             assert_eq!(room.prev_batch(), Some("t111_222_333".to_owned()));
         }
 
         // Some value when updating.
         {
-            let mut room = new_room(room_id!("!foo:bar.org"), room_response!({})).await;
+            let mut room = new_room(room_id!("!foo:bar.org"), room_response!({}));
 
             assert_eq!(room.prev_batch(), None);
 
@@ -329,7 +307,7 @@ mod tests {
 
     #[async_test]
     async fn test_timeline_queue_initially_empty() {
-        let room = new_room(room_id!("!foo:bar.org"), room_response!({})).await;
+        let room = new_room(room_id!("!foo:bar.org"), room_response!({}));
 
         assert!(room.timeline_queue().is_empty());
     }
@@ -347,7 +325,7 @@ mod tests {
                 }))
                 .unwrap()
                 .cast()
-            ).into()
+            )
         };
     }
 
@@ -368,8 +346,8 @@ mod tests {
         };
     }
 
-    #[async_test]
-    async fn test_timeline_queue_initially_not_empty() {
+    #[test]
+    fn test_timeline_queue_initially_not_empty() {
         let room = new_room_with_timeline(
             room_id!("!foo:bar.org"),
             room_response!({}),
@@ -377,8 +355,7 @@ mod tests {
                 timeline_event!(from "@alice:baz.org" with id "$x0:baz.org" at 0: "message 0"),
                 timeline_event!(from "@alice:baz.org" with id "$x1:baz.org" at 1: "message 1"),
             ],
-        )
-        .await;
+        );
 
         {
             let timeline_queue = room.timeline_queue();
@@ -394,8 +371,8 @@ mod tests {
         }
     }
 
-    #[async_test]
-    async fn test_timeline_queue_update_with_empty_timeline() {
+    #[test]
+    fn test_timeline_queue_update_with_empty_timeline() {
         let mut room = new_room_with_timeline(
             room_id!("!foo:bar.org"),
             room_response!({}),
@@ -403,8 +380,7 @@ mod tests {
                 timeline_event!(from "@alice:baz.org" with id "$x0:baz.org" at 0: "message 0"),
                 timeline_event!(from "@alice:baz.org" with id "$x1:baz.org" at 1: "message 1"),
             ],
-        )
-        .await;
+        );
 
         {
             let timeline_queue = room.timeline_queue();
@@ -436,8 +412,8 @@ mod tests {
         }
     }
 
-    #[async_test]
-    async fn test_timeline_queue_update_with_empty_timeline_and_with_limited() {
+    #[test]
+    fn test_timeline_queue_update_with_empty_timeline_and_with_limited() {
         let mut room = new_room_with_timeline(
             room_id!("!foo:bar.org"),
             room_response!({}),
@@ -445,8 +421,7 @@ mod tests {
                 timeline_event!(from "@alice:baz.org" with id "$x0:baz.org" at 0: "message 0"),
                 timeline_event!(from "@alice:baz.org" with id "$x1:baz.org" at 1: "message 1"),
             ],
-        )
-        .await;
+        );
 
         {
             let timeline_queue = room.timeline_queue();
@@ -477,8 +452,8 @@ mod tests {
         }
     }
 
-    #[async_test]
-    async fn test_timeline_queue_update_from_preloaded() {
+    #[test]
+    fn test_timeline_queue_update_from_preloaded() {
         let mut room = new_room_with_timeline(
             room_id!("!foo:bar.org"),
             room_response!({}),
@@ -486,8 +461,7 @@ mod tests {
                 timeline_event!(from "@alice:baz.org" with id "$x0:baz.org" at 0: "message 0"),
                 timeline_event!(from "@alice:baz.org" with id "$x1:baz.org" at 1: "message 1"),
             ],
-        )
-        .await;
+        );
 
         room.set_state(SlidingSyncRoomState::Preloaded);
 
@@ -527,8 +501,8 @@ mod tests {
         }
     }
 
-    #[async_test]
-    async fn test_timeline_queue_update_from_not_loaded() {
+    #[test]
+    fn test_timeline_queue_update_from_not_loaded() {
         let mut room = new_room_with_timeline(
             room_id!("!foo:bar.org"),
             room_response!({}),
@@ -536,8 +510,7 @@ mod tests {
                 timeline_event!(from "@alice:baz.org" with id "$x0:baz.org" at 0: "message 0"),
                 timeline_event!(from "@alice:baz.org" with id "$x1:baz.org" at 1: "message 1"),
             ],
-        )
-        .await;
+        );
 
         {
             let timeline_queue = room.timeline_queue();
@@ -577,8 +550,8 @@ mod tests {
         }
     }
 
-    #[async_test]
-    async fn test_timeline_queue_update_from_not_loaded_with_limited() {
+    #[test]
+    fn test_timeline_queue_update_from_not_loaded_with_limited() {
         let mut room = new_room_with_timeline(
             room_id!("!foo:bar.org"),
             room_response!({}),
@@ -586,8 +559,7 @@ mod tests {
                 timeline_event!(from "@alice:baz.org" with id "$x0:baz.org" at 0: "message 0"),
                 timeline_event!(from "@alice:baz.org" with id "$x1:baz.org" at 1: "message 1"),
             ],
-        )
-        .await;
+        );
 
         {
             let timeline_queue = room.timeline_queue();
@@ -644,8 +616,7 @@ mod tests {
                 }))
                 .unwrap()
                 .cast(),
-            )
-            .into()],
+            )],
         };
 
         let serialized = serde_json::to_value(&frozen_room).unwrap();
@@ -678,8 +649,8 @@ mod tests {
         assert_eq!(deserialized.room_id, frozen_room.room_id);
     }
 
-    #[async_test]
-    async fn test_frozen_sliding_sync_room_has_a_capped_version_of_the_timeline() {
+    #[test]
+    fn test_frozen_sliding_sync_room_has_a_capped_version_of_the_timeline() {
         // Just below the limit.
         {
             let max = NUMBER_OF_TIMELINE_EVENTS_TO_KEEP_FOR_THE_CACHE - 1;
@@ -697,7 +668,6 @@ mod tests {
                         .unwrap()
                         .cast(),
                     )
-                    .into()
                 })
                 .collect::<Vec<_>>();
 
@@ -705,8 +675,7 @@ mod tests {
                 room_id!("!foo:bar.org"),
                 room_response!({}),
                 timeline_events,
-            )
-            .await;
+            );
 
             let frozen_room = FrozenSlidingSyncRoom::from(&room);
             assert_eq!(frozen_room.timeline_queue.len(), max + 1);
@@ -735,7 +704,6 @@ mod tests {
                     .unwrap()
                     .cast(),
                 )
-                .into()
                 })
                 .collect::<Vec<_>>();
 
@@ -743,8 +711,7 @@ mod tests {
                 room_id!("!foo:bar.org"),
                 room_response!({}),
                 timeline_events,
-            )
-            .await;
+            );
 
             let frozen_room = FrozenSlidingSyncRoom::from(&room);
             assert_eq!(
