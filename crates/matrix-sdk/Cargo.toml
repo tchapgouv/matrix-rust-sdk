@@ -108,6 +108,8 @@ mime2ext = "0.1.53"
 once_cell = { workspace = true }
 percent-encoding = "2.3.1"
 pin-project-lite = { workspace = true }
+rand = { workspace = true, optional = true }
+rstest = { workspace = true }
 ruma = { workspace = true, features = [
     "rand",
     "unstable-msc2448",
