@@ -1,6 +1,5 @@
 use std::future::IntoFuture;
 
-use super::{Error, Timeline};
 use crate::timeline::Error::{AttachmentSizeExceededLimit, AttachmentSizeNotAvailable};
 use eyeball::{SharedObservable, Subscriber};
 use matrix_sdk::bwi_extensions::attachment::ClientAttachmentExt;

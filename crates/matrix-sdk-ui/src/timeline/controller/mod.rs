@@ -14,33 +14,18 @@
 
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
-pub(super) use self::state::{
-    AllRemoteEvents, FullEventMeta, PendingEdit, PendingEditKind, TimelineMetadata,
-    TimelineNewItemPosition, TimelineState, TimelineStateTransaction,
-};
-use super::{
-    event_handler::TimelineEventKind,
-    event_item::{ReactionStatus, RemoteEventOrigin},
-    item::TimelineUniqueId,
-    traits::{Decryptor, RoomDataProvider},
-    util::{rfind_event_by_id, rfind_event_item, RelativePosition},
-    Error, EventSendState, EventTimelineItem, InReplyToDetails, PaginationError, Profile,
-    ReactionInfo, RepliedToEvent, TimelineDetails, TimelineEventItemId, TimelineFocus,
-    TimelineItem, TimelineItemContent, TimelineItemKind,
-};
+//use super::{
+//   event_handler::TimelineEventKind,
+//    event_item::{ReactionStatus, RemoteEventOrigin},
+//    item::TimelineUniqueId,
+//    traits::{Decryptor, RoomDataProvider},
+//    util::{rfind_event_by_id, rfind_event_item, RelativePosition},
+//    Error, EventSendState, EventTimelineItem, InReplyToDetails, PaginationError, Profile,
+//    ReactionInfo, RepliedToEvent, TimelineDetails, TimelineEventItemId, TimelineFocus,
+//    TimelineItem, TimelineItemContent, TimelineItemKind,
+//};
 use crate::timeline::TimelineItemKind::Virtual;
 use crate::timeline::VirtualTimelineItem::ScanStateChanged;
-use crate::{
-    timeline::{
-        day_dividers::DayDividerAdjuster,
-        event_item::EventTimelineItemKind,
-        pinned_events_loader::{PinnedEventsLoader, PinnedEventsLoaderError},
-        reactions::FullReactionKey,
-        util::rfind_event_by_item_id,
-        TimelineEventFilterFn,
-    },
-    unable_to_decrypt_hook::UtdHookManager,
-};
 use as_variant::as_variant;
 use eyeball_im::VectorDiff;
 use eyeball_im_util::vector::VectorObserverExt;

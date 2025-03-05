@@ -31,17 +31,7 @@ use super::{
     to_device::{handle_forwarded_room_key_event, handle_room_key_event},
     DateDividerMode, Error, Timeline, TimelineDropHandle, TimelineFocus,
 };
-use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::bwi_content_scanner::BWIContentScannerWrapper;
-use matrix_sdk::{
-    encryption::backups::BackupState,
-    event_cache::{EventsOrigin, RoomEventCacheUpdate},
-    executor::spawn,
-    Room,
-};
-use ruma::{events::AnySyncTimelineEvent, RoomVersionId};
-use tokio::sync::broadcast::error::RecvError;
-use tracing::{info, info_span, trace, warn, Instrument, Span};
 use crate::{timeline::event_item::RemoteEventOrigin, unable_to_decrypt_hook::UtdHookManager};
 
 /// Builder that allows creating and configuring various parts of a

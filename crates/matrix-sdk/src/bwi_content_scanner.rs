@@ -113,7 +113,7 @@ impl BWIDownloadMediaExt for Client {
         debug!("###BWI### download authenticated media {:?}", media_source);
         let request = self.content_scanner().create_download_media_request(media_source).await?;
         Ok(self
-            .send(request, request_config)
+            .send(request)
             .await
             .inspect(|response| debug!("###BWI### Response for downloading {:?}", response))
             .map(|response| FileContent(response.file))
@@ -128,7 +128,7 @@ impl BWIDownloadMediaExt for Client {
         debug!("###BWI### download unauthenticated media {:?}", media_source);
         let request = self.content_scanner().create_download_media_request(media_source).await?;
         Ok(self
-            .send(request, None)
+            .send(request)
             .await
             .inspect(|response| debug!("###BWI### Response for downloading {:?}", response))
             .map(|response| FileContent(response.file))
@@ -154,7 +154,7 @@ impl BWIScanMediaExt for Client {
             None | Some(BWIScanState::Error) => {
                 let request = content_scanner.create_scan_media_request(file).await?;
 
-                let scan_state = match self.send(request, None).await {
+                let scan_state = match self.send(request).await {
                     Ok(response) => {
                         debug!("###BWI### Response for scan {:?}", response);
                         content_scanner.handle_scan_response(response)

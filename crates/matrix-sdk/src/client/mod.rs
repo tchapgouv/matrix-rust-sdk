@@ -25,9 +25,8 @@ use std::{
 use self::futures::SendRequest;
 use crate::event_handler::{EventHandlerContext, ObservableEventHandler};
 #[cfg(feature = "experimental-oidc")]
-use crate::oidc::Oidc;
-#[cfg(feature = "experimental-sliding-sync")]
-use crate::sliding_sync::Version as SlidingSyncVersion;
+use crate::authentication::oidc;
+use crate::client::oidc::Oidc;
 use crate::{
     authentication::{AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback},
     config::RequestConfig,
@@ -38,10 +37,11 @@ use crate::{
         EventHandler, EventHandlerDropGuard, EventHandlerHandle, EventHandlerStore, SyncEvent,
     },
     http_client::HttpClient,
-    matrix_auth::MatrixAuth,
+    authentication::matrix::MatrixAuth,
     notification_settings::NotificationSettings,
     room_preview::RoomPreview,
     send_queue::SendQueueData,
+    sliding_sync::Version as SlidingSyncVersion,
     sync::{RoomUpdate, SyncResponse},
     Account, AuthApi, AuthSession, Error, Media, Pusher, RefreshTokenError, Result, Room,
     TransmissionProgress,
@@ -1524,7 +1524,7 @@ impl Client {
         Client::add_history_visibility_initial_state_event(&mut request);
         // END #5991 BWI specific
 
-        let response = self.send(request, None).await?;
+        let response = self.send(request).await?;
         let base_room = self.base_client().get_or_create_room(&response.room_id, RoomState::Joined);
 
         let joined_room = Room::new(self.clone(), base_room);

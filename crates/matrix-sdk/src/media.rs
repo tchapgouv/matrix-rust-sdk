@@ -460,7 +460,7 @@ impl Media {
         request.method = Some(settings.method.clone());
         request.animated = Some(settings.animated);
 
-        Ok(self.client.send(request, request_config).await?.file)
+        Ok(self.client.send(request).await?.file)
     }
 
     #[deprecated]
@@ -479,7 +479,7 @@ impl Media {
             request.method = Some(settings.method.clone());
             request.animated = Some(settings.animated);
 
-            Ok(self.client.send(request, None).await?.file)
+            Ok(self.client.send(request).await?.file)
         }
     }
 
@@ -499,7 +499,7 @@ impl Media {
     async fn fetch_unauthenticated_media(&self, uri: &OwnedMxcUri) -> Result<Vec<u8>, Error> {
         #[allow(deprecated)]
         let request = media::get_content::v3::Request::from_url(uri)?;
-        Ok(self.client.send(request, None).await?.file)
+        Ok(self.client.send(request).await?.file)
     }
 
     async fn fetch_authenticated_media(
@@ -508,7 +508,7 @@ impl Media {
         uri: &OwnedMxcUri,
     ) -> Result<Vec<u8>, Error> {
         let request = authenticated_media::get_content::v1::Request::from_uri(uri)?;
-        Ok(self.client.send(request, request_config).await?.file)
+        Ok(self.client.send(request).await?.file)
     }
     // end BWI-specific
 

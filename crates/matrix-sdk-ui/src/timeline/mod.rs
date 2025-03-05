@@ -56,7 +56,6 @@ use ruma::{
 use subscriber::TimelineWithDropHandle;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, trace, warn};
-use util::rfind_event_by_item_id;
 
 use self::{
     algorithms::rfind_event_by_id, controller::TimelineController, futures::SendAttachment,
@@ -248,7 +247,7 @@ impl Timeline {
 
     pub(crate) async fn setup_content_scanner_hook(&self) -> &Self {
         info!("###BWI### setup content scanner hook");
-        let (timeline_items, timeline_stream) = self.subscribe_batched().await;
+        let (timeline_items, timeline_stream) = self.subscribe().await;
 
         let timeline_controller = self.controller.clone();
 
