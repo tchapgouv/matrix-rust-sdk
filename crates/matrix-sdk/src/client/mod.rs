@@ -38,6 +38,7 @@ use matrix_sdk_base::{
 };
 #[cfg(feature = "experimental-oidc")]
 use matrix_sdk_common::ttl_cache::TtlCache;
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{room::encryption::RoomEncryptionEventContent, InitialStateEvent};
 use ruma::{
@@ -264,6 +265,9 @@ pub(crate) struct ClientInner {
     /// The underlying HTTP client.
     pub(crate) http_client: HttpClient,
 
+    // BWI-specific
+    pub(crate) content_scanner: Arc<BWIContentScanner>,
+    // end BWI-specific
     /// User session data.
     pub(super) base_client: BaseClient,
 
@@ -346,6 +350,9 @@ impl ClientInner {
         homeserver: Url,
         sliding_sync_version: SlidingSyncVersion,
         http_client: HttpClient,
+        // BWI-specific
+        content_scanner: Arc<BWIContentScanner>,
+        // end BWI-specific
         base_client: BaseClient,
         server_capabilities: ClientServerCapabilities,
         respect_login_well_known: bool,
@@ -366,6 +373,7 @@ impl ClientInner {
             auth_ctx,
             sliding_sync_version: StdRwLock::new(sliding_sync_version),
             http_client,
+            content_scanner,
             base_client,
             caches,
             locks: Default::default(),
@@ -438,6 +446,13 @@ impl Client {
     pub fn http_client(&self) -> &reqwest::Client {
         &self.inner.http_client.inner
     }
+
+    // BWI-specific
+    /// The content scanner
+    pub fn content_scanner(&self) -> &Arc<BWIContentScanner> {
+        &self.inner.content_scanner
+    }
+    // end BWI-specific
 
     pub(crate) fn locks(&self) -> &ClientLocks {
         &self.inner.locks
@@ -2420,6 +2435,7 @@ impl Client {
                 self.homeserver(),
                 self.sliding_sync_version(),
                 self.inner.http_client.clone(),
+                self.inner.content_scanner.clone(),
                 self.inner
                     .base_client
                     .clone_with_in_memory_state_store(&cross_process_store_locks_holder_name, false)

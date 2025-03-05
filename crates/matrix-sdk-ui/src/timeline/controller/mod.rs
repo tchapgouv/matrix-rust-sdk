@@ -33,6 +33,10 @@ use matrix_sdk::{
     },
     Result, Room,
 };
+use matrix_sdk_base::media::MediaEventContent;
+use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState;
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
+use ruma::events::room::MediaSource;
 use ruma::{
     api::client::receipt::create_receipt::v3::ReceiptType as SendReceiptType,
     events::{
@@ -73,6 +77,8 @@ use super::{
     PaginationError, Profile, RepliedToEvent, TimelineDetails, TimelineEventItemId, TimelineFocus,
     TimelineItem, TimelineItemContent, TimelineItemKind,
 };
+use crate::timeline::TimelineItemKind::Virtual;
+use crate::timeline::VirtualTimelineItem::ScanStateChanged;
 use crate::{
     timeline::{
         algorithms::rfind_event_by_item_id,
@@ -135,6 +141,11 @@ pub(super) struct TimelineController<P: RoomDataProvider = Room, D: Decryptor = 
     /// Long-running task used to retry decryption of timeline items without
     /// blocking main processing.
     decryption_retry_task: DecryptionRetryTask<D>,
+
+    // BWI-specific
+    /// the used ContentScanner
+    content_scanner: Arc<BWIContentScanner>,
+    // end BWI-specific
 }
 
 #[derive(Clone)]
@@ -267,6 +278,9 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
         internal_id_prefix: Option<String>,
         unable_to_decrypt_hook: Option<Arc<UtdHookManager>>,
         is_room_encrypted: bool,
+        // BWI-specific
+        content_scanner: Arc<BWIContentScanner>,
+        // end BWI-specific
     ) -> Self {
         let (focus_data, focus_kind) = match focus {
             TimelineFocus::Live => (TimelineFocusData::Live, TimelineFocusKind::Live),
@@ -311,6 +325,7 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
             room_data_provider,
             settings,
             decryption_retry_task,
+            content_scanner,
         }
     }
 
@@ -1483,6 +1498,53 @@ impl TimelineController {
     ) {
         self.retry_event_decryption_inner(room.to_owned(), session_ids).await
     }
+
+    // BWI-specific
+    pub(crate) async fn handle_single_timeline_item(&self, diff: &Arc<TimelineItem>) {
+        if let Some(source) = self.filter_for_media_events(diff) {
+            debug!("###BWI###: Stated Scan for Timeline Item with id {}", diff.internal_id.0);
+            let scan_state = self.content_scanner.scan_attachment(source).await;
+            debug!("###BWI###: Finished Scan: Scan state is: {:?}", scan_state);
+            self.finish_content_scan_for_item_with_state(diff.internal_id.clone(), scan_state)
+                .await;
+        }
+    }
+
+    fn filter_for_media_events(&self, diff: &Arc<TimelineItem>) -> Option<MediaSource> {
+        if let Some(item) = diff.as_event() {
+            if let TimelineItemContent::Message(message) = item.content() {
+                return match message.msgtype() {
+                    MessageType::Image(content) => content.source(),
+                    MessageType::Video(content) => content.source(),
+                    MessageType::Audio(content) => content.source(),
+                    MessageType::File(content) => content.source(),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
+    async fn finish_content_scan_for_item_with_state(
+        &self,
+        id_of_event_with_attachment: TimelineUniqueId,
+        scan_state_after_scanning: BWIScanState,
+    ) {
+        let mut state = self.state.write().await;
+        state.items.push_back(TimelineItem::new(
+            Virtual(ScanStateChanged(
+                id_of_event_with_attachment.clone(),
+                scan_state_after_scanning.clone(),
+            )),
+            // possible solution: is there an item with this timelineUniqueId
+            TimelineUniqueId(id_of_event_with_attachment.clone().0 + "__scan_state"),
+        ));
+        info!(
+            "###BWI###: virtual Event with state {:?} and id {:?}",
+            scan_state_after_scanning, id_of_event_with_attachment.0
+        );
+    }
+    // end BWI-specific
 }
 
 #[cfg(test)]

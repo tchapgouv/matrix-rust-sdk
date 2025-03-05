@@ -37,7 +37,9 @@ imbl = { workspace = true, features = ["serde"] }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 matrix-sdk = { workspace = true, features = ["e2e-encryption"] }
+matrix-sdk-bwi = { workspace = true }
 matrix-sdk-base = { workspace = true }
+matrix-sdk-base-bwi = { workspace = true }
 mime = { workspace = true }
 once_cell = { workspace = true }
 pin-project-lite = { workspace = true }

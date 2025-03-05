@@ -41,6 +41,7 @@ use crate::{
     error::RumaApiError, http_client::HttpClient, send_queue::SendQueueData,
     sliding_sync::VersionBuilder as SlidingSyncVersionBuilder, HttpError, IdParseError,
 };
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 
 /// Builder that allows creating and configuring various parts of a [`Client`].
 ///
@@ -83,6 +84,9 @@ use crate::{
 #[must_use]
 #[derive(Clone, Debug)]
 pub struct ClientBuilder {
+    // BWI specific
+    use_content_scanner: bool,
+    // end BWI specific
     homeserver_cfg: Option<HomeserverConfig>,
     sliding_sync_version_builder: SlidingSyncVersionBuilder,
     http_cfg: Option<HttpConfig>,
@@ -106,6 +110,9 @@ impl ClientBuilder {
 
     pub(crate) fn new() -> Self {
         Self {
+            // BWI specific
+            use_content_scanner: true,
+            // end BWI specific
             homeserver_cfg: None,
             sliding_sync_version_builder: SlidingSyncVersionBuilder::Native,
             http_cfg: None,
@@ -189,6 +196,14 @@ impl ClientBuilder {
         ));
         self
     }
+
+    // BWI-specific
+    /// Disable the content scanner extension for a specific client
+    pub fn without_content_scanner(mut self) -> Self {
+        self.use_content_scanner = false;
+        self
+    }
+    // end BWI specific
 
     /// Set sliding sync to a specific version.
     pub fn sliding_sync_version_builder(
@@ -530,6 +545,9 @@ impl ClientBuilder {
             unstable_features: None,
         };
 
+        let content_scanner =
+            Arc::from(BWIContentScanner::new_with_url(&http_client.inner, &homeserver));
+
         let event_cache = OnceCell::new();
         let inner = ClientInner::new(
             auth_ctx,
@@ -537,6 +555,7 @@ impl ClientBuilder {
             homeserver,
             sliding_sync_version,
             http_client,
+            content_scanner,
             base_client,
             server_capabilities,
             self.respect_login_well_known,
