@@ -671,6 +671,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79296716171880943b8470b5f8d03aa55eb2e645a4874bdbb28adb49162e012c"
 
 [[package]]
+name = "bwi-example"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "eyeball-im 0.5.1",
+ "futures-util",
+ "log",
+ "matrix-sdk",
+ "matrix-sdk-base-bwi",
+ "matrix-sdk-bwi",
+ "matrix-sdk-ui",
+ "mime",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "bytemuck"
 version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1832,11 +1852,22 @@ dependencies = [
 
 [[package]]
 name = "eyeball-im"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1c02432230060cae0621e15803e073976d22974e0f013c9cb28a4ea1b484629"
+dependencies = [
+ "futures-core",
+ "imbl 3.0.0",
+ "tokio",
+]
+
+[[package]]
+name = "eyeball-im"
 version = "0.6.0"
 source = "git+https://github.com/jplatte/eyeball?branch=main#b4ca8997db0ee3767bbc08a2aec788cac05c55ac"
 dependencies = [
  "futures-core",
- "imbl",
+ "imbl 4.0.1",
  "tokio",
  "tracing",
 ]
@@ -1847,9 +1878,9 @@ version = "0.8.0"
 source = "git+https://github.com/jplatte/eyeball?branch=main#b4ca8997db0ee3767bbc08a2aec788cac05c55ac"
 dependencies = [
  "arrayvec",
- "eyeball-im",
+ "eyeball-im 0.6.0",
  "futures-core",
- "imbl",
+ "imbl 4.0.1",
  "pin-project-lite",
  "smallvec",
 ]
@@ -2659,6 +2690,19 @@ dependencies = [
 
 [[package]]
 name = "imbl"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc3be8d8cd36f33a46b1849f31f837c44d9fa87223baee3b4bd96b8f11df81eb"
+dependencies = [
+ "bitmaps",
+ "imbl-sized-chunks",
+ "rand_core",
+ "rand_xoshiro",
+ "version_check",
+]
+
+[[package]]
+name = "imbl"
 version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ae128b3bc67ed43ec0a7bb1c337a9f026717628b3c4033f07ded1da3e854951"
@@ -3303,7 +3347,7 @@ dependencies = [
  "dirs 6.0.0",
  "event-listener",
  "eyeball",
- "eyeball-im",
+ "eyeball-im 0.6.0",
  "eyre",
  "futures-core",
  "futures-executor",
@@ -3311,7 +3355,7 @@ dependencies = [
  "gloo-timers",
  "growable-bloom-filter",
  "http",
- "imbl",
+ "imbl 4.0.1",
  "indexmap 2.7.1",
  "js_int",
  "language-tags",
@@ -3372,7 +3416,7 @@ dependencies = [
  "bitflags 2.8.0",
  "decancer",
  "eyeball",
- "eyeball-im",
+ "eyeball-im 0.6.0",
  "futures-executor",
  "futures-util",
  "growable-bloom-filter",
@@ -3444,12 +3488,12 @@ version = "0.10.0"
 dependencies = [
  "assert_matches",
  "async-trait",
- "eyeball-im",
+ "eyeball-im 0.6.0",
  "futures-core",
  "futures-util",
  "getrandom 0.2.15",
  "gloo-timers",
- "imbl",
+ "imbl 4.0.1",
  "insta",
  "js-sys",
  "matrix-sdk-test-macros",
@@ -3558,7 +3602,7 @@ dependencies = [
  "as_variant",
  "async-compat",
  "extension-trait",
- "eyeball-im",
+ "eyeball-im 0.6.0",
  "futures-util",
  "language-tags",
  "log-panics",
@@ -3641,7 +3685,7 @@ dependencies = [
  "assert_matches2",
  "assign",
  "eyeball",
- "eyeball-im",
+ "eyeball-im 0.6.0",
  "futures",
  "futures-core",
  "futures-util",
@@ -3769,13 +3813,13 @@ dependencies = [
  "chrono",
  "emojis",
  "eyeball",
- "eyeball-im",
+ "eyeball-im 0.6.0",
  "eyeball-im-util",
  "futures-core",
  "futures-util",
  "fuzzy-matcher",
  "growable-bloom-filter",
- "imbl",
+ "imbl 4.0.1",
  "indexmap 2.7.1",
  "itertools 0.14.0",
  "matrix-sdk",
@@ -3897,7 +3941,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "futures-util",
- "imbl",
+ "imbl 4.0.1",
  "matrix-sdk",
  "matrix-sdk-ui",
  "ratatui",

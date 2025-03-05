@@ -268,6 +268,7 @@ pub(crate) struct ClientInner {
     // BWI-specific
     pub(crate) content_scanner: Arc<BWIContentScanner>,
     // end BWI-specific
+
     /// User session data.
     pub(super) base_client: BaseClient,
 

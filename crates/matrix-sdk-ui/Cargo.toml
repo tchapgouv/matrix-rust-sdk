@@ -15,6 +15,7 @@ rustls-tls = ["matrix-sdk/rustls-tls"]
 
 js = ["matrix-sdk/js"]
 uniffi = ["dep:uniffi", "matrix-sdk/uniffi", "matrix-sdk-base/uniffi"]
+enable_external_content_scanner_setup = []
 
 # Add support for encrypted extensible events.
 unstable-msc3956 = ["ruma/unstable-msc3956"]
