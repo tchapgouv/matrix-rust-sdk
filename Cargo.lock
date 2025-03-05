@@ -1388,6 +1388,7 @@ checksum = "a2d328fc287c61314c4a61af7cfdcbd7e678e39778488c7cb13ec133ce0f4059"
 dependencies = [
  "fsio",
  "indexmap 1.9.3",
+]
 
 [[package]]
 name = "equator"
