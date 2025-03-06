@@ -31,8 +31,8 @@ use super::{
     to_device::{handle_forwarded_room_key_event, handle_room_key_event},
     DateDividerMode, Error, Timeline, TimelineDropHandle, TimelineFocus,
 };
-use matrix_sdk::bwi_content_scanner::BWIContentScannerWrapper;
 use crate::{timeline::event_item::RemoteEventOrigin, unable_to_decrypt_hook::UtdHookManager};
+use matrix_sdk::bwi_content_scanner::BWIContentScannerWrapper;
 
 /// Builder that allows creating and configuring various parts of a
 /// [`Timeline`].

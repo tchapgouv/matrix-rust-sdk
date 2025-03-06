@@ -404,11 +404,14 @@ async fn test_enabling_backups_retries_decryption() {
             .to_raw_any()];
 
     let room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            is_direct: true,
-            initial_state,
-            preset: Some(RoomPreset::PrivateChat)
-        }), false)
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                is_direct: true,
+                initial_state,
+                preset: Some(RoomPreset::PrivateChat)
+            }),
+            false,
+        )
         .await
         .unwrap();
 

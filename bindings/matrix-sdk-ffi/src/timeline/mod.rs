@@ -142,13 +142,13 @@ impl Timeline {
                 });
             }
 
-     	   // BWI-specific
-        	request.await.map_err(|e| match e {
-            	Error::AttachmentSizeExceededLimit => RoomError::AttachmentSizeExceededUploadLimit,
-            	Error::AttachmentSizeNotAvailable => RoomError::FailedSendingAttachment,
-            	_ => RoomError::FailedSendingAttachment,
-        	})?;
-        	// end BWI-specific
+            // BWI-specific
+            request.await.map_err(|e| match e {
+                Error::AttachmentSizeExceededLimit => RoomError::AttachmentSizeExceededUploadLimit,
+                Error::AttachmentSizeNotAvailable => RoomError::FailedSendingAttachment,
+                _ => RoomError::FailedSendingAttachment,
+            })?;
+            // end BWI-specific
 
             Ok(())
         }));

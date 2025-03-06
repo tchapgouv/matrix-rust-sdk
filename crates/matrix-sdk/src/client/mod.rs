@@ -23,11 +23,12 @@ use std::{
 };
 
 use self::futures::SendRequest;
-use crate::event_handler::{EventHandlerContext, ObservableEventHandler};
 #[cfg(feature = "experimental-oidc")]
 use crate::authentication::oidc;
 use crate::client::oidc::Oidc;
+use crate::event_handler::{EventHandlerContext, ObservableEventHandler};
 use crate::{
+    authentication::matrix::MatrixAuth,
     authentication::{AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback},
     config::RequestConfig,
     deduplicating_handler::DeduplicatingHandler,
@@ -37,7 +38,6 @@ use crate::{
         EventHandler, EventHandlerDropGuard, EventHandlerHandle, EventHandlerStore, SyncEvent,
     },
     http_client::HttpClient,
-    authentication::matrix::MatrixAuth,
     notification_settings::NotificationSettings,
     room_preview::RoomPreview,
     send_queue::SendQueueData,
@@ -68,12 +68,12 @@ use matrix_sdk_base::{
 use matrix_sdk_base_bwi::room_alias::BWIRoomAlias;
 use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use matrix_sdk_bwi::federation::BWIFederationHandler;
+#[cfg(feature = "experimental-oidc")]
+use matrix_sdk_common::ttl_cache::TtlCache;
 use ruma::events::room::history_visibility::{
     HistoryVisibility, RoomHistoryVisibilityEventContent,
 };
 use ruma::events::room::server_acl::RoomServerAclEventContent;
-#[cfg(feature = "experimental-oidc")]
-use matrix_sdk_common::ttl_cache::TtlCache;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{room::encryption::RoomEncryptionEventContent, InitialStateEvent};
 use ruma::{

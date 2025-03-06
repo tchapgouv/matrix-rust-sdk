@@ -1406,9 +1406,8 @@ impl CryptoStore for SqliteCryptoStore {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use super::SqliteCryptoStore;
-    use matrix_sdk_common::deserialized_responses::WithheldCode;    
+    use matrix_sdk_common::deserialized_responses::WithheldCode;
     #[cfg(not(target_os = "macos"))]
     use matrix_sdk_crypto::{
         cryptostore_integration_tests, cryptostore_integration_tests_time, olm::SenderDataType,
@@ -1419,6 +1418,7 @@ mod tests {
     use once_cell::sync::Lazy;
     use ruma::{device_id, room_id, user_id};
     use similar_asserts::assert_eq;
+    use std::path::Path;
     use tempfile::{tempdir, TempDir};
     use tokio::fs;
 

@@ -512,7 +512,6 @@ impl Media {
     }
     // end BWI-specific
 
-
     /// Get a media file's content that is only available in the media cache.
     ///
     /// # Arguments
