@@ -5,22 +5,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use super::{room::Room, session_verification::SessionVerificationController, RUNTIME};
 use crate::client::BWIScanState::Infected;
-use crate::{
-    authentication::{HomeserverLoginDetails, OidcConfiguration, OidcError, SsoError, SsoHandler},
-    client,
-    encryption::Encryption,
-    notification::NotificationClient,
-    notification_settings::NotificationSettings,
-    room_directory_search::RoomDirectorySearch,
-    room_preview::RoomPreview,
-    ruma::{AuthData, MediaSource},
-    sync_service::{SyncService, SyncServiceBuilder},
-    task_handle::TaskHandle,
-    utils::AsyncRuntimeDropped,
-    ClientError,
-};
 use anyhow::{anyhow, Context as _};
 use matrix_sdk::bwi_extensions::attachment::ClientAttachmentExt;
 use matrix_sdk::bwi_extensions::client::BWIClientSetupExt;

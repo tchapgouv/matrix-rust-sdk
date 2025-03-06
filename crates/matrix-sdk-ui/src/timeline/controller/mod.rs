@@ -1664,20 +1664,25 @@ impl TimelineController {
         id_of_event_with_attachment: TimelineUniqueId,
         scan_state_after_scanning: BWIScanState,
     ) {
-        let mut state = self.state.write().await;
-        state.items.push_back(TimelineItem::new(
+        let scan_state_event = TimelineItem::new(
             Virtual(ScanStateChanged(
                 id_of_event_with_attachment.clone(),
                 scan_state_after_scanning.clone(),
             )),
             // possible solution: is there an item with this timelineUniqueId
             TimelineUniqueId(id_of_event_with_attachment.clone().0 + "__scan_state"),
-        ));
+        );
+
+        let mut state: RwLockWriteGuard<'_, TimelineState> = self.state.write().await;
+        let mut transaction = state.items.transaction();
+        transaction.push_back(scan_state_event, None);
+        transaction.commit();
         info!(
             "###BWI###: virtual Event with state {:?} and id {:?}",
             scan_state_after_scanning, id_of_event_with_attachment.0
         );
     }
+
     // end BWI-specific
 }
 
