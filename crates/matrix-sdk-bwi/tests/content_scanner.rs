@@ -13,23 +13,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use crate::helpers::{
-    clean_state_response_body, encrypted_file, infected_state_response_body, mount_public_key_mock,
-    mount_scan_mock,
-};
 use matrix_sdk_base::ruma::events::room::MediaSource::Encrypted;
 use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState;
 use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use serde_json::json;
 use wiremock::{MockServer, ResponseTemplate};
 
+use crate::helpers::{
+    clean_state_response_body, encrypted_file, infected_state_response_body, mount_public_key_mock,
+    mount_scan_mock,
+};
+
 #[tokio::test]
 #[ignore]
 async fn test_get_public_key() {
     // Arrange
     let client = reqwest::Client::default();
-    let content_scanner =
-        BWIContentScanner::new_with_url_as_str(client, "example.com").unwrap();
+    let content_scanner = BWIContentScanner::new_with_url_as_str(client, "example.com").unwrap();
 
     // Act
     let public_key = content_scanner.get_public_key().await;
@@ -40,15 +40,18 @@ async fn test_get_public_key() {
 }
 
 mod helpers {
-    use matrix_sdk_base::ruma::events::room::{
-        EncryptedFile, EncryptedFileInit, JsonWebKey, JsonWebKeyInit,
-    };
-    use matrix_sdk_base::ruma::mxc_uri;
-    use matrix_sdk_base::ruma::serde::Base64;
-    use serde_json::json;
     use std::collections::BTreeMap;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use matrix_sdk_base::ruma::{
+        events::room::{EncryptedFile, EncryptedFileInit, JsonWebKey, JsonWebKeyInit},
+        mxc_uri,
+        serde::Base64,
+    };
+    use serde_json::json;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     pub fn dummy_jwt() -> JsonWebKey {
         JsonWebKeyInit {

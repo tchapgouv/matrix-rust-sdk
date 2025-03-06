@@ -30,7 +30,7 @@ Most have fallback (though maybe with deprecation warning) support for an existi
 
 ### Splitting of concerns: Media
 
-In an effort to declutter the `Client` API dedicated types have been created dealing with specific concerns in one place. In `0.5` we introduced `client.account()`, and `client.encryption()`, we are doing the same with `client.media()` to manage media and attachments in one place with the [`media::Media` type][media typ]  now.
+In an effort to declutter the `Client` API dedicated types have been created dealing with specific concerns in one place. In `0.5` we introduced `client.account()`, and `client.encryption()`, we are doing the same with `client.media()` to manage media and attachments in one place with the [`media::Media` type][media type]  now.
 
 The signatures of media uploads, have also changed slightly: rather than expecting a reader `R: Read + Seek`, it now is a simple `&[u8]`. Which also means no more unnecessary `seek(0)` to reset the cursor, as we are just taking an immutable reference now.
 

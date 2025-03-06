@@ -14,12 +14,15 @@
  * limitations under the License.
  */
 
-use crate::regulatory::data_privacy::{BWIDataPrivacy, BWIDataPrivacySource};
-use crate::regulatory::imprint::{BWIImprint, BWIImprintSource};
-use crate::regulatory::organization::url_helper::BWIUrlHelper;
-use crate::regulatory::well_known_file::BWIWellKnownFileSourceImpl;
 use anyhow::Result;
 use matrix_sdk_base_bwi::http_client::HttpClient;
+
+use crate::regulatory::{
+    data_privacy::{BWIDataPrivacy, BWIDataPrivacySource},
+    imprint::{BWIImprint, BWIImprintSource},
+    organization::url_helper::BWIUrlHelper,
+    well_known_file::BWIWellKnownFileSourceImpl,
+};
 
 pub struct BWIOrganization {
     data_privacy_source: Box<dyn BWIDataPrivacySource>,
@@ -77,8 +80,8 @@ mod url_helper {
 
     impl BWIUrlHelper {
         fn with_base_url_without_schema(base_url: &str) -> Result<Self, ParseError> {
-            let formated_url = format!("https://{url}", url = base_url);
-            let parsed_url = Url::parse(formated_url.as_str())?;
+            let formatted_url = format!("https://{url}", url = base_url);
+            let parsed_url = Url::parse(formatted_url.as_str())?;
             let builder = BWIUrlHelper { url: parsed_url };
             Ok(builder)
         }
@@ -110,8 +113,9 @@ mod url_helper {
 
     #[cfg(test)]
     mod url_test {
-        use crate::regulatory::organization::url_helper::BWIUrlHelper;
         use url::{ParseError, Url};
+
+        use crate::regulatory::organization::url_helper::BWIUrlHelper;
 
         #[test]
         fn only_base_url() -> Result<(), ParseError> {
@@ -144,9 +148,11 @@ mod url_helper {
 
 #[cfg(test)]
 mod test {
-    use crate::regulatory::data_privacy::{BWIDataPrivacy, BWIDataPrivacySource};
-    use crate::regulatory::imprint::{BWIImprint, BWIImprintSource};
-    use crate::regulatory::organization::BWIOrganization;
+    use crate::regulatory::{
+        data_privacy::{BWIDataPrivacy, BWIDataPrivacySource},
+        imprint::{BWIImprint, BWIImprintSource},
+        organization::BWIOrganization,
+    };
 
     struct WellKnownMock {}
 

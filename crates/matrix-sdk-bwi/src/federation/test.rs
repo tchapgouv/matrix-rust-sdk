@@ -16,9 +16,11 @@
 
 #[cfg(test)]
 mod test_federation_create_server_acl {
-    use crate::federation::BWIFederationHandler;
-    use ruma_common::OwnedUserId;
     use std::str::FromStr;
+
+    use ruma_common::OwnedUserId;
+
+    use crate::federation::BWIFederationHandler;
 
     const SERVER_DOMAIN: &str = "test.de";
 
@@ -30,8 +32,8 @@ mod test_federation_create_server_acl {
         let allow = federation_handler.create_server_acl(true);
 
         // Assert
-        assert!(allow.contains(&"*".to_string()));
-        assert_eq!(allow.iter().count(), 1);
+        assert!(allow.contains(&"*".to_owned()));
+        assert_eq!(allow.len(), 1);
     }
 
     #[test]
@@ -42,7 +44,7 @@ mod test_federation_create_server_acl {
         let allow = federation_handler.create_server_acl(false);
 
         // Assert
-        assert_eq!(allow, vec!["test.de".to_string()]);
+        assert_eq!(allow, vec!["test.de".to_owned()]);
     }
 
     #[test]
@@ -56,6 +58,6 @@ mod test_federation_create_server_acl {
         let allow = federation_handler.create_server_acl(false);
 
         // Assert
-        assert_eq!(allow, vec!["test.de".to_string()]);
+        assert_eq!(allow, vec!["test.de".to_owned()]);
     }
 }

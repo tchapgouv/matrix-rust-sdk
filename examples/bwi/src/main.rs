@@ -1,22 +1,33 @@
+use std::{
+    path::{absolute, Path},
+    sync::Arc,
+};
+
 use anyhow::Result;
 use clap::Parser;
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt};
 use log::{debug, info};
-use matrix_sdk::encryption::backups::BackupState;
-use matrix_sdk::encryption::secret_storage::SecretStore;
-use matrix_sdk::media::{MediaEventContent, MediaFormat, MediaRequestParameters};
-use matrix_sdk::ruma::events::room::message::{ImageMessageEventContent, MessageType};
-use matrix_sdk::ruma::push::ComparisonOperator::Le;
-use matrix_sdk::{config::SyncSettings, ruma::OwnedRoomId, Client, Room};
+use matrix_sdk::{
+    config::SyncSettings,
+    encryption::{backups::BackupState, secret_storage::SecretStore},
+    media::{MediaEventContent, MediaFormat, MediaRequestParameters},
+    ruma::{
+        events::room::message::{ImageMessageEventContent, MessageType},
+        push::ComparisonOperator::Le,
+        OwnedRoomId,
+    },
+    Client, Room,
+};
 use matrix_sdk_ui::timeline::{RoomExt, TimelineItem, TimelineItemContent, TimelineItemKind};
-use std::path::{absolute, Path};
-use std::sync::Arc;
 use tracing::Level;
-use tracing_subscriber::filter::{filter_fn, FilterExt};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{filter, Layer};
+use tracing_subscriber::{
+    filter,
+    filter::{filter_fn, FilterExt},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+    Layer,
+};
 use url::Url;
 
 const BWI_TARGET: &str = "BWI";

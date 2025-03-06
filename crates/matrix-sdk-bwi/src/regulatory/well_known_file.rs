@@ -14,12 +14,15 @@
  * limitations under the License.
  */
 
-use crate::regulatory::data_privacy::{BWIDataPrivacy, BWIDataPrivacySource};
-use crate::regulatory::imprint::{BWIImprint, BWIImprintSource};
 use anyhow::Result;
 use matrix_sdk_base_bwi::http_client::HttpClient;
 use reqwest::Url;
 use serde::Deserialize;
+
+use crate::regulatory::{
+    data_privacy::{BWIDataPrivacy, BWIDataPrivacySource},
+    imprint::{BWIImprint, BWIImprintSource},
+};
 
 pub(crate) trait BWIWellKnownFileSource {
     fn get_wellknown_file(&self) -> Result<BWIWellKnownFile>;

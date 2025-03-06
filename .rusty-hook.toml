@@ -1,5 +1,5 @@
 [hooks]
-pre-commit = "cargo fmt -- --check"
+pre-commit = "rustup run nightly-2025-02-20 cargo fmt -- --check"
 pre-push = "cargo clippy -p matrix-sdk-bwi -p matrix-sdk-base-bwi --no-deps -- -Dwarnings"
 
 [logging]

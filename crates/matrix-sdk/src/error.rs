@@ -338,7 +338,6 @@ pub enum Error {
     UserTagName(#[from] InvalidUserTagName),
 
     /// An error occurred within sliding-sync
-    #[cfg(feature = "experimental-sliding-sync")]
     #[error(transparent)]
     SlidingSync(#[from] crate::sliding_sync::Error),
 
@@ -355,7 +354,7 @@ pub enum Error {
     /// An error occurred interacting with the OpenID Connect API.
     #[cfg(feature = "experimental-oidc")]
     #[error(transparent)]
-    Oidc(#[from] crate::oidc::OidcError),
+    Oidc(#[from] crate::authentication::oidc::OidcError),
 
     /// A concurrent request to a deduplicated request has failed.
     #[error("a concurrent request failed; see logs for details")]
@@ -562,7 +561,7 @@ pub enum RefreshTokenError {
     /// An error occurred interacting with the OpenID Connect API.
     #[cfg(feature = "experimental-oidc")]
     #[error(transparent)]
-    Oidc(#[from] Arc<crate::oidc::OidcError>),
+    Oidc(#[from] Arc<crate::authentication::oidc::OidcError>),
 }
 
 /// Errors that can occur when manipulating push notification settings.

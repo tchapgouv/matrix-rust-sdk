@@ -14,7 +14,7 @@ matrix-sdk-crypto = { workspace = true }
 matrix-sdk-sqlite = { workspace = true, features = ["crypto-store"] }
 matrix-sdk-test = { workspace = true }
 matrix-sdk-ui = { workspace = true }
-matrix-sdk = { workspace = true, features = ["native-tls", "e2e-encryption", "sqlite"] }
+matrix-sdk = { workspace = true, features = ["native-tls", "e2e-encryption", "sqlite", "testing"] }
 ruma = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -23,10 +23,14 @@ tokio = { workspace = true, default-features = false, features = ["rt-multi-thre
 wiremock = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-pprof = { version = "0.13.0", features = ["flamegraph", "criterion"] }
+pprof = { version = "0.14.0", features = ["flamegraph", "criterion"] }
 
 [[bench]]
 name = "crypto_bench"
+harness = false
+
+[[bench]]
+name = "linked_chunk"
 harness = false
 
 [[bench]]
@@ -35,6 +39,10 @@ harness = false
 
 [[bench]]
 name = "room_bench"
+harness = false
+
+[[bench]]
+name = "timeline"
 harness = false
 
 [package.metadata.release]

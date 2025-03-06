@@ -11,11 +11,8 @@ use matrix_sdk_test::{
 use ruma::{
     event_id,
     events::{
-        room::{
-            avatar::{self, RoomAvatarEventContent},
-            member::MembershipState,
-            message::RoomMessageEventContent,
-        },
+        direct::DirectUserIdentifier,
+        room::{avatar, member::MembershipState, message::RoomMessageEventContent},
         AnySyncStateEvent, AnySyncTimelineEvent, StateEventType,
     },
     mxc_uri, room_id,
@@ -64,7 +61,7 @@ async fn test_calculate_room_names_from_summary() {
 
     assert_eq!(
         RoomDisplayName::Calculated("example2".to_owned()),
-        room.compute_display_name().await.unwrap()
+        room.display_name().await.unwrap()
     );
 }
 
@@ -82,10 +79,7 @@ async fn test_room_names() {
     assert_eq!(client.rooms().len(), 1);
     let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
 
-    assert_eq!(
-        RoomDisplayName::Aliased("tutorial".to_owned()),
-        room.compute_display_name().await.unwrap()
-    );
+    assert_eq!(RoomDisplayName::Aliased("tutorial".to_owned()), room.display_name().await.unwrap());
 
     // Room with a name.
     mock_sync(&server, &*test_json::INVITE_SYNC, None).await;
@@ -98,7 +92,7 @@ async fn test_room_names() {
 
     assert_eq!(
         RoomDisplayName::Named("My Room Name".to_owned()),
-        invited_room.compute_display_name().await.unwrap()
+        invited_room.display_name().await.unwrap()
     );
 
     let mut sync_builder = SyncResponseBuilder::new();
@@ -136,7 +130,7 @@ async fn test_room_names() {
         RoomDisplayName::Calculated(
             "user_0, user_1, user_10, user_11, user_12, and 10 others".to_owned()
         ),
-        room.compute_display_name().await.unwrap()
+        room.display_name().await.unwrap()
     );
 
     // Room with joined and invited members.
@@ -184,7 +178,7 @@ async fn test_room_names() {
 
     assert_eq!(
         RoomDisplayName::Calculated("Bob, example1".to_owned()),
-        room.compute_display_name().await.unwrap()
+        room.display_name().await.unwrap()
     );
 
     // Room with only left members.
@@ -204,7 +198,7 @@ async fn test_room_names() {
 
     assert_eq!(
         RoomDisplayName::EmptyWas("user_0, user_1, user_2".to_owned()),
-        room.compute_display_name().await.unwrap()
+        room.display_name().await.unwrap()
     );
 }
 
@@ -830,7 +824,7 @@ async fn test_is_direct() {
     // The room is direct now.
     let direct_targets = room.direct_targets();
     assert_eq!(direct_targets.len(), 1);
-    assert!(direct_targets.contains(*BOB));
+    assert!(direct_targets.contains(<&DirectUserIdentifier>::from(*BOB)));
     assert!(room.is_direct().await.unwrap());
 
     // Unset the room as direct.
@@ -883,9 +877,7 @@ async fn test_room_avatar() {
     // Set the avatar, but not the info.
     let avatar_url_1 = mxc_uri!("mxc://server.local/abcdef");
 
-    let mut content = RoomAvatarEventContent::new();
-    content.url = Some(avatar_url_1.to_owned());
-    let event = factory.event(content).state_key("").into_raw_sync();
+    let event = factory.room_avatar().url(avatar_url_1).into_raw_sync();
 
     let mut sync_builder = SyncResponseBuilder::new();
     sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(event));
@@ -905,10 +897,7 @@ async fn test_room_avatar() {
     avatar_info_2.mimetype = Some("image/png".to_owned());
     avatar_info_2.size = Some(uint!(5243));
 
-    let mut content = RoomAvatarEventContent::new();
-    content.url = Some(avatar_url_2.to_owned());
-    content.info = Some(avatar_info_2.into());
-    let event = factory.event(content).state_key("").into_raw_sync();
+    let event = factory.room_avatar().url(avatar_url_2).info(avatar_info_2).into_raw_sync();
 
     sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_event(event));
     mock_sync(&server, sync_builder.build_json_sync_response(), None).await;

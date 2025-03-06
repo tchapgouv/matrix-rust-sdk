@@ -13,12 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use crate::content_scanner::url::content_scanner_api::Endpoint::{PublicKeyEndpoint, ScanEndpoint};
 use url::Url;
 
+use crate::content_scanner::url::content_scanner_api::Endpoint::{PublicKeyEndpoint, ScanEndpoint};
+
 pub(crate) mod content_scanner_api {
-    use crate::content_scanner::url::BWIContentScannerUrl;
     use url::Url;
+
+    use crate::content_scanner::url::BWIContentScannerUrl;
 
     pub enum Endpoint {
         PublicKeyEndpoint,

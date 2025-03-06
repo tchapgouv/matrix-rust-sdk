@@ -16,12 +16,15 @@ use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use matrix_sdk_common::{
-    linked_chunk::{LinkedChunk, Update},
+    linked_chunk::{ChunkIdentifier, ChunkIdentifierGenerator, Position, RawChunk, Update},
     AsyncTraitDeps,
 };
-use ruma::{MxcUri, RoomId};
+use ruma::{EventId, MxcUri, OwnedEventId, RoomId};
 
-use super::EventCacheStoreError;
+use super::{
+    media::{IgnoreMediaRetentionPolicy, MediaRetentionPolicy},
+    EventCacheStoreError,
+};
 use crate::{
     event_cache::{Event, Gap},
     media::MediaRequestParameters,
@@ -29,6 +32,7 @@ use crate::{
 
 /// A default capacity for linked chunks, when manipulating in conjunction with
 /// an `EventCacheStore` implementation.
+// TODO: move back?
 pub const DEFAULT_CHUNK_CAPACITY: usize = 128;
 
 /// An abstract trait that can be used to implement different store backends
@@ -56,11 +60,61 @@ pub trait EventCacheStore: AsyncTraitDeps {
         updates: Vec<Update<Event, Gap>>,
     ) -> Result<(), Self::Error>;
 
-    /// Reconstruct a full linked chunk by reloading it from storage.
-    async fn reload_linked_chunk(
+    /// Remove all data tied to a given room from the cache.
+    async fn remove_room(&self, room_id: &RoomId) -> Result<(), Self::Error> {
+        // Right now, this means removing all the linked chunk. If implementations
+        // override this behavior, they should *also* include this code.
+        self.handle_linked_chunk_updates(room_id, vec![Update::Clear]).await
+    }
+
+    /// Return all the raw components of a linked chunk, so the caller may
+    /// reconstruct the linked chunk later.
+    #[doc(hidden)]
+    async fn load_all_chunks(
         &self,
         room_id: &RoomId,
-    ) -> Result<Option<LinkedChunk<DEFAULT_CHUNK_CAPACITY, Event, Gap>>, Self::Error>;
+    ) -> Result<Vec<RawChunk<Event, Gap>>, Self::Error>;
+
+    /// Load the last chunk of the `LinkedChunk` holding all events of the room
+    /// identified by `room_id`.
+    ///
+    /// This is used to iteratively load events for the `EventCache`.
+    async fn load_last_chunk(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<(Option<RawChunk<Event, Gap>>, ChunkIdentifierGenerator), Self::Error>;
+
+    /// Load the chunk before the chunk identified by `before_chunk_identifier`
+    /// of the `LinkedChunk` holding all events of the room identified by
+    /// `room_id`
+    ///
+    /// This is used to iteratively load events for the `EventCache`.
+    async fn load_previous_chunk(
+        &self,
+        room_id: &RoomId,
+        before_chunk_identifier: ChunkIdentifier,
+    ) -> Result<Option<RawChunk<Event, Gap>>, Self::Error>;
+
+    /// Clear persisted events for all the rooms.
+    ///
+    /// This will empty and remove all the linked chunks stored previously,
+    /// using the above [`Self::handle_linked_chunk_updates`] methods.
+    async fn clear_all_rooms_chunks(&self) -> Result<(), Self::Error>;
+
+    /// Given a set of event IDs, return the duplicated events along with their
+    /// position if there are any.
+    async fn filter_duplicated_events(
+        &self,
+        room_id: &RoomId,
+        events: Vec<OwnedEventId>,
+    ) -> Result<Vec<(OwnedEventId, Position)>, Self::Error>;
+
+    /// Find an event by its ID.
+    async fn find_event(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+    ) -> Result<Option<(Position, Event)>, Self::Error>;
 
     /// Add a media file's content in the media store.
     ///
@@ -73,6 +127,7 @@ pub trait EventCacheStore: AsyncTraitDeps {
         &self,
         request: &MediaRequestParameters,
         content: Vec<u8>,
+        ignore_policy: IgnoreMediaRetentionPolicy,
     ) -> Result<(), Self::Error>;
 
     /// Replaces the given media's content key with another one.
@@ -120,6 +175,23 @@ pub trait EventCacheStore: AsyncTraitDeps {
         request: &MediaRequestParameters,
     ) -> Result<(), Self::Error>;
 
+    /// Get a media file's content associated to an `MxcUri` from the
+    /// media store.
+    ///
+    /// In theory, there could be several files stored using the same URI and a
+    /// different `MediaFormat`. This API is meant to be used with a media file
+    /// that has only been stored with a single format.
+    ///
+    /// If there are several media files for a given URI in different formats,
+    /// this API will only return one of them. Which one is left as an
+    /// implementation detail.
+    ///
+    /// # Arguments
+    ///
+    /// * `uri` - The `MxcUri` of the media file.
+    async fn get_media_content_for_uri(&self, uri: &MxcUri)
+        -> Result<Option<Vec<u8>>, Self::Error>;
+
     /// Remove all the media files' content associated to an `MxcUri` from the
     /// media store.
     ///
@@ -130,6 +202,42 @@ pub trait EventCacheStore: AsyncTraitDeps {
     ///
     /// * `uri` - The `MxcUri` of the media files.
     async fn remove_media_content_for_uri(&self, uri: &MxcUri) -> Result<(), Self::Error>;
+
+    /// Set the `MediaRetentionPolicy` to use for deciding whether to store or
+    /// keep media content.
+    ///
+    /// # Arguments
+    ///
+    /// * `policy` - The `MediaRetentionPolicy` to use.
+    async fn set_media_retention_policy(
+        &self,
+        policy: MediaRetentionPolicy,
+    ) -> Result<(), Self::Error>;
+
+    /// Get the current `MediaRetentionPolicy`.
+    fn media_retention_policy(&self) -> MediaRetentionPolicy;
+
+    /// Set whether the current [`MediaRetentionPolicy`] should be ignored for
+    /// the media.
+    ///
+    /// The change will be taken into account in the next cleanup.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The `MediaRequestParameters` of the file.
+    ///
+    /// * `ignore_policy` - Whether the current `MediaRetentionPolicy` should be
+    ///   ignored.
+    async fn set_ignore_media_retention_policy(
+        &self,
+        request: &MediaRequestParameters,
+        ignore_policy: IgnoreMediaRetentionPolicy,
+    ) -> Result<(), Self::Error>;
+
+    /// Clean up the media cache with the current `MediaRetentionPolicy`.
+    ///
+    /// If there is already an ongoing cleanup, this is a noop.
+    async fn clean_up_media_cache(&self) -> Result<(), Self::Error>;
 }
 
 #[repr(transparent)]
@@ -164,19 +272,55 @@ impl<T: EventCacheStore> EventCacheStore for EraseEventCacheStoreError<T> {
         self.0.handle_linked_chunk_updates(room_id, updates).await.map_err(Into::into)
     }
 
-    async fn reload_linked_chunk(
+    async fn load_all_chunks(
         &self,
         room_id: &RoomId,
-    ) -> Result<Option<LinkedChunk<DEFAULT_CHUNK_CAPACITY, Event, Gap>>, Self::Error> {
-        self.0.reload_linked_chunk(room_id).await.map_err(Into::into)
+    ) -> Result<Vec<RawChunk<Event, Gap>>, Self::Error> {
+        self.0.load_all_chunks(room_id).await.map_err(Into::into)
+    }
+
+    async fn load_last_chunk(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<(Option<RawChunk<Event, Gap>>, ChunkIdentifierGenerator), Self::Error> {
+        self.0.load_last_chunk(room_id).await.map_err(Into::into)
+    }
+
+    async fn load_previous_chunk(
+        &self,
+        room_id: &RoomId,
+        before_chunk_identifier: ChunkIdentifier,
+    ) -> Result<Option<RawChunk<Event, Gap>>, Self::Error> {
+        self.0.load_previous_chunk(room_id, before_chunk_identifier).await.map_err(Into::into)
+    }
+
+    async fn clear_all_rooms_chunks(&self) -> Result<(), Self::Error> {
+        self.0.clear_all_rooms_chunks().await.map_err(Into::into)
+    }
+
+    async fn filter_duplicated_events(
+        &self,
+        room_id: &RoomId,
+        events: Vec<OwnedEventId>,
+    ) -> Result<Vec<(OwnedEventId, Position)>, Self::Error> {
+        self.0.filter_duplicated_events(room_id, events).await.map_err(Into::into)
+    }
+
+    async fn find_event(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+    ) -> Result<Option<(Position, Event)>, Self::Error> {
+        self.0.find_event(room_id, event_id).await.map_err(Into::into)
     }
 
     async fn add_media_content(
         &self,
         request: &MediaRequestParameters,
         content: Vec<u8>,
+        ignore_policy: IgnoreMediaRetentionPolicy,
     ) -> Result<(), Self::Error> {
-        self.0.add_media_content(request, content).await.map_err(Into::into)
+        self.0.add_media_content(request, content, ignore_policy).await.map_err(Into::into)
     }
 
     async fn replace_media_key(
@@ -201,8 +345,38 @@ impl<T: EventCacheStore> EventCacheStore for EraseEventCacheStoreError<T> {
         self.0.remove_media_content(request).await.map_err(Into::into)
     }
 
+    async fn get_media_content_for_uri(
+        &self,
+        uri: &MxcUri,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0.get_media_content_for_uri(uri).await.map_err(Into::into)
+    }
+
     async fn remove_media_content_for_uri(&self, uri: &MxcUri) -> Result<(), Self::Error> {
         self.0.remove_media_content_for_uri(uri).await.map_err(Into::into)
+    }
+
+    async fn set_media_retention_policy(
+        &self,
+        policy: MediaRetentionPolicy,
+    ) -> Result<(), Self::Error> {
+        self.0.set_media_retention_policy(policy).await.map_err(Into::into)
+    }
+
+    fn media_retention_policy(&self) -> MediaRetentionPolicy {
+        self.0.media_retention_policy()
+    }
+
+    async fn set_ignore_media_retention_policy(
+        &self,
+        request: &MediaRequestParameters,
+        ignore_policy: IgnoreMediaRetentionPolicy,
+    ) -> Result<(), Self::Error> {
+        self.0.set_ignore_media_retention_policy(request, ignore_policy).await.map_err(Into::into)
+    }
+
+    async fn clean_up_media_cache(&self) -> Result<(), Self::Error> {
+        self.0.clean_up_media_cache().await.map_err(Into::into)
     }
 }
 

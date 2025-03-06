@@ -44,8 +44,8 @@ use ruma::{
         GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType, SyncStateEvent,
     },
     serde::Raw,
-    CanonicalJsonObject, EventId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedTransactionId,
-    OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
+    CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri,
+    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -419,6 +419,9 @@ impl IndexeddbStateStore {
             StateStoreDataKey::ComposerDraft(room_id) => {
                 self.encode_key(keys::KV, (StateStoreDataKey::COMPOSER_DRAFT, room_id))
             }
+            StateStoreDataKey::SeenKnockRequests(room_id) => {
+                self.encode_key(keys::KV, (StateStoreDataKey::SEEN_KNOCK_REQUESTS, room_id))
+            }
         }
     }
 }
@@ -439,11 +442,19 @@ struct PersistedQueuedRequest {
 
     priority: Option<usize>,
 
+    /// The time the original message was first attempted to be sent at.
+    #[serde(default = "created_now")]
+    created_at: MilliSecondsSinceUnixEpoch,
+
     // Migrated fields: keep these private, they're not used anymore elsewhere in the code base.
     /// Deprecated (from old format), now replaced with error field.
     is_wedged: Option<bool>,
 
     event: Option<SerializableEventContent>,
+}
+
+fn created_now() -> MilliSecondsSinceUnixEpoch {
+    MilliSecondsSinceUnixEpoch::now()
 }
 
 impl PersistedQueuedRequest {
@@ -464,7 +475,13 @@ impl PersistedQueuedRequest {
         // By default, events without a priority have a priority of 0.
         let priority = self.priority.unwrap_or(0);
 
-        Some(QueuedRequest { kind, transaction_id: self.transaction_id, error, priority })
+        Some(QueuedRequest {
+            kind,
+            transaction_id: self.transaction_id,
+            error,
+            priority,
+            created_at: self.created_at,
+        })
     }
 }
 
@@ -537,6 +554,10 @@ impl_state_store!({
                 .map(|f| self.deserialize_value::<ComposerDraft>(&f))
                 .transpose()?
                 .map(StateStoreDataValue::ComposerDraft),
+            StateStoreDataKey::SeenKnockRequests(_) => value
+                .map(|f| self.deserialize_value::<BTreeMap<OwnedEventId, OwnedUserId>>(&f))
+                .transpose()?
+                .map(StateStoreDataValue::SeenKnockRequests),
         };
 
         Ok(value)
@@ -573,6 +594,11 @@ impl_state_store!({
             ),
             StateStoreDataKey::ComposerDraft(_) => self.serialize_value(
                 &value.into_composer_draft().expect("Session data not a composer draft"),
+            ),
+            StateStoreDataKey::SeenKnockRequests(_) => self.serialize_value(
+                &value
+                    .into_seen_knock_requests()
+                    .expect("Session data is not a set of seen knock request ids"),
             ),
         };
 
@@ -1358,6 +1384,7 @@ impl_state_store!({
         &self,
         room_id: &RoomId,
         transaction_id: OwnedTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
         kind: QueuedRequestKind,
         priority: usize,
     ) -> Result<()> {
@@ -1389,6 +1416,7 @@ impl_state_store!({
             is_wedged: None,
             event: None,
             priority: Some(priority),
+            created_at,
         });
 
         // Save the new vector into db.
@@ -1558,6 +1586,7 @@ impl_state_store!({
         room_id: &RoomId,
         parent_txn_id: &TransactionId,
         own_txn_id: ChildTransactionId,
+        created_at: MilliSecondsSinceUnixEpoch,
         content: DependentQueuedRequestKind,
     ) -> Result<()> {
         let encoded_key = self.encode_key(keys::DEPENDENT_SEND_QUEUE, room_id);
@@ -1584,6 +1613,7 @@ impl_state_store!({
             parent_transaction_id: parent_txn_id.to_owned(),
             own_transaction_id: own_txn_id,
             parent_key: None,
+            created_at,
         });
 
         // Save the new vector into db.

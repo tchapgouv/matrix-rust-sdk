@@ -8,7 +8,6 @@ pub mod v1 {
         //!
         //! [spec]: https://spec.matrix.org/latest/client-server-api/#get_matrixclientv1mediadownloadservernamemediaid
 
-        use crate::content_scanner::dto::EncryptedMetadataRequest;
         #[allow(unused_imports)] // actually used in the macros
         use reqwest::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
         use ruma_common::{
@@ -16,6 +15,8 @@ pub mod v1 {
             http_headers::ContentDisposition,
             metadata,
         };
+
+        use crate::content_scanner::dto::EncryptedMetadataRequest;
 
         #[allow(dead_code)]
         const METADATA: Metadata = metadata! {
@@ -48,8 +49,9 @@ pub mod v1 {
             #[ruma_api(header = CONTENT_TYPE)]
             pub content_type: Option<String>,
 
-            /// The value of the `Content-Disposition` HTTP header, possibly containing the name of the
-            /// file that was previously uploaded.
+            /// The value of the `Content-Disposition` HTTP header, possibly
+            /// containing the name of the file that was previously
+            /// uploaded.
             #[ruma_api(header = CONTENT_DISPOSITION)]
             pub content_disposition: Option<ContentDisposition>,
         }

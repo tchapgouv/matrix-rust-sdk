@@ -19,10 +19,7 @@ use std::time::Duration;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
-use matrix_sdk::{
-    assert_next_matches_with_timeout, config::SyncSettings,
-    test_utils::logged_in_client_with_server,
-};
+use matrix_sdk::{config::SyncSettings, test_utils::logged_in_client_with_server};
 use matrix_sdk_test::{
     async_test, event_factory::EventFactory, mocks::mock_encryption_state, JoinedRoomBuilder,
     SyncResponseBuilder, ALICE, BOB,
@@ -57,13 +54,13 @@ async fn test_new_focused() {
         target_event,
         Some("prev1".to_owned()),
         vec![
-            f.text_msg("i tried so hard").sender(*ALICE).into_timeline(),
-            f.text_msg("and got so far").sender(*ALICE).into_timeline(),
+            f.text_msg("i tried so hard").sender(*ALICE).into_event(),
+            f.text_msg("and got so far").sender(*ALICE).into_event(),
         ],
-        f.text_msg("in the end").event_id(target_event).sender(*BOB).into_timeline(),
+        f.text_msg("in the end").event_id(target_event).sender(*BOB).into_event(),
         vec![
-            f.text_msg("it doesn't even").sender(*ALICE).into_timeline(),
-            f.text_msg("matter").sender(*ALICE).into_timeline(),
+            f.text_msg("it doesn't even").sender(*ALICE).into_event(),
+            f.text_msg("matter").sender(*ALICE).into_event(),
         ],
         Some("next1".to_owned()),
         vec![],
@@ -91,8 +88,8 @@ async fn test_new_focused() {
 
     let (items, mut timeline_stream) = timeline.subscribe().await;
 
-    assert_eq!(items.len(), 5 + 1); // event items + a day divider
-    assert!(items[0].is_day_divider());
+    assert_eq!(items.len(), 5 + 1); // event items + a date divider
+    assert!(items[0].is_date_divider());
     assert_eq!(
         items[1].as_event().unwrap().content().as_message().unwrap().body(),
         "i tried so hard"
@@ -117,35 +114,39 @@ async fn test_new_focused() {
         None,
         vec![
             // reversed manually here
-            f.text_msg("And even though I tried, it all fell apart").sender(*BOB).into_timeline(),
-            f.text_msg("I kept everything inside").sender(*BOB).into_timeline(),
+            f.text_msg("And even though I tried, it all fell apart").sender(*BOB).into_event(),
+            f.text_msg("I kept everything inside").sender(*BOB).into_event(),
         ],
         vec![],
     )
     .await;
 
-    let hit_start = timeline.focused_paginate_backwards(20).await.unwrap();
+    let hit_start = timeline.paginate_backwards(20).await.unwrap();
     assert!(hit_start);
 
     server.reset().await;
 
-    assert_let!(Some(VectorDiff::PushFront { value: message }) = timeline_stream.next().await);
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 4);
+
+    assert_let!(VectorDiff::PushFront { value: message } = &timeline_updates[0]);
     assert_eq!(
         message.as_event().unwrap().content().as_message().unwrap().body(),
         "And even though I tried, it all fell apart"
     );
 
-    assert_let!(Some(VectorDiff::PushFront { value: message }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushFront { value: message } = &timeline_updates[1]);
     assert_eq!(
         message.as_event().unwrap().content().as_message().unwrap().body(),
         "I kept everything inside"
     );
 
-    // Day divider post processing.
-    assert_let!(Some(VectorDiff::PushFront { value: item }) = timeline_stream.next().await);
-    assert!(item.is_day_divider());
-    assert_let!(Some(VectorDiff::Remove { index }) = timeline_stream.next().await);
-    assert_eq!(index, 3);
+    // Date divider post processing.
+    assert_let!(VectorDiff::PushFront { value: item } = &timeline_updates[2]);
+    assert!(item.is_date_divider());
+
+    assert_let!(VectorDiff::Remove { index } = &timeline_updates[3]);
+    assert_eq!(*index, 3);
 
     // Now trigger a forward pagination.
     mock_messages(
@@ -153,25 +154,28 @@ async fn test_new_focused() {
         "next1".to_owned(),
         Some("next2".to_owned()),
         vec![
-            f.text_msg("I had to fall, to lose it all").sender(*BOB).into_timeline(),
-            f.text_msg("But in the end, it doesn't event matter").sender(*BOB).into_timeline(),
+            f.text_msg("I had to fall, to lose it all").sender(*BOB).into_event(),
+            f.text_msg("But in the end, it doesn't event matter").sender(*BOB).into_event(),
         ],
         vec![],
     )
     .await;
 
-    let hit_start = timeline.focused_paginate_forwards(20).await.unwrap();
+    let hit_start = timeline.paginate_forwards(20).await.unwrap();
     assert!(!hit_start); // because we gave it another next2 token.
 
     server.reset().await;
 
-    assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
+    assert_let!(VectorDiff::PushBack { value: message } = &timeline_updates[0]);
     assert_eq!(
         message.as_event().unwrap().content().as_message().unwrap().body(),
         "I had to fall, to lose it all"
     );
 
-    assert_let!(Some(VectorDiff::PushBack { value: message }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value: message } = &timeline_updates[1]);
     assert_eq!(
         message.as_event().unwrap().content().as_message().unwrap().body(),
         "But in the end, it doesn't event matter"
@@ -181,7 +185,7 @@ async fn test_new_focused() {
 }
 
 #[async_test]
-async fn test_focused_timeline_reacts() {
+async fn test_focused_timeline_does_not_react() {
     let room_id = room_id!("!a98sd12bjh:example.org");
     let (client, server) = logged_in_client_with_server().await;
     let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
@@ -204,7 +208,7 @@ async fn test_focused_timeline_reacts() {
         target_event,
         None,
         vec![],
-        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_timeline(),
+        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_event(),
         vec![],
         None,
         vec![],
@@ -227,12 +231,12 @@ async fn test_focused_timeline_reacts() {
 
     let (items, mut timeline_stream) = timeline.subscribe().await;
 
-    assert_eq!(items.len(), 1 + 1); // event items + a day divider
-    assert!(items[0].is_day_divider());
+    assert_eq!(items.len(), 1 + 1); // event items + a date divider
+    assert!(items[0].is_date_divider());
 
     let event_item = items[1].as_event().unwrap();
     assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
-    assert_eq!(event_item.reactions().len(), 0);
+    assert_eq!(event_item.content().reactions().len(), 0);
 
     assert_pending!(timeline_stream);
 
@@ -242,7 +246,7 @@ async fn test_focused_timeline_reacts() {
         // This event must be ignored.
         f.text_msg("this is a sync event").sender(*ALICE).into(),
         // This event must not be ignored.
-        f.reaction(target_event, "👍".to_owned()).sender(*BOB).into(),
+        f.reaction(target_event, "👍").sender(*BOB).into(),
     ]));
 
     // Sync the room.
@@ -250,15 +254,7 @@ async fn test_focused_timeline_reacts() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
-    let item = assert_next_matches_with_timeout!(timeline_stream, VectorDiff::Set { index: 1, value: item } => item);
-
-    let event_item = item.as_event().unwrap();
-    // Text hasn't changed.
-    assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
-    // But now there's one reaction to the event.
-    assert_eq!(event_item.reactions().len(), 1);
-
-    // And nothing more.
+    // Nothing was received by the focused event timeline
     assert_pending!(timeline_stream);
 }
 
@@ -286,7 +282,7 @@ async fn test_focused_timeline_local_echoes() {
         target_event,
         None,
         vec![],
-        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_timeline(),
+        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_event(),
         vec![],
         None,
         vec![],
@@ -309,12 +305,12 @@ async fn test_focused_timeline_local_echoes() {
 
     let (items, mut timeline_stream) = timeline.subscribe().await;
 
-    assert_eq!(items.len(), 1 + 1); // event items + a day divider
-    assert!(items[0].is_day_divider());
+    assert_eq!(items.len(), 1 + 1); // event items + a date divider
+    assert!(items[0].is_date_divider());
 
     let event_item = items[1].as_event().unwrap();
     assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
-    assert_eq!(event_item.reactions().len(), 0);
+    assert_eq!(event_item.content().reactions().len(), 0);
 
     sleep(Duration::from_millis(100)).await;
     assert_pending!(timeline_stream);
@@ -322,14 +318,17 @@ async fn test_focused_timeline_local_echoes() {
     // Add a reaction to the focused event, which will cause a local echo to happen.
     timeline.toggle_reaction(&event_item.identifier(), "✨").await.unwrap();
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 1);
+
     // We immediately get the local echo for the reaction.
-    let item = assert_next_matches_with_timeout!(timeline_stream, VectorDiff::Set { index: 1, value: item } => item);
+    assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[0]);
 
     let event_item = item.as_event().unwrap();
     // Text hasn't changed.
     assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
     // But now there's one reaction to the event.
-    let reactions = event_item.reactions();
+    let reactions = event_item.content().reactions();
     assert_eq!(reactions.len(), 1);
     assert!(reactions.get("✨").unwrap().get(client.user_id().unwrap()).is_some());
 
@@ -362,7 +361,7 @@ async fn test_focused_timeline_doesnt_show_local_echoes() {
         target_event,
         None,
         vec![],
-        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_timeline(),
+        f.text_msg("yolo").event_id(target_event).sender(*BOB).into_event(),
         vec![],
         None,
         vec![],
@@ -385,12 +384,12 @@ async fn test_focused_timeline_doesnt_show_local_echoes() {
 
     let (items, mut timeline_stream) = timeline.subscribe().await;
 
-    assert_eq!(items.len(), 1 + 1); // event items + a day divider
-    assert!(items[0].is_day_divider());
+    assert_eq!(items.len(), 1 + 1); // event items + a date divider
+    assert!(items[0].is_date_divider());
 
     let event_item = items[1].as_event().unwrap();
     assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
-    assert_eq!(event_item.reactions().len(), 0);
+    assert_eq!(event_item.content().reactions().len(), 0);
 
     assert_pending!(timeline_stream);
 

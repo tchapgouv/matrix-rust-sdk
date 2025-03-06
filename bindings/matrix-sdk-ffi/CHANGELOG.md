@@ -2,6 +2,9 @@
 
 Breaking changes:
 
+- Matrix client API errors coming from API responses will now be mapped to `ClientError::MatrixApi`, containing both the
+  original message and the associated error code and kind. 
+
 - `EventSendState` now has two additional variants: `CrossSigningNotSetup` and
   `SendingFromUnverifiedDevice`. These indicate that your own device is not
   properly cross-signed, which is a requirement when using the identity-based
@@ -33,3 +36,6 @@ Additions:
 
 - Add `Encryption::get_user_identity` which returns `UserIdentity`
 - Add `ClientBuilder::room_key_recipient_strategy`
+- Add `Room::send_raw`
+- Expose `withdraw_verification` to `UserIdentity`
+- Expose `report_room` to `Room`

@@ -13,12 +13,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use matrix_sdk_base::crypto::vodozemac::pk_encryption::{Message, PkEncryption};
-use matrix_sdk_base::crypto::vodozemac::Curve25519PublicKey;
-use matrix_sdk_base::ruma::events::room::EncryptedFile;
-use matrix_sdk_base::ruma::exports::serde_json;
-use matrix_sdk_base::ruma::serde::base64::Standard;
-use matrix_sdk_base::ruma::serde::Base64;
+use matrix_sdk_base::{
+    crypto::vodozemac::{
+        pk_encryption::{Message, PkEncryption},
+        Curve25519PublicKey,
+    },
+    ruma::{
+        events::room::EncryptedFile,
+        exports::serde_json,
+        serde::{base64::Standard, Base64},
+    },
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,13 +125,16 @@ impl EncryptedMetadataRequestBuilder {
 
 #[cfg(test)]
 mod test_encrypted_file {
-    use crate::content_scanner::dto::BWIEncryptedFileDto;
-    use matrix_sdk_base::ruma::events::room::{EncryptedFile, EncryptedFileInit, JsonWebKeyInit};
-    use matrix_sdk_base::ruma::exports::serde_json;
-    use matrix_sdk_base::ruma::exports::serde_json::json;
-    use matrix_sdk_base::ruma::mxc_uri;
-    use matrix_sdk_base::ruma::serde::Base64;
     use std::collections::BTreeMap;
+
+    use matrix_sdk_base::ruma::{
+        events::room::{EncryptedFile, EncryptedFileInit, JsonWebKeyInit},
+        exports::{serde_json, serde_json::json},
+        mxc_uri,
+        serde::Base64,
+    };
+
+    use crate::content_scanner::dto::BWIEncryptedFileDto;
 
     #[test]
     fn test_serialization_suitable_for_content_scanner_request() {

@@ -38,11 +38,10 @@ use matrix_sdk::{
     },
     sliding_sync::VersionBuilder,
     test_utils::{logged_in_client_with_server, mocks::MatrixMockServer},
-    Client, RoomInfo, RoomMemberships, RoomState, SlidingSyncList, SlidingSyncMode,
+    Client, Room, RoomInfo, RoomMemberships, RoomState, SlidingSyncList, SlidingSyncMode,
 };
-use matrix_sdk_base::{
-    ruma::{owned_room_id, room_alias_id},
-    sliding_sync::http,
+use matrix_sdk_base::ruma::{
+    api::client::sync::sync_events::v5 as http, owned_room_id, room_alias_id,
 };
 use matrix_sdk_test::async_test;
 use matrix_sdk_ui::{
@@ -58,7 +57,7 @@ use tokio::{
     sync::Mutex,
     time::{sleep, timeout},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use wiremock::{matchers::AnyMatcher, Mock, MockServer};
 
 use crate::helpers::{wait_for_room, TestClientBuilder};
@@ -195,10 +194,13 @@ async fn test_room_avatar_group_conversation() -> Result<()> {
 
     // alice creates a room and invites bob and celine.
     let alice_room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![bob.user_id().unwrap().to_owned(), celine.user_id().unwrap().to_owned()],
-            is_direct: true,
-        }), false)
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![bob.user_id().unwrap().to_owned(), celine.user_id().unwrap().to_owned()],
+                is_direct: true,
+            }),
+            false,
+        )
         .await?;
 
     sleep(Duration::from_secs(1)).await;
@@ -847,10 +849,28 @@ async fn test_delayed_decryption_latest_event() -> Result<()> {
     Ok(())
 }
 
+async fn get_or_wait_for_room(client: &Client, room_id: &RoomId) -> Room {
+    let (mut rooms, mut room_stream) = client.rooms_stream();
+
+    loop {
+        if let Some(room) = rooms.iter().find(|room| room.room_id() == room_id) {
+            return room.clone();
+        }
+
+        if let Ok(Some(diffs)) = timeout(Duration::from_secs(3), room_stream.next()).await {
+            for diff in diffs {
+                diff.apply(&mut rooms);
+            }
+        } else {
+            panic!("bob never founds out about the room");
+        }
+    }
+}
+
 #[tokio::test]
-async fn test_delayed_invite_response_and_sent_message_decryption() -> Result<()> {
-    let alice = TestClientBuilder::new("alice").use_sqlite().build().await?;
-    let bob = TestClientBuilder::new("bob").use_sqlite().build().await?;
+async fn test_delayed_invite_response_and_sent_message_decryption() {
+    let alice = TestClientBuilder::new("alice").use_sqlite().build().await.unwrap();
+    let bob = TestClientBuilder::new("bob").use_sqlite().build().await.unwrap();
 
     let alice_sync_service = SyncService::builder(alice.clone()).build().await.unwrap();
     alice_sync_service.start().await;
@@ -858,7 +878,7 @@ async fn test_delayed_invite_response_and_sent_message_decryption() -> Result<()
     let bob_sync_service = SyncService::builder(bob.clone()).build().await.unwrap();
     bob_sync_service.start().await;
 
-    // alice creates a room and invites bob.
+    // Alice creates a room and will invite Bob.
     let alice_room = alice
         .create_room(
             assign!(CreateRoomRequest::new(), {
@@ -868,66 +888,74 @@ async fn test_delayed_invite_response_and_sent_message_decryption() -> Result<()
             }),
             false,
         )
-        .await?;
-    alice_room.enable_encryption().await?;
+        .await
+        .unwrap();
+    alice_room.enable_encryption().await.unwrap();
 
     // Initial message to make sure any lazy /members call is performed before the
     // test actually starts
     alice_room
         .send(RoomMessageEventContent::text_plain("dummy message to make members call"))
-        .await?;
+        .await
+        .unwrap();
 
     // Send the invite to Bob and a message to reproduce the edge case
     alice_room.invite_user_by_id(bob.user_id().unwrap()).await.unwrap();
-    alice_room.send(RoomMessageEventContent::text_plain("hello world")).await?;
+    alice_room.send(RoomMessageEventContent::text_plain("hello world")).await.unwrap();
 
-    // Wait until Bob receives the invite
-    let bob_sync_stream = bob.sync_stream(SyncSettings::new()).await;
-    pin_mut!(bob_sync_stream);
+    let room_id = alice_room.room_id();
 
-    while let Some(Ok(response)) =
-        timeout(Duration::from_secs(3), bob_sync_stream.next()).await.expect("Room sync timed out")
-    {
-        if response.rooms.invite.contains_key(alice_room.room_id()) {
-            break;
-        }
-    }
+    // Wait until Bob receives the invite.
+    let bob_room = get_or_wait_for_room(&bob, room_id).await;
 
-    // Join the room from Bob's client
-    let bob_room = bob.get_room(alice_room.room_id()).unwrap();
-    bob_room.join().await?;
+    // Join the room from Bob's client.
+    let bob_timeline = bob_room.timeline().await.unwrap();
+    let (_, timeline_stream) = bob_timeline.subscribe().await;
+    pin_mut!(timeline_stream);
+
+    info!("Bob joins the room.");
+    bob_room.join().await.unwrap();
 
     assert_eq!(alice_room.state(), RoomState::Joined);
     assert!(alice_room.is_encrypted().await.unwrap());
     assert_eq!(bob_room.state(), RoomState::Joined);
     assert!(bob_room.is_encrypted().await.unwrap());
 
-    let bob_timeline = bob_room.timeline_builder().build().await?;
-    let (_, timeline_stream) = bob_timeline.subscribe().await;
-    pin_mut!(timeline_stream);
+    // Get previous events, including the sent messages.
+    bob_timeline.paginate_backwards(3).await.unwrap();
 
-    // Get previous events, including the sent message
-    bob_timeline.paginate_backwards(3).await?;
+    // Look for the sent message, which should not be an UTD event.
+    while let Ok(Some(diffs)) = timeout(Duration::from_secs(3), timeline_stream.next()).await {
+        trace!(?diffs, "Received diffs from Bob's room");
 
-    // Look for the sent message, which should not be an UTD event
-    loop {
-        let diff = timeout(Duration::from_millis(100), timeline_stream.next())
-            .await
-            .expect("Timed out. Neither an UTD nor the sent message were found")
-            .unwrap();
-        if let VectorDiff::PushFront { value } = diff {
-            if let Some(content) = value.as_event().map(|e| e.content()) {
-                if let Some(message) = content.as_message() {
-                    if message.body() == "hello world" {
-                        return Ok(());
+        for diff in diffs {
+            match diff {
+                VectorDiff::PushFront { value: event }
+                | VectorDiff::PushBack { value: event }
+                | VectorDiff::Insert { value: event, .. }
+                | VectorDiff::Set { value: event, .. } => {
+                    let Some(event) = event.as_event() else {
+                        continue;
+                    };
+
+                    let content = event.content();
+
+                    if content.as_unable_to_decrypt().is_some() {
+                        info!("Observed UTD for {}", event.event_id().unwrap());
                     }
-                    panic!("Unexpected message event found");
-                } else if content.as_unable_to_decrypt().is_some() {
-                    panic!("UTD found!")
+
+                    if let Some(message) = content.as_message() {
+                        assert_eq!(message.body(), "hello world");
+                        return;
+                    }
                 }
+
+                _ => {}
             }
         }
     }
+
+    panic!("We never received the decrypted event!");
 }
 
 #[tokio::test]
@@ -1057,7 +1085,8 @@ async fn test_room_preview() -> Result<()> {
     let room_alias = format!("aliasy_mac_alias{suffix}");
 
     let room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
             invite: vec![],
             is_direct: false,
             name: Some("Alice's Room".to_owned()),
@@ -1067,20 +1096,25 @@ async fn test_room_preview() -> Result<()> {
                 InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(HistoryVisibility::WorldReadable)).to_raw_any(),
                 InitialStateEvent::new(RoomJoinRulesEventContent::new(JoinRule::Invite)).to_raw_any(),
             ],
-        }), false)
+        }),
+            false,
+        )
         .await?;
 
     room.set_avatar_url(mxc_uri!("mxc://localhost/alice"), None).await?;
 
     // Alice creates another room, and still doesn't invite Bob.
     let private_room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            name: Some("Alice's Room 2".to_owned()),
-            initial_state: vec![
-                InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(HistoryVisibility::Shared)).to_raw_any(),
-                InitialStateEvent::new(RoomJoinRulesEventContent::new(JoinRule::Public)).to_raw_any(),
-            ],
-        }), false)
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                name: Some("Alice's Room 2".to_owned()),
+                initial_state: vec![
+                    InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(HistoryVisibility::Shared)).to_raw_any(),
+                    InitialStateEvent::new(RoomJoinRulesEventContent::new(JoinRule::Public)).to_raw_any(),
+                ],
+            }),
+            false,
+        )
         .await?;
 
     let room_id = room.room_id();

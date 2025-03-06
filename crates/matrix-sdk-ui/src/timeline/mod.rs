@@ -16,8 +16,9 @@
 //!
 //! See [`Timeline`] for details.
 
-use std::{path::PathBuf, pin::Pin, sync::Arc, task::Poll};
+use std::{fs, path::PathBuf, sync::Arc};
 
+use algorithms::rfind_event_by_item_id;
 use event_item::{extract_room_msg_edit_content, TimelineItemHandle};
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
@@ -33,7 +34,7 @@ use matrix_sdk::{
     Client, Result,
 };
 use mime::Mime;
-use pin_project_lite::pin_project;
+use pinned_events_loader::PinnedEventsRoom;
 use ruma::{
     api::client::receipt::create_receipt::v3::ReceiptType,
     events::{
@@ -52,15 +53,18 @@ use ruma::{
     serde::Raw,
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId, RoomVersionId, UserId,
 };
+use subscriber::TimelineWithDropHandle;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, trace, warn};
-use util::rfind_event_by_item_id;
 
-use crate::timeline::pinned_events_loader::PinnedEventsRoom;
+use self::{
+    algorithms::rfind_event_by_id, controller::TimelineController, futures::SendAttachment,
+};
 
+mod algorithms;
 mod builder;
 mod controller;
-mod day_dividers;
+mod date_dividers;
 mod error;
 mod event_handler;
 mod event_item;
@@ -69,13 +73,11 @@ pub mod futures;
 mod item;
 mod pagination;
 mod pinned_events_loader;
-mod reactions;
-mod read_receipts;
+mod subscriber;
 #[cfg(test)]
 mod tests;
 mod to_device;
 mod traits;
-mod util;
 mod virtual_item;
 
 pub use self::{
@@ -91,11 +93,9 @@ pub use self::{
     },
     event_type_filter::TimelineEventTypeFilter,
     item::{TimelineItem, TimelineItemKind, TimelineUniqueId},
-    pagination::LiveBackPaginationStatus,
     traits::RoomExt,
     virtual_item::VirtualTimelineItem,
 };
-use self::{controller::TimelineController, futures::SendAttachment, util::rfind_event_by_id};
 
 /// Information needed to reply to an event.
 #[derive(Debug, Clone)]
@@ -178,6 +178,14 @@ impl TimelineFocus {
     }
 }
 
+/// Changes how dividers get inserted, either in between each day or in between
+/// each month
+#[derive(Debug, Clone)]
+pub enum DateDividerMode {
+    Daily,
+    Monthly,
+}
+
 impl Timeline {
     /// Create a new [`TimelineBuilder`] for the given room.
     pub fn builder(room: &Room) -> TimelineBuilder {
@@ -238,7 +246,7 @@ impl Timeline {
 
     pub(crate) async fn setup_content_scanner_hook(&self) -> &Self {
         info!("###BWI### setup content scanner hook");
-        let (timeline_items, timeline_stream) = self.subscribe_batched().await;
+        let (timeline_items, timeline_stream) = self.subscribe().await;
 
         let timeline_controller = self.controller.clone();
 
@@ -323,28 +331,17 @@ impl Timeline {
         }
     }
 
-    /// Get the current timeline items, and a stream of changes.
+    /// Get the current timeline items, along with a stream of updates of
+    /// timeline items.
     ///
-    /// You can poll this stream to receive updates. See
-    /// [`futures_util::StreamExt`] for a high-level API on top of [`Stream`].
+    /// The stream produces `Vec<VectorDiff<_>>`, which means multiple updates
+    /// at once. There are no delays, it consumes as many updates as possible
+    /// and batches them.
     pub async fn subscribe(
         &self,
-    ) -> (Vector<Arc<TimelineItem>>, impl Stream<Item = VectorDiff<Arc<TimelineItem>>>) {
-        let (items, stream) = self.controller.subscribe().await;
-        let stream = TimelineStream::new(stream, self.drop_handle.clone());
-        (items, stream)
-    }
-
-    /// Get the current timeline items, and a batched stream of changes.
-    ///
-    /// In contrast to [`subscribe`](Self::subscribe), this stream can yield
-    /// multiple diffs at once. The batching is done such that no arbitrary
-    /// delays are added.
-    pub async fn subscribe_batched(
-        &self,
     ) -> (Vector<Arc<TimelineItem>>, impl Stream<Item = Vec<VectorDiff<Arc<TimelineItem>>>>) {
-        let (items, stream) = self.controller.subscribe_batched().await;
-        let stream = TimelineStream::new(stream, self.drop_handle.clone());
+        let (items, stream) = self.controller.subscribe().await;
+        let stream = TimelineWithDropHandle::new(stream, self.drop_handle.clone());
         (items, stream)
     }
 
@@ -467,10 +464,13 @@ impl Timeline {
                     original_message,
                 )) = message_like_event
                 {
+                    // We don't have access to reactions here.
+                    let reactions = Default::default();
                     ReplyContent::Message(Message::from_event(
                         original_message.content.clone(),
                         extract_room_msg_edit_content(message_like_event.relations()),
                         &self.items().await,
+                        reactions,
                     ))
                 } else {
                     ReplyContent::Raw(raw_sync_event)
@@ -544,9 +544,9 @@ impl Timeline {
                         }
                     }
 
-                    EditedContent::MediaCaption { caption, formatted_caption } => {
+                    EditedContent::MediaCaption { caption, formatted_caption, mentions } => {
                         if handle
-                            .edit_media_caption(caption, formatted_caption)
+                            .edit_media_caption(caption, formatted_caption, mentions)
                             .await
                             .map_err(RoomSendQueueError::StorageError)?
                         {
@@ -590,22 +590,30 @@ impl Timeline {
     /// If the encryption feature is enabled, this method will transparently
     /// encrypt the room message if the room is encrypted.
     ///
+    /// The attachment and its optional thumbnail are stored in the media cache
+    /// and can be retrieved at any time, by calling
+    /// [`Media::get_media_content()`] with the `MediaSource` that can be found
+    /// in the corresponding `TimelineEventItem`, and using a
+    /// `MediaFormat::File`.
+    ///
     /// # Arguments
     ///
-    /// * `path` - The path of the file to be sent.
+    /// * `source` - The source of the attachment to send.
     ///
     /// * `mime_type` - The attachment's mime type.
     ///
     /// * `config` - An attachment configuration object containing details about
     ///   the attachment like a thumbnail, its size, duration etc.
+    ///
+    /// [`Media::get_media_content()`]: matrix_sdk::Media::get_media_content
     #[instrument(skip_all)]
     pub fn send_attachment(
         &self,
-        path: impl Into<PathBuf>,
+        source: impl Into<AttachmentSource>,
         mime_type: Mime,
         config: AttachmentConfig,
     ) -> SendAttachment<'_> {
-        SendAttachment::new(self, path.into(), mime_type, config)
+        SendAttachment::new(self, source.into(), mime_type, config)
     }
 
     /// Redact an event given its [`TimelineEventItemId`] and an optional
@@ -870,7 +878,7 @@ impl Timeline {
         f: impl Fn(Arc<TimelineItem>) -> Option<U>,
     ) -> (Vector<U>, impl Stream<Item = VectorDiff<U>>) {
         let (items, stream) = self.controller.subscribe_filter_map(f).await;
-        let stream = TimelineStream::new(stream, self.drop_handle.clone());
+        let stream = TimelineWithDropHandle::new(stream, self.drop_handle.clone());
         (items, stream)
     }
 }
@@ -882,6 +890,7 @@ struct TimelineDropHandle {
     room_update_join_handle: JoinHandle<()>,
     pinned_events_join_handle: Option<JoinHandle<()>>,
     room_key_from_backups_join_handle: JoinHandle<()>,
+    room_keys_received_join_handle: JoinHandle<()>,
     room_key_backup_enabled_join_handle: JoinHandle<()>,
     local_echo_listener_handle: JoinHandle<()>,
     _event_cache_drop_handle: Arc<EventCacheDropHandles>,
@@ -902,34 +911,59 @@ impl Drop for TimelineDropHandle {
         self.room_update_join_handle.abort();
         self.room_key_from_backups_join_handle.abort();
         self.room_key_backup_enabled_join_handle.abort();
+        self.room_keys_received_join_handle.abort();
         self.encryption_changes_handle.abort();
-    }
-}
-
-pin_project! {
-    struct TimelineStream<S> {
-        #[pin]
-        inner: S,
-        drop_handle: Arc<TimelineDropHandle>,
-    }
-}
-
-impl<S> TimelineStream<S> {
-    fn new(inner: S, drop_handle: Arc<TimelineDropHandle>) -> Self {
-        Self { inner, drop_handle }
-    }
-}
-
-impl<S: Stream> Stream for TimelineStream<S> {
-    type Item = S::Item;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        self.project().inner.poll_next(cx)
     }
 }
 
 pub type TimelineEventFilterFn =
     dyn Fn(&AnySyncTimelineEvent, &RoomVersionId) -> bool + Send + Sync;
+
+/// A source for sending an attachment.
+///
+/// The [`AttachmentSource::File`] variant can be constructed from any type that
+/// implements `Into<PathBuf>`.
+#[derive(Debug, Clone)]
+pub enum AttachmentSource {
+    /// The data of the attachment.
+    Data {
+        /// The bytes of the attachment.
+        bytes: Vec<u8>,
+
+        /// The filename of the attachment.
+        filename: String,
+    },
+
+    /// An attachment loaded from a file.
+    ///
+    /// The bytes and the filename will be read from the file at the given path.
+    File(PathBuf),
+}
+
+impl AttachmentSource {
+    /// Try to convert this attachment source into a `(bytes, filename)` tuple.
+    pub(crate) fn try_into_bytes_and_filename(self) -> Result<(Vec<u8>, String), Error> {
+        match self {
+            Self::Data { bytes, filename } => Ok((bytes, filename)),
+            Self::File(path) => {
+                let filename = path
+                    .file_name()
+                    .ok_or(Error::InvalidAttachmentFileName)?
+                    .to_str()
+                    .ok_or(Error::InvalidAttachmentFileName)?
+                    .to_owned();
+                let bytes = fs::read(&path).map_err(|_| Error::InvalidAttachmentData)?;
+                Ok((bytes, filename))
+            }
+        }
+    }
+}
+
+impl<P> From<P> for AttachmentSource
+where
+    P: Into<PathBuf>,
+{
+    fn from(value: P) -> Self {
+        Self::File(value.into())
+    }
+}

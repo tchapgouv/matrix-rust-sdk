@@ -1,12 +1,11 @@
-use std::env;
-use std::process::exit;
+use std::{env, process::exit};
 
+use matrix_sdk::{
+    media::{MediaFormat, MediaRequestParameters},
+    ruma::{events::room::MediaSource, OwnedMxcUri},
+    Client,
+};
 use url::Url;
-
-use matrix_sdk::media::{MediaFormat, MediaRequest};
-use matrix_sdk::ruma::events::room::MediaSource;
-use matrix_sdk::ruma::OwnedMxcUri;
-use matrix_sdk::Client;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,13 +30,11 @@ async fn download_media(
     mediasource_url: String,
 ) -> matrix_sdk::Result<Vec<u8>> {
     let homeserver_url = Url::parse(&homeserver_url)?;
-    let client = Client::new(homeserver_url).await?;
+    let client = Client::new(homeserver_url).await.unwrap();
 
     let source = MediaSource::Plain(OwnedMxcUri::from(mediasource_url));
-    let result = client
+    return client
         .media()
-        .get_media_content(&MediaRequest { source, format: MediaFormat::File }, true)
+        .get_media_content(&MediaRequestParameters { source, format: MediaFormat::File }, true)
         .await;
-
-    result
 }

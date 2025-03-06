@@ -13,13 +13,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use crate::bwi_bindings::PasswordStrength::{Medium, Strong, Weak};
-use crate::error::ClientError;
-use crate::error::ClientError::Generic;
-use matrix_sdk_bwi::password_evaluator::{BWIPasswordEvaluator, BWIPasswordStrength};
-use matrix_sdk_bwi::regulatory::data_privacy::BWIDataPrivacySource;
-use matrix_sdk_bwi::regulatory::imprint::BWIImprintSource;
-use matrix_sdk_bwi::regulatory::organization::BWIOrganization;
+use matrix_sdk_bwi::{
+    password_evaluator::{BWIPasswordEvaluator, BWIPasswordStrength},
+    regulatory::{
+        data_privacy::BWIDataPrivacySource, imprint::BWIImprintSource,
+        organization::BWIOrganization,
+    },
+};
+
+use crate::{
+    bwi_bindings::PasswordStrength::{Medium, Strong, Weak},
+    error::{ClientError, ClientError::Generic},
+};
 
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn get_imprint_as_url(homeserver_url: &str) -> Result<String, ClientError> {

@@ -6,6 +6,61 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- [**breaking**] The `MediaRetentionPolicy` can now trigger regular cleanups
+  with its new `cleanup_frequency` setting.
+  ([#4603](https://github.com/matrix-org/matrix-rust-sdk/pull/4603))
+  - `Clone` is a supertrait of `EventCacheStoreMedia`.
+  - `EventCacheStoreMedia` has a new method `last_media_cleanup_time_inner`
+  - There are new `'static` bounds in `MediaService` for the media cache stores
+- `event_cache::store::MemoryStore` implements `Clone`.
+- `BaseClient` now has a `handle_verification_events` field which is `true` by 
+  default and can be negated so the `NotificationClient` won't handle received 
+  verification events too, causing errors in the `VerificationMachine`.
+
+## [0.10.0] - 2025-02-04
+
+### Features
+
+- [**breaking**] `EventCacheStore` allows to control which media content is
+  allowed in the media cache, and how long it should be kept, with a
+  `MediaRetentionPolicy`:
+  - `EventCacheStore::add_media_content()` has an extra argument,
+    `ignore_policy`, which decides whether a media content should ignore the
+    `MediaRetentionPolicy`. It should be stored alongside the media content.
+  - `EventCacheStore` has four new methods: `media_retention_policy()`,
+    `set_media_retention_policy()`, `set_ignore_media_retention_policy()` and
+    `clean_up_media_cache()`.
+  - `EventCacheStore` implementations should delegate media cache methods to the
+    methods of the same name of `MediaService` to use the `MediaRetentionPolicy`.
+    They need to implement the `EventCacheStoreMedia` trait that can be tested
+    with the `event_cache_store_media_integration_tests!` macro.
+    ([#4571](https://github.com/matrix-org/matrix-rust-sdk/pull/4571))
+
+### Refactor
+
+- [**breaking**] Replaced `Room::compute_display_name` with the reintroduced
+  `Room::display_name()`. The new method computes a display name, or return a
+  cached value from the previous successful computation. If you need a sync
+  variant, consider using `Room::cached_display_name()`.
+  ([#4470](https://github.com/matrix-org/matrix-rust-sdk/pull/4470))
+- [**breaking**]: The reexported types `SyncTimelineEvent` and `TimelineEvent`
+  have been fused into a single type `TimelineEvent`, and its field
+  `push_actions` has been made `Option`al (it is set to `None` when we couldn't
+  compute the push actions, because we lacked some information).
+  ([#4568](https://github.com/matrix-org/matrix-rust-sdk/pull/4568))
+
+## [0.9.0] - 2024-12-18
+
+### Features
+
+- Introduced support for
+  [MSC4171](https://github.com/matrix-org/matrix-rust-sdk/pull/4335), enabling
+  the designation of certain users as service members. These flagged users are
+  excluded from the room display name calculation.
+  ([#4335](https://github.com/matrix-org/matrix-rust-sdk/pull/4335))
+
 ### Bug Fixes
 
 - Fix an off-by-one error in the `ObservableMap` when the `remove()` method is

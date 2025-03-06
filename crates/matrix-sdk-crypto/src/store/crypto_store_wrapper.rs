@@ -4,7 +4,10 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use matrix_sdk_common::store_locks::CrossProcessStoreLock;
 use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{
+    broadcast::{self},
+    Mutex,
+};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tracing::{debug, trace, warn};
 
@@ -172,7 +175,9 @@ impl CryptoStoreWrapper {
             if let Some(own_identity_after) = maybe_own_identity.as_ref() {
                 // Only do this if our identity is passing from not verified to verified,
                 // the previously_verified can only change in that case.
-                if !own_identity_was_verified_before_change && own_identity_after.is_verified() {
+                let own_identity_is_verified = own_identity_after.is_verified();
+
+                if !own_identity_was_verified_before_change && own_identity_is_verified {
                     debug!("Own identity is now verified, check all known identities for verification status changes");
                     // We need to review all the other identities to see if they are verified now
                     // and mark them as such
@@ -180,6 +185,12 @@ impl CryptoStoreWrapper {
                         own_identity_after,
                     )
                     .await?;
+                } else if own_identity_was_verified_before_change != own_identity_is_verified {
+                    // Log that the verification state of the identity changed.
+                    debug!(
+                        own_identity_is_verified,
+                        "The verification state of our own identity has changed",
+                    );
                 }
             }
 
@@ -292,11 +303,12 @@ impl CryptoStoreWrapper {
     /// the stream. Updates that happen at the same time are batched into a
     /// [`Vec`].
     ///
-    /// If the reader of the stream lags too far behind, a warning will be
-    /// logged and items will be dropped.
-    pub fn room_keys_received_stream(&self) -> impl Stream<Item = Vec<RoomKeyInfo>> {
-        let stream = BroadcastStream::new(self.room_keys_received_sender.subscribe());
-        Self::filter_errors_out_of_stream(stream, "room_keys_received_stream")
+    /// If the reader of the stream lags too far behind an error will be sent to
+    /// the reader.
+    pub fn room_keys_received_stream(
+        &self,
+    ) -> impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>> {
+        BroadcastStream::new(self.room_keys_received_sender.subscribe())
     }
 
     /// Receive notifications of received `m.room_key.withheld` messages.

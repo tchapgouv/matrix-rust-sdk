@@ -1,18 +1,19 @@
 [package]
 name = "matrix-sdk-ui"
 description = "GUI-centric utilities on top of matrix-rust-sdk (experimental)."
-version = "0.8.0"
+version = "0.10.0"
 edition = "2021"
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
 license = "Apache-2.0"
 rust-version = { workspace = true }
 
 [features]
-default = ["rustls-tls"]
+default = ["native-tls"]
 
 native-tls = ["matrix-sdk/native-tls"]
 rustls-tls = ["matrix-sdk/rustls-tls"]
 
+js = ["matrix-sdk/js"]
 uniffi = ["dep:uniffi", "matrix-sdk/uniffi", "matrix-sdk-base/uniffi"]
 enable_external_content_scanner_setup = []
 
@@ -36,7 +37,7 @@ growable-bloom-filter = { workspace = true }
 imbl = { workspace = true, features = ["serde"] }
 indexmap = { workspace = true }
 itertools = { workspace = true }
-matrix-sdk = { workspace = true, features = ["experimental-sliding-sync", "e2e-encryption"] }
+matrix-sdk = { workspace = true, features = ["e2e-encryption"] }
 matrix-sdk-bwi = { workspace = true }
 matrix-sdk-base = { workspace = true }
 matrix-sdk-base-bwi = { workspace = true }
@@ -52,7 +53,9 @@ tokio-stream = { workspace = true, features = ["sync"] }
 tracing = { workspace = true, features = ["attributes"] }
 unicode-normalization = { workspace = true }
 uniffi = { workspace = true, optional = true }
-url = { workspace = true }
+
+emojis = "0.6.4"
+unicode-segmentation = "1.12.0"
 
 [dev-dependencies]
 anyhow = { workspace = true }
@@ -64,6 +67,7 @@ matrix-sdk = { workspace = true, features = ["testing", "sqlite"] }
 matrix-sdk-test = { workspace = true }
 stream_assert = { workspace = true }
 tempfile = { workspace = true }
+url = { workspace = true }
 wiremock = { workspace = true }
 
 [lints]

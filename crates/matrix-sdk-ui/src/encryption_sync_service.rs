@@ -31,9 +31,8 @@ use std::{pin::Pin, time::Duration};
 use async_stream::stream;
 use futures_core::stream::Stream;
 use futures_util::{pin_mut, StreamExt};
-use matrix_sdk::{Client, SlidingSync, LEASE_DURATION_MS};
-use matrix_sdk_base::sliding_sync::http;
-use ruma::assign;
+use matrix_sdk::{sleep::sleep, Client, SlidingSync, LEASE_DURATION_MS};
+use ruma::{api::client::sync::sync_events::v5 as http, assign};
 use tokio::sync::OwnedMutexGuard;
 use tracing::{debug, instrument, trace, Span};
 
@@ -174,7 +173,7 @@ impl EncryptionSyncService {
                     LEASE_DURATION_MS
                 );
 
-                tokio::time::sleep(Duration::from_millis(LEASE_DURATION_MS.into())).await;
+                sleep(Duration::from_millis(LEASE_DURATION_MS.into())).await;
 
                 lock_guard = self
                     .client
@@ -202,7 +201,7 @@ impl EncryptionSyncService {
             match sync.next().await {
                 Some(Ok(update_summary)) => {
                     // This API is only concerned with the e2ee and to-device extensions.
-                    // Warn if anything weird has been received from the proxy.
+                    // Warn if anything weird has been received from the homeserver.
                     if !update_summary.lists.is_empty() {
                         debug!(?update_summary.lists, "unexpected non-empty list of lists in encryption sync API");
                     }
@@ -250,7 +249,7 @@ impl EncryptionSyncService {
                 match self.next_sync_with_lock(&mut sync).await? {
                     Some(Ok(update_summary)) => {
                         // This API is only concerned with the e2ee and to-device extensions.
-                        // Warn if anything weird has been received from the proxy.
+                        // Warn if anything weird has been received from the homeserver.
                         if !update_summary.lists.is_empty() {
                             debug!(?update_summary.lists, "unexpected non-empty list of lists in encryption sync API");
                         }

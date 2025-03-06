@@ -16,28 +16,30 @@ use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
-use matrix_sdk::deserialized_responses::SyncTimelineEvent;
-use matrix_sdk_test::{async_test, sync_timeline_event, ALICE, BOB, CAROL};
+use imbl::vector;
+use matrix_sdk::deserialized_responses::TimelineEvent;
+use matrix_sdk_test::{
+    async_test, event_factory::PreviousMembership, sync_timeline_event, ALICE, BOB, CAROL,
+};
 use ruma::{
     events::{
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
-            member::{MembershipState, RedactedRoomMemberEventContent, RoomMemberEventContent},
-            message::{MessageType, RoomMessageEventContent},
-            name::RoomNameEventContent,
+            member::{MembershipState, RedactedRoomMemberEventContent},
+            message::MessageType,
             topic::RedactedRoomTopicEventContent,
         },
         FullStateEventContent,
     },
-    owned_event_id, owned_mxc_uri, MilliSecondsSinceUnixEpoch,
+    mxc_uri, owned_event_id, MilliSecondsSinceUnixEpoch,
 };
 use stream_assert::assert_next_matches;
 
 use super::TestTimeline;
 use crate::timeline::{
-    controller::{TimelineNewItemPosition, TimelineSettings},
+    controller::TimelineSettings,
     event_item::{AnyOtherFullStateEventContent, RemoteEventOrigin},
-    tests::{ReadReceiptMap, TestRoomDataProvider},
+    tests::{ReadReceiptMap, TestRoomDataProvider, TestTimelineBuilder},
     MembershipChange, TimelineDetails, TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
 };
 
@@ -49,9 +51,14 @@ async fn test_initial_events() {
     let f = &timeline.factory;
     timeline
         .controller
-        .add_events_at(
-            [f.text_msg("A").sender(*ALICE), f.text_msg("B").sender(*BOB)].into_iter(),
-            TimelineNewItemPosition::End { origin: RemoteEventOrigin::Sync },
+        .handle_remote_events_with_diffs(
+            vec![VectorDiff::Append {
+                values: vector![
+                    f.text_msg("A").sender(*ALICE).into_event(),
+                    f.text_msg("B").sender(*BOB).into_event()
+                ],
+            }],
+            RemoteEventOrigin::Sync,
         )
         .await;
 
@@ -62,7 +69,7 @@ async fn test_initial_events() {
     assert_eq!(item.as_event().unwrap().sender(), *BOB);
 
     let item = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
-    assert_matches!(&item.kind, TimelineItemKind::Virtual(VirtualTimelineItem::DayDivider(_)));
+    assert_matches!(&item.kind, TimelineItemKind::Virtual(VirtualTimelineItem::DateDivider(_)));
 }
 
 #[async_test]
@@ -79,31 +86,33 @@ async fn test_replace_with_initial_events_and_read_marker() {
         .entry(ALICE.to_owned())
         .or_insert_with(|| (event_id.to_owned(), Receipt::new(MilliSecondsSinceUnixEpoch::now())));
 
-    let timeline = TestTimeline::with_room_data_provider(
-        TestRoomDataProvider::default()
-            // Also add a fully read marker.
-            .with_fully_read_marker(event_id)
-            .with_initial_user_receipts(receipts),
-    )
-    .with_settings(TimelineSettings { track_read_receipts: true, ..Default::default() });
+    let timeline = TestTimelineBuilder::new()
+        .provider(
+            TestRoomDataProvider::default()
+                // Also add a fully read marker.
+                .with_fully_read_marker(event_id)
+                .with_initial_user_receipts(receipts),
+        )
+        .settings(TimelineSettings { track_read_receipts: true, ..Default::default() })
+        .build();
 
     let f = &timeline.factory;
-    let ev = f.text_msg("hey").sender(*ALICE).into_sync();
+    let ev = f.text_msg("hey").sender(*ALICE).into_event();
 
     timeline
         .controller
-        .add_events_at(
-            [ev].into_iter(),
-            TimelineNewItemPosition::End { origin: RemoteEventOrigin::Sync },
+        .handle_remote_events_with_diffs(
+            vec![VectorDiff::Append { values: vector![ev] }],
+            RemoteEventOrigin::Sync,
         )
         .await;
 
     let items = timeline.controller.items().await;
     assert_eq!(items.len(), 2);
-    assert!(items[0].is_day_divider());
+    assert!(items[0].is_date_divider());
     assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "hey");
 
-    let ev = f.text_msg("yo").sender(*BOB).into_sync();
+    let ev = f.text_msg("yo").sender(*BOB).into_event();
     timeline
         .controller
         .replace_with_initial_remote_events([ev].into_iter(), RemoteEventOrigin::Sync)
@@ -111,7 +120,7 @@ async fn test_replace_with_initial_events_and_read_marker() {
 
     let items = timeline.controller.items().await;
     assert_eq!(items.len(), 2);
-    assert!(items[0].is_day_divider());
+    assert!(items[0].is_date_divider());
     assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "yo");
 }
 
@@ -121,7 +130,7 @@ async fn test_sticker() {
     let mut stream = timeline.subscribe_events().await;
 
     timeline
-        .handle_live_event(SyncTimelineEvent::new(sync_timeline_event!({
+        .handle_live_event(TimelineEvent::new(sync_timeline_event!({
             "content": {
                 "body": "Happy sticker",
                 "info": {
@@ -148,16 +157,9 @@ async fn test_room_member() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe_events().await;
 
-    let mut first_room_member_content = RoomMemberEventContent::new(MembershipState::Invite);
-    first_room_member_content.displayname = Some("Alice".to_owned());
-    timeline
-        .handle_live_state_event_with_state_key(
-            &BOB,
-            ALICE.to_owned(),
-            first_room_member_content.clone(),
-            None,
-        )
-        .await;
+    // Bob invites Alice.
+    let f = &timeline.factory;
+    timeline.handle_live_event(f.member(&BOB).invited(&ALICE).display_name("Alice")).await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     assert!(item.can_be_replied_to());
@@ -165,14 +167,12 @@ async fn test_room_member() {
     assert_matches!(membership.content(), FullStateEventContent::Original { .. });
     assert_matches!(membership.change(), Some(MembershipChange::Invited));
 
-    let mut second_room_member_content = RoomMemberEventContent::new(MembershipState::Join);
-    second_room_member_content.displayname = Some("Alice".to_owned());
     timeline
-        .handle_live_state_event_with_state_key(
-            &ALICE,
-            ALICE.to_owned(),
-            second_room_member_content.clone(),
-            Some(first_room_member_content),
+        .handle_live_event(
+            f.member(&ALICE)
+                .membership(MembershipState::Join)
+                .display_name("Alice")
+                .previous(PreviousMembership::new(MembershipState::Invite).display_name("Alice")),
         )
         .await;
 
@@ -181,14 +181,12 @@ async fn test_room_member() {
     assert_matches!(membership.content(), FullStateEventContent::Original { .. });
     assert_matches!(membership.change(), Some(MembershipChange::InvitationAccepted));
 
-    let mut third_room_member_content = RoomMemberEventContent::new(MembershipState::Join);
-    third_room_member_content.displayname = Some("Alice In Wonderland".to_owned());
     timeline
-        .handle_live_state_event_with_state_key(
-            &ALICE,
-            ALICE.to_owned(),
-            third_room_member_content.clone(),
-            Some(second_room_member_content),
+        .handle_live_event(
+            f.member(&ALICE)
+                .membership(MembershipState::Join)
+                .display_name("Alice In Wonderland")
+                .previous(PreviousMembership::new(MembershipState::Join).display_name("Alice")),
         )
         .await;
 
@@ -197,15 +195,16 @@ async fn test_room_member() {
     assert_matches!(profile.displayname_change(), Some(_));
     assert_matches!(profile.avatar_url_change(), None);
 
-    let mut fourth_room_member_content = RoomMemberEventContent::new(MembershipState::Join);
-    fourth_room_member_content.displayname = Some("Alice In Wonderland".to_owned());
-    fourth_room_member_content.avatar_url = Some(owned_mxc_uri!("mxc://lolcathost.io/abc"));
     timeline
-        .handle_live_state_event_with_state_key(
-            &ALICE,
-            ALICE.to_owned(),
-            fourth_room_member_content.clone(),
-            Some(third_room_member_content),
+        .handle_live_event(
+            f.member(&ALICE)
+                .membership(MembershipState::Join)
+                .display_name("Alice In Wonderland")
+                .avatar_url(mxc_uri!("mxc://lolcathost.io/abc"))
+                .previous(
+                    PreviousMembership::new(MembershipState::Join)
+                        .display_name("Alice In Wonderland"),
+                ),
         )
         .await;
 
@@ -217,14 +216,13 @@ async fn test_room_member() {
     {
         // No avatar or display name in the new room member event content, but it's
         // possible to get the previous one using the getters.
-        let room_member_content = RoomMemberEventContent::new(MembershipState::Leave);
-
         timeline
-            .handle_live_state_event_with_state_key(
-                &ALICE,
-                ALICE.to_owned(),
-                room_member_content,
-                Some(fourth_room_member_content),
+            .handle_live_event(
+                f.member(&ALICE).membership(MembershipState::Leave).previous(
+                    PreviousMembership::new(MembershipState::Join)
+                        .display_name("Alice In Wonderland")
+                        .avatar_url(mxc_uri!("mxc://lolcathost.io/abc")),
+                ),
             )
             .await;
 
@@ -240,11 +238,11 @@ async fn test_room_member() {
     }
 
     timeline
-        .handle_live_redacted_state_event_with_state_key(
+        .handle_live_event(f.redacted_state(
             &ALICE,
-            ALICE.to_owned(),
+            ALICE.as_str(),
             RedactedRoomMemberEventContent::new(MembershipState::Join),
-        )
+        ))
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -258,9 +256,8 @@ async fn test_other_state() {
     let timeline = TestTimeline::new();
     let mut stream = timeline.subscribe().await;
 
-    timeline
-        .handle_live_state_event(&ALICE, RoomNameEventContent::new("Alice's room".to_owned()), None)
-        .await;
+    let f = &timeline.factory;
+    timeline.handle_live_event(f.room_name("Alice's room").sender(&ALICE)).await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     assert_let!(TimelineItemContent::OtherState(ev) = item.as_event().unwrap().content());
@@ -269,10 +266,12 @@ async fn test_other_state() {
     assert_eq!(content.name, "Alice's room");
     assert_matches!(prev_content, None);
 
-    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
-    assert!(day_divider.is_day_divider());
+    let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(date_divider.is_date_divider());
 
-    timeline.handle_live_redacted_state_event(&ALICE, RedactedRoomTopicEventContent::new()).await;
+    timeline
+        .handle_live_event(f.redacted_state(&ALICE, "", RedactedRoomTopicEventContent::new()))
+        .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     assert_let!(TimelineItemContent::OtherState(ev) = item.as_event().unwrap().content());
@@ -281,97 +280,26 @@ async fn test_other_state() {
 }
 
 #[async_test]
-async fn test_dedup_pagination() {
-    let timeline = TestTimeline::new();
-
-    let event = timeline
-        .event_builder
-        .make_sync_message_event(*ALICE, RoomMessageEventContent::text_plain("o/"));
-    timeline.handle_live_event(SyncTimelineEvent::new(event.clone())).await;
-    // This cast is not actually correct, sync events aren't valid
-    // back-paginated events, as they are missing `room_id`. However, the
-    // timeline doesn't care about that `room_id` and casts back to
-    // `Raw<AnySyncTimelineEvent>` before attempting to deserialize.
-    timeline.handle_back_paginated_event(event.cast()).await;
-
-    let timeline_items = timeline.controller.items().await;
-    assert_eq!(timeline_items.len(), 2);
-    assert_matches!(
-        timeline_items[0].kind,
-        TimelineItemKind::Virtual(VirtualTimelineItem::DayDivider(_))
-    );
-    assert_matches!(timeline_items[1].kind, TimelineItemKind::Event(_));
-}
-
-#[async_test]
-async fn test_dedup_initial() {
-    let timeline = TestTimeline::new();
-
-    let f = &timeline.factory;
-    let event_a = f.text_msg("A").sender(*ALICE).into_sync();
-    let event_b = f.text_msg("B").sender(*BOB).into_sync();
-    let event_c = f.text_msg("C").sender(*CAROL).into_sync();
-
-    timeline
-        .controller
-        .add_events_at(
-            [
-                // two events
-                event_a.clone(),
-                event_b.clone(),
-                // same events got duplicated in next sync response
-                event_a,
-                event_b,
-                // … and a new event also came in
-                event_c,
-            ]
-            .into_iter(),
-            TimelineNewItemPosition::End { origin: RemoteEventOrigin::Sync },
-        )
-        .await;
-
-    let timeline_items = timeline.controller.items().await;
-    assert_eq!(timeline_items.len(), 4);
-
-    assert!(timeline_items[0].is_day_divider());
-
-    let event1 = &timeline_items[1];
-    let event2 = &timeline_items[2];
-    let event3 = &timeline_items[3];
-
-    // Make sure the order is right.
-    assert_eq!(event1.as_event().unwrap().sender(), *ALICE);
-    assert_eq!(event2.as_event().unwrap().sender(), *BOB);
-    assert_eq!(event3.as_event().unwrap().sender(), *CAROL);
-
-    // Make sure we reused IDs when deduplicating events.
-    assert_eq!(event1.unique_id().0, "0");
-    assert_eq!(event2.unique_id().0, "1");
-    assert_eq!(event3.unique_id().0, "2");
-    assert_eq!(timeline_items[0].unique_id().0, "3");
-}
-
-#[async_test]
 async fn test_internal_id_prefix() {
-    let timeline = TestTimeline::with_internal_id_prefix("le_prefix_".to_owned());
+    let timeline = TestTimelineBuilder::new().internal_id_prefix("le_prefix_".to_owned()).build();
 
     let f = &timeline.factory;
-    let ev_a = f.text_msg("A").sender(*ALICE).into_sync();
-    let ev_b = f.text_msg("B").sender(*BOB).into_sync();
-    let ev_c = f.text_msg("C").sender(*CAROL).into_sync();
+    let ev_a = f.text_msg("A").sender(*ALICE).into_event();
+    let ev_b = f.text_msg("B").sender(*BOB).into_event();
+    let ev_c = f.text_msg("C").sender(*CAROL).into_event();
 
     timeline
         .controller
-        .add_events_at(
-            [ev_a, ev_b, ev_c].into_iter(),
-            TimelineNewItemPosition::End { origin: RemoteEventOrigin::Sync },
+        .handle_remote_events_with_diffs(
+            vec![VectorDiff::Append { values: vector![ev_a, ev_b, ev_c] }],
+            RemoteEventOrigin::Sync,
         )
         .await;
 
     let timeline_items = timeline.controller.items().await;
     assert_eq!(timeline_items.len(), 4);
 
-    assert!(timeline_items[0].is_day_divider());
+    assert!(timeline_items[0].is_date_divider());
     assert_eq!(timeline_items[0].unique_id().0, "le_prefix_3");
 
     let event1 = &timeline_items[1];
@@ -427,8 +355,8 @@ async fn test_sanitized() {
         "
     );
 
-    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
-    assert!(day_divider.is_day_divider());
+    let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(date_divider.is_date_divider());
 }
 
 #[async_test]
@@ -445,8 +373,8 @@ async fn test_reply() {
     let first_event_id = first_event.event_id().unwrap();
     let first_event_sender = *ALICE;
 
-    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
-    assert!(day_divider.is_day_divider());
+    let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(date_divider.is_date_divider());
 
     let reply_formatted_body = format!("\
         <mx-reply>\
@@ -495,8 +423,8 @@ async fn test_thread() {
     let first_event = item.as_event().unwrap();
     let first_event_id = first_event.event_id().unwrap();
 
-    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
-    assert!(day_divider.is_day_divider());
+    let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(date_divider.is_date_divider());
 
     timeline
         .handle_live_event(
@@ -521,33 +449,35 @@ async fn test_thread() {
 
 #[async_test]
 async fn test_replace_with_initial_events_when_batched() {
-    let timeline = TestTimeline::with_room_data_provider(TestRoomDataProvider::default())
-        .with_settings(TimelineSettings::default());
+    let timeline = TestTimelineBuilder::new()
+        .provider(TestRoomDataProvider::default())
+        .settings(TimelineSettings::default())
+        .build();
 
     let f = &timeline.factory;
-    let ev = f.text_msg("hey").sender(*ALICE).into_sync();
+    let ev = f.text_msg("hey").sender(*ALICE).into_event();
 
     timeline
         .controller
-        .add_events_at(
-            [ev].into_iter(),
-            TimelineNewItemPosition::End { origin: RemoteEventOrigin::Sync },
+        .handle_remote_events_with_diffs(
+            vec![VectorDiff::Append { values: vector![ev] }],
+            RemoteEventOrigin::Sync,
         )
         .await;
 
-    let (items, mut stream) = timeline.controller.subscribe_batched().await;
+    let (items, mut stream) = timeline.controller.subscribe().await;
     assert_eq!(items.len(), 2);
-    assert!(items[0].is_day_divider());
+    assert!(items[0].is_date_divider());
     assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "hey");
 
-    let ev = f.text_msg("yo").sender(*BOB).into_sync();
+    let ev = f.text_msg("yo").sender(*BOB).into_event();
     timeline
         .controller
         .replace_with_initial_remote_events([ev].into_iter(), RemoteEventOrigin::Sync)
         .await;
 
     // Assert there are more than a single Clear diff in the next batch:
-    // Clear + PushBack (event) + PushFront (day divider)
+    // Clear + PushBack (event) + PushFront (date divider)
     let batched_diffs = stream.next().await.unwrap();
     assert_eq!(batched_diffs.len(), 3);
     assert_matches!(batched_diffs[0], VectorDiff::Clear);
@@ -555,6 +485,6 @@ async fn test_replace_with_initial_events_when_batched() {
         assert!(value.as_event().is_some());
     });
     assert_matches!(&batched_diffs[2], VectorDiff::PushFront { value } => {
-        assert_matches!(value.as_virtual(), Some(VirtualTimelineItem::DayDivider(_)));
+        assert_matches!(value.as_virtual(), Some(VirtualTimelineItem::DateDivider(_)));
     });
 }
