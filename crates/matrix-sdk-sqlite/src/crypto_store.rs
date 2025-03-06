@@ -1408,12 +1408,12 @@ impl CryptoStore for SqliteCryptoStore {
 mod tests {
     use super::SqliteCryptoStore;
     use matrix_sdk_common::deserialized_responses::WithheldCode;
-//    #[cfg(not(target_os = "macos"))]
+    //    #[cfg(not(target_os = "macos"))]
     use matrix_sdk_crypto::{
         cryptostore_integration_tests, cryptostore_integration_tests_time, olm::SenderDataType,
         store::CryptoStore,
     };
-//    #[cfg(not(target_os = "macos"))]
+    //    #[cfg(not(target_os = "macos"))]
     use matrix_sdk_test::async_test;
     use once_cell::sync::Lazy;
     use ruma::{device_id, room_id, user_id};
