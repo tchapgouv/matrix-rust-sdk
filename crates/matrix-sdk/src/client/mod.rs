@@ -25,7 +25,6 @@ use std::{
 use self::futures::SendRequest;
 #[cfg(feature = "experimental-oidc")]
 use crate::authentication::oidc;
-use crate::client::oidc::Oidc;
 use crate::event_handler::{EventHandlerContext, ObservableEventHandler};
 use crate::{
     authentication::matrix::MatrixAuth,

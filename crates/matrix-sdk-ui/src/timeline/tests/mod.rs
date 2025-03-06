@@ -21,18 +21,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use super::{
-    controller::{TimelineNewItemPosition, TimelineSettings},
-    event_handler::TimelineEventKind,
-    event_item::RemoteEventOrigin,
-    traits::RoomDataProvider,
-    util::rfind_event_by_item_id,
-    EventTimelineItem, Profile, TimelineController, TimelineEventItemId, TimelineFocus,
-    TimelineItem,
-};
-use crate::{
-    timeline::pinned_events_loader::PinnedEventsRoom, unable_to_decrypt_hook::UtdHookManager,
-};
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::VectorDiff;
 use futures_core::Stream;
@@ -41,6 +29,7 @@ use indexmap::IndexMap;
 use matrix_sdk::bwi_content_scanner::BWIContentScannerWrapper;
 use matrix_sdk::{
     config::RequestConfig,
+    crypto::OlmMachine,
     deserialized_responses::TimelineEvent,
     event_cache::paginator::{PaginableRoom, PaginatorError},
     room::{EventWithContextResponse, Messages, MessagesOptions},
@@ -63,8 +52,8 @@ use ruma::{
     push::{PushConditionPowerLevelsCtx, PushConditionRoomCtx, Ruleset},
     room_id,
     serde::Raw,
-    uint, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
-    RoomVersionId, TransactionId, UInt, UserId,
+    uint, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedTransactionId,
+    OwnedUserId, RoomVersionId, TransactionId, UInt, UserId,
 };
 use tokio::sync::RwLock;
 
