@@ -22,34 +22,6 @@ use std::{
     sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak},
 };
 
-use self::futures::SendRequest;
-#[cfg(feature = "experimental-oidc")]
-use crate::authentication::oidc;
-use crate::event_handler::{EventHandlerContext, ObservableEventHandler};
-use crate::{
-    authentication::matrix::MatrixAuth,
-    authentication::{AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback},
-    config::RequestConfig,
-    deduplicating_handler::DeduplicatingHandler,
-    error::{HttpError, HttpResult},
-    event_cache::EventCache,
-    event_handler::{
-        EventHandler, EventHandlerDropGuard, EventHandlerHandle, EventHandlerStore, SyncEvent,
-    },
-    http_client::HttpClient,
-    notification_settings::NotificationSettings,
-    room_preview::RoomPreview,
-    send_queue::SendQueueData,
-    sliding_sync::Version as SlidingSyncVersion,
-    sync::{RoomUpdate, SyncResponse},
-    Account, AuthApi, AuthSession, Error, Media, Pusher, RefreshTokenError, Result, Room,
-    TransmissionProgress,
-};
-#[cfg(feature = "e2e-encryption")]
-use crate::{
-    encryption::{Encryption, EncryptionData, EncryptionSettings, VerificationState},
-    store_locks::CrossProcessStoreLock,
-};
 use caches::ClientCaches;
 use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::{Vector, VectorDiff};
@@ -109,6 +81,36 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{broadcast, Mutex, OnceCell, RwLock, RwLockReadGuard};
 use tracing::{debug, error, instrument, trace, warn, Instrument, Span};
 use url::Url;
+
+use self::futures::SendRequest;
+#[cfg(feature = "experimental-oidc")]
+use crate::authentication::oidc::Oidc;
+use crate::{
+    authentication::{
+        matrix::MatrixAuth, AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback,
+    },
+    config::RequestConfig,
+    deduplicating_handler::DeduplicatingHandler,
+    error::HttpResult,
+    event_cache::EventCache,
+    event_handler::{
+        EventHandler, EventHandlerContext, EventHandlerDropGuard, EventHandlerHandle,
+        EventHandlerStore, ObservableEventHandler, SyncEvent,
+    },
+    http_client::HttpClient,
+    notification_settings::NotificationSettings,
+    room_preview::RoomPreview,
+    send_queue::SendQueueData,
+    sliding_sync::Version as SlidingSyncVersion,
+    sync::{RoomUpdate, SyncResponse},
+    Account, AuthApi, AuthSession, Error, HttpError, Media, Pusher, RefreshTokenError, Result,
+    Room, TransmissionProgress,
+};
+#[cfg(feature = "e2e-encryption")]
+use crate::{
+    encryption::{Encryption, EncryptionData, EncryptionSettings, VerificationState},
+    store_locks::CrossProcessStoreLock,
+};
 
 mod builder;
 pub(crate) mod caches;
