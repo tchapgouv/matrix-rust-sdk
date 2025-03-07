@@ -30,7 +30,7 @@ use matrix_sdk_ui::timeline::{AttachmentSource, EventSendState, RoomExt, Timelin
 use ruma::{
     event_id,
     events::room::{message::MessageType, MediaSource},
-    room_id, UInt,
+    room_id, uint, UInt,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -221,7 +221,11 @@ async fn test_send_attachment_from_bytes() {
     mock.mock_room_send().ok(event_id!("$media")).mock_once().mount().await;
 
     // Queue sending of an attachment.
-    let config = AttachmentConfig::new().caption(Some("caption".to_owned()));
+    // BWI-specific
+    let config = AttachmentConfig::new()
+        .caption(Some("caption".to_owned()))
+        .info(AttachmentInfo::File(BaseFileInfo { size: Some(uint!(42)), ..Default::default() }));
+    // end BWI-specific
     timeline.send_attachment(source, mime::TEXT_PLAIN, config).use_send_queue().await.unwrap();
 
     {

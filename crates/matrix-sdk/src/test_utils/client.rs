@@ -14,14 +14,15 @@
 
 //! Augmented [`ClientBuilder`] that can set up an already logged-in user.
 
-use matrix_sdk_base::{store::StoreConfig, SessionMeta};
-use ruma::{api::MatrixVersion, device_id, user_id};
-
 use crate::{
     authentication::matrix::{MatrixSession, MatrixSessionTokens},
     config::RequestConfig,
     Client, ClientBuilder,
 };
+use matrix_sdk_base::{store::StoreConfig, SessionMeta};
+use matrix_sdk_bwi::attachment::FILE_SIZE_LIMIT;
+use matrix_sdk_bwi::settings_cache::BWISettingsCache;
+use ruma::{api::MatrixVersion, device_id, user_id};
 
 /// The Bearer token for tests
 pub const TEST_BEARER_TOKEN: &str = "1234";
@@ -84,6 +85,10 @@ impl MockClientBuilder {
                 .await
                 .unwrap();
         }
+
+        // BWI-specific
+        client.store().store(&FILE_SIZE_LIMIT, 5000u64).await.unwrap();
+        // end BWI-specific
 
         client
     }
