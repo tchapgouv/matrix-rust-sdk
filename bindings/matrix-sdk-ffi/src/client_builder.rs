@@ -606,17 +606,16 @@ impl ClientBuilder {
 
         inner_builder = inner_builder.add_root_certificates(certificates);
 
-        // // BWI-specific
-        // inner_builder = match builder.public_keys_for_jwt_token_validation {
-        //     None => Ok::<_,
-        // ClientBuildError>(inner_builder.without_server_jwt_token_validation()),
-        //     Some(keys) => Ok({
-        //         inner_builder
-        //             .public_keys_for_jwt_from_strings(&keys)
-        //             .map_err(|_| ClientBuildError::ServerIsNotVerified)?
-        //     }),
-        // }?;
-        // // end BWI specific
+        // BWI-specific
+        inner_builder = match builder.public_keys_for_jwt_token_validation {
+            None => Ok::<_, ClientBuildError>(inner_builder.without_server_jwt_token_validation()),
+            Some(keys) => Ok({
+                inner_builder
+                    .public_keys_for_jwt_from_strings(&keys)
+                    .map_err(|_| ClientBuildError::ServerIsNotVerified)?
+            }),
+        }?;
+        // end BWI specific
 
         if builder.disable_built_in_root_certificates {
             inner_builder = inner_builder.disable_built_in_root_certificates();

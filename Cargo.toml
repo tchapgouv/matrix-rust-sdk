@@ -1,12 +1,11 @@
 [workspace]
 members = [
-    "benchmarks",
+    # "benchmarks",
     "bindings/matrix-sdk-crypto-ffi",
     "bindings/matrix-sdk-ffi",
     "crates/*",
     "testing/*",
     "examples/*",
-    "labs/*",
     # bwi-specific
     # "labs/*", causes errors
     # end bwi-specific
@@ -19,8 +18,7 @@ exclude = [
 # xtask, testing and the bindings should only be built when invoked explicitly.
 # bwi-specific
 # default-members = ["benchmarks", "crates/*", "labs/*"] disable labs as this only causes errors
-# default-members = ["crates/*"]
-default-members = ["benchmarks", "crates/*", "labs/*"]
+default-members = ["crates/*"]
 # end bwi-specific
 resolver = "2"
 

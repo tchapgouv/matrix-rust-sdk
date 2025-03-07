@@ -20,7 +20,8 @@ use std::{fmt, sync::Arc};
 use homeserver_config::*;
 use matrix_sdk_base::{store::StoreConfig, BaseClient};
 use matrix_sdk_base_bwi::jwt_token::{
-    BWIPublicKeyForJWTTokenValidation, BWIPublicKeyForJWTTokenValidationParseError,
+    BWIJWTTokenValidationError, BWIPublicKeyForJWTTokenValidation,
+    BWIPublicKeyForJWTTokenValidationParseError, BWITokenValidator,
 };
 use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use ruma::{
@@ -30,6 +31,7 @@ use ruma::{
 use thiserror::Error;
 use tokio::sync::{broadcast, Mutex, OnceCell};
 use tracing::{debug, field::debug, instrument, warn, Span};
+use url::Url;
 
 use super::{Client, ClientInner};
 #[cfg(feature = "experimental-oidc")]
@@ -43,7 +45,8 @@ use crate::http_client::HttpSettings;
 use crate::{
     authentication::AuthCtx, client::ClientServerCapabilities, config::RequestConfig,
     error::RumaApiError, http_client::HttpClient, send_queue::SendQueueData,
-    sliding_sync::VersionBuilder as SlidingSyncVersionBuilder, HttpError, IdParseError,
+    sliding_sync::VersionBuilder as SlidingSyncVersionBuilder,
+    ClientBuildError::ServerIsNotVerified, HttpError, IdParseError,
 };
 
 /// Builder that allows creating and configuring various parts of a [`Client`].
@@ -543,10 +546,10 @@ impl ClientBuilder {
         let HomeserverDiscoveryResult { server, homeserver, supported_versions } =
             homeserver_cfg.discover(&http_client).await?;
 
-        // // BWI specific
-        // Self::verify_jwt_token(self.public_keys_for_jwt_validation, &homeserver)
-        //     .await
-        //     .map_err(|_err| ServerIsNotVerified)?;
+        // BWI specific
+        Self::verify_jwt_token(self.public_keys_for_jwt_validation, &homeserver)
+            .await
+            .map_err(|_err| ServerIsNotVerified)?;
 
         let sliding_sync_version = {
             let supported_versions = match supported_versions {
@@ -613,22 +616,22 @@ impl ClientBuilder {
         Ok(Client { inner })
     }
 
-    // // BWI specific
-    // /// verify the jwt token of the given homeserver with the provided Public
-    // /// Keys
-    // async fn verify_jwt_token(
-    //     public_keys_for_jwt_validation:
-    // Option<Vec<BWIPublicKeyForJWTTokenValidation>>,     homeserver_url: &Url,
-    // ) -> Result<(), BWIJWTTokenValidationError> {
-    //     match public_keys_for_jwt_validation {
-    //         None => Ok(()),
-    //         Some(public_keys) => {
-    //             let token_validator =
-    // BWITokenValidator::for_homeserver(homeserver_url.to_owned());
-    // token_validator.validate_with_keys(&public_keys).await         }
-    //     }
-    // }
-    // // end BWI specific
+    // BWI specific
+    /// verify the jwt token of the given homeserver with the provided Public
+    /// Keys
+    async fn verify_jwt_token(
+        public_keys_for_jwt_validation: Option<Vec<BWIPublicKeyForJWTTokenValidation>>,
+        homeserver_url: &Url,
+    ) -> Result<(), BWIJWTTokenValidationError> {
+        match public_keys_for_jwt_validation {
+            None => Ok(()),
+            Some(public_keys) => {
+                let token_validator = BWITokenValidator::for_homeserver(homeserver_url.to_owned());
+                token_validator.validate_with_keys(&public_keys).await
+            }
+        }
+    }
+    // end BWI specific
 }
 
 /// Creates a server name from a user supplied string. The string is first
