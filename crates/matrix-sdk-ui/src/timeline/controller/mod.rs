@@ -86,9 +86,9 @@ use super::{
     item::TimelineUniqueId,
     subscriber::TimelineSubscriber,
     traits::{Decryptor, RoomDataProvider},
-    DateDividerMode, Error, EventSendState, EventTimelineItem, InReplyToDetails, Message,
-    PaginationError, Profile, RepliedToEvent, TimelineDetails, TimelineEventItemId, TimelineFocus,
-    TimelineItem, TimelineItemContent, TimelineItemKind,
+    DateDividerMode, Error, EventSendState, EventTimelineItem, InReplyToDetails, PaginationError,
+    Profile, RepliedToEvent, TimelineDetails, TimelineEventItemId, TimelineFocus, TimelineItem,
+    TimelineItemContent, TimelineItemKind,
 };
 use crate::{
     timeline::{

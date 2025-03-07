@@ -112,13 +112,16 @@ impl BWIDownloadMediaExt for Client {
     ) -> Result<FileContent, BWIContentScannerError> {
         debug!("###BWI### download authenticated media {:?}", media_source);
         let request = self.content_scanner().create_download_media_request(media_source).await?;
-        Ok(self
-            .send(request)
-            .await
-            .inspect(|response| debug!("###BWI### Response for downloading {:?}", response))
-            .map(|response| FileContent(response.file))
-            .inspect_err(|e| error!("###BWI### Download failed: {}", e))
-            .map_err(|_| BWIContentScannerError::DownloadFailed)?)
+
+        Ok(match request_config {
+            Some(request_config) => self.send(request).with_request_config(request_config),
+            None => self.send(request),
+        }
+        .await
+        .inspect(|response| debug!("###BWI### Response for downloading {:?}", response))
+        .map(|response| FileContent(response.file))
+        .inspect_err(|e| error!("###BWI### Download failed: {}", e))
+        .map_err(|_| BWIContentScannerError::DownloadFailed)?)
     }
 
     async fn download_unauthenticated_media(
