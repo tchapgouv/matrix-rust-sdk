@@ -1499,7 +1499,7 @@ impl Client {
     /// # let homeserver = Url::parse("http://example.com").unwrap();
     /// let request = CreateRoomRequest::new();
     /// let client = Client::new(homeserver).await.unwrap();
-    /// assert!(client.create_room(request).await.is_ok());
+    /// assert!(client.create_room(request, false).await.is_ok());
     /// # };
     /// ```
     pub async fn create_room(
