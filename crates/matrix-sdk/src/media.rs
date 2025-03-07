@@ -42,7 +42,7 @@ use ruma::{
     },
     assign,
     events::room::{MediaSource, ThumbnailInfo},
-    MilliSecondsSinceUnixEpoch, MxcUri, OwnedMxcUri, TransactionId, UInt,
+    MxcUri, OwnedMxcUri, TransactionId, UInt,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
@@ -460,7 +460,14 @@ impl Media {
         request.method = Some(settings.method.clone());
         request.animated = Some(settings.animated);
 
-        Ok(self.client.send(request).await?.file)
+        let thumbnail = match request_config {
+            Some(request_config) => {
+                self.client.send(request).with_request_config(request_config).await?.file
+            }
+            None => self.client.send(request).await?.file,
+        };
+
+        Ok(thumbnail)
     }
 
     #[deprecated]
@@ -508,7 +515,13 @@ impl Media {
         uri: &OwnedMxcUri,
     ) -> Result<Vec<u8>, Error> {
         let request = authenticated_media::get_content::v1::Request::from_uri(uri)?;
-        Ok(self.client.send(request).await?.file)
+        let media = match request_config {
+            Some(request_config) => {
+                self.client.send(request).with_request_config(request_config).await?.file
+            }
+            None => self.client.send(request).await?.file,
+        };
+        Ok(media)
     }
     // end BWI-specific
 
