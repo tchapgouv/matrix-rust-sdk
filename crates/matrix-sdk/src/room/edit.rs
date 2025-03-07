@@ -16,7 +16,7 @@
 
 use std::future::Future;
 
-use matrix_sdk_base::{deserialized_responses::SyncTimelineEvent, SendOutsideWasm};
+use matrix_sdk_base::{deserialized_responses::TimelineEvent, SendOutsideWasm};
 use ruma::{
     events::{
         poll::unstable_start::{
@@ -28,8 +28,8 @@ use ruma::{
             RoomMessageEventContentWithoutRelation,
         },
         AnyMessageLikeEvent, AnyMessageLikeEventContent, AnySyncMessageLikeEvent,
-        AnySyncTimelineEvent, AnyTimelineEvent, MessageLikeEvent, OriginalMessageLikeEvent,
-        SyncMessageLikeEvent,
+        AnySyncTimelineEvent, AnyTimelineEvent, Mentions, MessageLikeEvent,
+        OriginalMessageLikeEvent, SyncMessageLikeEvent,
     },
     EventId, RoomId, UserId,
 };
@@ -54,6 +54,10 @@ pub enum EditedContent {
         ///
         /// Set to `None` to remove an existing formatted caption.
         formatted_caption: Option<FormattedBody>,
+
+        /// New set of intentional mentions to be included in the edited
+        /// caption.
+        mentions: Option<Mentions>,
     },
 
     /// The content is a new poll start.
@@ -125,11 +129,11 @@ trait EventSource {
     fn get_event(
         &self,
         event_id: &EventId,
-    ) -> impl Future<Output = Result<SyncTimelineEvent, EditError>> + SendOutsideWasm;
+    ) -> impl Future<Output = Result<TimelineEvent, EditError>> + SendOutsideWasm;
 }
 
 impl EventSource for &Room {
-    async fn get_event(&self, event_id: &EventId) -> Result<SyncTimelineEvent, EditError> {
+    async fn get_event(&self, event_id: &EventId) -> Result<TimelineEvent, EditError> {
         match self.event_cache().await {
             Ok((event_cache, _drop_handles)) => {
                 if let Some(event) = event_cache.event(event_id).await {
@@ -144,10 +148,7 @@ impl EventSource for &Room {
         }
 
         trace!("trying with /event now");
-        self.event(event_id, None)
-            .await
-            .map(Into::into)
-            .map_err(|err| EditError::Fetch(Box::new(err)))
+        self.event(event_id, None).await.map_err(|err| EditError::Fetch(Box::new(err)))
     }
 }
 
@@ -196,7 +197,7 @@ async fn make_edit_event<S: EventSource>(
             Ok(replacement.into())
         }
 
-        EditedContent::MediaCaption { caption, formatted_caption } => {
+        EditedContent::MediaCaption { caption, formatted_caption, mentions } => {
             // Handle edits of m.room.message.
             let AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(original)) =
                 message_like_event
@@ -207,13 +208,13 @@ async fn make_edit_event<S: EventSource>(
                 });
             };
 
-            let mentions = original.content.mentions.clone();
+            let original_mentions = original.content.mentions.clone();
             let replied_to_original_room_msg =
                 extract_replied_to(source, room_id, original.content.relates_to.clone()).await;
 
             let mut prev_content = original.content;
 
-            if !update_media_caption(&mut prev_content, caption, formatted_caption) {
+            if !update_media_caption(&mut prev_content, caption, formatted_caption, mentions) {
                 return Err(EditError::IncompatibleEditType {
                     target: prev_content.msgtype.msgtype().to_owned(),
                     new_content: "caption for a media room message",
@@ -221,7 +222,7 @@ async fn make_edit_event<S: EventSource>(
             }
 
             let replacement = prev_content.make_replacement(
-                ReplacementMetadata::new(event_id.to_owned(), mentions),
+                ReplacementMetadata::new(event_id.to_owned(), original_mentions),
                 replied_to_original_room_msg.as_ref(),
             );
 
@@ -282,7 +283,10 @@ pub(crate) fn update_media_caption(
     content: &mut RoomMessageEventContent,
     caption: Option<String>,
     formatted_caption: Option<FormattedBody>,
+    mentions: Option<Mentions>,
 ) -> bool {
+    content.mentions = mentions;
+
     match &mut content.msgtype {
         MessageType::Audio(event) => {
             set_caption!(event, caption);
@@ -352,15 +356,15 @@ mod tests {
     use std::collections::BTreeMap;
 
     use assert_matches2::{assert_let, assert_matches};
-    use matrix_sdk_base::deserialized_responses::SyncTimelineEvent;
+    use matrix_sdk_base::deserialized_responses::TimelineEvent;
     use matrix_sdk_test::{async_test, event_factory::EventFactory};
     use ruma::{
         event_id,
         events::{
             room::message::{MessageType, Relation, RoomMessageEventContentWithoutRelation},
-            AnyMessageLikeEventContent, AnySyncTimelineEvent,
+            AnyMessageLikeEventContent, AnySyncTimelineEvent, Mentions,
         },
-        owned_mxc_uri, room_id,
+        owned_mxc_uri, owned_user_id, room_id,
         serde::Raw,
         user_id, EventId, OwnedEventId,
     };
@@ -371,11 +375,11 @@ mod tests {
 
     #[derive(Default)]
     struct TestEventCache {
-        events: BTreeMap<OwnedEventId, SyncTimelineEvent>,
+        events: BTreeMap<OwnedEventId, TimelineEvent>,
     }
 
     impl EventSource for TestEventCache {
-        async fn get_event(&self, event_id: &EventId) -> Result<SyncTimelineEvent, EditError> {
+        async fn get_event(&self, event_id: &EventId) -> Result<TimelineEvent, EditError> {
             Ok(self.events.get(event_id).unwrap().clone())
         }
     }
@@ -390,7 +394,7 @@ mod tests {
         cache.events.insert(
             event_id.to_owned(),
             // TODO: use the EventFactory for state events too.
-            SyncTimelineEvent::new(
+            TimelineEvent::new(
                 Raw::<AnySyncTimelineEvent>::from_json_string(
                     json!({
                         "content": {
@@ -506,7 +510,11 @@ mod tests {
             room_id,
             own_user_id,
             event_id,
-            EditedContent::MediaCaption { caption: Some("yo".to_owned()), formatted_caption: None },
+            EditedContent::MediaCaption {
+                caption: Some("yo".to_owned()),
+                formatted_caption: None,
+                mentions: None,
+            },
         )
         .await
         .unwrap_err();
@@ -543,6 +551,7 @@ mod tests {
             EditedContent::MediaCaption {
                 caption: Some("Best joke ever".to_owned()),
                 formatted_caption: None,
+                mentions: None,
             },
         )
         .await
@@ -572,12 +581,12 @@ mod tests {
         let mut cache = TestEventCache::default();
         let f = EventFactory::new();
 
-        let event: SyncTimelineEvent = f
+        let event = f
             .image(filename.to_owned(), owned_mxc_uri!("mxc://sdk.rs/rickroll"))
             .caption(Some("caption".to_owned()), None)
             .event_id(event_id)
             .sender(own_user_id)
-            .into();
+            .into_event();
 
         {
             // Sanity checks.
@@ -602,7 +611,7 @@ mod tests {
             own_user_id,
             event_id,
             // Remove the caption by setting it to None.
-            EditedContent::MediaCaption { caption: None, formatted_caption: None },
+            EditedContent::MediaCaption { caption: None, formatted_caption: None, mentions: None },
         )
         .await
         .unwrap();
@@ -619,6 +628,81 @@ mod tests {
         assert_eq!(new_image.filename(), "rickroll.gif");
         assert!(new_image.caption().is_none());
         assert!(new_image.formatted_caption().is_none());
+    }
+
+    #[async_test]
+    async fn test_add_media_caption_mention() {
+        let event_id = event_id!("$1");
+        let own_user_id = user_id!("@me:saucisse.bzh");
+
+        let filename = "rickroll.gif";
+
+        let mut cache = TestEventCache::default();
+        let f = EventFactory::new();
+
+        // Start with a media event that has no mentions.
+        let event = f
+            .image(filename.to_owned(), owned_mxc_uri!("mxc://sdk.rs/rickroll"))
+            .event_id(event_id)
+            .sender(own_user_id)
+            .into_event();
+
+        {
+            // Sanity checks.
+            let event = event.raw().deserialize().unwrap();
+            assert_let!(AnySyncTimelineEvent::MessageLike(event) = event);
+            assert_let!(
+                AnyMessageLikeEventContent::RoomMessage(msg) = event.original_content().unwrap()
+            );
+            assert_matches!(msg.mentions, None);
+        }
+
+        cache.events.insert(event_id.to_owned(), event);
+
+        let room_id = room_id!("!galette:saucisse.bzh");
+
+        // Add an intentional mention in the caption.
+        let mentioned_user_id = owned_user_id!("@crepe:saucisse.bzh");
+        let edit_event = {
+            let mentions = Mentions::with_user_ids([mentioned_user_id.clone()]);
+            make_edit_event(
+                cache,
+                room_id,
+                own_user_id,
+                event_id,
+                EditedContent::MediaCaption {
+                    caption: None,
+                    formatted_caption: None,
+                    mentions: Some(mentions),
+                },
+            )
+            .await
+            .unwrap()
+        };
+
+        assert_let!(AnyMessageLikeEventContent::RoomMessage(msg) = edit_event);
+        assert_let!(MessageType::Image(image) = msg.msgtype);
+
+        assert!(image.caption().is_none());
+        assert!(image.formatted_caption().is_none());
+
+        // The raw event contains the mention.
+        assert_let!(Some(mentions) = msg.mentions);
+        assert!(!mentions.room);
+        assert_eq!(
+            mentions.user_ids.into_iter().collect::<Vec<_>>(),
+            vec![mentioned_user_id.clone()]
+        );
+
+        assert_let!(Some(Relation::Replacement(repl)) = msg.relates_to);
+        assert_let!(MessageType::Image(new_image) = repl.new_content.msgtype);
+        assert!(new_image.caption().is_none());
+        assert!(new_image.formatted_caption().is_none());
+
+        // The replacement contains the mention.
+        assert_let!(Some(mentions) = repl.new_content.mentions);
+        assert!(!mentions.room);
+        assert_eq!(mentions.user_ids.into_iter().collect::<Vec<_>>(), vec![mentioned_user_id]);
     }
 
     #[async_test]

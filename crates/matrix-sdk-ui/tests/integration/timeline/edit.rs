@@ -20,15 +20,11 @@ use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::{FutureExt, StreamExt};
 use matrix_sdk::{
-    config::SyncSettings,
     room::edit::EditedContent,
-    test_utils::{logged_in_client_with_server, mocks::MatrixMockServer},
+    test_utils::mocks::{MatrixMockServer, RoomMessagesResponseTemplate},
     Client,
 };
-use matrix_sdk_test::{
-    async_test, event_factory::EventFactory, mocks::mock_encryption_state, JoinedRoomBuilder,
-    SyncResponseBuilder, ALICE, BOB,
-};
+use matrix_sdk_test::{async_test, event_factory::EventFactory, JoinedRoomBuilder, ALICE, BOB};
 use matrix_sdk_ui::{
     timeline::{
         EditError, Error, EventSendState, RoomExt, TimelineDetails, TimelineEventItemId,
@@ -48,79 +44,71 @@ use ruma::{
             MessageType, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
             TextMessageEventContent,
         },
-        AnyMessageLikeEventContent, AnyStateEvent, AnyTimelineEvent,
+        AnyMessageLikeEventContent, AnyTimelineEvent,
     },
     owned_event_id, room_id,
     serde::Raw,
     OwnedRoomId,
 };
-use serde_json::json;
-use stream_assert::assert_next_matches;
+use stream_assert::{assert_next_matches, assert_pending};
 use tokio::{task::yield_now, time::sleep};
-use wiremock::{
-    matchers::{header, method, path_regex},
-    Mock, ResponseTemplate,
-};
-
-use crate::mock_sync;
 
 #[async_test]
 async fn test_edit() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let room = server.sync_joined_room(&client, room_id).await;
 
     let f = EventFactory::new();
 
-    let mut sync_builder = SyncResponseBuilder::new();
-    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    server.mock_room_state_encryption().plain().mount().await;
 
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    mock_encryption_state(&server, false).await;
-
-    let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
     let event_id = event_id!("$msda7m:localhost");
-    sync_builder.add_joined_room(
-        JoinedRoomBuilder::new(room_id)
-            .add_timeline_event(f.text_msg("hello").sender(&ALICE).event_id(event_id)),
-    );
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("hello").sender(&ALICE).event_id(event_id)),
+        )
+        .await;
 
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
 
-    assert_let!(Some(VectorDiff::PushBack { value: first }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value: first } = &timeline_updates[0]);
     let item = first.as_event().unwrap();
     assert_eq!(item.read_receipts().len(), 1, "implicit read receipt");
+    assert_matches!(item.latest_edit_json(), None);
     assert_let!(TimelineItemContent::Message(msg) = item.content());
     assert_matches!(msg.msgtype(), MessageType::Text(_));
     assert_matches!(msg.in_reply_to(), None);
     assert!(!msg.is_edited());
 
-    assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
-    assert!(day_divider.is_day_divider());
+    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[1]);
+    assert!(date_divider.is_date_divider());
 
-    sync_builder.add_joined_room(
-        JoinedRoomBuilder::new(room_id)
-            .add_timeline_event(f.text_html("Test", "<em>Test</em>").sender(&BOB))
-            .add_timeline_event(
-                f.text_msg("* hi")
-                    .sender(&ALICE)
-                    .edit(event_id, RoomMessageEventContent::text_plain("hi").into()),
-            ),
-    );
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_html("Test", "<em>Test</em>").sender(&BOB))
+                .add_timeline_event(
+                    f.text_msg("* hi")
+                        .sender(&ALICE)
+                        .edit(event_id, RoomMessageEventContent::text_plain("hi").into()),
+                ),
+        )
+        .await;
 
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 4);
 
-    assert_let!(Some(VectorDiff::PushBack { value: second }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value: second } = &timeline_updates[0]);
     let item = second.as_event().unwrap();
     assert!(item.event_id().is_some());
     assert!(!item.is_own());
@@ -128,6 +116,7 @@ async fn test_edit() {
     assert_eq!(item.read_receipts().len(), 1, "implicit read receipt");
 
     assert_let!(TimelineItemContent::Message(msg) = item.content());
+    assert_matches!(item.latest_edit_json(), None);
     assert_let!(MessageType::Text(TextMessageEventContent { body, .. }) = msg.msgtype());
     assert_eq!(body, "Test");
     assert_matches!(msg.in_reply_to(), None);
@@ -135,8 +124,9 @@ async fn test_edit() {
 
     // No more implicit read receipt in Alice's message, because they edited
     // something after the second event.
-    assert_let!(Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[1]);
     let item = item.as_event().unwrap();
+    assert_matches!(item.latest_edit_json(), None);
     assert_let!(TimelineItemContent::Message(msg) = item.content());
     assert_let!(MessageType::Text(text) = msg.msgtype());
     assert_eq!(text.body, "hello");
@@ -145,7 +135,7 @@ async fn test_edit() {
     assert_eq!(item.read_receipts().len(), 0, "no more implicit read receipt");
 
     // ... so Alice's read receipt moves to Bob's message.
-    assert_let!(Some(VectorDiff::Set { index: 2, value: second }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::Set { index: 2, value: second } = &timeline_updates[2]);
     let item = second.as_event().unwrap();
     assert!(item.event_id().is_some());
     assert!(!item.is_own());
@@ -153,8 +143,9 @@ async fn test_edit() {
     assert_eq!(item.read_receipts().len(), 2, "should carry alice and bob's read receipts");
 
     // The text changes in Alice's message.
-    assert_let!(Some(VectorDiff::Set { index: 1, value: edit }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::Set { index: 1, value: edit } = &timeline_updates[3]);
     let item = edit.as_event().unwrap();
+    assert_matches!(item.latest_edit_json(), Some(_));
     assert_let!(TimelineItemContent::Message(edited) = item.content());
     assert_let!(MessageType::Text(text) = edited.msgtype());
     assert_eq!(text.body, "hi");
@@ -165,55 +156,42 @@ async fn test_edit() {
 #[async_test]
 async fn test_edit_local_echo() {
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
 
-    let mut sync_builder = SyncResponseBuilder::new();
-    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
 
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
+    let room = server.sync_joined_room(&client, room_id).await;
 
-    mock_encryption_state(&server, false).await;
+    server.mock_room_state_encryption().plain().mount().await;
 
-    let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
-    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    mock_encryption_state(&server, false).await;
-    let mounted_send = Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(ResponseTemplate::new(413).set_body_json(json!({
-            "errcode": "M_TOO_LARGE",
-        })))
-        .expect(1)
-        .mount_as_scoped(&server)
-        .await;
+    let mounted_send =
+        server.mock_room_send().error_too_large().mock_once().mount_as_scoped().await;
 
     // Redacting a local event works.
     timeline.send(RoomMessageEventContent::text_plain("hello, just you").into()).await.unwrap();
 
-    assert_let!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next().await);
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
+    assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
 
     let internal_id = item.unique_id();
 
     let item = item.as_event().unwrap();
     assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
 
-    assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
-    assert!(day_divider.is_day_divider());
+    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[1]);
+    assert!(date_divider.is_date_divider());
 
     // We haven't set a route for sending events, so this will fail.
 
-    assert_let!(Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next().await);
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 1);
+
+    assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[0]);
 
     let item = item.as_event().unwrap();
     assert!(item.is_local_echo());
@@ -224,18 +202,13 @@ async fn test_edit_local_echo() {
         Some(EventSendState::SendingFailed { is_recoverable: false, .. })
     );
 
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 
     // Set up the success response before editing, since edit causes an immediate
     // retry (the room's send queue is not blocked, since the one event it couldn't
     // send failed in an unrecoverable way).
     drop(mounted_send);
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$1" })))
-        .expect(1)
-        .mount(&server)
-        .await;
+    server.mock_room_send().ok(event_id!("$1")).mount().await;
 
     // Editing the local echo works, since it was in the failed state.
     timeline
@@ -246,8 +219,11 @@ async fn test_edit_local_echo() {
         .await
         .unwrap();
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 1);
+
     // Observe local echo being replaced.
-    assert_let!(Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[0]);
 
     assert_eq!(item.unique_id(), internal_id);
 
@@ -260,8 +236,14 @@ async fn test_edit_local_echo() {
     let edit_message = item.content().as_message().unwrap();
     assert_eq!(edit_message.body(), "hello, world");
 
+    // Re-enable the room's queue.
+    timeline.room().send_queue().set_enabled(true);
+
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 1);
+
     // Observe the event being sent, and replacing the local echo.
-    assert_let!(Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[0]);
 
     let item = item.as_event().unwrap();
     assert!(item.is_local_echo());
@@ -270,41 +252,34 @@ async fn test_edit_local_echo() {
     assert_eq!(edit_message.body(), "hello, world");
 
     // No new updates.
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 }
 
 #[async_test]
 async fn test_send_edit() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let room = server.sync_joined_room(&client, room_id).await;
 
-    let mut sync_builder = SyncResponseBuilder::new();
-    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    server.mock_room_state_encryption().plain().mount().await;
 
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    mock_encryption_state(&server, false).await;
-
-    let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
 
     let f = EventFactory::new();
-    sync_builder.add_joined_room(
-        JoinedRoomBuilder::new(room_id).add_timeline_event(
-            f.text_msg("Hello, World!")
-                .sender(client.user_id().unwrap())
-                .event_id(event_id!("$original_event")),
-        ),
-    );
-
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("Hello, World!")
+                    .sender(client.user_id().unwrap())
+                    .event_id(event_id!("$original_event")),
+            ),
+        )
+        .await;
 
     let hello_world_item =
         assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
@@ -312,15 +287,7 @@ async fn test_send_edit() {
     assert!(!hello_world_message.is_edited());
     assert!(hello_world_item.is_editable());
 
-    mock_encryption_state(&server, false).await;
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$edit_event" })),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
+    server.mock_room_send().ok(event_id!("$edit_event")).mock_once().mount().await;
 
     timeline
         .edit(
@@ -349,43 +316,37 @@ async fn test_send_edit() {
     // updates, so just wait for a bit before verifying that the endpoint was
     // called.
     sleep(Duration::from_millis(200)).await;
-
-    server.verify().await;
 }
 
 #[async_test]
 async fn test_send_reply_edit() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let room = server.sync_joined_room(&client, room_id).await;
 
-    let mut sync_builder = SyncResponseBuilder::new();
-    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    server.mock_room_state_encryption().plain().mount().await;
 
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    mock_encryption_state(&server, false).await;
-
-    let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
 
     let f = EventFactory::new();
     let event_id = event_id!("$original_event");
-    sync_builder.add_joined_room(
-        JoinedRoomBuilder::new(room_id)
-            .add_timeline_event(f.text_msg("Hello, World!").sender(&ALICE).event_id(event_id))
-            .add_timeline_event(
-                f.text_msg("Hello, Alice!").reply_to(event_id).sender(client.user_id().unwrap()),
-            ),
-    );
 
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("Hello, World!").sender(&ALICE).event_id(event_id))
+                .add_timeline_event(
+                    f.text_msg("Hello, Alice!")
+                        .reply_to(event_id)
+                        .sender(client.user_id().unwrap()),
+                ),
+        )
+        .await;
 
     // 'Hello, World!' message.
     assert_next_matches!(timeline_stream, VectorDiff::PushBack { .. });
@@ -399,15 +360,7 @@ async fn test_send_reply_edit() {
     assert_eq!(in_reply_to.event_id, event_id);
     assert_matches!(in_reply_to.event, TimelineDetails::Ready(_));
 
-    mock_encryption_state(&server, false).await;
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$edit_event" })),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
+    server.mock_room_send().ok(event_id!("$edit_event")).mock_once().mount().await;
 
     timeline
         .edit(
@@ -439,45 +392,40 @@ async fn test_send_reply_edit() {
     // updates, so just wait for a bit before verifying that the endpoint was
     // called.
     sleep(Duration::from_millis(200)).await;
-
-    server.verify().await;
 }
 
 #[async_test]
 async fn test_edit_to_replied_updates_reply() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let room = server.sync_joined_room(&client, room_id).await;
 
-    let mut sync_builder = SyncResponseBuilder::new();
-    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    server.mock_room_state_encryption().plain().mount().await;
 
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    mock_encryption_state(&server, false).await;
-
-    let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
 
     let f = EventFactory::new();
-    let event_id = event_id!("$original_event");
+    let eid1 = event_id!("$original_event");
+    let eid2 = event_id!("$reply1");
+    let eid3 = event_id!("$reply2");
     let user_id = client.user_id().unwrap();
 
     // When a room has two messages, one is a reply to the other…
-    sync_builder.add_joined_room(
-        JoinedRoomBuilder::new(room_id)
-            .add_timeline_event(f.text_msg("bonjour").sender(user_id).event_id(event_id))
-            .add_timeline_event(f.text_msg("hi back").reply_to(event_id).sender(*ALICE))
-            .add_timeline_event(f.text_msg("yo").reply_to(event_id).sender(*BOB)),
-    );
-
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("bonjour").sender(user_id).event_id(eid1))
+                .add_timeline_event(
+                    f.text_msg("hi back").reply_to(eid1).sender(*ALICE).event_id(eid2),
+                )
+                .add_timeline_event(f.text_msg("yo").reply_to(eid1).sender(*BOB).event_id(eid3)),
+        )
+        .await;
 
     // (I see all the messages in the timeline.)
     let replied_to_item = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => {
@@ -491,7 +439,7 @@ async fn test_edit_to_replied_updates_reply() {
         assert_eq!(reply_message.body(), "hi back");
 
         let in_reply_to = reply_message.in_reply_to().unwrap();
-        assert_eq!(in_reply_to.event_id, event_id);
+        assert_eq!(in_reply_to.event_id, eid1);
 
         assert_let!(TimelineDetails::Ready(replied_to) = &in_reply_to.event);
         assert_eq!(replied_to.content().as_message().unwrap().body(), "bonjour");
@@ -502,21 +450,13 @@ async fn test_edit_to_replied_updates_reply() {
         assert_eq!(reply_message.body(), "yo");
 
         let in_reply_to = reply_message.in_reply_to().unwrap();
-        assert_eq!(in_reply_to.event_id, event_id);
+        assert_eq!(in_reply_to.event_id, eid1);
 
         assert_let!(TimelineDetails::Ready(replied_to) = &in_reply_to.event);
         assert_eq!(replied_to.content().as_message().unwrap().body(), "bonjour");
     });
 
-    mock_encryption_state(&server, false).await;
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$edit_event" })),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
+    server.mock_room_send().ok(event_id!("$edit_event")).mock_once().mount().await;
 
     // If I edit the first message,…
     timeline
@@ -538,7 +478,7 @@ async fn test_edit_to_replied_updates_reply() {
         assert!(!reply_message.is_edited());
 
         let in_reply_to = reply_message.in_reply_to().unwrap();
-        assert_eq!(in_reply_to.event_id, event_id);
+        assert_eq!(in_reply_to.event_id, eid1);
         assert_let!(TimelineDetails::Ready(replied_to) = &in_reply_to.event);
         assert_eq!(replied_to.content().as_message().unwrap().body(), "hello world");
     });
@@ -549,7 +489,7 @@ async fn test_edit_to_replied_updates_reply() {
         assert!(!reply_message.is_edited());
 
         let in_reply_to = reply_message.in_reply_to().unwrap();
-        assert_eq!(in_reply_to.event_id, event_id);
+        assert_eq!(in_reply_to.event_id, eid1);
         assert_let!(TimelineDetails::Ready(replied_to) = &in_reply_to.event);
         assert_eq!(replied_to.content().as_message().unwrap().body(), "hello world");
     });
@@ -562,26 +502,18 @@ async fn test_edit_to_replied_updates_reply() {
     });
 
     sleep(Duration::from_millis(200)).await;
-
-    server.verify().await;
 }
 
 #[async_test]
 async fn test_send_edit_poll() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let room = server.sync_joined_room(&client, room_id).await;
 
-    let mut sync_builder = SyncResponseBuilder::new();
-    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    server.mock_room_state_encryption().plain().mount().await;
 
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    mock_encryption_state(&server, false).await;
-
-    let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
@@ -593,20 +525,19 @@ async fn test_send_edit_poll() {
     .unwrap();
 
     let f = EventFactory::new();
-    sync_builder.add_joined_room(
-        JoinedRoomBuilder::new(room_id).add_timeline_event(
-            f.event(NewUnstablePollStartEventContent::new(UnstablePollStartContentBlock::new(
-                "Test",
-                poll_answers,
-            )))
-            .sender(client.user_id().unwrap())
-            .event_id(event_id!("$original_event")),
-        ),
-    );
-
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.event(NewUnstablePollStartEventContent::new(UnstablePollStartContentBlock::new(
+                    "Test",
+                    poll_answers,
+                )))
+                .sender(client.user_id().unwrap())
+                .event_id(event_id!("$original_event")),
+            ),
+        )
+        .await;
 
     let poll_event = assert_next_matches!(timeline_stream, VectorDiff::PushBack { value } => value);
     assert_let!(TimelineItemContent::Poll(poll) = poll_event.content());
@@ -615,15 +546,7 @@ async fn test_send_edit_poll() {
     assert_eq!(poll_results.answers.len(), 2);
     assert!(!poll_results.has_been_edited);
 
-    mock_encryption_state(&server, false).await;
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$edit_event" })),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
+    server.mock_room_send().ok(event_id!("$edit_event")).mock_once().mount().await;
 
     let edited_poll_answers = UnstablePollAnswers::try_from(vec![
         UnstablePollAnswer::new("0", "Yes"),
@@ -664,8 +587,6 @@ async fn test_send_edit_poll() {
     // updates, so just wait for a bit before verifying that the endpoint was
     // called.
     sleep(Duration::from_millis(200)).await;
-
-    server.verify().await;
 }
 
 #[async_test]
@@ -739,53 +660,37 @@ async fn test_send_edit_when_timeline_is_clear() {
 
 #[async_test]
 async fn test_edit_local_echo_with_unsupported_content() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let room = server.sync_joined_room(&client, room_id).await;
 
-    let mut sync_builder = SyncResponseBuilder::new();
-    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    server.mock_room_state_encryption().plain().mount().await;
 
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    mock_encryption_state(&server, false).await;
-
-    let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
     let (_, mut timeline_stream) = timeline.subscribe().await;
 
-    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
-
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    mock_encryption_state(&server, false).await;
-    let mounted_send = Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(ResponseTemplate::new(413).set_body_json(json!({
-            "errcode": "M_TOO_LARGE",
-        })))
-        .expect(1)
-        .mount_as_scoped(&server)
-        .await;
+    let mounted_send = server.mock_room_send().error_too_large().expect(1).mount_as_scoped().await;
 
     timeline.send(RoomMessageEventContent::text_plain("hello, just you").into()).await.unwrap();
 
-    assert_let!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next().await);
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
+    assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
 
     let item = item.as_event().unwrap();
     assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
 
-    assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
-    assert!(day_divider.is_day_divider());
+    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[1]);
+    assert!(date_divider.is_date_divider());
 
     // We haven't set a route for sending events, so this will fail.
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 1);
 
-    assert_let!(Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[0]);
 
     let item = item.as_event().unwrap();
     assert!(item.is_local_echo());
@@ -796,17 +701,13 @@ async fn test_edit_local_echo_with_unsupported_content() {
         Some(EventSendState::SendingFailed { is_recoverable: false, .. })
     );
 
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 
     // Set up the success response before editing, since edit causes an immediate
     // retry (the room's send queue is not blocked, since the one event it couldn't
     // send failed in an unrecoverable way).
     drop(mounted_send);
-    Mock::given(method("PUT"))
-        .and(path_regex(r"^/_matrix/client/r0/rooms/.*/send/.*"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "event_id": "$1" })))
-        .mount(&server)
-        .await;
+    server.mock_room_send().ok(event_id!("$1")).mount().await;
 
     let answers = vec![UnstablePollAnswer::new("A", "Answer A")].try_into().unwrap();
     let poll_content_block = UnstablePollStartContentBlock::new("question", answers);
@@ -828,7 +729,10 @@ async fn test_edit_local_echo_with_unsupported_content() {
         .await
         .unwrap();
 
-    assert_let!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next().await);
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 1);
+
+    assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
 
     let item = item.as_event().unwrap();
     assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
@@ -846,6 +750,8 @@ async fn test_edit_local_echo_with_unsupported_content() {
 
     // We couldn't edit the local echo, since their content types didn't match
     assert_matches!(edit_err, Error::EditError(EditError::ContentMismatch { .. }));
+
+    assert_pending!(timeline_stream);
 }
 
 struct PendingEditHelper {
@@ -888,12 +794,12 @@ impl PendingEditHelper {
     async fn handle_backpagination(&mut self, events: Vec<Raw<AnyTimelineEvent>>, batch_size: u16) {
         self.server
             .mock_room_messages()
-            .ok("123".to_owned(), Some("yolo".to_owned()), events, Vec::<Raw<AnyStateEvent>>::new())
+            .ok(RoomMessagesResponseTemplate::default().end_token("yolo").events(events))
             .mock_once()
             .mount()
             .await;
 
-        self.timeline.live_paginate_backwards(batch_size).await.unwrap();
+        self.timeline.paginate_backwards(batch_size).await.unwrap();
     }
 }
 
@@ -919,7 +825,7 @@ async fn test_pending_edit() {
     .await;
 
     // Nothing happens.
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 
     // But when I receive the original event after a bit…
     h.handle_sync(
@@ -928,8 +834,11 @@ async fn test_pending_edit() {
     )
     .await;
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
     // Then I get the edited content immediately.
-    assert_let!(Some(VectorDiff::PushBack { value }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
 
     let event = value.as_event().unwrap();
     let latest_edit_json = event.latest_edit_json().expect("we should have an edit json");
@@ -939,13 +848,12 @@ async fn test_pending_edit() {
     assert!(msg.is_edited());
     assert_eq!(msg.body(), "[edit]");
 
-    // The day divider.
-    assert_next_matches!(timeline_stream, VectorDiff::PushFront { value } => {
-        assert!(value.is_day_divider());
-    });
+    // The date divider.
+    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[1]);
+    assert!(date_divider.is_date_divider());
 
     // And nothing else.
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 }
 
 #[async_test]
@@ -977,7 +885,7 @@ async fn test_pending_edit_overrides() {
     .await;
 
     // Nothing happens.
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 
     // And then I receive the original event after a bit…
     h.handle_sync(
@@ -986,19 +894,21 @@ async fn test_pending_edit_overrides() {
     )
     .await;
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
     // Then I get the latest edited content immediately.
-    assert_let!(Some(VectorDiff::PushBack { value }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
     let msg = value.as_event().unwrap().content().as_message().unwrap();
     assert!(msg.is_edited());
     assert_eq!(msg.body(), "bonjour");
 
-    // The day divider.
-    assert_next_matches!(timeline_stream, VectorDiff::PushFront { value } => {
-        assert!(value.is_day_divider());
-    });
+    // The date divider.
+    assert_let!(VectorDiff::PushFront { value } = &timeline_updates[1]);
+    assert!(value.is_date_divider());
 
     // And nothing else.
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 }
 
 #[async_test]
@@ -1034,19 +944,21 @@ async fn test_pending_edit_from_backpagination() {
     )
     .await;
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
     // Then I get the latest edited content immediately.
-    assert_let!(Some(VectorDiff::PushBack { value }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
     let msg = value.as_event().unwrap().content().as_message().unwrap();
     assert!(msg.is_edited());
     assert_eq!(msg.body(), "hello");
 
-    // The day divider.
-    assert_next_matches!(timeline_stream, VectorDiff::PushFront { value } => {
-        assert!(value.is_day_divider());
-    });
+    // The date divider.
+    assert_let!(VectorDiff::PushFront { value } = &timeline_updates[1]);
+    assert!(value.is_date_divider());
 
     // And nothing else.
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 }
 
 #[async_test]
@@ -1054,20 +966,23 @@ async fn test_pending_edit_from_backpagination_doesnt_override_pending_edit_from
     let mut h = PendingEditHelper::new().await;
     let f = EventFactory::new();
 
-    let (_, mut timeline_stream) = h.timeline.subscribe().await;
-
     // When I receive an edit live from a sync for an event I don't know about…
     let original_event_id = event_id!("$original");
     let edit_event_id = event_id!("$edit");
     h.handle_sync(
-        JoinedRoomBuilder::new(&h.room_id).add_timeline_event(
-            f.text_msg("* hello")
-                .sender(&ALICE)
-                .event_id(edit_event_id)
-                .edit(original_event_id, RoomMessageEventContent::text_plain("[edit]").into()),
-        ),
+        JoinedRoomBuilder::new(&h.room_id)
+            .add_timeline_event(
+                f.text_msg("* hello")
+                    .sender(&ALICE)
+                    .event_id(edit_event_id)
+                    .edit(original_event_id, RoomMessageEventContent::text_plain("[edit]").into()),
+            )
+            .set_timeline_prev_batch("prev-batch-token".to_owned())
+            .set_timeline_limited(),
     )
     .await;
+
+    let (_, mut timeline_stream) = h.timeline.subscribe().await;
 
     // And then I receive an edit from a back-pagination for the same event…
     let edit_event_id2 = event_id!("$edit2");
@@ -1084,7 +999,7 @@ async fn test_pending_edit_from_backpagination_doesnt_override_pending_edit_from
     .await;
 
     // Nothing happens.
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 
     // And then I receive the original event after a bit…
     h.handle_sync(
@@ -1093,20 +1008,22 @@ async fn test_pending_edit_from_backpagination_doesnt_override_pending_edit_from
     )
     .await;
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
     // Then I get the edit from the sync, even if the back-pagination happened
     // after.
-    assert_let!(Some(VectorDiff::PushBack { value }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
     let msg = value.as_event().unwrap().content().as_message().unwrap();
     assert!(msg.is_edited());
     assert_eq!(msg.body(), "[edit]");
 
-    // The day divider.
-    assert_next_matches!(timeline_stream, VectorDiff::PushFront { value } => {
-        assert!(value.is_day_divider());
-    });
+    // The date divider.
+    assert_let!(VectorDiff::PushFront { value } = &timeline_updates[1]);
+    assert!(value.is_date_divider());
 
     // And nothing else.
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 }
 
 #[async_test]
@@ -1142,7 +1059,7 @@ async fn test_pending_poll_edit() {
     .await;
 
     // Nothing happens.
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 
     // But when I receive the original event after a bit…
     let event_content = NewUnstablePollStartEventContent::new(UnstablePollStartContentBlock::new(
@@ -1160,8 +1077,11 @@ async fn test_pending_poll_edit() {
     )
     .await;
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
     // Then I get the edited content immediately.
-    assert_let!(Some(VectorDiff::PushBack { value }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value } = &timeline_updates[0]);
     let poll = as_variant!(value.as_event().unwrap().content(), TimelineItemContent::Poll).unwrap();
     assert!(poll.is_edit());
 
@@ -1170,34 +1090,25 @@ async fn test_pending_poll_edit() {
     assert_eq!(results.answers[0].text, "Yes");
     assert_eq!(results.answers[1].text, "No");
 
-    // The day divider.
-    assert_next_matches!(timeline_stream, VectorDiff::PushFront { value } => {
-        assert!(value.is_day_divider());
-    });
+    // The date divider.
+    assert_let!(VectorDiff::PushFront { value } = &timeline_updates[1]);
+    assert!(value.is_date_divider());
 
     // And nothing else.
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 }
 
 #[async_test]
 async fn test_send_edit_non_existing_item() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
     let room_id = room_id!("!a98sd12bjh:example.org");
-    let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let room = server.sync_joined_room(&client, room_id).await;
 
-    let mut sync_builder = SyncResponseBuilder::new();
-    sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+    server.mock_room_state_encryption().plain().mount().await;
 
-    mock_sync(&server, sync_builder.build_json_sync_response(), None).await;
-    let _response = client.sync_once(sync_settings.clone()).await.unwrap();
-    server.reset().await;
-
-    mock_encryption_state(&server, false).await;
-
-    let room = client.get_room(room_id).unwrap();
     let timeline = room.timeline().await.unwrap();
-
-    mock_encryption_state(&server, false).await;
 
     let error = timeline
         .edit(

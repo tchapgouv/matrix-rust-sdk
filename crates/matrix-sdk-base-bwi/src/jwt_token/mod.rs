@@ -14,14 +14,16 @@
  * limitations under the License.
  */
 
-use crate::jwt_token::BWIPublicKeyForJWTTokenValidationParseError::PublicKeyLoadingFailed;
-use jsonwebtoken::errors::ErrorKind::InvalidSignature;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use std::{fs, io, path::Path};
+
+use jsonwebtoken::{
+    decode, errors::ErrorKind::InvalidSignature, Algorithm, DecodingKey, Validation,
+};
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use std::{fs, io};
 use url::Url;
+
+use crate::jwt_token::BWIPublicKeyForJWTTokenValidationParseError::PublicKeyLoadingFailed;
 
 const JWT_TOKEN_FOR_VALIDATION_ENDPOINT: &str = "_bum/client/v1/verify";
 
@@ -57,7 +59,8 @@ impl BWIPublicKeyForJWTTokenValidation {
         BWIPublicKeyForJWTTokenValidation::from_string(&public_key)
     }
 
-    // No impl From<String> as this has a different semantic meaning, aka being a factory-method
+    // No impl From<String> as this has a different semantic meaning, aka being a
+    // factory-method
     pub fn from_string(
         public_key_as_string: &str,
     ) -> Result<Self, BWIPublicKeyForJWTTokenValidationParseError> {
@@ -66,7 +69,8 @@ impl BWIPublicKeyForJWTTokenValidation {
         })
     }
 
-    // No impl From<String> as this has a different semantic meaning, aka being a factory-method
+    // No impl From<String> as this has a different semantic meaning, aka being a
+    // factory-method
     pub fn from_u8(
         public_key_as_string: &[u8],
     ) -> Result<Self, BWIPublicKeyForJWTTokenValidationParseError> {

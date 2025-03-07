@@ -18,11 +18,12 @@ use std::{
 };
 
 use futures_util::{pin_mut, StreamExt as _};
-use matrix_sdk::{room::Room, Client, ClientBuildError, SlidingSyncList, SlidingSyncMode};
-use matrix_sdk_base::{
-    deserialized_responses::TimelineEvent, sliding_sync::http, RoomState, StoreError,
+use matrix_sdk::{
+    room::Room, sleep::sleep, Client, ClientBuildError, SlidingSyncList, SlidingSyncMode,
 };
+use matrix_sdk_base::{deserialized_responses::TimelineEvent, RoomState, StoreError};
 use ruma::{
+    api::client::sync::sync_events::v5 as http,
     assign,
     directory::RoomTypeFilter,
     events::{
@@ -175,8 +176,8 @@ impl NotificationClient {
         //
         // Spawn an `EncryptionSync` that runs two iterations of the sliding sync loop:
         // - the first iteration allows to get SS events as well as send e2ee requests.
-        // - the second one let the SS proxy forward events triggered by the sending of
-        // e2ee requests.
+        // - the second one let the SS homeserver forward events triggered by the
+        //   sending of e2ee requests.
         //
         // Keep timeouts small for both, since we might be short on time.
 
@@ -212,7 +213,7 @@ impl NotificationClient {
                     for _ in 0..3 {
                         trace!("waiting for decryption…");
 
-                        tokio::time::sleep(Duration::from_millis(wait)).await;
+                        sleep(Duration::from_millis(wait)).await;
 
                         let new_event = room.decrypt_event(raw_event.cast_ref()).await?;
 
@@ -740,7 +741,7 @@ impl NotificationItem {
             sender_display_name,
             sender_avatar_url,
             is_sender_name_ambiguous,
-            room_computed_display_name: room.compute_display_name().await?.to_string(),
+            room_computed_display_name: room.display_name().await?.to_string(),
             room_avatar_url: room.avatar_url().map(|s| s.to_string()),
             room_canonical_alias: room.canonical_alias().map(|c| c.to_string()),
             is_direct_message_room: room.is_direct().await?,

@@ -63,16 +63,17 @@ use async_stream::stream;
 use eyeball::Subscriber;
 use futures_util::{pin_mut, Stream, StreamExt};
 use matrix_sdk::{
-    event_cache::EventCacheError, Client, Error as SlidingSyncError, SlidingSync, SlidingSyncList,
-    SlidingSyncMode,
+    event_cache::EventCacheError, timeout::timeout, Client, Error as SlidingSyncError, SlidingSync,
+    SlidingSyncList, SlidingSyncMode,
 };
-use matrix_sdk_base::sliding_sync::http;
 pub use room::*;
 pub use room_list::*;
-use ruma::{assign, directory::RoomTypeFilter, events::StateEventType, OwnedRoomId, RoomId, UInt};
+use ruma::{
+    api::client::sync::sync_events::v5 as http, assign, directory::RoomTypeFilter,
+    events::StateEventType, OwnedRoomId, RoomId, UInt,
+};
 pub use state::*;
 use thiserror::Error;
-use tokio::time::timeout;
 use tracing::debug;
 
 use crate::timeline;
@@ -92,6 +93,8 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     // Those two events are required to properly compute room previews.
     (StateEventType::RoomCreate, ""),
     (StateEventType::RoomHistoryVisibility, ""),
+    // Required to correctly calculate the room display name.
+    (StateEventType::MemberHints, ""),
 ];
 
 /// The default `required_state` constant value for sliding sync room
@@ -326,7 +329,7 @@ impl RoomListService {
                 };
 
                 // `state.next().await` has a maximum of `yield_delay` time to execute…
-                let next_state = match timeout(yield_delay, state.next()).await {
+                let next_state = match timeout(state.next(), yield_delay).await {
                     // A new state has been received before `yield_delay` time. The new
                     // `sync_indicator` value won't be yielded.
                     Ok(next_state) => next_state,
@@ -465,13 +468,10 @@ pub enum SyncIndicator {
 mod tests {
     use std::future::ready;
 
-    use assert_matches::assert_matches;
     use futures_util::{pin_mut, StreamExt};
     use matrix_sdk::{
+        authentication::matrix::{MatrixSession, MatrixSessionTokens},
         config::RequestConfig,
-        matrix_auth::{MatrixSession, MatrixSessionTokens},
-        reqwest::Url,
-        sliding_sync::Version as SlidingSyncVersion,
         Client, SlidingSyncMode,
     };
     use matrix_sdk_base::SessionMeta;
@@ -520,31 +520,6 @@ mod tests {
             request.url.path() == "/_matrix/client/unstable/org.matrix.simplified_msc3575/sync"
                 && request.method == Method::POST
         }
-    }
-
-    #[async_test]
-    async fn test_sliding_sync_proxy_url() -> Result<(), Error> {
-        let (client, _) = new_client().await;
-
-        {
-            let room_list = RoomListService::new(client.clone()).await?;
-            assert_matches!(room_list.sliding_sync().version(), SlidingSyncVersion::Native);
-        }
-
-        {
-            let url = Url::parse("https://foo.matrix/").unwrap();
-            client.set_sliding_sync_version(SlidingSyncVersion::Proxy { url: url.clone() });
-
-            let room_list = RoomListService::new(client.clone()).await?;
-            assert_matches!(
-                room_list.sliding_sync().version(),
-                SlidingSyncVersion::Proxy { url: given_url } => {
-                    assert_eq!(&url, given_url);
-                }
-            );
-        }
-
-        Ok(())
     }
 
     #[async_test]

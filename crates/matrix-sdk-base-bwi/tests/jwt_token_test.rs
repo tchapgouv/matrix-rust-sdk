@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
-use matrix_sdk_base_bwi::jwt_token::BWIJWTTokenValidationError::NoValidPublicKey;
-use matrix_sdk_base_bwi::jwt_token::{BWIPublicKeyForJWTTokenValidation, BWITokenValidator};
+use matrix_sdk_base_bwi::jwt_token::{
+    BWIJWTTokenValidationError::NoValidPublicKey, BWIPublicKeyForJWTTokenValidation,
+    BWITokenValidator,
+};
 use url::Url;
 
 const VALID_PUB_KEYFILE: &str = "tests/resources/valid_jwt_key.key.pub";

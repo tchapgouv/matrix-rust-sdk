@@ -79,6 +79,18 @@ pub enum Update<Item, Gap> {
         items: Vec<Item>,
     },
 
+    /// An item has been replaced in the linked chunk.
+    ///
+    /// The `at` position MUST resolve to the actual position an existing *item*
+    /// (not a gap).
+    ReplaceItem {
+        /// The position of the item that's being replaced.
+        at: Position,
+
+        /// The new value for the item.
+        item: Item,
+    },
+
     /// An item has been removed inside a chunk of kind Items.
     RemoveItem {
         /// The [`Position`] of the item.
@@ -126,6 +138,11 @@ impl<Item, Gap> ObservableUpdates<Item, Gap> {
         self.inner.write().unwrap().push(update);
     }
 
+    /// Clear all pending updates.
+    pub(super) fn clear_pending(&mut self) {
+        self.inner.write().unwrap().clear_pending();
+    }
+
     /// Take new updates.
     ///
     /// Updates that have been taken will not be read again.
@@ -138,6 +155,7 @@ impl<Item, Gap> ObservableUpdates<Item, Gap> {
     }
 
     /// Subscribe to updates by using a [`Stream`].
+    #[cfg(test)]
     pub(super) fn subscribe(&mut self) -> UpdatesSubscriber<Item, Gap> {
         // A subscriber is a new update reader, it needs its own token.
         let token = self.new_reader_token();
@@ -229,6 +247,19 @@ impl<Item, Gap> UpdatesInner<Item, Gap> {
         }
     }
 
+    /// Clear all pending updates.
+    fn clear_pending(&mut self) {
+        self.updates.clear();
+
+        // Reset all the per-reader indices.
+        for idx in self.last_index_per_reader.values_mut() {
+            *idx = 0;
+        }
+
+        // No need to wake the wakers; they're waiting for a new update, and we
+        // just made them all disappear.
+    }
+
     /// Take new updates; it considers the caller is the main reader, i.e. it
     /// will use the [`Self::MAIN_READER_TOKEN`].
     ///
@@ -264,6 +295,7 @@ impl<Item, Gap> UpdatesInner<Item, Gap> {
     }
 
     /// Return the number of updates in the buffer.
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.updates.len()
     }
@@ -302,6 +334,7 @@ pub(super) struct UpdatesSubscriber<Item, Gap> {
 
 impl<Item, Gap> UpdatesSubscriber<Item, Gap> {
     /// Create a new [`Self`].
+    #[cfg(test)]
     fn new(updates: Weak<RwLock<UpdatesInner<Item, Gap>>>, token: ReaderToken) -> Self {
         Self { updates, token }
     }

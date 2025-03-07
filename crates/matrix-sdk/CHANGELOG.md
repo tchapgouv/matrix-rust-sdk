@@ -6,6 +6,182 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- [**breaking**]: The `RoomPagination::run_backwards` method has been removed, and replaced by two
+simpler methods:
+  - `RoomPagination::run_backwards_until()`, which will retrigger back-paginations until a certain
+  number of events have been received (and retry if the timeline has been reset in the background).
+  - `RoomPagination::run_backwards_once()`, which will run a single back-pagination (and retry if
+  the timeline has been reset in the background).
+  ([#4689](https://github.com/matrix-org/matrix-rust-sdk/pull/4689))
+- [**breaking**]: The `Oidc::account_management_url` method now caches the
+  result of a call, subsequent calls to the method will not contact the OIDC
+  provider for a while, instead the cached URI will be returned. If caching of
+  this URI is not desirable, the `Oidc::fetch_account_management_url` method
+  can be used.
+  ([#4663](https://github.com/matrix-org/matrix-rust-sdk/pull/4663))
+
+- The `MediaRetentionPolicy` can now trigger regular cleanups with its new
+  `cleanup_frequency` setting.
+  ([#4603](https://github.com/matrix-org/matrix-rust-sdk/pull/4603))
+- [**breaking**] The HTTP client only allows TLS 1.2 or newer, as recommended by
+  [BCP 195](https://datatracker.ietf.org/doc/bcp195/).
+  ([#4647](https://github.com/matrix-org/matrix-rust-sdk/pull/4647))
+- Add `Room::report_room` api. ([#4713](https://github.com/matrix-org/matrix-rust-sdk/pull/4713))
+- `Client::notification_client` will create a copy of the existing `Client`, but now it'll make sure 
+  it doesn't handle any verification events to avoid an issue with these events being received and 
+  processed twice if `NotificationProcessSetup` was `SingleSetup`.
+
+### Bug Fixes
+
+- Ensure all known secrets are removed from secret storage when invoking the
+  `Recovery::disable()` method. While the server is not guaranteed to delete
+  these secrets, making an attempt to remove them is considered good practice.
+  Note that all secrets are uploaded to the server in an encrypted form.
+  ([#4629](https://github.com/matrix-org/matrix-rust-sdk/pull/4629))
+
+### Refactor
+
+- [**breaking**] We now require Rust 1.85 as the minimum supported Rust version to compile.
+  Yay for async closures!
+  ([#4745](https://github.com/matrix-org/matrix-rust-sdk/pull/4745)
+- [**breaking**]: The `Oidc` API only supports public clients, i.e. clients
+  without a secret.
+  ([#4634](https://github.com/matrix-org/matrix-rust-sdk/pull/4634))
+  - `Oidc::restore_registered_client()` takes a `ClientId` instead of
+    `ClientCredentials`
+  - `Oidc::restore_registered_client()` must NOT be called after
+    `Oidc::register_client()` anymore.
+- [**breaking**]: The `authentication::qrcode` module now reexports types from
+  `oauth2` rather than `openidconnect`. Some type names might have changed.
+  ([#4604](https://github.com/matrix-org/matrix-rust-sdk/pull/4604))
+- [**breaking**] `Oidc::authorize_scope()` was removed because it has no use
+  case anymore, according to the latest version of
+  [MSC2967](https://github.com/matrix-org/matrix-spec-proposals/pull/2967).
+  ([#4664](https://github.com/matrix-org/matrix-rust-sdk/pull/4664))
+- The `UserSession` type cannot be deserialized from its old format anymore. The
+  old format used an `issuer_info` field instead of an `issuer` field.
+- [**breaking**]: The `Oidc` API uses the `GET /auth_metadata` endpoint from the
+  latest version of [MSC2965](https://github.com/matrix-org/matrix-spec-proposals/pull/2965)
+  by default. The previous `GET /auth_issuer` endpoint is still supported as a
+  fallback for now.
+  ([#4673](https://github.com/matrix-org/matrix-rust-sdk/pull/4673))
+  - It is not possible to provide a custom issuer anymore:
+    `Oidc::given_provider_metadata()` was removed, and the parameter was removed
+    from `Oidc::register_client()`.
+  - `Oidc::fetch_authentication_issuer()` was removed. To check if the
+    homeserver supports OAuth 2.0, use `Oidc::provider_metadata()`. To get the
+    issuer, use `VerifiedProviderMetadata::issuer()`.
+  - `Oidc::provider_metadata()` returns an `OauthDiscoveryError`. It has a
+    `NotSupported` variant and an `is_not_supported()` method to check if the
+    error is due to the server not supporting OAuth 2.0.
+  - `OidcError::MissingAuthenticationIssuer` was removed.
+- [**breaking**]: The `authentication::qrcode` module was moved inside
+  `authentication::oidc`, because it is only available through the `Oidc` API.
+- [**breaking**]: The behavior of `Oidc::logout()` is now aligned with
+  [MSC4254](https://github.com/matrix-org/matrix-spec-proposals/pull/4254)
+  ([#4674](https://github.com/matrix-org/matrix-rust-sdk/pull/4674))
+  - Support for [RP-Initiated Logout](https://openid.net/specs/openid-connect-rpinitiated-1_0.html)
+    was removed, so it doesn't return an `OidcEndSessionUrlBuilder` anymore.
+  - Only one request is made to revoke the access token, since the server is
+    supposed to revoke both the access token and the associated refresh token
+    when the request is made.
+- [**breaking**]: Remove most of the parameter methods of
+  `OidcAuthCodeUrlBuilder`, since they were parameters defined in OpenID
+  Connect. Only the `prompt` and `user_id_hint` parameters are still supported.
+  ([#4699](https://github.com/matrix-org/matrix-rust-sdk/pull/4699))
+- [**breaking**]: Remove support for ID tokens in the `Oidc` API.
+  ([#4726](https://github.com/matrix-org/matrix-rust-sdk/pull/4726))
+  - The `latest_id_token` field of `OidcSessionTokens` was removed. (De)
+    serialization of the type should be backwards-compatible.
+  - `Oidc::restore_registered_client()` doesn't take a `VerifiedClientMetadata`
+    anymore.
+  - `Oidc::latest_id_token()` and `Oidc::client_metadata()` were removed.
+- [**breaking**]: The `Oidc` API makes use of the oauth2 crate rather than
+  mas-oidc-client.
+  ([#4761](https://github.com/matrix-org/matrix-rust-sdk/pull/4761))
+  - `ClientId` is a different type reexported from the oauth2 crate.
+  - The error types that were in the `oidc` module have been moved to the
+    `oidc::error` module.
+  - The `prompt` parameter of `Oidc::url_for_oidc()` is now optional, and
+    `Prompt` is a different type reexported from Ruma, that only supports the
+    `create` value.
+  - The `device_id` parameter of `Oidc::login` is now an `Option<OwnedDeviceId>`.
+  - The `state` field of `OidcAuthorizationData` and `AuthorizationCode`, and
+    the parameter of the same name in `Oidc::abort_authorization()` now use
+    `CsrfToken`.
+  - The `error` field of `AuthorizationError` uses an error type from the oauth2
+    crate rather than one from mas-oidc-client.
+
+## [0.10.0] - 2025-02-04
+
+### Features
+
+- Allow to set and check whether an image is animated via its `ImageInfo`.
+  ([#4503](https://github.com/matrix-org/matrix-rust-sdk/pull/4503))
+
+- Implement `Default` for `BaseImageInfo`, `BaseVideoInfo`, `BaseAudioInfo` and
+  `BaseFileInfo`.
+  ([#4503](https://github.com/matrix-org/matrix-rust-sdk/pull/4503))
+
+- Expose `Client::server_versions()` publicly to allow users of the library to
+  get the versions of Matrix supported by the homeserver.
+  ([#4519](https://github.com/matrix-org/matrix-rust-sdk/pull/4519))
+
+- Create `RoomPrivacySettings` helper to group room settings functionality
+  related to room access and visibility.
+  ([#4401](https://github.com/matrix-org/matrix-rust-sdk/pull/4401))
+
+- Enable HTTP/2 support in the HTTP client.
+  ([#4566](https://github.com/matrix-org/matrix-rust-sdk/pull/4566))
+
+- The media contents stored in the media cache can now be controlled with a
+  `MediaRetentionPolicy` and the new `Media` methods `media_retention_policy()`,
+  `set_media_retention_policy()`, `clean_up_media_cache()`.
+  ([#4571](https://github.com/matrix-org/matrix-rust-sdk/pull/4571))
+
+### Refactor
+
+- [**breaking**]: The `RoomEventCacheUpdate::Clear` variant has been removed, as
+  it is redundant with the `RoomEventCacheUpdate::UpdateTimelineEvents { diffs:
+  Vec<VectorDiff<_>>, .. }` where `VectorDiff` has its own `Clear` variant.
+  ([#4627](https://github.com/matrix-org/matrix-rust-sdk/pull/4627))
+
+- Improve the performance of `EventCache` (approximately 4.5 times faster).
+  ([#4616](https://github.com/matrix-org/matrix-rust-sdk/pull/4616))
+
+- [**breaking**]: The reexported types `SyncTimelineEvent` and `TimelineEvent` have been fused into a single type
+  `TimelineEvent`, and its field `push_actions` has been made `Option`al (it is set to `None` when
+  we couldn't compute the push actions, because we lacked some information).
+  ([#4568](https://github.com/matrix-org/matrix-rust-sdk/pull/4568))
+
+- [**breaking**] Move the optional `RequestConfig` argument of the
+  `Client::send()` method to the `with_request_config()` builder method. You
+  should call `Client::send(request).with_request_config(request_config).await`
+  now instead.
+  ([#4443](https://github.com/matrix-org/matrix-rust-sdk/pull/4443))
+
+- [**breaking**] Remove the `AttachmentConfig::with_thumbnail()` constructor and
+  replace it with the `AttachmentConfig::thumbnail()` builder method. You should
+  call `AttachmentConfig::new().thumbnail(thumbnail)` now instead.
+  ([#4452](https://github.com/matrix-org/matrix-rust-sdk/pull/4452))
+
+- [**breaking**] `Room::send_attachment()` and `RoomSendQueue::send_attachment()`
+  now take any type that implements `Into<String>` for the filename.
+  ([#4451](https://github.com/matrix-org/matrix-rust-sdk/pull/4451))
+
+- [**breaking**] `Recovery::are_we_the_last_man_standing()` has been renamed to `is_last_device()`.
+  ([#4522](https://github.com/matrix-org/matrix-rust-sdk/pull/4522))
+
+- [**breaking**] The `matrix_auth` module is now at `authentication::matrix`.
+  ([#4575](https://github.com/matrix-org/matrix-rust-sdk/pull/4575))
+
+- [**breaking**] The `oidc` module is now at `authentication::oidc`.
+  ([#4575](https://github.com/matrix-org/matrix-rust-sdk/pull/4575))
+
+## [0.9.0] - 2024-12-18
+
 ### Bug Fixes
 
 - Use the inviter's server name and the server name from the room alias as
@@ -27,6 +203,11 @@ All notable changes to this project will be documented in this file.
 
 - [**breaking**] Make all fields of Thumbnail required
   ([#4324](https://github.com/matrix-org/matrix-rust-sdk/pull/4324))
+
+- `Backups::exists_on_server`, which always fetches up-to-date information from the
+  server about whether a key storage backup exists, was renamed to
+  `fetch_exists_on_the_server`, and a new implementation of `exists_on_server`
+  which caches the most recent answer is now provided.
 
 ## [0.8.0] - 2024-11-19
 

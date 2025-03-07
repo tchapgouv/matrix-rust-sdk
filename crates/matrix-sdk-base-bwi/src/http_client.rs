@@ -13,12 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use crate::http_client::HttpError::{Failed, Undefined};
+use std::fmt::{Display, Formatter};
+
 use async_trait::async_trait;
 use reqwest::{Response, StatusCode};
-use std::fmt::{Display, Formatter};
 use thiserror::Error;
 use url::Url;
+
+use crate::http_client::HttpError::{Failed, Undefined};
 
 #[derive(Error, Debug)]
 pub enum HttpError {

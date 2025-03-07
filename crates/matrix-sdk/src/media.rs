@@ -23,33 +23,41 @@ use std::{fmt, fs::File, path::Path};
 
 use eyeball::SharedObservable;
 use futures_util::future::try_join;
-pub use matrix_sdk_base::media::*;
+use matrix_sdk_base::event_cache::store::media::IgnoreMediaRetentionPolicy;
+pub use matrix_sdk_base::{event_cache::store::media::MediaRetentionPolicy, media::*};
 use mime::Mime;
-use ruma::events::room::EncryptedFile;
 use ruma::{
     api::{
         client::{authenticated_media, error::ErrorKind, media},
         MatrixVersion,
     },
     assign,
-    events::room::{MediaSource, ThumbnailInfo},
-    MilliSecondsSinceUnixEpoch, MxcUri, OwnedMxcUri,
+    events::room::{EncryptedFile, MediaSource, ThumbnailInfo},
+    MilliSecondsSinceUnixEpoch, MxcUri, OwnedMxcUri, TransactionId, UInt,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::{fs::File as TokioFile, io::AsyncWriteExt};
 
-use crate::Error::UnknownError;
 use crate::{
-    attachment::Thumbnail, config::RequestConfig, futures::SendRequest, Client, Error, Result,
-    TransmissionProgress,
+    attachment::Thumbnail, config::RequestConfig, futures::SendRequest, Client, Error,
+    Error::UnknownError, Result, TransmissionProgress,
 };
 
 /// A conservative upload speed of 1Mbps
 const DEFAULT_UPLOAD_SPEED: u64 = 125_000;
 /// 5 min minimal upload request timeout, used to clamp the request timeout.
 const MIN_UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 5);
+/// The server name used to generate local MXC URIs.
+// This mustn't represent a potentially valid media server, otherwise it'd be
+// possible for an attacker to return malicious content under some
+// preconditions (e.g. the cache store has been cleared before the upload
+// took place). To mitigate against this, we use the .localhost TLD,
+// which is guaranteed to be on the local machine. As a result, the only attack
+// possible would be coming from the user themselves, which we consider a
+// non-threat.
+const LOCAL_MXC_SERVER_NAME: &str = "send-queue.localhost";
 
 /// A high-level API to interact with the media API.
 #[derive(Debug, Clone)]
@@ -130,6 +138,10 @@ pub enum MediaError {
     /// Preallocated media already had content, cannot overwrite.
     #[error("preallocated media already had content, cannot overwrite")]
     CannotOverwriteMedia,
+
+    /// Local-only media content was not found.
+    #[error("local-only media content was not found")]
+    LocalMediaNotFound,
 }
 
 /// `IntoFuture` returned by [`Media::upload`].
@@ -185,7 +197,7 @@ impl Media {
             content_type: Some(content_type.essence_str().to_owned()),
         });
 
-        self.client.send(request, Some(request_config))
+        self.client.send(request).with_request_config(request_config)
     }
 
     /// Returns a reasonable upload timeout for an upload, based on the size of
@@ -229,7 +241,7 @@ impl Media {
         // Note: this request doesn't have any parameters.
         let request = media::create_mxc_uri::v1::Request::default();
 
-        let response = self.client.send(request, None).await?;
+        let response = self.client.send(request).await?;
 
         Ok(PreallocatedMxcUri {
             uri: response.content_uri,
@@ -267,7 +279,7 @@ impl Media {
 
         let request_config = self.client.request_config().timeout(timeout);
 
-        if let Err(err) = self.client.send(request, Some(request_config)).await {
+        if let Err(err) = self.client.send(request).with_request_config(request_config).await {
             match err.client_api_error_kind() {
                 Some(ErrorKind::CannotOverwriteMedia) => {
                     Err(Error::Media(MediaError::CannotOverwriteMedia))
@@ -393,6 +405,12 @@ impl Media {
         request: &MediaRequestParameters,
         use_cache: bool,
     ) -> Result<Vec<u8>> {
+        // Ignore request parameters for local medias, notably those pending in the send
+        // queue.
+        if let Some(uri) = Self::as_local_uri(&request.source) {
+            return self.get_local_media_content(uri).await;
+        }
+
         // Read from the cache.
         if use_cache {
             if let Some(content) =
@@ -469,7 +487,7 @@ impl Media {
                 .event_cache_store()
                 .lock()
                 .await?
-                .add_media_content(request, content.clone())
+                .add_media_content(request, content.clone(), IgnoreMediaRetentionPolicy::No)
                 .await?;
         }
 
@@ -492,7 +510,7 @@ impl Media {
             .download_authenticated_media_request(file)
             .await
             .map_err(|e| UnknownError(Box::new(e)))?;
-        let content = self.client.send(request, request_config).await?.file;
+        let content = self.client.send(request).with_request_config(request_config).await?.file;
         Ok(content)
     }
 
@@ -526,7 +544,7 @@ impl Media {
         request.method = Some(settings.method.clone());
         request.animated = Some(settings.animated);
 
-        Ok(self.client.send(request, request_config).await?.file)
+        Ok(self.client.send(request).with_request_config(request_config).await?.file)
     }
 
     #[deprecated]
@@ -545,7 +563,7 @@ impl Media {
             request.method = Some(settings.method.clone());
             request.animated = Some(settings.animated);
 
-            Ok(self.client.send(request, None).await?.file)
+            Ok(self.client.send(request).with_request_config(None).await?.file)
         }
     }
 
@@ -565,7 +583,7 @@ impl Media {
     async fn fetch_unauthenticated_media(&self, uri: &OwnedMxcUri) -> Result<Vec<u8>, Error> {
         #[allow(deprecated)]
         let request = media::get_content::v3::Request::from_url(uri)?;
-        Ok(self.client.send(request, None).await?.file)
+        Ok(self.client.send(request).with_request_config(None).await?.file)
     }
 
     async fn fetch_authenticated_media(
@@ -574,9 +592,25 @@ impl Media {
         uri: &OwnedMxcUri,
     ) -> Result<Vec<u8>, Error> {
         let request = authenticated_media::get_content::v1::Request::from_uri(uri)?;
-        Ok(self.client.send(request, request_config).await?.file)
+        Ok(self.client.send(request).with_request_config(request_config).await?.file)
     }
     // end BWI-specific
+
+    /// Get a media file's content that is only available in the media cache.
+    ///
+    /// # Arguments
+    ///
+    /// * `uri` - The local MXC URI of the media content.
+    async fn get_local_media_content(&self, uri: &MxcUri) -> Result<Vec<u8>> {
+        // Read from the cache.
+        self.client
+            .event_cache_store()
+            .lock()
+            .await?
+            .get_media_content_for_uri(uri)
+            .await?
+            .ok_or_else(|| MediaError::LocalMediaNotFound.into())
+    }
 
     /// Remove a media file's content from the store.
     ///
@@ -708,6 +742,44 @@ impl Media {
         Ok(())
     }
 
+    /// Set the [`MediaRetentionPolicy`] to use for deciding whether to store or
+    /// keep media content.
+    ///
+    /// It is used:
+    ///
+    /// * When a media needs to be cached, to check that it does not exceed the
+    ///   max file size.
+    ///
+    /// * When [`Media::clean_up_media_cache()`], to check that all media
+    ///   content in the store fits those criteria.
+    ///
+    /// To apply the new policy to the media cache right away,
+    /// [`Media::clean_up_media_cache()`] should be called after this.
+    ///
+    /// By default, an empty `MediaRetentionPolicy` is used, which means that no
+    /// criteria are applied.
+    ///
+    /// # Arguments
+    ///
+    /// * `policy` - The `MediaRetentionPolicy` to use.
+    pub async fn set_media_retention_policy(&self, policy: MediaRetentionPolicy) -> Result<()> {
+        self.client.event_cache_store().lock().await?.set_media_retention_policy(policy).await?;
+        Ok(())
+    }
+
+    /// Get the current `MediaRetentionPolicy`.
+    pub async fn media_retention_policy(&self) -> Result<MediaRetentionPolicy> {
+        Ok(self.client.event_cache_store().lock().await?.media_retention_policy())
+    }
+
+    /// Clean up the media cache with the current [`MediaRetentionPolicy`].
+    ///
+    /// If there is already an ongoing cleanup, this is a noop.
+    pub async fn clean_up_media_cache(&self) -> Result<()> {
+        self.client.event_cache_store().lock().await?.clean_up_media_cache().await?;
+        Ok(())
+    }
+
     /// Upload the file bytes in `data` and return the source information.
     pub(crate) async fn upload_plain_media_and_thumbnail(
         &self,
@@ -750,5 +822,125 @@ impl Media {
         let url = response.content_uri;
 
         Ok(Some((MediaSource::Plain(url), thumbnail_info)))
+    }
+
+    /// Create an [`OwnedMxcUri`] for a file or thumbnail we want to store
+    /// locally before sending it.
+    ///
+    /// This uses a MXC ID that is only locally valid.
+    pub(crate) fn make_local_uri(txn_id: &TransactionId) -> OwnedMxcUri {
+        OwnedMxcUri::from(format!("mxc://{LOCAL_MXC_SERVER_NAME}/{txn_id}"))
+    }
+
+    /// Create a [`MediaRequest`] for a file we want to store locally before
+    /// sending it.
+    ///
+    /// This uses a MXC ID that is only locally valid.
+    pub(crate) fn make_local_file_media_request(txn_id: &TransactionId) -> MediaRequestParameters {
+        MediaRequestParameters {
+            source: MediaSource::Plain(Self::make_local_uri(txn_id)),
+            format: MediaFormat::File,
+        }
+    }
+
+    /// Create a [`MediaRequest`] for a file we want to store locally before
+    /// sending it.
+    ///
+    /// This uses a MXC ID that is only locally valid.
+    pub(crate) fn make_local_thumbnail_media_request(
+        txn_id: &TransactionId,
+        height: UInt,
+        width: UInt,
+    ) -> MediaRequestParameters {
+        MediaRequestParameters {
+            source: MediaSource::Plain(Self::make_local_uri(txn_id)),
+            format: MediaFormat::Thumbnail(MediaThumbnailSettings::new(width, height)),
+        }
+    }
+
+    /// Returns the local MXC URI contained by the given source, if any.
+    ///
+    /// A local MXC URI is a URI that was generated with `make_local_uri`.
+    fn as_local_uri(source: &MediaSource) -> Option<&MxcUri> {
+        let uri = match source {
+            MediaSource::Plain(uri) => uri,
+            MediaSource::Encrypted(file) => &file.url,
+        };
+
+        uri.server_name()
+            .is_ok_and(|server_name| server_name == LOCAL_MXC_SERVER_NAME)
+            .then_some(uri)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_matches2::assert_matches;
+    use ruma::{
+        events::room::{EncryptedFile, MediaSource},
+        mxc_uri, owned_mxc_uri, uint, MxcUri,
+    };
+    use serde_json::json;
+
+    use super::Media;
+
+    /// Create an `EncryptedFile` with the given MXC URI.
+    fn encrypted_file(mxc_uri: &MxcUri) -> Box<EncryptedFile> {
+        Box::new(
+            serde_json::from_value(json!({
+                "url": mxc_uri,
+                "key": {
+                    "kty": "oct",
+                    "key_ops": ["encrypt", "decrypt"],
+                    "alg": "A256CTR",
+                    "k": "b50ACIv6LMn9AfMCFD1POJI_UAFWIclxAN1kWrEO2X8",
+                    "ext": true,
+                },
+                "iv": "AK1wyzigZtQAAAABAAAAKK",
+                "hashes": {
+                    "sha256": "foobar",
+                },
+                "v": "v2",
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_as_local_uri() {
+        let txn_id = "abcdef";
+
+        // Request generated with `make_local_file_media_request`.
+        let request = Media::make_local_file_media_request(txn_id.into());
+        assert_matches!(Media::as_local_uri(&request.source), Some(uri));
+        assert_eq!(uri.media_id(), Ok(txn_id));
+
+        // Request generated with `make_local_thumbnail_media_request`.
+        let request =
+            Media::make_local_thumbnail_media_request(txn_id.into(), uint!(100), uint!(100));
+        assert_matches!(Media::as_local_uri(&request.source), Some(uri));
+        assert_eq!(uri.media_id(), Ok(txn_id));
+
+        // Local plain source.
+        let source = MediaSource::Plain(Media::make_local_uri(txn_id.into()));
+        assert_matches!(Media::as_local_uri(&source), Some(uri));
+        assert_eq!(uri.media_id(), Ok(txn_id));
+
+        // Local encrypted source.
+        let source = MediaSource::Encrypted(encrypted_file(&Media::make_local_uri(txn_id.into())));
+        assert_matches!(Media::as_local_uri(&source), Some(uri));
+        assert_eq!(uri.media_id(), Ok(txn_id));
+
+        // Test non-local plain source.
+        let source = MediaSource::Plain(owned_mxc_uri!("mxc://server.local/poiuyt"));
+        assert_matches!(Media::as_local_uri(&source), None);
+
+        // Test non-local encrypted source.
+        let source = MediaSource::Encrypted(encrypted_file(mxc_uri!("mxc://server.local/mlkjhg")));
+        assert_matches!(Media::as_local_uri(&source), None);
+
+        // Test invalid MXC URI.
+        let source = MediaSource::Plain("https://server.local/nbvcxw".into());
+        assert_matches!(Media::as_local_uri(&source), None);
     }
 }

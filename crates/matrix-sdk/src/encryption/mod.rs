@@ -21,7 +21,7 @@ use std::{
     io::{Cursor, Read, Write},
     iter,
     path::PathBuf,
-    sync::{Arc, Mutex as StdMutex},
+    sync::Arc,
 };
 
 use eyeball::{SharedObservable, Subscriber};
@@ -31,12 +31,13 @@ use futures_util::{
     stream::{self, StreamExt},
 };
 use matrix_sdk_base::crypto::{
+    store::RoomKeyInfo,
     types::requests::{
         OutgoingRequest, OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest,
     },
     CrossSigningBootstrapRequests, OlmMachine,
 };
-use matrix_sdk_common::executor::spawn;
+use matrix_sdk_common::{executor::spawn, locks::Mutex as StdMutex};
 use ruma::{
     api::client::{
         keys::{
@@ -50,11 +51,15 @@ use ruma::{
         uiaa::{AuthData, UiaaInfo},
     },
     assign,
-    events::room::{MediaSource, ThumbnailInfo},
-    DeviceId, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
+    events::{
+        direct::DirectUserIdentifier,
+        room::{MediaSource, ThumbnailInfo},
+    },
+    DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
 };
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLockReadGuard};
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::{debug, error, instrument, trace, warn};
 use url::Url;
 use vodozemac::Curve25519PublicKey;
@@ -126,7 +131,7 @@ impl EncryptionData {
     pub fn initialize_room_key_tasks(&self, client: &Arc<ClientInner>) {
         let weak_client = WeakClient::from_inner(client);
 
-        let mut tasks = self.tasks.lock().unwrap();
+        let mut tasks = self.tasks.lock();
         tasks.upload_room_keys = Some(BackupUploadingTask::new(weak_client.clone()));
 
         if self.encryption_settings.backup_download_strategy
@@ -142,7 +147,7 @@ impl EncryptionData {
     /// This should happen after the usual tasks have been set up and after the
     /// E2EE initialization tasks have been set up.
     pub fn initialize_recovery_state_update_task(&self, client: &Client) {
-        let mut guard = self.tasks.lock().unwrap();
+        let mut guard = self.tasks.lock();
 
         let future = Recovery::update_state_after_backup_state_change(client);
         let join_handle = spawn(future);
@@ -276,7 +281,7 @@ impl CrossSigningResetHandle {
         let mut upload_request = self.upload_request.clone();
         upload_request.auth = auth;
 
-        while let Err(e) = self.client.send(upload_request.clone(), None).await {
+        while let Err(e) = self.client.send(upload_request.clone()).await {
             if *self.is_cancelled.lock().await {
                 return Ok(());
             }
@@ -286,7 +291,7 @@ impl CrossSigningResetHandle {
             }
         }
 
-        self.client.send(self.signatures_request.clone(), None).await?;
+        self.client.send(self.signatures_request.clone()).await?;
 
         Ok(())
     }
@@ -398,7 +403,7 @@ impl Client {
     /// # Panics
     ///
     /// Panics if no key query needs to be done.
-    #[instrument(skip(self))]
+    #[instrument(skip(self, device_keys))]
     pub(crate) async fn keys_query(
         &self,
         request_id: &TransactionId,
@@ -406,7 +411,7 @@ impl Client {
     ) -> Result<get_keys::v3::Response> {
         let request = assign!(get_keys::v3::Request::new(), { device_keys });
 
-        let response = self.send(request, None).await?;
+        let response = self.send(request).await?;
         self.mark_request_as_sent(request_id, &response).await?;
         self.encryption().update_state_after_keys_query(&response).await;
 
@@ -518,7 +523,7 @@ impl Client {
             .get_missing_sessions(users)
             .await?
         {
-            let response = self.send(request, None).await?;
+            let response = self.send(request).await?;
             self.mark_request_as_sent(&request_id, &response).await?;
         }
 
@@ -546,7 +551,7 @@ impl Client {
             "Uploading public encryption keys",
         );
 
-        let response = self.send(request.clone(), None).await?;
+        let response = self.send(request.clone()).await?;
         self.mark_request_as_sent(request_id, &response).await?;
 
         Ok(response)
@@ -577,7 +582,7 @@ impl Client {
             request.messages.clone(),
         );
 
-        self.send(request, None).await
+        self.send(request).await
     }
 
     pub(crate) async fn send_verification_request(
@@ -605,7 +610,7 @@ impl Client {
         // Find the room we share with the `user_id` and only with `user_id`
         let room = rooms.into_iter().find(|r| {
             let targets = r.direct_targets();
-            targets.len() == 1 && targets.contains(user_id)
+            targets.len() == 1 && targets.contains(<&DirectUserIdentifier>::from(user_id))
         });
 
         trace!(?room, "Found room");
@@ -627,7 +632,7 @@ impl Client {
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
             AnyOutgoingRequest::SignatureUpload(request) => {
-                let response = self.send(request.clone(), None).await?;
+                let response = self.send(request.clone()).await?;
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
             AnyOutgoingRequest::RoomMessage(request) => {
@@ -635,7 +640,7 @@ impl Client {
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
             AnyOutgoingRequest::KeysClaim(request) => {
-                let response = self.send(request.clone(), None).await?;
+                let response = self.send(request.clone()).await?;
                 self.mark_request_as_sent(r.request_id(), &response).await?;
             }
         }
@@ -713,6 +718,15 @@ impl Encryption {
     /// Get the public Curve25519 key of our own device.
     pub async fn curve25519_key(&self) -> Option<Curve25519PublicKey> {
         self.client.olm_machine().await.as_ref().map(|o| o.identity_keys().curve25519)
+    }
+
+    /// Get the current device creation timestamp.
+    pub async fn device_creation_timestamp(&self) -> MilliSecondsSinceUnixEpoch {
+        match self.get_own_device().await {
+            Ok(Some(device)) => device.first_time_seen_ts(),
+            // Should not happen, there should always be an own device
+            _ => MilliSecondsSinceUnixEpoch::now(),
+        }
     }
 
     #[cfg(feature = "experimental-oidc")]
@@ -1132,8 +1146,8 @@ impl Encryption {
         if let Some(req) = upload_keys_req {
             self.client.send_outgoing_request(req).await?;
         }
-        self.client.send(upload_signing_keys_req, None).await?;
-        self.client.send(upload_signatures_req, None).await?;
+        self.client.send(upload_signing_keys_req).await?;
+        self.client.send(upload_signatures_req).await?;
 
         Ok(())
     }
@@ -1150,7 +1164,7 @@ impl Encryption {
     /// # let client = Client::new(homeserver).await?;
     /// # let user_id = unimplemented!();
     /// let encryption = client.encryption();
-    ///       
+    ///
     /// if let Some(handle) = encryption.reset_cross_signing().await? {
     ///     match handle.auth_type() {
     ///         CrossSigningResetAuthType::Uiaa(uiaa) => {
@@ -1195,7 +1209,7 @@ impl Encryption {
             self.client.send_outgoing_request(req).await?;
         }
 
-        if let Err(error) = self.client.send(upload_signing_keys_req.clone(), None).await {
+        if let Err(error) = self.client.send(upload_signing_keys_req.clone()).await {
             if let Some(auth_type) = CrossSigningResetAuthType::new(&self.client, &error).await? {
                 let client = self.client.clone();
 
@@ -1209,7 +1223,7 @@ impl Encryption {
                 Err(error.into())
             }
         } else {
-            self.client.send(upload_signatures_req, None).await?;
+            self.client.send(upload_signatures_req).await?;
 
             Ok(None)
         }
@@ -1432,6 +1446,45 @@ impl Encryption {
         Ok(ret)
     }
 
+    /// Receive notifications of room keys being received as a [`Stream`].
+    ///
+    /// Each time a room key is updated in any way, an update will be sent to
+    /// the stream. Updates that happen at the same time are batched into a
+    /// [`Vec`].
+    ///
+    /// If the reader of the stream lags too far behind, an error is broadcast
+    /// containing the number of skipped items.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::Client;
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// use futures_util::StreamExt;
+    ///
+    /// let Some(mut room_keys_stream) =
+    ///     client.encryption().room_keys_received_stream().await
+    /// else {
+    ///     return Ok(());
+    /// };
+    ///
+    /// while let Some(update) = room_keys_stream.next().await {
+    ///     println!("Received room keys {update:?}");
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn room_keys_received_stream(
+        &self,
+    ) -> Option<impl Stream<Item = Result<Vec<RoomKeyInfo>, BroadcastStreamRecvError>>> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref()?;
+
+        Some(olm.store().room_keys_received_stream())
+    }
+
     /// Get the secret storage manager of the client.
     pub fn secret_storage(&self) -> SecretStorage {
         SecretStorage { client: self.client.to_owned() }
@@ -1600,7 +1653,7 @@ impl Encryption {
     ///   allow for the initial upload of cross-signing keys without
     ///   authentication, rendering this parameter obsolete.
     pub(crate) fn spawn_initialization_task(&self, auth_data: Option<AuthData>) {
-        let mut tasks = self.client.inner.e2ee.tasks.lock().unwrap();
+        let mut tasks = self.client.inner.e2ee.tasks.lock();
 
         let this = self.clone();
         tasks.setup_e2ee = Some(spawn(async move {
@@ -1626,7 +1679,7 @@ impl Encryption {
     /// Waits for end-to-end encryption initialization tasks to finish, if any
     /// was running in the background.
     pub async fn wait_for_e2ee_initialization_tasks(&self) {
-        let task = self.client.inner.e2ee.tasks.lock().unwrap().setup_e2ee.take();
+        let task = self.client.inner.e2ee.tasks.lock().setup_e2ee.take();
 
         if let Some(task) = task {
             if let Err(err) = task.await {
@@ -1725,9 +1778,9 @@ mod tests {
 
     use crate::{
         assert_next_matches_with_timeout,
+        authentication::matrix::{MatrixSession, MatrixSessionTokens},
         config::RequestConfig,
         encryption::VerificationState,
-        matrix_auth::{MatrixSession, MatrixSessionTokens},
         test_utils::{logged_in_client, no_retry_test_client, set_client_session},
         Client,
     };

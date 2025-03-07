@@ -15,8 +15,10 @@
  */
 #![cfg(test)]
 mod pipeline_tests {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     #[tokio::test]
     async fn test_mock() {
@@ -39,7 +41,8 @@ mod pipeline_tests {
             client.get(format!("{}/hello", &mock_server.uri())).send().await.unwrap().status();
         assert_eq!(status, 200);
 
-        // If the request doesn't match any `Mock` mounted on our `MockServer` a 404 is returned.
+        // If the request doesn't match any `Mock` mounted on our `MockServer` a 404 is
+        // returned.
         let status =
             client.get(format!("{}/missing", &mock_server.uri())).send().await.unwrap().status();
         assert_eq!(status, 404);

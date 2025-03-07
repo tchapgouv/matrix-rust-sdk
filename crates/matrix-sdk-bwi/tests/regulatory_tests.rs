@@ -13,9 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-use matrix_sdk_bwi::regulatory::data_privacy::BWIDataPrivacySource;
-use matrix_sdk_bwi::regulatory::imprint::BWIImprintSource;
-use matrix_sdk_bwi::regulatory::organization::BWIOrganization;
+use matrix_sdk_bwi::regulatory::{
+    data_privacy::BWIDataPrivacySource, imprint::BWIImprintSource, organization::BWIOrganization,
+};
 
 const TEST_URL: &str = "example.com";
 

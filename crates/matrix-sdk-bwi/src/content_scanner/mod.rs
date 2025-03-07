@@ -17,26 +17,28 @@ mod dto;
 mod request;
 mod url;
 
-use crate::content_scanner::dto::{
-    BWIContentScannerPublicKey, BWIPublicKeyDto, BWIScanStateForbiddenResultDto,
-    BWIScanStateResultDto, EncryptedMetadataRequestBuilder,
-};
-use crate::content_scanner::url::BWIContentScannerUrl;
-use crate::content_scanner::BWIContentScannerError::ScanFailed;
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
+
 use http::StatusCode;
-use matrix_sdk_base::ruma::events::room::MediaSource::{Encrypted, Plain};
-use matrix_sdk_base::ruma::events::room::{EncryptedFile, MediaSource};
-use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState;
-use matrix_sdk_base_bwi::http_client::HttpError;
+use matrix_sdk_base::ruma::events::room::{
+    EncryptedFile, MediaSource,
+    MediaSource::{Encrypted, Plain},
+};
+use matrix_sdk_base_bwi::{content_scanner::scan_state::BWIScanState, http_client::HttpError};
 use reqwest::{Error, Response};
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Mutex;
-
-use crate::content_scanner::request::v1::download_encrypted::Request;
 use tracing::{debug, error, warn};
+
+use crate::content_scanner::{
+    dto::{
+        BWIContentScannerPublicKey, BWIPublicKeyDto, BWIScanStateForbiddenResultDto,
+        BWIScanStateResultDto, EncryptedMetadataRequestBuilder,
+    },
+    request::v1::download_encrypted::Request,
+    url::BWIContentScannerUrl,
+    BWIContentScannerError::ScanFailed,
+};
 
 #[derive(Error, Debug)]
 pub enum BWIContentScannerError {
@@ -273,7 +275,7 @@ impl BWIContentScanner {
         let scan_result = match body.clean {
             true => BWIScanState::Trusted,
             false => {
-                warn!("###BWI### inconsistent response from the content scanner. Maybe an old version of the content scanner ist used");
+                warn!("###BWI### inconsistent response from the content scanner. Maybe an old version of the content scanner is used");
                 BWIScanState::Infected
             }
         };

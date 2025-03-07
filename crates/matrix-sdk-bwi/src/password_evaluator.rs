@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-use crate::password_evaluator::BWIPasswordStrength::{Medium, Strong, Weak};
 use zxcvbn::{zxcvbn, Score};
+
+use crate::password_evaluator::BWIPasswordStrength::{Medium, Strong, Weak};
 
 #[derive(Debug)]
 pub struct BWIPasswordEvaluator {}

@@ -26,9 +26,9 @@ der [Struktur des Matrix-Rust-SDK](https://github.com/matrix-org/matrix-rust-sdk
 
 Daneben enthält dieses Rust-SDK noch weitere Crates:
 
-* **matirx-sdk-base-bwi** - Alle Bundesmessenger-Erweiterungen, welche keine Abhängigkeiten zu den bestehenden
+* **matrix-sdk-base-bwi** - Alle Bundesmessenger-Erweiterungen, welche keine Abhängigkeiten zu den bestehenden
   matirx-sdk crates haben.
-* **matirx-sdk-bwi** - Alle Bundesmessenger-Erweiterungen, welche Abhängigkeiten zu der matirx-sdk crate haben.
+* **matrix-sdk-bwi** - Alle Bundesmessenger-Erweiterungen, welche Abhängigkeiten zu der matirx-sdk crate haben.
 
 ## Abhängigkeiten
 

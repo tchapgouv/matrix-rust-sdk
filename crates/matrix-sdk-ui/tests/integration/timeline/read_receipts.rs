@@ -18,10 +18,18 @@ use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
-use matrix_sdk::{config::SyncSettings, room::Receipts, test_utils::logged_in_client_with_server};
+use matrix_sdk::{
+    config::SyncSettings,
+    room::Receipts,
+    test_utils::{
+        logged_in_client_with_server,
+        mocks::{MatrixMockServer, RoomMessagesResponseTemplate},
+    },
+};
 use matrix_sdk_test::{
-    async_test, mocks::mock_encryption_state, sync_timeline_event, EphemeralTestEvent,
-    JoinedRoomBuilder, RoomAccountDataTestEvent, SyncResponseBuilder, ALICE, BOB,
+    async_test, event_factory::EventFactory, mocks::mock_encryption_state, sync_timeline_event,
+    EphemeralTestEvent, JoinedRoomBuilder, RoomAccountDataTestEvent, SyncResponseBuilder, ALICE,
+    BOB, CAROL,
 };
 use matrix_sdk_ui::timeline::RoomExt;
 use ruma::{
@@ -29,13 +37,14 @@ use ruma::{
     event_id,
     events::{
         receipt::ReceiptThread,
-        room::message::{MessageType, SyncRoomMessageEvent},
+        room::message::{MessageType, RoomMessageEventContent, SyncRoomMessageEvent},
         AnySyncMessageLikeEvent, AnySyncTimelineEvent,
     },
     room_id, user_id, RoomVersionId,
 };
 use serde_json::json;
 use stream_assert::{assert_pending, assert_ready};
+use tokio::task::yield_now;
 use wiremock::{
     matchers::{body_json, header, method, path_regex},
     Mock, ResponseTemplate,
@@ -132,8 +141,11 @@ async fn test_read_receipts_updates() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 5);
+
     // We don't list the read receipt of our own user on events.
-    assert_let!(Some(VectorDiff::PushBack { value: first_item }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value: first_item } = &timeline_updates[0]);
     let first_event = first_item.as_event().unwrap();
     assert!(first_event.read_receipts().is_empty());
 
@@ -144,26 +156,24 @@ async fn test_read_receipts_updates() {
     assert_pending!(own_receipts_subscriber);
 
     // Implicit read receipt of @alice:localhost.
-    assert_let!(Some(VectorDiff::PushBack { value: second_item }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value: second_item } = &timeline_updates[1]);
     let second_event = second_item.as_event().unwrap();
     assert_eq!(second_event.read_receipts().len(), 1);
 
     // Read receipt of @alice:localhost is moved to third event.
-    assert_let!(
-        Some(VectorDiff::Set { index: 1, value: second_item }) = timeline_stream.next().await
-    );
+    assert_let!(VectorDiff::Set { index: 1, value: second_item } = &timeline_updates[2]);
     let second_event = second_item.as_event().unwrap();
     assert!(second_event.read_receipts().is_empty());
 
-    assert_let!(Some(VectorDiff::PushBack { value: third_item }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value: third_item } = &timeline_updates[3]);
     let third_event = third_item.as_event().unwrap();
     assert_eq!(third_event.read_receipts().len(), 1);
 
     let (alice_receipt_event_id, _) = timeline.latest_user_read_receipt(alice).await.unwrap();
     assert_eq!(alice_receipt_event_id, third_event_id);
 
-    assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
-    assert!(day_divider.is_day_divider());
+    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[4]);
+    assert!(date_divider.is_date_divider());
 
     // Read receipt on unknown event is ignored.
     sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_ephemeral_event(
@@ -254,9 +264,10 @@ async fn test_read_receipts_updates() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
-    assert_let!(
-        Some(VectorDiff::Set { index: 3, value: third_item }) = timeline_stream.next().await
-    );
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 1);
+
+    assert_let!(VectorDiff::Set { index: 3, value: third_item } = &timeline_updates[0]);
     let third_event = third_item.as_event().unwrap();
     assert_eq!(third_event.read_receipts().len(), 2);
 
@@ -291,6 +302,7 @@ async fn test_read_receipts_updates() {
 
     assert_ready!(own_receipts_subscriber);
     assert_pending!(own_receipts_subscriber);
+    assert_pending!(timeline_stream);
 }
 
 #[async_test]
@@ -377,8 +389,11 @@ async fn test_read_receipts_updates_on_filtered_events() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 4);
+
     // We don't list the read receipt of our own user on events.
-    assert_let!(Some(VectorDiff::PushBack { value: item_a }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value: item_a } = &timeline_updates[0]);
     let event_a = item_a.as_event().unwrap();
     assert!(event_a.read_receipts().is_empty());
 
@@ -389,7 +404,7 @@ async fn test_read_receipts_updates_on_filtered_events() {
     assert_eq!(own_receipt_timeline_event, event_a_id);
 
     // Implicit read receipt of @bob:localhost.
-    assert_let!(Some(VectorDiff::Set { index: 0, value: item_a }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::Set { index: 0, value: item_a } = &timeline_updates[1]);
     let event_a = item_a.as_event().unwrap();
     assert_eq!(event_a.read_receipts().len(), 1);
 
@@ -402,7 +417,7 @@ async fn test_read_receipts_updates_on_filtered_events() {
     assert_eq!(bob_receipt_timeline_event, event_a.event_id().unwrap());
 
     // Implicit read receipt of @alice:localhost.
-    assert_let!(Some(VectorDiff::PushBack { value: item_c }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::PushBack { value: item_c } = &timeline_updates[2]);
     let event_c = item_c.as_event().unwrap();
     assert_eq!(event_c.read_receipts().len(), 1);
 
@@ -412,8 +427,8 @@ async fn test_read_receipts_updates_on_filtered_events() {
         timeline.latest_user_read_receipt_timeline_event_id(*ALICE).await.unwrap();
     assert_eq!(alice_receipt_timeline_event, event_c_id);
 
-    assert_let!(Some(VectorDiff::PushFront { value: day_divider }) = timeline_stream.next().await);
-    assert!(day_divider.is_day_divider());
+    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[3]);
+    assert!(date_divider.is_date_divider());
 
     // Read receipt on filtered event.
     sync_builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_ephemeral_event(
@@ -463,11 +478,14 @@ async fn test_read_receipts_updates_on_filtered_events() {
     let _response = client.sync_once(sync_settings.clone()).await.unwrap();
     server.reset().await;
 
-    assert_let!(Some(VectorDiff::Set { index: 1, value: item_a }) = timeline_stream.next().await);
+    assert_let!(Some(timeline_updates) = timeline_stream.next().await);
+    assert_eq!(timeline_updates.len(), 2);
+
+    assert_let!(VectorDiff::Set { index: 1, value: item_a } = &timeline_updates[0]);
     let event_a = item_a.as_event().unwrap();
     assert!(event_a.read_receipts().is_empty());
 
-    assert_let!(Some(VectorDiff::Set { index: 2, value: item_c }) = timeline_stream.next().await);
+    assert_let!(VectorDiff::Set { index: 2, value: item_c } = &timeline_updates[1]);
     let event_c = item_c.as_event().unwrap();
     assert_eq!(event_c.read_receipts().len(), 2);
 
@@ -505,6 +523,7 @@ async fn test_read_receipts_updates_on_filtered_events() {
     let own_receipt_timeline_event =
         timeline.latest_user_read_receipt_timeline_event_id(own_user_id).await.unwrap();
     assert_eq!(own_receipt_timeline_event, event_c_id);
+    assert_pending!(timeline_stream);
 }
 
 #[async_test]
@@ -1298,4 +1317,123 @@ async fn test_latest_user_read_receipt() {
 
     let (user_receipt_id, _) = timeline.latest_user_read_receipt(own_user_id).await.unwrap();
     assert_eq!(user_receipt_id, event_e_id);
+}
+
+#[async_test]
+async fn test_no_duplicate_receipt_after_backpagination() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    client.event_cache().subscribe().unwrap();
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+
+    // We want the following final state in the room:
+    // - received from back-pagination:
+    //  - $1: an event from Alice
+    //  - $2: an event from Bob
+    // - received from sync:
+    //  - $3: an hidden event sent by Alice, with a read receipt from Carol
+    //
+    // As a result, since $3 is *after* the two others, Alice's implicit read
+    // receipt and Carol's receipt on the edit event should be placed onto the
+    // most recent rendered event, that is, $2.
+
+    let eid1 = event_id!("$1_backpaginated_oldest");
+    let eid2 = event_id!("$2_backpaginated_newest");
+    let eid3 = event_id!("$3_sync_event");
+
+    let f = EventFactory::new().room(room_id);
+
+    // Alice sends an edit via sync.
+    let ev3 = f
+        .text_msg("* I am Alice.")
+        .edit(eid1, RoomMessageEventContent::text_plain("I am Alice.").into())
+        .sender(*ALICE)
+        .event_id(eid3)
+        .into_raw_sync();
+
+    // Carol has a read receipt on the edit.
+    let read_receipt_event_content = f
+        .read_receipts()
+        .add(eid3, *CAROL, ruma::events::receipt::ReceiptType::Read, ReceiptThread::Unthreaded)
+        .build();
+
+    let prev_batch_token = "prev-batch-token";
+
+    let room = server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(ev3)
+                .add_ephemeral_event(EphemeralTestEvent::Custom(json!({
+                    "type": "m.receipt",
+                    "room_id": room_id,
+                    "content": read_receipt_event_content,
+                })))
+                .set_timeline_limited()
+                .set_timeline_prev_batch(prev_batch_token),
+        )
+        .await;
+
+    let timeline = room.timeline().await.unwrap();
+
+    server
+        .mock_room_messages()
+        .match_from(prev_batch_token)
+        .ok(RoomMessagesResponseTemplate::default().events(vec![
+            // In reverse order!
+            f.text_msg("I am Bob.").sender(*BOB).event_id(eid2),
+            f.text_msg("I am the destroyer of worlds.").sender(*ALICE).event_id(eid1),
+        ]))
+        .mock_once()
+        .mount()
+        .await;
+
+    timeline.paginate_backwards(42).await.unwrap();
+
+    yield_now().await;
+
+    // Check that the receipts are at the correct place.
+    let timeline_items = timeline.items().await;
+    assert_eq!(timeline_items.len(), 3);
+
+    assert!(timeline_items[0].is_date_divider());
+
+    {
+        let event1 = timeline_items[1].as_event().unwrap();
+        // Sanity check: this is the edited event from Alice.
+        assert_eq!(event1.event_id().unwrap(), eid1);
+
+        let receipts = &event1.read_receipts();
+
+        // Carol has explicitly seen ev3, which is after Bob's event, so there shouldn't
+        // be a receipt for them here.
+        assert!(receipts.get(*CAROL).is_none());
+
+        // Alice has seen this event, being the sender; but Alice has also sent an edit
+        // after Bob's message, so Alice must not have a read receipt here.
+        assert!(receipts.get(*ALICE).is_none());
+
+        // And Bob has seen the original, but posted something after it, so no receipt
+        // for Bob either.
+        assert!(receipts.get(*BOB).is_none());
+
+        // In other words, no receipts here.
+        assert!(receipts.is_empty());
+    }
+
+    {
+        let event2 = timeline_items[2].as_event().unwrap();
+
+        // Sanity check: this is Bob's event.
+        assert_eq!(event2.event_id().unwrap(), eid2);
+
+        let receipts = &event2.read_receipts();
+        // Bob's event should hold *all* the receipts:
+        assert_eq!(receipts.len(), 3);
+        receipts.get(*ALICE).unwrap();
+        receipts.get(*BOB).unwrap();
+        receipts.get(*CAROL).unwrap();
+    }
 }
