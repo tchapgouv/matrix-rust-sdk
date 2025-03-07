@@ -103,7 +103,6 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
     let sender_id = owned_user_id!("@sender:example.com");
 
     let f = EventFactory::new().room(&room_id).sender(&sender_id);
-
     let mut joined_room_builder =
         JoinedRoomBuilder::new(&room_id).add_state_event(StateTestEvent::Encryption);
 

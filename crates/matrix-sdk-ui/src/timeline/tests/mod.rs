@@ -31,6 +31,7 @@ use matrix_sdk::{
     crypto::OlmMachine,
     deserialized_responses::TimelineEvent,
     event_cache::paginator::{PaginableRoom, PaginatorError},
+    reqwest,
     room::{EventWithContextResponse, Messages, MessagesOptions},
     send_queue::RoomSendQueueUpdate,
     BoxFuture,
@@ -38,6 +39,7 @@ use matrix_sdk::{
 use matrix_sdk_base::{
     crypto::types::events::CryptoContextInfo, latest_event::LatestEvent, RoomInfo, RoomState,
 };
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use matrix_sdk_test::{event_factory::EventFactory, ALICE, DEFAULT_TEST_ROOM_ID};
 use ruma::{
     events::{
@@ -78,6 +80,14 @@ mod read_receipts;
 mod redaction;
 mod shields;
 mod virt;
+
+// BWI-specific
+fn create_dummy_content_scanner() -> Arc<BWIContentScanner> {
+    Arc::from(
+        BWIContentScanner::new_with_url_as_str(reqwest::Client::default(), "example.com").unwrap(),
+    )
+}
+// end BWI-specific
 
 /// A timeline instance used only for testing purposes in unit tests.
 #[derive(Default)]
@@ -128,6 +138,9 @@ impl TestTimelineBuilder {
             self.internal_id_prefix,
             self.utd_hook,
             self.is_room_encrypted,
+            // TCHAP-specific
+            create_dummy_content_scanner(),
+            // end TCHAP-specific
         );
         if let Some(settings) = self.settings {
             controller = controller.with_settings(settings);

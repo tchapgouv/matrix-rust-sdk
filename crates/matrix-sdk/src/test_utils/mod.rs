@@ -41,7 +41,12 @@ pub fn test_client_builder(homeserver_url: Option<String>) -> ClientBuilder {
     let homeserver = homeserver_url
         .map(|url| Url::try_from(url.as_str()).unwrap())
         .unwrap_or_else(|| Url::try_from("http://localhost:1234").unwrap());
-    Client::builder().homeserver_url(homeserver).server_versions([MatrixVersion::V1_0])
+    Client::builder()
+        .homeserver_url(homeserver)
+        .server_versions([MatrixVersion::V1_0])
+        // BWI-specific
+        .without_server_jwt_token_validation()
+    // end BWI-specific
 }
 
 /// A [`Client`] using the given `homeserver_url` (or localhost:1234), that will

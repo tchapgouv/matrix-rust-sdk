@@ -206,6 +206,10 @@ pub enum ClientBuildError {
     EventCache(#[from] EventCacheError),
     #[error("Failed to build the client: {message}")]
     Generic { message: String },
+    // BWI specific
+    #[error("None of the provided public keys verifies the signature of the server")]
+    ServerIsNotVerified,
+    // end BWI specific
 }
 
 impl From<MatrixClientBuildError> for ClientBuildError {
@@ -222,6 +226,9 @@ impl From<MatrixClientBuildError> for ClientBuildError {
             MatrixClientBuildError::SlidingSyncVersion(e) => {
                 ClientBuildError::SlidingSyncVersion(e)
             }
+            // BWI specific
+            MatrixClientBuildError::ServerIsNotVerified => ClientBuildError::ServerIsNotVerified,
+            // end BWI specific
             _ => ClientBuildError::Sdk(e),
         }
     }
@@ -253,6 +260,9 @@ impl From<ClientError> for ClientBuildError {
 
 #[derive(Clone, uniffi::Object)]
 pub struct ClientBuilder {
+    // BWI specific
+    public_keys_for_jwt_token_validation: Option<Vec<String>>,
+    // end BWI specific
     session_paths: Option<SessionPaths>,
     username: Option<String>,
     homeserver_cfg: Option<HomeserverConfig>,
@@ -282,6 +292,9 @@ impl ClientBuilder {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            // BWI specific
+            public_keys_for_jwt_token_validation: Some(Vec::new()),
+            // end BWI specific
             session_paths: None,
             username: None,
             homeserver_cfg: None,
@@ -361,6 +374,26 @@ impl ClientBuilder {
         builder.session_paths = Some(SessionPaths { data_path, cache_path });
         Arc::new(builder)
     }
+
+    // BWI specific
+    /// Set the public keys that could be used for validating
+    /// the identity of the server via the jwt token flow
+    pub fn public_keys_for_jwt_token_validation(
+        self: Arc<Self>,
+        public_keys_for_jwt: Vec<String>,
+    ) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.public_keys_for_jwt_token_validation = Some(public_keys_for_jwt);
+        Arc::new(builder)
+    }
+
+    /// Disable Jwt-Token validation
+    pub fn without_jwt_token_validation(self: Arc<Self>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.public_keys_for_jwt_token_validation = None;
+        Arc::new(builder)
+    }
+    // end BWI specific
 
     pub fn username(self: Arc<Self>, username: String) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
@@ -572,6 +605,17 @@ impl ClientBuilder {
         }
 
         inner_builder = inner_builder.add_root_certificates(certificates);
+
+        // BWI-specific
+        inner_builder = match builder.public_keys_for_jwt_token_validation {
+            None => Ok::<_, ClientBuildError>(inner_builder.without_server_jwt_token_validation()),
+            Some(keys) => Ok({
+                inner_builder
+                    .public_keys_for_jwt_from_strings(&keys)
+                    .map_err(|_| ClientBuildError::ServerIsNotVerified)?
+            }),
+        }?;
+        // end BWI specific
 
         if builder.disable_built_in_root_certificates {
             inner_builder = inner_builder.disable_built_in_root_certificates();

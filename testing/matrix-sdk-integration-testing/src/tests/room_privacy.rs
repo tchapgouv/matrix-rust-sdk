@@ -61,11 +61,14 @@ async fn test_publishing_room_alias() -> anyhow::Result<()> {
     )
     .to_raw_any();
     let room_id = client
-        .create_room(assign!(CreateRoomRequest::new(), {
-            initial_state: vec![
-                room_history_visibility,
-            ]
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                initial_state: vec![
+                    room_history_visibility,
+                ],
+            }),
+            false,
+        )
         .await?
         .room_id()
         .to_owned();
@@ -190,14 +193,17 @@ async fn test_removing_published_room_alias() -> anyhow::Result<()> {
     )
     .to_raw_any();
     let room_id = client
-        .create_room(assign!(CreateRoomRequest::new(), {
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
             room_alias_name: Some(local_part_room_alias),
             initial_state: vec![
                 room_history_visibility,
                 canonical_alias,
             ],
-            visibility: Visibility::Public,
-        }))
+                visibility: Visibility::Public,
+            }),
+            false,
+        )
         .await?
         .room_id()
         .to_owned();

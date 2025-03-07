@@ -20,6 +20,7 @@ use matrix_sdk::{
     },
     ruma::{
         api::client::{
+            discovery::get_authorization_server_metadata::msc2965::Prompt as RumaOidcPrompt,
             push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
             room::{create_room, Visibility},
             session::get_login_types,
@@ -38,6 +39,7 @@ use matrix_sdk::{
     sliding_sync::Version as SdkSlidingSyncVersion,
     AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
 };
+use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState as SDKScanState;
 use matrix_sdk_ui::notification_client::{
     NotificationClient as MatrixNotificationClient,
     NotificationProcessSetup as MatrixNotificationProcessSetup,
@@ -74,6 +76,7 @@ use super::{room::Room, session_verification::SessionVerificationController, RUN
 use crate::{
     authentication::{HomeserverLoginDetails, OidcConfiguration, OidcError, SsoError, SsoHandler},
     client,
+    client::BWIScanState::Infected,
     encryption::Encryption,
     notification::NotificationClient,
     notification_settings::NotificationSettings,
@@ -110,6 +113,45 @@ pub struct HttpPusherData {
 pub enum PusherKind {
     Http { data: HttpPusherData },
     Email,
+}
+
+/// The State that is indicated by the BWI Content Scanner
+#[derive(Clone, uniffi::Enum)]
+pub enum BWIScanState {
+    /// The Content is marked as safe
+    Trusted,
+
+    /// The content is marked as infected and must not be loaded
+    Infected,
+
+    /// The mime type of the file is not allowed
+    MimeTypeNotAllowed,
+
+    /**
+    The content can not be scanned.
+    That could happen because the ContentScanner is not available
+    or the content can not be uploaded.
+    */
+    Error,
+
+    /// The scan process is triggered bug not finished
+    InProgress,
+
+    /// The file can no longer be found and can therefore not be scanned
+    NotFound,
+}
+
+impl From<SDKScanState> for BWIScanState {
+    fn from(value: SDKScanState) -> Self {
+        match value {
+            SDKScanState::Trusted => BWIScanState::Trusted,
+            SDKScanState::Infected => BWIScanState::Infected,
+            SDKScanState::Error => BWIScanState::Error,
+            SDKScanState::InProgress => BWIScanState::InProgress,
+            SDKScanState::NotFound => BWIScanState::NotFound,
+            SDKScanState::MimeTypeNotAllowed => BWIScanState::MimeTypeNotAllowed,
+        }
+    }
 }
 
 impl TryFrom<PusherKind> for RumaPusherKind {
@@ -396,10 +438,20 @@ impl Client {
     /// view has succeeded, call `login_with_oidc_callback` with the callback it
     /// returns. If a failure occurs and a callback isn't available, make sure
     /// to call `abort_oidc_auth` to inform the client of this.
+    ///
+    /// # Arguments
+    ///
+    /// * `oidc_configuration` - The configuration used to load the credentials
+    ///   of the client if it is already registered with the authorization
+    ///   server, or register the client and store its credentials if it isn't.
+    ///
+    /// * `prompt` - The desired user experience in the web UI. No value means
+    ///   that the user wishes to login into an existing account, and a value of
+    ///   `Create` means that the user wishes to register a new account.
     pub async fn url_for_oidc(
         &self,
         oidc_configuration: &OidcConfiguration,
-        prompt: OidcPrompt,
+        prompt: Option<OidcPrompt>,
     ) -> Result<Arc<OidcAuthorizationData>, OidcError> {
         let oidc_metadata: VerifiedClientMetadata = oidc_configuration.try_into()?;
         let registrations_file = Path::new(&oidc_configuration.dynamic_registrations_file);
@@ -411,7 +463,7 @@ impl Client {
                     tracing::error!("Failed to parse {:?}", issuer);
                     return None;
                 };
-                Some((issuer, ClientId(client_id.clone())))
+                Some((issuer, ClientId::new(client_id.clone())))
             })
             .collect::<HashMap<_, _>>();
         let registrations = OidcRegistrations::new(
@@ -420,8 +472,11 @@ impl Client {
             static_registrations,
         )?;
 
-        let data =
-            self.inner.oidc().url_for_oidc(oidc_metadata, registrations, prompt.into()).await?;
+        let data = self
+            .inner
+            .oidc()
+            .url_for_oidc(oidc_metadata, registrations, prompt.map(Into::into))
+            .await?;
 
         Ok(Arc::new(data))
     }
@@ -679,8 +734,12 @@ impl Client {
         Ok(device_id.to_string())
     }
 
-    pub async fn create_room(&self, request: CreateRoomParameters) -> Result<String, ClientError> {
-        let response = self.inner.create_room(request.try_into()?).await?;
+    pub async fn create_room(
+        &self,
+        request: CreateRoomParameters,
+        is_federated: bool,
+    ) -> Result<String, ClientError> {
+        let response = self.inner.create_room(request.try_into()?, is_federated).await?;
         Ok(String::from(response.room_id()))
     }
 
@@ -767,6 +826,24 @@ impl Client {
             )
             .await?)
     }
+
+    // BWI specific
+    pub fn set_content_scanner_url(&self, _url: String) {}
+
+    pub async fn get_content_scanner_result_for_attachment(
+        &self,
+        _media_source: Arc<MediaSource>,
+    ) -> Result<BWIScanState, ClientError> {
+        Ok(Infected)
+    }
+
+    pub async fn download_attachment_from_content_scanner(
+        &self,
+        _media_source: Arc<MediaSource>,
+    ) -> Result<Vec<u8>, ClientError> {
+        Err(anyhow!("This method is not implemented, but your file is infected anyway!").into())
+    }
+    // end BWI specific
 
     pub async fn get_session_verification_controller(
         &self,
@@ -1611,7 +1688,7 @@ impl Session {
                         },
                     issuer,
                 } = api.user_session().context("Missing session")?;
-                let client_id = api.client_id().context("OIDC client ID is missing.")?.0.clone();
+                let client_id = api.client_id().context("OIDC client ID is missing.")?.clone();
                 let oidc_data = OidcSessionData { client_id, issuer };
 
                 let oidc_data = serde_json::to_string(&oidc_data).ok();
@@ -1659,8 +1736,7 @@ impl TryFrom<Session> for AuthSession {
                 issuer: oidc_data.issuer,
             };
 
-            let session =
-                OidcSession { client_id: ClientId(oidc_data.client_id), user: user_session };
+            let session = OidcSession { client_id: oidc_data.client_id, user: user_session };
 
             Ok(AuthSession::Oidc(session.into()))
         } else {
@@ -1686,13 +1762,13 @@ impl TryFrom<Session> for AuthSession {
 #[derive(Serialize, Deserialize)]
 #[serde(try_from = "OidcSessionDataDeHelper")]
 pub(crate) struct OidcSessionData {
-    client_id: String,
+    client_id: ClientId,
     issuer: String,
 }
 
 #[derive(Deserialize)]
 struct OidcSessionDataDeHelper {
-    client_id: String,
+    client_id: ClientId,
     issuer_info: Option<AuthenticationServerInfo>,
     issuer: Option<String>,
 }
@@ -1747,7 +1823,7 @@ pub struct MediaFileHandle {
 }
 
 impl MediaFileHandle {
-    fn new(handle: SdkMediaFileHandle) -> Self {
+    pub(crate) fn new(handle: SdkMediaFileHandle) -> Self {
         Self { inner: RwLock::new(Some(handle)) }
     }
 }
@@ -1814,26 +1890,6 @@ impl TryFrom<SlidingSyncVersion> for SdkSlidingSyncVersion {
 
 #[derive(Clone, uniffi::Enum)]
 pub enum OidcPrompt {
-    /// The Authorization Server must not display any authentication or consent
-    /// user interface pages.
-    None,
-
-    /// The Authorization Server should prompt the End-User for
-    /// reauthentication.
-    Login,
-
-    /// The Authorization Server should prompt the End-User for consent before
-    /// returning information to the Client.
-    Consent,
-
-    /// The Authorization Server should prompt the End-User to select a user
-    /// account.
-    ///
-    /// This enables an End-User who has multiple accounts at the Authorization
-    /// Server to select amongst the multiple accounts that they might have
-    /// current sessions for.
-    SelectAccount,
-
     /// The Authorization Server should prompt the End-User to create a user
     /// account.
     ///
@@ -1847,26 +1903,17 @@ pub enum OidcPrompt {
 impl From<&SdkOidcPrompt> for OidcPrompt {
     fn from(value: &SdkOidcPrompt) -> Self {
         match value {
-            SdkOidcPrompt::None => Self::None,
-            SdkOidcPrompt::Login => Self::Login,
-            SdkOidcPrompt::Consent => Self::Consent,
-            SdkOidcPrompt::SelectAccount => Self::SelectAccount,
             SdkOidcPrompt::Create => Self::Create,
-            SdkOidcPrompt::Unknown(value) => Self::Unknown { value: value.to_owned() },
             _ => Self::Unknown { value: value.to_string() },
         }
     }
 }
 
-impl From<OidcPrompt> for SdkOidcPrompt {
+impl From<OidcPrompt> for RumaOidcPrompt {
     fn from(value: OidcPrompt) -> Self {
         match value {
-            OidcPrompt::None => Self::None,
-            OidcPrompt::Login => Self::Login,
-            OidcPrompt::Consent => Self::Consent,
-            OidcPrompt::SelectAccount => Self::SelectAccount,
             OidcPrompt::Create => Self::Create,
-            OidcPrompt::Unknown { value } => Self::Unknown(value),
+            OidcPrompt::Unknown { value } => value.into(),
         }
     }
 }

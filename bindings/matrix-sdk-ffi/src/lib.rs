@@ -5,6 +5,9 @@
                                                  // lines after docs.
 
 mod authentication;
+/// BWI extension for exposing api calls
+mod bwi_bindings;
+/// BWI end
 mod chunk_iterator;
 mod client;
 mod client_builder;

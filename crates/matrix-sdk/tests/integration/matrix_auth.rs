@@ -477,6 +477,9 @@ async fn test_login_with_cross_signing_bootstrapping() {
                 ..Default::default()
             })
             .request_config(RequestConfig::new().disable_retry())
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -530,6 +533,9 @@ async fn test_login_with_cross_signing_bootstrapping() {
                 ..Default::default()
             })
             .request_config(RequestConfig::new().disable_retry())
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -606,6 +612,9 @@ async fn test_login_doesnt_fail_if_cross_signing_bootstrapping_failed() {
             ..Default::default()
         })
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();

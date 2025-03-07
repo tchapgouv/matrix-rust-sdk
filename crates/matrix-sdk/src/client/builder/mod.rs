@@ -19,13 +19,19 @@ use std::{fmt, sync::Arc};
 
 use homeserver_config::*;
 use matrix_sdk_base::{store::StoreConfig, BaseClient};
+use matrix_sdk_base_bwi::jwt_token::{
+    BWIJWTTokenValidationError, BWIPublicKeyForJWTTokenValidation,
+    BWIPublicKeyForJWTTokenValidationParseError, BWITokenValidator,
+};
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use ruma::{
     api::{error::FromHttpResponseError, MatrixVersion},
     OwnedServerName, ServerName,
 };
 use thiserror::Error;
 use tokio::sync::{broadcast, Mutex, OnceCell};
-use tracing::{debug, field::debug, instrument, Span};
+use tracing::{debug, field::debug, instrument, warn, Span};
+use url::Url;
 
 use super::{Client, ClientInner};
 #[cfg(feature = "experimental-oidc")]
@@ -39,7 +45,8 @@ use crate::http_client::HttpSettings;
 use crate::{
     authentication::AuthCtx, client::ClientServerCapabilities, config::RequestConfig,
     error::RumaApiError, http_client::HttpClient, send_queue::SendQueueData,
-    sliding_sync::VersionBuilder as SlidingSyncVersionBuilder, HttpError, IdParseError,
+    sliding_sync::VersionBuilder as SlidingSyncVersionBuilder,
+    ClientBuildError::ServerIsNotVerified, HttpError, IdParseError,
 };
 
 /// Builder that allows creating and configuring various parts of a [`Client`].
@@ -83,6 +90,10 @@ use crate::{
 #[must_use]
 #[derive(Clone, Debug)]
 pub struct ClientBuilder {
+    // BWI specific
+    public_keys_for_jwt_validation: Option<Vec<BWIPublicKeyForJWTTokenValidation>>,
+    use_content_scanner: bool,
+    // end BWI specific
     homeserver_cfg: Option<HomeserverConfig>,
     sliding_sync_version_builder: SlidingSyncVersionBuilder,
     http_cfg: Option<HttpConfig>,
@@ -106,6 +117,10 @@ impl ClientBuilder {
 
     pub(crate) fn new() -> Self {
         Self {
+            // BWI specific
+            public_keys_for_jwt_validation: Some(Vec::new()),
+            use_content_scanner: true,
+            // end BWI specific
             homeserver_cfg: None,
             sliding_sync_version_builder: SlidingSyncVersionBuilder::Native,
             http_cfg: None,
@@ -189,6 +204,45 @@ impl ClientBuilder {
         ));
         self
     }
+
+    // BWI-specific
+    /// Set the public keys that could be used for validating
+    /// the identity of the server via the jwt token flow
+    pub fn public_keys_for_jwt_from_strings(
+        mut self,
+        public_keys_for_jwt_as_paths: &[String],
+    ) -> Result<Self, BWIPublicKeyForJWTTokenValidationParseError> {
+        let public_keys = public_keys_for_jwt_as_paths
+            .iter()
+            .map(|public_key_path| {
+                BWIPublicKeyForJWTTokenValidation::from_string(public_key_path.as_str())
+            })
+            .filter(|result_of_parsing| {
+                if let Err(error) = result_of_parsing {
+                    warn!("Error while parsing file: {:?}", error);
+                    return false;
+                }
+                true
+            })
+            .map(|result| result.expect("Errors are already handled before"))
+            .collect();
+        self.public_keys_for_jwt_validation = Some(public_keys);
+        Ok(self)
+    }
+
+    /// By default, the jwt-token validation is enabled.
+    /// To disable it, call this method when creating the client
+    pub fn without_server_jwt_token_validation(mut self) -> Self {
+        self.public_keys_for_jwt_validation = None;
+        self
+    }
+
+    /// Disable the content scanner extension for a specific client
+    pub fn without_content_scanner(mut self) -> Self {
+        self.use_content_scanner = false;
+        self
+    }
+    // end BWI specific
 
     /// Set sliding sync to a specific version.
     pub fn sliding_sync_version_builder(
@@ -492,6 +546,11 @@ impl ClientBuilder {
         let HomeserverDiscoveryResult { server, homeserver, supported_versions } =
             homeserver_cfg.discover(&http_client).await?;
 
+        // BWI specific
+        Self::verify_jwt_token(self.public_keys_for_jwt_validation, &homeserver)
+            .await
+            .map_err(|_err| ServerIsNotVerified)?;
+
         let sliding_sync_version = {
             let supported_versions = match supported_versions {
                 Some(versions) => Some(versions),
@@ -529,7 +588,10 @@ impl ClientBuilder {
             server_versions: self.server_versions,
             unstable_features: None,
         };
-
+        // BWI specific
+        let content_scanner =
+            Arc::from(BWIContentScanner::new_with_url(&http_client.inner, &homeserver));
+        // end BWI specific
         let event_cache = OnceCell::new();
         let inner = ClientInner::new(
             auth_ctx,
@@ -537,6 +599,7 @@ impl ClientBuilder {
             homeserver,
             sliding_sync_version,
             http_client,
+            content_scanner,
             base_client,
             server_capabilities,
             self.respect_login_well_known,
@@ -552,6 +615,23 @@ impl ClientBuilder {
 
         Ok(Client { inner })
     }
+
+    // BWI specific
+    /// verify the jwt token of the given homeserver with the provided Public
+    /// Keys
+    async fn verify_jwt_token(
+        public_keys_for_jwt_validation: Option<Vec<BWIPublicKeyForJWTTokenValidation>>,
+        homeserver_url: &Url,
+    ) -> Result<(), BWIJWTTokenValidationError> {
+        match public_keys_for_jwt_validation {
+            None => Ok(()),
+            Some(public_keys) => {
+                let token_validator = BWITokenValidator::for_homeserver(homeserver_url.to_owned());
+                token_validator.validate_with_keys(&public_keys).await
+            }
+        }
+    }
+    // end BWI specific
 }
 
 /// Creates a server name from a user supplied string. The string is first
@@ -753,6 +833,13 @@ pub enum ClientBuildError {
     #[cfg(feature = "sqlite")]
     #[error(transparent)]
     SqliteStore(#[from] matrix_sdk_sqlite::OpenStoreError),
+
+    // BWI specific
+    /// Error for a failed validation of the JWT-Token authentication
+    /// The supplied server name was invalid.
+    #[error("None of the provided public keys verifies the signature of the server")]
+    ServerIsNotVerified,
+    // end BWI specific
 }
 
 // The http mocking library is not supported for wasm32
@@ -841,7 +928,10 @@ pub(crate) mod tests {
     async fn test_discovery_direct_legacy() {
         // Given a homeserver without a well-known file.
         let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new();
+        let mut builder = ClientBuilder::new()
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
 
         // When building a client with the server's URL.
         builder = builder.server_name_or_homeserver_url(homeserver.uri());
@@ -883,7 +973,10 @@ pub(crate) mod tests {
         // doesn't support sliding sync.
         let server = MockServer::start().await;
         let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new();
+        let mut builder = ClientBuilder::new()
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
 
         Mock::given(method("GET"))
             .and(path("/.well-known/matrix/client"))
@@ -906,7 +999,10 @@ pub(crate) mod tests {
     async fn test_sliding_sync_discover_native() {
         // Given a homeserver with a `/versions` file.
         let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new();
+        let mut builder = ClientBuilder::new()
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
 
         // When building the client with sliding sync to auto-discover the
         // native version.
@@ -926,7 +1022,10 @@ pub(crate) mod tests {
         let homeserver = make_mock_homeserver().await;
         let builder = ClientBuilder::new()
             .server_name_or_homeserver_url(homeserver.uri())
-            .with_decryption_trust_requirement(TrustRequirement::CrossSigned);
+            .with_decryption_trust_requirement(TrustRequirement::CrossSigned)
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
 
         let client = builder.build().await.unwrap();
         assert_matches!(
@@ -942,7 +1041,10 @@ pub(crate) mod tests {
 
         let builder = ClientBuilder::new()
             .server_name_or_homeserver_url(homeserver.uri())
-            .with_decryption_trust_requirement(TrustRequirement::Untrusted);
+            .with_decryption_trust_requirement(TrustRequirement::Untrusted)
+            // BWI-specific
+            .without_server_jwt_token_validation();
+        // end BWI-specific
 
         let client = builder.build().await.unwrap();
         assert_matches!(
@@ -986,8 +1088,14 @@ pub(crate) mod tests {
     async fn test_cross_process_store_locks_holder_name() {
         {
             let homeserver = make_mock_homeserver().await;
-            let client =
-                ClientBuilder::new().homeserver_url(homeserver.uri()).build().await.unwrap();
+            let client = ClientBuilder::new()
+                .homeserver_url(homeserver.uri())
+                // BWI-specific
+                .without_server_jwt_token_validation()
+                // end BWI-specific
+                .build()
+                .await
+                .unwrap();
 
             assert_eq!(client.cross_process_store_locks_holder_name(), "main");
         }
@@ -997,6 +1105,9 @@ pub(crate) mod tests {
             let client = ClientBuilder::new()
                 .homeserver_url(homeserver.uri())
                 .cross_process_store_locks_holder_name("foo".to_owned())
+                // BWI-specific
+                .without_server_jwt_token_validation()
+                // end BWI-specific
                 .build()
                 .await
                 .unwrap();

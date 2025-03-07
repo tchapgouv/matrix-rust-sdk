@@ -211,6 +211,9 @@ async fn test_get_media_file_with_auth_matrix_1_11() {
     let client = Client::builder()
         .homeserver_url(server.uri())
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();
@@ -326,6 +329,9 @@ async fn test_get_media_file_with_auth_matrix_stable_feature() {
     let client = Client::builder()
         .homeserver_url(server.uri())
         .request_config(RequestConfig::new().disable_retry())
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();

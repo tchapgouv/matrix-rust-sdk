@@ -1,0 +1,35 @@
+[package]
+name = "matrix-sdk-bwi"
+version = "0.6.0"
+edition = "2021"
+rust-version.workspace = true
+license = "Apache-2.0"
+
+[features]
+client = [] # needed for creating ruma like requests
+server = [] # needed for creating ruma like requests
+unstable-exhaustive-types = [] # needed for creating ruma like requests
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+http = { workspace = true }
+matrix-sdk-base = { workspace = true, features = ["e2e-encryption"] }
+matrix-sdk-base-bwi = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+reqwest = { workspace = true, features = ["json"] }
+ruma-common = { workspace = true, features = ["api"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+wiremock = { workspace = true }
+zxcvbn = "3.1.0"
+
+
+[dev-dependencies]
+rusty-hook = "0.11.2"
+
+[lints]
+workspace = true

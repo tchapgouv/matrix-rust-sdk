@@ -375,6 +375,9 @@ async fn test_backup_resumption() {
     let client = builder
         .request_config(RequestConfig::new().disable_retry())
         .sqlite_store(dir.path(), None)
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();
@@ -408,6 +411,9 @@ async fn test_backup_resumption() {
     let client = builder
         .request_config(RequestConfig::new().disable_retry())
         .sqlite_store(dir.path(), None)
+        // BWI-specific
+        .without_server_jwt_token_validation()
+        // end BWI-specific
         .build()
         .await
         .unwrap();
@@ -673,10 +679,13 @@ async fn test_incremental_upload_of_keys() -> Result<()> {
     backups.create().await.expect("We should be able to create a new backup");
 
     let alice_room = client
-        .create_room(assign!(CreateRoomRequest::new(), {
-            invite: vec![],
-            is_direct: true,
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                invite: vec![],
+                is_direct: true,
+            }),
+            false,
+        )
         .await?;
 
     alice_room.enable_encryption().await?;
@@ -726,7 +735,10 @@ async fn test_incremental_upload_of_keys_sliding_sync() -> Result<()> {
     let server = wiremock::MockServer::start().await;
     let builder = Client::builder()
         .homeserver_url(server.uri())
-        .server_versions([ruma::api::MatrixVersion::V1_0]);
+        .server_versions([ruma::api::MatrixVersion::V1_0])
+        // BWI-specific
+        .without_server_jwt_token_validation();
+    // end BWI-specific
 
     let client =
         builder.request_config(RequestConfig::new().disable_retry()).build().await.unwrap();
@@ -762,7 +774,7 @@ async fn test_incremental_upload_of_keys_sliding_sync() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = client.create_room(request).await?;
+    let alice_room = client.create_room(request, false).await?;
 
     alice_room.enable_encryption().await?;
 

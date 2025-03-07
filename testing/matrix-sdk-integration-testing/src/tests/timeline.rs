@@ -79,9 +79,12 @@ async fn test_toggling_reaction() -> Result<()> {
     debug!("Creating room…");
     let user_id = alice.user_id().unwrap().to_owned();
     let room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            is_direct: true,
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                is_direct: true,
+            }),
+            false,
+        )
         .await?;
 
     // Send a first message and then wait for the remote echo.
@@ -239,9 +242,12 @@ async fn test_stale_local_echo_time_abort_edit() {
 
     debug!("Creating room…");
     let room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            is_direct: true,
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                is_direct: true,
+            }),
+            false,
+        )
         .await
         .unwrap();
 
@@ -398,11 +404,14 @@ async fn test_enabling_backups_retries_decryption() {
             .to_raw_any()];
 
     let room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            is_direct: true,
-            initial_state,
-            preset: Some(RoomPreset::PrivateChat)
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                is_direct: true,
+                initial_state,
+                preset: Some(RoomPreset::PrivateChat)
+            }),
+            false,
+        )
         .await
         .unwrap();
 
@@ -533,11 +542,14 @@ async fn test_room_keys_received_on_notification_client_trigger_redecryption() {
             .to_raw_any()];
 
     let alice_room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            is_direct: true,
-            initial_state,
-            preset: Some(RoomPreset::PrivateChat)
-        }))
+        .create_room(
+            assign!(CreateRoomRequest::new(), {
+                is_direct: true,
+                initial_state,
+                preset: Some(RoomPreset::PrivateChat)
+            }),
+            false,
+        )
         .await
         .unwrap();
 

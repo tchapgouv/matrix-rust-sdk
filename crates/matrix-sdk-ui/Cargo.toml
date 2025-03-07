@@ -15,6 +15,7 @@ rustls-tls = ["matrix-sdk/rustls-tls"]
 
 js = ["matrix-sdk/js"]
 uniffi = ["dep:uniffi", "matrix-sdk/uniffi", "matrix-sdk-base/uniffi"]
+enable_external_content_scanner_setup = []
 
 # Add support for encrypted extensible events.
 unstable-msc3956 = ["ruma/unstable-msc3956"]
@@ -37,7 +38,9 @@ imbl = { workspace = true, features = ["serde"] }
 indexmap = { workspace = true }
 itertools = { workspace = true }
 matrix-sdk = { workspace = true, features = ["e2e-encryption"] }
+matrix-sdk-bwi = { workspace = true }
 matrix-sdk-base = { workspace = true }
+matrix-sdk-base-bwi = { workspace = true }
 mime = { workspace = true }
 once_cell = { workspace = true }
 pin-project-lite = { workspace = true }

@@ -34,7 +34,7 @@ async fn test_redacting_name() -> Result<()> {
     });
 
     let mut sync_token = None;
-    let room = tamatoa.create_room(request).await?;
+    let room = tamatoa.create_room(request, false).await?;
     let room_id = room.room_id().to_owned();
     for _ in 0..=10 {
         sync_token = Some(sync_once(&tamatoa, sync_token).await?);
@@ -106,7 +106,7 @@ async fn test_redacting_name_static() -> Result<()> {
     });
 
     let mut sync_token = None;
-    let room = tamatoa.create_room(request).await?;
+    let room = tamatoa.create_room(request, false).await?;
     let room_id = room.room_id().to_owned();
     for _ in 0..=10 {
         sync_token = Some(sync_once(&tamatoa, sync_token).await?);

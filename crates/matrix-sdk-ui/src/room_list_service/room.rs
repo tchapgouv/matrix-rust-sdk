@@ -110,9 +110,25 @@ impl Room {
                 .get_or_try_init(async { Ok(Arc::new(builder.build().await?)) })
                 .await
                 .map_err(Error::InitializingTimeline)?;
+
+            // BWI-specific: set up the hook for starting the content scanner
+            // not part of the timeline builder, as this would have a greater impact
+            self.setup_content_scanner_hook().await;
+            // end BWI-specific
             Ok(())
         }
     }
+
+    // BWI-specific
+    async fn setup_content_scanner_hook(&self) {
+        self.inner
+            .timeline
+            .get()
+            .expect("Timeline should be initialized")
+            .setup_content_scanner_hook()
+            .await;
+    }
+    // end BWI-specific
 
     /// Get the latest event in the timeline.
     ///

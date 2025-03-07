@@ -36,6 +36,8 @@ use matrix_sdk_base::{
     BaseClient, RoomInfoNotableUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
     StateStoreDataKey, StateStoreDataValue, SyncOutsideWasm,
 };
+use matrix_sdk_base_bwi::room_alias::BWIRoomAlias;
+use matrix_sdk_bwi::{content_scanner::BWIContentScanner, federation::BWIFederationHandler};
 #[cfg(feature = "experimental-oidc")]
 use matrix_sdk_common::ttl_cache::TtlCache;
 #[cfg(feature = "e2e-encryption")]
@@ -65,6 +67,10 @@ use ruma::{
         MatrixVersion, OutgoingRequest,
     },
     assign,
+    events::room::{
+        history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent},
+        server_acl::RoomServerAclEventContent,
+    },
     push::Ruleset,
     time::Instant,
     DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedServerName,
@@ -264,6 +270,9 @@ pub(crate) struct ClientInner {
     /// The underlying HTTP client.
     pub(crate) http_client: HttpClient,
 
+    // BWI-specific
+    pub(crate) content_scanner: Arc<BWIContentScanner>,
+    // end BWI-specific
     /// User session data.
     pub(super) base_client: BaseClient,
 
@@ -346,6 +355,9 @@ impl ClientInner {
         homeserver: Url,
         sliding_sync_version: SlidingSyncVersion,
         http_client: HttpClient,
+        // BWI-specific
+        content_scanner: Arc<BWIContentScanner>,
+        // end BWI-specific
         base_client: BaseClient,
         server_capabilities: ClientServerCapabilities,
         respect_login_well_known: bool,
@@ -366,6 +378,7 @@ impl ClientInner {
             auth_ctx,
             sliding_sync_version: StdRwLock::new(sliding_sync_version),
             http_client,
+            content_scanner,
             base_client,
             caches,
             locks: Default::default(),
@@ -438,6 +451,13 @@ impl Client {
     pub fn http_client(&self) -> &reqwest::Client {
         &self.inner.http_client.inner
     }
+
+    // BWI-specific
+    /// The content scanner
+    pub fn content_scanner(&self) -> &Arc<BWIContentScanner> {
+        &self.inner.content_scanner
+    }
+    // end BWI-specific
 
     pub(crate) fn locks(&self) -> &ClientLocks {
         &self.inner.locks
@@ -1479,12 +1499,31 @@ impl Client {
     /// # let homeserver = Url::parse("http://example.com").unwrap();
     /// let request = CreateRoomRequest::new();
     /// let client = Client::new(homeserver).await.unwrap();
-    /// assert!(client.create_room(request).await.is_ok());
+    /// assert!(client.create_room(request, false).await.is_ok());
     /// # };
     /// ```
-    pub async fn create_room(&self, request: create_room::v3::Request) -> Result<Room> {
+    pub async fn create_room(
+        &self,
+        mut request: create_room::v3::Request,
+        is_federated: bool,
+    ) -> Result<Room> {
         let invite = request.invite.clone();
         let is_direct_room = request.is_direct;
+
+        if !is_direct_room {
+            // BWI specific: create room alias
+            Client::add_room_alias(&mut request);
+            // END BWI specific
+
+            // BWI specific: add acl initial state event
+            self.add_acl_initial_state_event(&mut request, is_federated);
+            // END #6880 BWI specific
+        }
+
+        // BWI specific: #5991 create room with HistoryVisibility set to invite
+        Client::add_history_visibility_initial_state_event(&mut request);
+        // END #5991 BWI specific
+
         let response = self.send(request).await?;
 
         let base_room = self.base_client().get_or_create_room(&response.room_id, RoomState::Joined);
@@ -1502,6 +1541,47 @@ impl Client {
 
         Ok(joined_room)
     }
+
+    // BWI specific: create room alias
+    pub(self) fn add_room_alias(request: &mut create_room::v3::Request) {
+        if let Some(room_name) = &request.name {
+            request.room_alias_name = Some(BWIRoomAlias::alias_for_room_name(room_name));
+        }
+    }
+    // END BWI specific
+
+    // BWI specific: #5991 create room with HistoryVisibility set to invite
+    pub(self) fn add_history_visibility_initial_state_event(
+        request: &mut create_room::v3::Request,
+    ) {
+        request.initial_state.push(
+            InitialStateEvent::new(RoomHistoryVisibilityEventContent::new(
+                HistoryVisibility::Invited,
+            ))
+            .to_raw_any(),
+        );
+    }
+    // END #5991 BWI specific
+
+    // BWI specific: #6880 add acl initial state event
+    pub(self) fn add_acl_initial_state_event(
+        &self,
+        request: &mut create_room::v3::Request,
+        is_federated: bool,
+    ) {
+        let federation_handler =
+            BWIFederationHandler::for_user_id(self.user_id().expect("Server should be set"));
+
+        request.initial_state.push(
+            InitialStateEvent::new(RoomServerAclEventContent::new(
+                false,
+                federation_handler.create_server_acl(is_federated),
+                Vec::new(),
+            ))
+            .to_raw_any(),
+        );
+    }
+    // END #6880 BWI specific
 
     /// Create a DM room.
     ///
@@ -1531,7 +1611,7 @@ impl Client {
             initial_state,
         });
 
-        self.create_room(request).await
+        self.create_room(request, false).await
     }
 
     /// Search the homeserver's directory for public rooms with a filter.
@@ -2420,6 +2500,7 @@ impl Client {
                 self.homeserver(),
                 self.sliding_sync_version(),
                 self.inner.http_client.clone(),
+                self.inner.content_scanner.clone(),
                 self.inner
                     .base_client
                     .clone_with_in_memory_state_store(&cross_process_store_locks_holder_name, false)
@@ -2625,6 +2706,9 @@ pub(crate) mod tests {
 
         let client = Client::builder()
             .insecure_server_name_no_tls(alice.server_name())
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -2957,6 +3041,9 @@ pub(crate) mod tests {
                 StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
                     .state_store(memory_store.clone()),
             )
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -2979,6 +3066,9 @@ pub(crate) mod tests {
                 StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
                     .state_store(memory_store.clone()),
             )
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -3016,10 +3106,14 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_no_network_doesnt_cause_infinite_retries() {
+        let server = MockServer::start().await;
         // Note: not `no_retry_test_client` or `logged_in_client` which uses the former,
         // since we want infinite retries for transient errors.
-        let client =
-            test_client_builder(None).request_config(RequestConfig::new()).build().await.unwrap();
+        let client = test_client_builder(Some(server.uri().clone()))
+            .request_config(RequestConfig::new())
+            .build()
+            .await
+            .unwrap();
         set_client_session(&client).await;
 
         // We don't define a mock server on purpose here, so that the error is really a
@@ -3123,10 +3217,13 @@ pub(crate) mod tests {
 
         // Create a room in the internal store
         let room = client
-            .create_room(assign!(CreateRoomRequest::new(), {
-                invite: vec![],
-                is_direct: false,
-            }))
+            .create_room(
+                assign!(CreateRoomRequest::new(), {
+                    invite: vec![],
+                    is_direct: false,
+                }),
+                false,
+            )
             .await
             .unwrap();
 

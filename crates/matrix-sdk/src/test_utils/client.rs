@@ -38,7 +38,11 @@ impl MockClientBuilder {
         let default_builder = Client::builder()
             .homeserver_url(&homeserver)
             .server_versions([MatrixVersion::V1_12])
-            .request_config(RequestConfig::new().disable_retry());
+            .request_config(RequestConfig::new().disable_retry())
+            // BWI-specific
+            .without_server_jwt_token_validation()
+            // end BWI-specific
+        ;
 
         Self { builder: default_builder, auth_state: AuthState::LoggedInWithMatrixAuth }
     }
@@ -162,7 +166,7 @@ pub mod oauth {
 
     /// An OAuth 2.0 `ClientId`, for unit or integration tests.
     pub fn mock_client_id() -> ClientId {
-        ClientId("test_client_id".to_owned())
+        ClientId::new("test_client_id".to_owned())
     }
 
     /// `VerifiedClientMetadata` that should be valid in most cases, for unit or
