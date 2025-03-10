@@ -14,39 +14,48 @@
 
 #![allow(missing_docs)]
 
-use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::{
+    collections::BTreeSet,
+    sync::atomic::{AtomicU64, Ordering::SeqCst},
+};
 
 use as_variant::as_variant;
 use matrix_sdk_common::deserialized_responses::{
-    SyncTimelineEvent, TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason,
+    TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason,
 };
 use ruma::{
     events::{
-        message::TextContentBlock,
+        member_hints::MemberHintsEventContent,
         poll::{
-            end::PollEndEventContent,
-            response::{PollResponseEventContent, SelectionsContentBlock},
+            unstable_end::UnstablePollEndEventContent,
+            unstable_response::UnstablePollResponseEventContent,
             unstable_start::{
                 NewUnstablePollStartEventContent, ReplacementUnstablePollStartEventContent,
                 UnstablePollAnswer, UnstablePollStartContentBlock, UnstablePollStartEventContent,
             },
         },
         reaction::ReactionEventContent,
+        receipt::{Receipt, ReceiptEventContent, ReceiptThread, ReceiptType},
         relation::{Annotation, InReplyTo, Replacement, Thread},
         room::{
+            avatar::{self, RoomAvatarEventContent},
             encrypted::{EncryptedEventScheme, RoomEncryptedEventContent},
             member::{MembershipState, RoomMemberEventContent},
             message::{
                 FormattedBody, ImageMessageEventContent, MessageType, Relation,
                 RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
             },
+            name::RoomNameEventContent,
             redaction::RoomRedactionEventContent,
+            tombstone::RoomTombstoneEventContent,
+            topic::RoomTopicEventContent,
         },
         AnySyncTimelineEvent, AnyTimelineEvent, BundledMessageLikeRelations, EventContent,
+        RedactedMessageLikeEventContent, RedactedStateEventContent,
     },
     serde::Raw,
-    server_name, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri, OwnedRoomId,
-    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
+    server_name, EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri,
+    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -67,12 +76,43 @@ impl TimestampArg for u64 {
     }
 }
 
-#[derive(Debug, Default, Serialize)]
-struct Unsigned {
+/// A thin copy of [`ruma::events::UnsignedRoomRedactionEvent`].
+#[derive(Debug, Serialize)]
+struct RedactedBecause {
+    /// Data specific to the event type.
+    content: RoomRedactionEventContent,
+
+    /// The globally unique event identifier for the user who sent the event.
+    event_id: OwnedEventId,
+
+    /// The fully-qualified ID of the user who sent this event.
+    sender: OwnedUserId,
+
+    /// Timestamp in milliseconds on originating homeserver when this event was
+    /// sent.
+    origin_server_ts: MilliSecondsSinceUnixEpoch,
+}
+
+#[derive(Debug, Serialize)]
+struct Unsigned<C: EventContent> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prev_content: Option<C>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     transaction_id: Option<OwnedTransactionId>,
+
     #[serde(rename = "m.relations", skip_serializing_if = "Option::is_none")]
     relations: Option<BundledMessageLikeRelations<Raw<AnySyncTimelineEvent>>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redacted_because: Option<RedactedBecause>,
+}
+
+// rustc can't derive Default because C isn't marked as `Default` 🤔 oh well.
+impl<C: EventContent> Default for Unsigned<C> {
+    fn default() -> Self {
+        Self { prev_content: None, transaction_id: None, relations: None, redacted_because: None }
+    }
 }
 
 #[derive(Debug)]
@@ -80,10 +120,12 @@ pub struct EventBuilder<C: EventContent> {
     sender: Option<OwnedUserId>,
     room: Option<OwnedRoomId>,
     event_id: Option<OwnedEventId>,
+    /// Whether the event should *not* have an event id. False by default.
+    no_event_id: bool,
     redacts: Option<OwnedEventId>,
     content: C,
     server_ts: MilliSecondsSinceUnixEpoch,
-    unsigned: Option<Unsigned>,
+    unsigned: Option<Unsigned<C>>,
     state_key: Option<String>,
 }
 
@@ -103,6 +145,13 @@ where
 
     pub fn event_id(mut self, event_id: &EventId) -> Self {
         self.event_id = Some(event_id.to_owned());
+        self.no_event_id = false;
+        self
+    }
+
+    pub fn no_event_id(mut self) -> Self {
+        self.event_id = None;
+        self.no_event_id = true;
         self
     }
 
@@ -132,29 +181,42 @@ where
         self
     }
 
+    /// For state events manually created, define the state key.
+    ///
+    /// For other state events created in the [`EventFactory`], this is
+    /// automatically filled upon creation or update of the events.
     pub fn state_key(mut self, state_key: impl Into<String>) -> Self {
         self.state_key = Some(state_key.into());
         self
     }
 
     #[inline(always)]
-    fn construct_json<T>(self, requires_room: bool) -> Raw<T> {
+    fn construct_json(self, requires_room: bool) -> serde_json::Value {
+        // Use the `sender` preferably, or resort to the `redacted_because` sender if
+        // none has been set.
+        let sender = self
+            .sender
+            .or_else(|| Some(self.unsigned.as_ref()?.redacted_because.as_ref()?.sender.clone()))
+            .expect("we should have a sender user id at this point");
+
+        let mut json = json!({
+            "type": self.content.event_type(),
+            "content": self.content,
+            "sender": sender,
+            "origin_server_ts": self.server_ts,
+        });
+
+        let map = json.as_object_mut().unwrap();
+
         let event_id = self
             .event_id
             .or_else(|| {
                 self.room.as_ref().map(|room_id| EventId::new(room_id.server_name().unwrap()))
             })
-            .unwrap_or_else(|| EventId::new(server_name!("dummy.org")));
-
-        let mut json = json!({
-            "type": self.content.event_type(),
-            "content": self.content,
-            "event_id": event_id,
-            "sender": self.sender.expect("we should have a sender user id at this point"),
-            "origin_server_ts": self.server_ts,
-        });
-
-        let map = json.as_object_mut().unwrap();
+            .or_else(|| (!self.no_event_id).then(|| EventId::new(server_name!("dummy.org"))));
+        if let Some(event_id) = event_id {
+            map.insert("event_id".to_owned(), json!(event_id));
+        }
 
         if requires_room {
             let room_id = self.room.expect("TimelineEvent requires a room id");
@@ -173,7 +235,7 @@ where
             map.insert("state_key".to_owned(), json!(state_key));
         }
 
-        Raw::new(map).unwrap().cast()
+        json
     }
 
     /// Build an event from the [`EventBuilder`] and convert it into a
@@ -182,34 +244,30 @@ where
     /// The generic argument `T` allows you to automatically cast the [`Raw`]
     /// event into any desired type.
     pub fn into_raw<T>(self) -> Raw<T> {
-        self.construct_json(true)
+        Raw::new(&self.construct_json(true)).unwrap().cast()
     }
 
     pub fn into_raw_timeline(self) -> Raw<AnyTimelineEvent> {
-        self.construct_json(true)
-    }
-
-    pub fn into_timeline(self) -> TimelineEvent {
-        TimelineEvent::new(self.into_raw_timeline())
+        Raw::new(&self.construct_json(true)).unwrap().cast()
     }
 
     pub fn into_raw_sync(self) -> Raw<AnySyncTimelineEvent> {
-        self.construct_json(false)
+        Raw::new(&self.construct_json(false)).unwrap().cast()
     }
 
-    pub fn into_sync(self) -> SyncTimelineEvent {
-        SyncTimelineEvent::new(self.into_raw_sync())
+    pub fn into_event(self) -> TimelineEvent {
+        TimelineEvent::new(self.into_raw_sync())
     }
 }
 
 impl EventBuilder<RoomEncryptedEventContent> {
-    /// Turn this event into a SyncTimelineEvent representing a decryption
+    /// Turn this event into a [`TimelineEvent`] representing a decryption
     /// failure
-    pub fn into_utd_sync_timeline_event(self) -> SyncTimelineEvent {
+    pub fn into_utd_sync_timeline_event(self) -> TimelineEvent {
         let session_id = as_variant!(&self.content.scheme, EncryptedEventScheme::MegolmV1AesSha2)
             .map(|content| content.session_id.clone());
 
-        SyncTimelineEvent::new_utd_event(
+        TimelineEvent::new_utd_event(
             self.into(),
             UnableToDecryptInfo {
                 session_id,
@@ -297,12 +355,12 @@ where
     }
 }
 
-impl<E: EventContent> From<EventBuilder<E>> for SyncTimelineEvent
+impl<E: EventContent> From<EventBuilder<E>> for TimelineEvent
 where
     E::EventType: Serialize,
 {
     fn from(val: EventBuilder<E>) -> Self {
-        val.into_sync()
+        val.into_event()
     }
 }
 
@@ -344,6 +402,7 @@ impl EventFactory {
             room: self.room.clone(),
             server_ts: self.next_server_ts(),
             event_id: None,
+            no_event_id: false,
             redacts: None,
             content,
             unsigned: None,
@@ -354,6 +413,11 @@ impl EventFactory {
     /// Create a new plain text `m.room.message`.
     pub fn text_msg(&self, content: impl Into<String>) -> EventBuilder<RoomMessageEventContent> {
         self.event(RoomMessageEventContent::text_plain(content.into()))
+    }
+
+    /// Create a new plain emote `m.room.message`.
+    pub fn emote(&self, content: impl Into<String>) -> EventBuilder<RoomMessageEventContent> {
+        self.event(RoomMessageEventContent::emote_plain(content.into()))
     }
 
     /// Create a new `m.room.member` event for the given member.
@@ -399,6 +463,70 @@ impl EventFactory {
         event
     }
 
+    /// Create a tombstone state event for the room.
+    pub fn room_tombstone(
+        &self,
+        body: impl Into<String>,
+        replacement: &RoomId,
+    ) -> EventBuilder<RoomTombstoneEventContent> {
+        let mut event =
+            self.event(RoomTombstoneEventContent::new(body.into(), replacement.to_owned()));
+        event.state_key = Some("".to_owned());
+        event
+    }
+
+    /// Create a state event for the topic.
+    pub fn room_topic(&self, topic: impl Into<String>) -> EventBuilder<RoomTopicEventContent> {
+        let mut event = self.event(RoomTopicEventContent::new(topic.into()));
+        // The state key is empty for a room topic state event.
+        event.state_key = Some("".to_owned());
+        event
+    }
+
+    /// Create a state event for the room name.
+    pub fn room_name(&self, name: impl Into<String>) -> EventBuilder<RoomNameEventContent> {
+        let mut event = self.event(RoomNameEventContent::new(name.into()));
+        // The state key is empty for a room name state event.
+        event.state_key = Some("".to_owned());
+        event
+    }
+
+    /// Create an empty state event for the room avatar.
+    pub fn room_avatar(&self) -> EventBuilder<RoomAvatarEventContent> {
+        let mut event = self.event(RoomAvatarEventContent::new());
+        // The state key is empty for a room avatar state event.
+        event.state_key = Some("".to_owned());
+        event
+    }
+
+    /// Create a new `m.member_hints` event with the given service members.
+    ///
+    /// ```
+    /// use std::collections::BTreeSet;
+    ///
+    /// use matrix_sdk_test::event_factory::EventFactory;
+    /// use ruma::{
+    ///     events::{member_hints::MemberHintsEventContent, SyncStateEvent},
+    ///     owned_user_id, room_id,
+    ///     serde::Raw,
+    ///     user_id,
+    /// };
+    ///
+    /// let factory = EventFactory::new().room(room_id!("!test:localhost"));
+    ///
+    /// let event: Raw<SyncStateEvent<MemberHintsEventContent>> = factory
+    ///     .member_hints(BTreeSet::from([owned_user_id!("@alice:localhost")]))
+    ///     .sender(user_id!("@alice:localhost"))
+    ///     .into_raw();
+    /// ```
+    pub fn member_hints(
+        &self,
+        service_members: BTreeSet<OwnedUserId>,
+    ) -> EventBuilder<MemberHintsEventContent> {
+        // The `m.member_hints` event always has an empty state key, so let's set it.
+        self.event(MemberHintsEventContent::new(service_members)).state_key("")
+    }
+
     /// Create a new plain/html `m.room.message`.
     pub fn text_html(
         &self,
@@ -417,15 +545,65 @@ impl EventFactory {
     pub fn reaction(
         &self,
         event_id: &EventId,
-        annotation: String,
+        annotation: impl Into<String>,
     ) -> EventBuilder<ReactionEventContent> {
-        self.event(ReactionEventContent::new(Annotation::new(event_id.to_owned(), annotation)))
+        self.event(ReactionEventContent::new(Annotation::new(
+            event_id.to_owned(),
+            annotation.into(),
+        )))
     }
 
-    /// Create a redaction for the given event id.
+    /// Create a live redaction for the given event id.
+    ///
+    /// Note: this is not a redacted event, but a redaction event, that will
+    /// cause another event to be redacted.
     pub fn redaction(&self, event_id: &EventId) -> EventBuilder<RoomRedactionEventContent> {
         let mut builder = self.event(RoomRedactionEventContent::new_v11(event_id.to_owned()));
         builder.redacts = Some(event_id.to_owned());
+        builder
+    }
+
+    /// Create a redacted event, with extra information in the unsigned section
+    /// about the redaction itself.
+    pub fn redacted<T: RedactedMessageLikeEventContent>(
+        &self,
+        redacter: &UserId,
+        content: T,
+    ) -> EventBuilder<T> {
+        let mut builder = self.event(content);
+
+        let redacted_because = RedactedBecause {
+            content: RoomRedactionEventContent::default(),
+            event_id: EventId::new(server_name!("dummy.server")),
+            sender: redacter.to_owned(),
+            origin_server_ts: self.next_server_ts(),
+        };
+        builder.unsigned.get_or_insert_with(Default::default).redacted_because =
+            Some(redacted_because);
+
+        builder
+    }
+
+    /// Create a redacted state event, with extra information in the unsigned
+    /// section about the redaction itself.
+    pub fn redacted_state<T: RedactedStateEventContent>(
+        &self,
+        redacter: &UserId,
+        state_key: impl Into<String>,
+        content: T,
+    ) -> EventBuilder<T> {
+        let mut builder = self.event(content);
+
+        let redacted_because = RedactedBecause {
+            content: RoomRedactionEventContent::default(),
+            event_id: EventId::new(server_name!("dummy.server")),
+            sender: redacter.to_owned(),
+            origin_server_ts: self.next_server_ts(),
+        };
+        builder.unsigned.get_or_insert_with(Default::default).redacted_because =
+            Some(redacted_because);
+        builder.state_key = Some(state_key.into());
+
         builder
     }
 
@@ -478,13 +656,13 @@ impl EventFactory {
     /// start event id.
     pub fn poll_response(
         &self,
-        answer_id: impl Into<String>,
+        answers: Vec<impl Into<String>>,
         poll_start_id: &EventId,
-    ) -> EventBuilder<PollResponseEventContent> {
-        let selection_content: SelectionsContentBlock = vec![answer_id.into()].into();
-        let poll_response_content =
-            PollResponseEventContent::new(selection_content, poll_start_id.to_owned());
-        self.event(poll_response_content)
+    ) -> EventBuilder<UnstablePollResponseEventContent> {
+        self.event(UnstablePollResponseEventContent::new(
+            answers.into_iter().map(Into::into).collect(),
+            poll_start_id.to_owned(),
+        ))
     }
 
     /// Create a poll response with the given text and the associated poll start
@@ -493,12 +671,8 @@ impl EventFactory {
         &self,
         content: impl Into<String>,
         poll_start_id: &EventId,
-    ) -> EventBuilder<PollEndEventContent> {
-        let poll_end_content = PollEndEventContent::new(
-            TextContentBlock::plain(content.into()),
-            poll_start_id.to_owned(),
-        );
-        self.event(poll_end_content)
+    ) -> EventBuilder<UnstablePollEndEventContent> {
+        self.event(UnstablePollEndEventContent::new(content.into(), poll_start_id.to_owned()))
     }
 
     /// Creates a plain (unencrypted) image event content referencing the given
@@ -510,6 +684,11 @@ impl EventFactory {
     ) -> EventBuilder<RoomMessageEventContent> {
         let image_event_content = ImageMessageEventContent::plain(filename, url);
         self.event(RoomMessageEventContent::new(MessageType::Image(image_event_content)))
+    }
+
+    /// Create a read receipt event.
+    pub fn read_receipts(&self) -> ReadReceiptBuilder<'_> {
+        ReadReceiptBuilder { factory: self, content: ReceiptEventContent(Default::default()) }
     }
 
     /// Set the next server timestamp.
@@ -530,9 +709,148 @@ impl EventBuilder<RoomMemberEventContent> {
         self
     }
 
+    /// Set that the sender of this event invited the user passed as a parameter
+    /// here.
+    pub fn invited(mut self, invited_user: &UserId) -> Self {
+        assert_ne!(
+            self.sender.as_deref().unwrap(),
+            invited_user,
+            "invited user and sender can't be the same person"
+        );
+        self.content.membership = MembershipState::Invite;
+        self.state_key = Some(invited_user.to_string());
+        self
+    }
+
+    /// Set that the sender of this event kicked the user passed as a parameter
+    /// here.
+    pub fn kicked(mut self, kicked_user: &UserId) -> Self {
+        assert_ne!(
+            self.sender.as_deref().unwrap(),
+            kicked_user,
+            "kicked user and sender can't be the same person, otherwise it's just a Leave"
+        );
+        self.content.membership = MembershipState::Leave;
+        self.state_key = Some(kicked_user.to_string());
+        self
+    }
+
+    /// Set that the sender of this event banned the user passed as a parameter
+    /// here.
+    pub fn banned(mut self, banned_user: &UserId) -> Self {
+        assert_ne!(
+            self.sender.as_deref().unwrap(),
+            banned_user,
+            "a user can't ban itself" // hopefully
+        );
+        self.content.membership = MembershipState::Ban;
+        self.state_key = Some(banned_user.to_string());
+        self
+    }
+
     /// Set the display name of the `m.room.member` event.
     pub fn display_name(mut self, display_name: impl Into<String>) -> Self {
         self.content.displayname = Some(display_name.into());
         self
+    }
+
+    /// Set the avatar URL of the `m.room.member` event.
+    pub fn avatar_url(mut self, url: &MxcUri) -> Self {
+        self.content.avatar_url = Some(url.to_owned());
+        self
+    }
+
+    /// Set the reason field of the `m.room.member` event.
+    pub fn reason(mut self, reason: impl Into<String>) -> Self {
+        self.content.reason = Some(reason.into());
+        self
+    }
+
+    /// Set the previous membership state (in the unsigned section).
+    pub fn previous(mut self, previous: impl Into<PreviousMembership>) -> Self {
+        let previous = previous.into();
+
+        let mut prev_content = RoomMemberEventContent::new(previous.state);
+        if let Some(avatar_url) = previous.avatar_url {
+            prev_content.avatar_url = Some(avatar_url);
+        }
+        if let Some(display_name) = previous.display_name {
+            prev_content.displayname = Some(display_name);
+        }
+
+        self.unsigned.get_or_insert_with(Default::default).prev_content = Some(prev_content);
+        self
+    }
+}
+
+impl EventBuilder<RoomAvatarEventContent> {
+    /// Defines the URL for the room avatar.
+    pub fn url(mut self, url: &MxcUri) -> Self {
+        self.content.url = Some(url.to_owned());
+        self
+    }
+
+    /// Defines the image info for the avatar.
+    pub fn info(mut self, image: avatar::ImageInfo) -> Self {
+        self.content.info = Some(Box::new(image));
+        self
+    }
+}
+
+pub struct ReadReceiptBuilder<'a> {
+    factory: &'a EventFactory,
+    content: ReceiptEventContent,
+}
+
+impl ReadReceiptBuilder<'_> {
+    /// Add a single read receipt to the event.
+    pub fn add(
+        mut self,
+        event_id: &EventId,
+        user_id: &UserId,
+        tyype: ReceiptType,
+        thread: ReceiptThread,
+    ) -> Self {
+        let by_event = self.content.0.entry(event_id.to_owned()).or_default();
+        let by_type = by_event.entry(tyype).or_default();
+
+        let mut receipt = Receipt::new(self.factory.next_server_ts());
+        receipt.thread = thread;
+
+        by_type.insert(user_id.to_owned(), receipt);
+        self
+    }
+
+    /// Finalize the builder into the receipt event content.
+    pub fn build(self) -> ReceiptEventContent {
+        self.content
+    }
+}
+
+pub struct PreviousMembership {
+    state: MembershipState,
+    avatar_url: Option<OwnedMxcUri>,
+    display_name: Option<String>,
+}
+
+impl PreviousMembership {
+    pub fn new(state: MembershipState) -> Self {
+        Self { state, avatar_url: None, display_name: None }
+    }
+
+    pub fn avatar_url(mut self, url: &MxcUri) -> Self {
+        self.avatar_url = Some(url.to_owned());
+        self
+    }
+
+    pub fn display_name(mut self, name: impl Into<String>) -> Self {
+        self.display_name = Some(name.into());
+        self
+    }
+}
+
+impl From<MembershipState> for PreviousMembership {
+    fn from(state: MembershipState) -> Self {
+        Self::new(state)
     }
 }

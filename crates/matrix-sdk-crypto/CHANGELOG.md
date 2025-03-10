@@ -6,10 +6,63 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- [**breaking**] Add support for the shared history flag defined in [MSC3061](https://github.com/matrix-org/matrix-spec-proposals/pull/3061).
+  The shared history flag is now respected when room keys are received as an
+  `m.room_key` event as well as when they are imported from a backup or a file
+  export. We also ensure to set the flag when we send out room keys. Due to
+  this, a new argument to the constructor for `room_key::MegolmV1AesSha2Content`
+  has been added and `PickledInboundGroupSession` has received a new
+  `shared_history` field that defaults to `false.`
+  ([#4700](https://github.com/matrix-org/matrix-rust-sdk/pull/4700))
+
+## [0.10.0] - 2025-02-04
+
+### Features
+
+- [**breaking**] `CollectStrategy::DeviceBasedStrategy` is now split into three
+  separate strategies (`AllDevices`, `ErrorOnVerifiedUserProblem`,
+  `OnlyTrustedDevices`), to make the behaviour clearer.
+  ([#4581](https://github.com/matrix-org/matrix-rust-sdk/pull/4581))
+
+- Accept stable identifier `sender_device_keys` for MSC4147 (Including device
+  keys with Olm-encrypted events).
+  ([#4420](https://github.com/matrix-org/matrix-rust-sdk/pull/4420))
+
+- Room keys are not shared with unsigned dehydrated devices.
+  ([#4551](https://github.com/matrix-org/matrix-rust-sdk/pull/4551))
+  
+- Have the `RoomIdentityProvider` return processing changes when identities transition
+  to `IdentityState::Verified` too.
+  ([#4670](https://github.com/matrix-org/matrix-rust-sdk/pull/4670))
+
+## [0.9.0] - 2024-12-18
+
+### Features
+
+- Expose new API `DehydratedDevices::get_dehydrated_device_pickle_key`, `DehydratedDevices::save_dehydrated_device_pickle_key`
+  and `DehydratedDevices::delete_dehydrated_device_pickle_key` to store/load the dehydrated device pickle key.
+  This allows client to automatically rotate the dehydrated device to avoid one-time-keys exhaustion and to_device accumulation.
+  [**breaking**] `DehydratedDevices::keys_for_upload` and `DehydratedDevices::rehydrate` now use the `DehydratedDeviceKey`
+  as parameter instead of a raw byte array. Use `DehydratedDeviceKey::from_bytes` to migrate.
+  ([#4383](https://github.com/matrix-org/matrix-rust-sdk/pull/4383))
+
+- Add extra logging in `OtherUserIdentity::pin_current_master_key` and
+  `OtherUserIdentity::withdraw_verification`.
+  ([#4415](https://github.com/matrix-org/matrix-rust-sdk/pull/4415))
+
 - Added new `UtdCause` variants `WithheldForUnverifiedOrInsecureDevice` and `WithheldBySender`.
-  These variants provide clearer categorization for expected Unable-To-Decrypt (UTD) errors 
+  These variants provide clearer categorization for expected Unable-To-Decrypt (UTD) errors
   when the sender either did not wish to share or was unable to share the room_key.
   ([#4305](https://github.com/matrix-org/matrix-rust-sdk/pull/4305))
+
+- `UtdCause` has two new variants that replace the existing `HistoricalMessage`:
+  `HistoricalMessageAndBackupIsDisabled` and `HistoricalMessageAndDeviceIsUnverified`.
+  These give more detail about what went wrong and allow us to suggest to users
+  what actions they can take to fix the problem. See the doc comments on these
+  variants for suggested wording.
+  ([#4384](https://github.com/matrix-org/matrix-rust-sdk/pull/4384))
 
 ## [0.8.0] - 2024-11-19
 
@@ -74,6 +127,12 @@ All notable changes to this project will be documented in this file.
 
 
 ### Refactor
+
+- Fix [#4424](https://github.com/matrix-org/matrix-rust-sdk/issues/4424) Failed
+  storage upgrade for "PreviouslyVerifiedButNoLonger". This bug caused errors to
+  occur when loading crypto information from storage, which typically prevented
+  apps from starting correctly.
+  ([#4430](https://github.com/matrix-org/matrix-rust-sdk/pull/4430))
 
 - Add new method `OlmMachine::try_decrypt_room_event`.
   ([#4116](https://github.com/matrix-org/matrix-rust-sdk/pull/4116))

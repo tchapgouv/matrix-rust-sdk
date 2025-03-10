@@ -5,35 +5,15 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use super::{room::Room, session_verification::SessionVerificationController, RUNTIME};
 use crate::client::BWIScanState::Infected;
-use crate::{
-    authentication::{HomeserverLoginDetails, OidcConfiguration, OidcError, SsoError, SsoHandler},
-    client,
-    encryption::Encryption,
-    notification::NotificationClient,
-    notification_settings::NotificationSettings,
-    room_directory_search::RoomDirectorySearch,
-    room_preview::RoomPreview,
-    ruma::{AuthData, MediaSource},
-    sync_service::{SyncService, SyncServiceBuilder},
-    task_handle::TaskHandle,
-    utils::AsyncRuntimeDropped,
-    ClientError,
-};
 use anyhow::{anyhow, Context as _};
 use matrix_sdk::bwi_extensions::attachment::ClientAttachmentExt;
 use matrix_sdk::bwi_extensions::client::BWIClientSetupExt;
 use matrix_sdk::{
-    media::{
-        MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequestParameters,
-        MediaThumbnailSettings,
-    },
-    oidc::{
+    authentication::oidc::{
         registrations::{ClientId, OidcRegistrations},
         requests::account_management::AccountManagementActionFull,
         types::{
-            client_credentials::ClientCredentials,
             registration::{
                 ClientMetadata, ClientMetadataVerificationError, VerifiedClientMetadata,
             },
@@ -41,7 +21,10 @@ use matrix_sdk::{
         },
         OidcAuthorizationData, OidcSession,
     },
-    reqwest::StatusCode,
+    media::{
+        MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequestParameters,
+        MediaThumbnailSettings,
+    },
     ruma::{
         api::client::{
             push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
@@ -50,14 +33,17 @@ use matrix_sdk::{
             user_directory::search_users,
         },
         events::{
-            room::{avatar::RoomAvatarEventContent, encryption::RoomEncryptionEventContent},
-            AnyInitialStateEvent, AnyToDeviceEvent, InitialStateEvent,
+            room::{
+                avatar::RoomAvatarEventContent, encryption::RoomEncryptionEventContent,
+                message::MessageType,
+            },
+            AnyInitialStateEvent, InitialStateEvent,
         },
         serde::Raw,
         EventEncryptionAlgorithm, RoomId, TransactionId, UInt, UserId,
     },
     sliding_sync::Version as SdkSlidingSyncVersion,
-    AuthApi, AuthSession, Client as MatrixClient, HttpError, SessionChange, SessionTokens,
+    AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
 };
 use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState as SDKScanState;
 use matrix_sdk_ui::notification_client::{
@@ -68,14 +54,17 @@ use mime::Mime;
 use ruma::{
     api::client::{
         alias::get_alias, discovery::discover_homeserver::AuthenticationServerInfo,
-        uiaa::UserIdentifier,
+        error::ErrorKind, uiaa::UserIdentifier,
     },
     events::{
         ignored_user_list::IgnoredUserListEventContent,
+        key::verification::request::ToDeviceKeyVerificationRequestEvent,
         room::{
+            history_visibility::RoomHistoryVisibilityEventContent,
             join_rules::{
                 AllowRule as RumaAllowRule, JoinRule as RumaJoinRule, RoomJoinRulesEventContent,
             },
+            message::OriginalSyncRoomMessageEvent,
             power_levels::RoomPowerLevelsEventContent,
         },
         GlobalAccountDataEventType,
@@ -88,6 +77,23 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, error, warn};
 use url::Url;
+
+use super::{room::Room, session_verification::SessionVerificationController, RUNTIME};
+use crate::{
+    authentication::{HomeserverLoginDetails, OidcConfiguration, OidcError, SsoError, SsoHandler},
+    client,
+    encryption::Encryption,
+    notification::NotificationClient,
+    notification_settings::NotificationSettings,
+    room::RoomHistoryVisibility,
+    room_directory_search::RoomDirectorySearch,
+    room_preview::RoomPreview,
+    ruma::{AuthData, MediaSource},
+    sync_service::{SyncService, SyncServiceBuilder},
+    task_handle::TaskHandle,
+    utils::AsyncRuntimeDropped,
+    ClientError,
+};
 
 #[derive(Clone, uniffi::Record)]
 pub struct PusherIdentifiers {
@@ -162,7 +168,7 @@ impl TryFrom<PusherKind> for RumaPusherKind {
                 let mut ruma_data = RumaHttpPusherData::new(data.url);
                 if let Some(payload) = data.default_payload {
                     let json: Value = serde_json::from_str(&payload)?;
-                    ruma_data.default_payload = json;
+                    ruma_data.data.insert("default_payload".to_owned(), json);
                 }
                 ruma_data.format = data.format.map(Into::into);
                 Ok(Self::Http(ruma_data))
@@ -246,12 +252,27 @@ impl Client {
             tokio::sync::RwLock<Option<SessionVerificationController>>,
         > = Default::default();
         let controller = session_verification_controller.clone();
+        sdk_client.add_event_handler(
+            move |event: ToDeviceKeyVerificationRequestEvent| async move {
+                if let Some(session_verification_controller) = &*controller.clone().read().await {
+                    session_verification_controller
+                        .process_incoming_verification_request(
+                            &event.sender,
+                            event.content.transaction_id,
+                        )
+                        .await;
+                }
+            },
+        );
 
-        sdk_client.add_event_handler(move |ev: AnyToDeviceEvent| async move {
-            if let Some(session_verification_controller) = &*controller.clone().read().await {
-                session_verification_controller.process_to_device_message(ev).await;
-            } else {
-                debug!("received to-device message, but verification controller isn't ready");
+        let controller = session_verification_controller.clone();
+        sdk_client.add_event_handler(move |event: OriginalSyncRoomMessageEvent| async move {
+            if let MessageType::VerificationRequest(_) = &event.content.msgtype {
+                if let Some(session_verification_controller) = &*controller.clone().read().await {
+                    session_verification_controller
+                        .process_incoming_verification_request(&event.sender, event.event_id)
+                        .await;
+                }
             }
         });
 
@@ -307,26 +328,17 @@ impl Client {
     /// Information about login options for the client's homeserver.
     pub async fn homeserver_login_details(&self) -> Arc<HomeserverLoginDetails> {
         let oidc = self.inner.oidc();
-        let (supports_oidc_login, supported_oidc_prompts) = match oidc
-            .fetch_authentication_issuer()
-            .await
-        {
-            Ok(issuer) => match &oidc.given_provider_metadata(&issuer).await {
-                Ok(metadata) => {
-                    let prompts = metadata
-                        .prompt_values_supported
-                        .as_ref()
-                        .map_or_else(Vec::new, |prompts| prompts.iter().map(Into::into).collect());
+        let (supports_oidc_login, supported_oidc_prompts) = match &oidc.provider_metadata().await {
+            Ok(metadata) => {
+                let prompts = metadata
+                    .prompt_values_supported
+                    .as_ref()
+                    .map_or_else(Vec::new, |prompts| prompts.iter().map(Into::into).collect());
 
-                    (true, prompts)
-                }
-                Err(error) => {
-                    error!("Failed to fetch OIDC provider metadata: {error}");
-                    (true, Default::default())
-                }
-            },
+                (true, prompts)
+            }
             Err(error) => {
-                error!("Failed to fetch authentication issuer: {error}");
+                error!("Failed to fetch OIDC provider metadata: {error}");
                 (false, Default::default())
             }
         };
@@ -855,8 +867,11 @@ impl Client {
             .await?
             .context("Failed retrieving user identity")?;
 
-        let session_verification_controller =
-            SessionVerificationController::new(self.inner.encryption(), user_identity);
+        let session_verification_controller = SessionVerificationController::new(
+            self.inner.encryption(),
+            user_identity,
+            self.inner.account(),
+        );
 
         *self.session_verification_controller.write().await =
             Some(session_verification_controller.clone());
@@ -864,10 +879,8 @@ impl Client {
         Ok(Arc::new(session_verification_controller))
     }
 
-    /// Log out the current user. This method returns an optional URL that
-    /// should be presented to the user to complete logout (in the case of
-    /// Session having been authenticated using OIDC).
-    pub async fn logout(&self) -> Result<Option<String>, ClientError> {
+    /// Log the current user out.
+    pub async fn logout(&self) -> Result<(), ClientError> {
         let Some(auth_api) = self.inner.auth_api() else {
             return Err(anyhow!("Missing authentication API").into());
         };
@@ -876,19 +889,13 @@ impl Client {
             AuthApi::Matrix(a) => {
                 tracing::info!("Logging out via the homeserver.");
                 a.logout().await?;
-                Ok(None)
+                Ok(())
             }
 
             AuthApi::Oidc(api) => {
                 tracing::info!("Logging out via OIDC.");
-                let end_session_builder = api.logout().await?;
-
-                if let Some(builder) = end_session_builder {
-                    let url = builder.build()?.url;
-                    return Ok(Some(url.to_string()));
-                }
-
-                Ok(None)
+                api.logout().await?;
+                Ok(())
             }
             _ => Err(anyhow!("Unknown authentication API").into()),
         }
@@ -1122,11 +1129,12 @@ impl Client {
         let room_alias = RoomAliasId::parse(&room_alias)?;
         match self.inner.resolve_room_alias(&room_alias).await {
             Ok(response) => Ok(Some(response.into())),
-            Err(HttpError::Reqwest(http_error)) => match http_error.status() {
-                Some(StatusCode::NOT_FOUND) => Ok(None),
-                _ => Err(http_error.into()),
+            Err(error) => match error.client_api_error_kind() {
+                // The room alias wasn't found, so we return None.
+                Some(ErrorKind::NotFound) => Ok(None),
+                // In any other case we just return the error, mapped.
+                _ => Err(error.into()),
             },
-            Err(error) => Err(error.into()),
         }
     }
 
@@ -1229,17 +1237,6 @@ impl Client {
     pub async fn is_room_alias_available(&self, alias: String) -> Result<bool, ClientError> {
         let alias = RoomAliasId::parse(alias)?;
         self.inner.is_room_alias_available(&alias).await.map_err(Into::into)
-    }
-
-    /// Creates a new room alias associated with the provided room id.
-    pub async fn create_room_alias(
-        &self,
-        room_alias: String,
-        room_id: String,
-    ) -> Result<(), ClientError> {
-        let room_alias = RoomAliasId::parse(room_alias)?;
-        let room_id = RoomId::parse(room_id)?;
-        self.inner.create_room_alias(&room_alias, &room_id).await.map_err(Into::into)
     }
 }
 
@@ -1467,6 +1464,8 @@ pub struct CreateRoomParameters {
     #[uniffi(default = None)]
     pub join_rule_override: Option<JoinRule>,
     #[uniffi(default = None)]
+    pub history_visibility_override: Option<RoomHistoryVisibility>,
+    #[uniffi(default = None)]
     pub canonical_alias: Option<String>,
 }
 
@@ -1514,6 +1513,12 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
             initial_state.push(InitialStateEvent::new(content).to_raw_any());
         }
 
+        if let Some(history_visibility_override) = value.history_visibility_override {
+            let content =
+                RoomHistoryVisibilityEventContent::new(history_visibility_override.try_into()?);
+            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+        }
+
         request.initial_state = initial_state;
 
         if let Some(power_levels) = value.power_level_content_override {
@@ -1540,6 +1545,9 @@ pub enum RoomVisibility {
 
     /// Indicates that the room will not be shown in the published room list.
     Private,
+
+    /// A custom value that's not present in the spec.
+    Custom { value: String },
 }
 
 impl From<RoomVisibility> for Visibility {
@@ -1547,6 +1555,17 @@ impl From<RoomVisibility> for Visibility {
         match value {
             RoomVisibility::Public => Self::Public,
             RoomVisibility::Private => Self::Private,
+            RoomVisibility::Custom { value } => value.as_str().into(),
+        }
+    }
+}
+
+impl From<Visibility> for RoomVisibility {
+    fn from(value: Visibility) -> Self {
+        match value {
+            Visibility::Public => Self::Public,
+            Visibility::Private => Self::Private,
+            _ => Self::Custom { value: value.as_str().to_owned() },
         }
     }
 }
@@ -1610,10 +1629,13 @@ impl Session {
         match auth_api {
             // Build the session from the regular Matrix Auth Session.
             AuthApi::Matrix(a) => {
-                let matrix_sdk::matrix_auth::MatrixSession {
+                let matrix_sdk::authentication::matrix::MatrixSession {
                     meta: matrix_sdk::SessionMeta { user_id, device_id },
                     tokens:
-                        matrix_sdk::matrix_auth::MatrixSessionTokens { access_token, refresh_token },
+                        matrix_sdk::authentication::matrix::MatrixSessionTokens {
+                            access_token,
+                            refresh_token,
+                        },
                 } = a.session().context("Missing session")?;
 
                 Ok(Session {
@@ -1628,21 +1650,17 @@ impl Session {
             }
             // Build the session from the OIDC UserSession.
             AuthApi::Oidc(api) => {
-                let matrix_sdk::oidc::UserSession {
+                let matrix_sdk::authentication::oidc::UserSession {
                     meta: matrix_sdk::SessionMeta { user_id, device_id },
                     tokens:
-                        matrix_sdk::oidc::OidcSessionTokens {
+                        matrix_sdk::authentication::oidc::OidcSessionTokens {
                             access_token,
                             refresh_token,
                             latest_id_token,
                         },
                     issuer,
                 } = api.user_session().context("Missing session")?;
-                let client_id = api
-                    .client_credentials()
-                    .context("OIDC client credentials are missing.")?
-                    .client_id()
-                    .to_owned();
+                let client_id = api.client_id().context("OIDC client ID is missing.")?.0.clone();
                 let client_metadata =
                     api.client_metadata().context("OIDC client metadata is missing.")?.clone();
                 let oidc_data = OidcSessionData {
@@ -1692,12 +1710,12 @@ impl TryFrom<Session> for AuthSession {
                 .transpose()
                 .context("OIDC latest_id_token is invalid.")?;
 
-            let user_session = matrix_sdk::oidc::UserSession {
+            let user_session = matrix_sdk::authentication::oidc::UserSession {
                 meta: matrix_sdk::SessionMeta {
                     user_id: user_id.try_into()?,
                     device_id: device_id.into(),
                 },
-                tokens: matrix_sdk::oidc::OidcSessionTokens {
+                tokens: matrix_sdk::authentication::oidc::OidcSessionTokens {
                     access_token,
                     refresh_token,
                     latest_id_token,
@@ -1706,7 +1724,7 @@ impl TryFrom<Session> for AuthSession {
             };
 
             let session = OidcSession {
-                credentials: ClientCredentials::None { client_id: oidc_data.client_id },
+                client_id: ClientId(oidc_data.client_id),
                 metadata: oidc_data.client_metadata,
                 user: user_session,
             };
@@ -1714,12 +1732,12 @@ impl TryFrom<Session> for AuthSession {
             Ok(AuthSession::Oidc(session.into()))
         } else {
             // Create a regular Matrix Session.
-            let session = matrix_sdk::matrix_auth::MatrixSession {
+            let session = matrix_sdk::authentication::matrix::MatrixSession {
                 meta: matrix_sdk::SessionMeta {
                     user_id: user_id.try_into()?,
                     device_id: device_id.into(),
                 },
-                tokens: matrix_sdk::matrix_auth::MatrixSessionTokens {
+                tokens: matrix_sdk::authentication::matrix::MatrixSessionTokens {
                     access_token,
                     refresh_token,
                 },
@@ -1870,7 +1888,6 @@ impl MediaFileHandle {
 #[derive(Clone, uniffi::Enum)]
 pub enum SlidingSyncVersion {
     None,
-    Proxy { url: String },
     Native,
 }
 
@@ -1878,7 +1895,6 @@ impl From<SdkSlidingSyncVersion> for SlidingSyncVersion {
     fn from(value: SdkSlidingSyncVersion) -> Self {
         match value {
             SdkSlidingSyncVersion::None => Self::None,
-            SdkSlidingSyncVersion::Proxy { url } => Self::Proxy { url: url.to_string() },
             SdkSlidingSyncVersion::Native => Self::Native,
         }
     }
@@ -1890,9 +1906,6 @@ impl TryFrom<SlidingSyncVersion> for SdkSlidingSyncVersion {
     fn try_from(value: SlidingSyncVersion) -> Result<Self, Self::Error> {
         Ok(match value {
             SlidingSyncVersion::None => Self::None,
-            SlidingSyncVersion::Proxy { url } => Self::Proxy {
-                url: Url::parse(&url).map_err(|e| ClientError::Generic { msg: e.to_string() })?,
-            },
             SlidingSyncVersion::Native => Self::Native,
         })
     }

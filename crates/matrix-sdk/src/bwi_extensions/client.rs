@@ -57,7 +57,7 @@ impl BWIInnerClientSetup for crate::Client {
 
     async fn try_load_size_limit_from_server(&self) -> Result<FileSize, Error> {
         let request = ruma::api::client::authenticated_media::get_media_config::v1::Request::new();
-        let response = self.send(request, None).await.map_err(Error::from)?;
+        let response = self.send(request).await.map_err(Error::from)?;
         Ok(FileSize(u64::from(response.upload_size)))
     }
 

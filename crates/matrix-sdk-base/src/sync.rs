@@ -16,7 +16,7 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use matrix_sdk_common::{debug::DebugRawEvent, deserialized_responses::SyncTimelineEvent};
+use matrix_sdk_common::{debug::DebugRawEvent, deserialized_responses::TimelineEvent};
 use ruma::{
     api::client::sync::sync_events::{
         v3::{InvitedRoom as InvitedRoomUpdate, KnockedRoom as KnockedRoomUpdate},
@@ -102,7 +102,7 @@ impl RoomUpdates {
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for RoomUpdates {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Rooms")
+        f.debug_struct("RoomUpdates")
             .field("leave", &self.leave)
             .field("join", &self.join)
             .field("invite", &DebugInvitedRoomUpdates(&self.invite))
@@ -138,7 +138,7 @@ pub struct JoinedRoomUpdate {
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for JoinedRoomUpdate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("JoinedRoom")
+        f.debug_struct("JoinedRoomUpdate")
             .field("unread_notifications", &self.unread_notifications)
             .field("timeline", &self.timeline)
             .field("state", &DebugListOfRawEvents(&self.state))
@@ -215,7 +215,7 @@ impl LeftRoomUpdate {
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for LeftRoomUpdate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("JoinedRoom")
+        f.debug_struct("LeftRoomUpdate")
             .field("timeline", &self.timeline)
             .field("state", &DebugListOfRawEvents(&self.state))
             .field("account_data", &DebugListOfRawEventsNoId(&self.account_data))
@@ -236,7 +236,7 @@ pub struct Timeline {
     pub prev_batch: Option<String>,
 
     /// A list of events.
-    pub events: Vec<SyncTimelineEvent>,
+    pub events: Vec<TimelineEvent>,
 }
 
 impl Timeline {

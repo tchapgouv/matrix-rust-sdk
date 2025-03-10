@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use async_trait::async_trait;
+use matrix_sdk_common::BoxFuture;
 use ruma::{
     events::{
         room::member::{MembershipState, SyncRoomMemberEvent},
@@ -31,18 +31,17 @@ use crate::store::IdentityUpdates;
 ///
 /// This is implemented by `matrix_sdk::Room` and is a trait here so we can
 /// supply a mock when needed.
-#[async_trait]
 pub trait RoomIdentityProvider: core::fmt::Debug {
     /// Is the user with the supplied ID a member of this room?
-    async fn is_member(&self, user_id: &UserId) -> bool;
+    fn is_member<'a>(&'a self, user_id: &'a UserId) -> BoxFuture<'a, bool>;
 
     /// Return a list of the [`UserIdentity`] of all members of this room
-    async fn member_identities(&self) -> Vec<UserIdentity>;
+    fn member_identities(&self) -> BoxFuture<'_, Vec<UserIdentity>>;
 
     /// Return the [`UserIdentity`] of the user with the supplied ID (even if
     /// they are not a member of this room) or None if this user does not
     /// exist.
-    async fn user_identity(&self, user_id: &UserId) -> Option<UserIdentity>;
+    fn user_identity<'a>(&'a self, user_id: &'a UserId) -> BoxFuture<'a, Option<UserIdentity>>;
 
     /// Return the [`IdentityState`] of the supplied user identity.
     /// Normally only overridden in tests.
@@ -147,6 +146,14 @@ impl<R: RoomIdentityProvider> RoomIdentityState<R> {
                 if let Some(user_identity @ UserIdentity::Other(_)) =
                     self.room.user_identity(user_id).await
                 {
+                    // Don't notify on membership changes of verified or pinned identities
+                    if matches!(
+                        self.room.state_of(&user_identity),
+                        IdentityState::Verified | IdentityState::Pinned
+                    ) {
+                        return vec![];
+                    }
+
                     match event.content.membership {
                         MembershipState::Join | MembershipState::Invite => {
                             // They are joining the room - check whether we need to display a
@@ -193,50 +200,20 @@ impl<R: RoomIdentityProvider> RoomIdentityState<R> {
     }
 
     /// Updates our internal state for this user to the supplied `new_state`. If
-    /// the change of state is significant (it requires something to change
-    /// in the UI, like a warning being added or removed), returns the
-    /// change information we will surface to the UI.
+    /// the state changed it returns the change information we will surface to
+    /// the UI.
     fn update_user_state_to(
         &mut self,
         user_id: &UserId,
         new_state: IdentityState,
     ) -> Option<IdentityStatusChange> {
-        use IdentityState::*;
-
         let old_state = self.known_states.get(user_id);
 
-        match (old_state, &new_state) {
-            // good -> bad - report so we can add a message
-            (Pinned, PinViolation) |
-            (Pinned, VerificationViolation) |
-            (Verified, PinViolation) |
-            (Verified, VerificationViolation) |
-
-            // bad -> good - report so we can remove a message
-            (PinViolation, Pinned) |
-            (PinViolation, Verified) |
-            (VerificationViolation, Pinned) |
-            (VerificationViolation, Verified) |
-
-            // Changed the type of bad - report so can change the message
-            (PinViolation, VerificationViolation) |
-            (VerificationViolation, PinViolation) => Some(self.set_state(user_id, new_state)),
-
-            // good -> good - don't report - no message needed in either case
-            (Pinned, Verified) |
-            (Verified, Pinned) => {
-                // The state has changed, so we update it
-                self.set_state(user_id, new_state);
-                // but there is no need to report a change to the UI
-                None
-            }
-
-            // State didn't change - don't report - nothing changed
-            (Pinned, Pinned) |
-            (Verified, Verified) |
-            (PinViolation, PinViolation) |
-            (VerificationViolation, VerificationViolation) => None,
+        if old_state == new_state {
+            return None;
         }
+
+        Some(self.set_state(user_id, new_state))
     }
 
     fn set_state(&mut self, user_id: &UserId, new_state: IdentityState) -> IdentityStatusChange {
@@ -352,7 +329,7 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use async_trait::async_trait;
+    use matrix_sdk_common::BoxFuture;
     use matrix_sdk_test::async_test;
     use ruma::{
         device_id,
@@ -398,7 +375,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn test_verifying_a_pinned_identity_in_the_room_does_nothing() {
+    async fn test_verifying_a_pinned_identity_in_the_room_notifies() {
         // Given someone in the room is pinned
         let user_id = user_id!("@u:s.co");
         let mut room = FakeRoom::new();
@@ -410,8 +387,14 @@ mod tests {
             identity_change(&mut room, user_id, IdentityState::Verified, false, false).await;
         let update = state.process_change(updates).await;
 
-        // Then we emit no update
-        assert_eq!(update, vec![]);
+        // Then we emit an update
+        assert_eq!(
+            update,
+            vec![IdentityStatusChange {
+                user_id: user_id.to_owned(),
+                changed_to: IdentityState::Verified
+            }]
+        );
     }
 
     #[async_test]
@@ -723,7 +706,7 @@ mod tests {
 
     #[async_test]
     async fn test_a_verified_identity_leaving_the_room_does_nothing() {
-        // Given a pinned user is in the room
+        // Given a verified user is in the room
         let user_id = user_id!("@u:s.co");
         let mut room = FakeRoom::new();
         room.member(other_user_identity(user_id).await, IdentityState::Verified);
@@ -1030,23 +1013,28 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl RoomIdentityProvider for FakeRoom {
-        async fn is_member(&self, user_id: &UserId) -> bool {
-            self.users.lock().unwrap().get(user_id).map(|m| m.is_member).unwrap_or(false)
+        fn is_member<'a>(&'a self, user_id: &'a UserId) -> BoxFuture<'a, bool> {
+            Box::pin(async {
+                self.users.lock().unwrap().get(user_id).map(|m| m.is_member).unwrap_or(false)
+            })
         }
 
-        async fn member_identities(&self) -> Vec<UserIdentity> {
-            self.users
-                .lock()
-                .unwrap()
-                .values()
-                .filter_map(|m| if m.is_member { Some(m.user_identity.clone()) } else { None })
-                .collect()
+        fn member_identities(&self) -> BoxFuture<'_, Vec<UserIdentity>> {
+            Box::pin(async {
+                self.users
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter_map(|m| if m.is_member { Some(m.user_identity.clone()) } else { None })
+                    .collect()
+            })
         }
 
-        async fn user_identity(&self, user_id: &UserId) -> Option<UserIdentity> {
-            self.users.lock().unwrap().get(user_id).map(|m| m.user_identity.clone())
+        fn user_identity<'a>(&'a self, user_id: &'a UserId) -> BoxFuture<'a, Option<UserIdentity>> {
+            Box::pin(async {
+                self.users.lock().unwrap().get(user_id).map(|m| m.user_identity.clone())
+            })
         }
 
         fn state_of(&self, user_identity: &UserIdentity) -> IdentityState {

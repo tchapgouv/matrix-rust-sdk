@@ -1,33 +1,24 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use matrix_sdk::{
-    config::SyncSettings, test_utils::logged_in_client_with_server, utils::IntoRawStateEventContent,
-};
+use matrix_sdk::test_utils::mocks::MatrixMockServer;
 use matrix_sdk_base::{
     store::StoreConfig, BaseClient, RoomInfo, RoomState, SessionMeta, StateChanges, StateStore,
 };
 use matrix_sdk_sqlite::SqliteStateStore;
-use matrix_sdk_test::{
-    event_factory::EventFactory, EventBuilder, JoinedRoomBuilder, StateTestEvent,
-    SyncResponseBuilder,
-};
+use matrix_sdk_test::{event_factory::EventFactory, JoinedRoomBuilder, StateTestEvent};
 use matrix_sdk_ui::{timeline::TimelineFocus, Timeline};
 use ruma::{
     api::client::membership::get_member_events,
     device_id,
-    events::room::member::{RoomMemberEvent, RoomMemberEventContent},
-    owned_room_id, owned_user_id,
+    events::room::member::{MembershipState, RoomMemberEvent},
+    mxc_uri, owned_room_id, owned_user_id,
     serde::Raw,
     user_id, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId,
 };
-use serde::Serialize;
 use serde_json::json;
 use tokio::runtime::Builder;
-use wiremock::{
-    matchers::{header, method, path, path_regex, query_param, query_param_is_missing},
-    Mock, MockServer, Request, ResponseTemplate,
-};
+use wiremock::{Request, ResponseTemplate};
 
 pub fn receive_all_members_benchmark(c: &mut Criterion) {
     const MEMBERS_IN_ROOM: usize = 100000;
@@ -35,28 +26,17 @@ pub fn receive_all_members_benchmark(c: &mut Criterion) {
     let runtime = Builder::new_multi_thread().build().expect("Can't create runtime");
     let room_id = owned_room_id!("!room:example.com");
 
-    let ev_builder = EventBuilder::new();
+    let f = EventFactory::new().room(&room_id);
     let mut member_events: Vec<Raw<RoomMemberEvent>> = Vec::with_capacity(MEMBERS_IN_ROOM);
-    let member_content_json = json!({
-        "avatar_url": "mxc://example.org/SEsfnsuifSDFSSEF",
-        "displayname": "Alice Margatroid",
-        "membership": "join",
-        "reason": "Looking for support",
-    });
-    let member_content: Raw<RoomMemberEventContent> =
-        member_content_json.into_raw_state_event_content().cast();
     for i in 0..MEMBERS_IN_ROOM {
         let user_id = OwnedUserId::try_from(format!("@user_{}:matrix.org", i)).unwrap();
-        let state_key = user_id.to_string();
-        let event: Raw<RoomMemberEvent> = ev_builder
-            .make_state_event(
-                &user_id,
-                &room_id,
-                &state_key,
-                member_content.deserialize().unwrap(),
-                None,
-            )
-            .cast();
+        let event = f
+            .member(&user_id)
+            .membership(MembershipState::Join)
+            .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
+            .display_name("Alice Margatroid")
+            .reason("Looking for support")
+            .into_raw();
         member_events.push(event);
     }
 
@@ -123,9 +103,7 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
     let sender_id = owned_user_id!("@sender:example.com");
 
     let f = EventFactory::new().room(&room_id).sender(&sender_id);
-    let (client, server) = runtime.block_on(logged_in_client_with_server());
 
-    let mut sync_response_builder = SyncResponseBuilder::new();
     let mut joined_room_builder =
         JoinedRoomBuilder::new(&room_id).add_state_event(StateTestEvent::Encryption);
 
@@ -147,17 +125,15 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
             }
         }
     )));
-    let response_json =
-        sync_response_builder.add_joined_room(joined_room_builder).build_json_sync_response();
-    runtime.block_on(mock_sync(&server, response_json, None));
 
-    let sync_settings = SyncSettings::default();
-    runtime.block_on(client.sync_once(sync_settings)).expect("Could not sync");
-    runtime.block_on(server.reset());
+    let (server, client, room) = runtime.block_on(async move {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
 
-    runtime.block_on(
-        Mock::given(method("GET"))
-            .and(path_regex(r"/_matrix/client/r0/rooms/.*/event/.*"))
+        let room = server.sync_room(&client, joined_room_builder).await;
+
+        server
+            .mock_room_event()
             .respond_with(move |r: &Request| {
                 let segments: Vec<&str> = r.url.path_segments().expect("Invalid path").collect();
                 let event_id_str = segments[6];
@@ -171,10 +147,14 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
                     .set_delay(Duration::from_millis(50))
                     .set_body_json(event.json())
             })
-            .mount(&server),
-    );
+            .mount()
+            .await;
 
-    let room = client.get_room(&room_id).expect("Room not found");
+        client.event_cache().subscribe().unwrap();
+
+        (server, client, room)
+    });
+
     let pinned_event_ids = room.pinned_event_ids().unwrap_or_default();
     assert!(!pinned_event_ids.is_empty());
     assert_eq!(pinned_event_ids.len(), PINNED_EVENTS_COUNT);
@@ -184,15 +164,6 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("Test");
     group.throughput(Throughput::Elements(count as u64));
     group.sample_size(10);
-
-    let client = Arc::new(client);
-
-    {
-        let client = client.clone();
-        runtime.spawn_blocking(move || {
-            client.event_cache().subscribe().unwrap();
-        });
-    }
 
     group.bench_function(BenchmarkId::new("load_pinned_events", name), |b| {
         b.to_async(&runtime).iter(|| async {
@@ -220,40 +191,25 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
 
     {
         let _guard = runtime.enter();
-        runtime.block_on(server.reset());
         drop(server);
     }
 
     group.finish();
 }
 
-async fn mock_sync(server: &MockServer, response_body: impl Serialize, since: Option<String>) {
-    let mut mock_builder = Mock::given(method("GET"))
-        .and(path("/_matrix/client/r0/sync"))
-        .and(header("authorization", "Bearer 1234"));
-
-    if let Some(since) = since {
-        mock_builder = mock_builder.and(query_param("since", since));
-    } else {
-        mock_builder = mock_builder.and(query_param_is_missing("since"));
-    }
-
-    mock_builder
-        .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
-        .mount(server)
-        .await;
-}
-
 fn criterion() -> Criterion {
     #[cfg(target_os = "linux")]
-    let criterion = Criterion::default().with_profiler(pprof::criterion::PProfProfiler::new(
-        100,
-        pprof::criterion::Output::Flamegraph(None),
-    ));
-    #[cfg(not(target_os = "linux"))]
-    let criterion = Criterion::default();
+    {
+        Criterion::default().with_profiler(pprof::criterion::PProfProfiler::new(
+            100,
+            pprof::criterion::Output::Flamegraph(None),
+        ))
+    }
 
-    criterion
+    #[cfg(not(target_os = "linux"))]
+    {
+        Criterion::default()
+    }
 }
 
 criterion_group! {

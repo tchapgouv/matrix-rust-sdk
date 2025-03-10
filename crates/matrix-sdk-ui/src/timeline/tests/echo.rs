@@ -18,19 +18,19 @@ use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
 use matrix_sdk::{assert_next_matches_with_timeout, send_queue::RoomSendQueueUpdate};
 use matrix_sdk_base::store::QueueWedgeError;
-use matrix_sdk_test::{async_test, event_factory::EventFactory, ALICE, BOB};
+use matrix_sdk_test::{async_test, ALICE, BOB};
 use ruma::{
     event_id,
     events::{room::message::RoomMessageEventContent, AnyMessageLikeEventContent},
     user_id, MilliSecondsSinceUnixEpoch,
 };
-use stream_assert::assert_next_matches;
+use stream_assert::{assert_next_matches, assert_pending};
 
 use super::TestTimeline;
 use crate::timeline::{
     controller::TimelineSettings,
     event_item::{EventSendState, RemoteEventOrigin},
-    tests::TestRoomDataProvider,
+    tests::{TestRoomDataProvider, TestTimelineBuilder},
 };
 
 #[async_test]
@@ -56,9 +56,9 @@ async fn test_remote_echo_full_trip() {
     };
 
     {
-        // The day divider comes in late.
-        let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
-        assert!(day_divider.is_day_divider());
+        // The date divider comes in late.
+        let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+        assert!(date_divider.is_date_divider());
     }
 
     // Scenario 2: The local event has not been sent to the server successfully, it
@@ -121,9 +121,18 @@ async fn test_remote_echo_full_trip() {
         .await;
 
     // The local echo is replaced with the remote echo.
-    let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
+    assert_next_matches!(stream, VectorDiff::Remove { index: 1 });
+    let item = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
     assert!(!item.as_event().unwrap().is_local_echo());
     assert_eq!(*item.unique_id(), id);
+
+    // The date divider is adjusted.
+    // A new date divider is inserted, and the older one is removed.
+    let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(date_divider.is_date_divider());
+    assert_next_matches!(stream, VectorDiff::Remove { index: 2 });
+
+    assert_pending!(stream);
 }
 
 #[async_test]
@@ -143,8 +152,8 @@ async fn test_remote_echo_new_position() {
     let txn_id_from_event = item.as_event().unwrap();
     assert_eq!(txn_id, txn_id_from_event.transaction_id().unwrap());
 
-    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
-    assert!(day_divider.is_day_divider());
+    let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(date_divider.is_date_divider());
 
     // … and another event that comes back before the remote echo
     timeline.handle_live_event(f.text_msg("test").sender(&BOB)).await;
@@ -153,8 +162,8 @@ async fn test_remote_echo_new_position() {
     let bob_message = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
     assert!(bob_message.is_remote_event());
 
-    let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
-    assert!(day_divider.is_day_divider());
+    let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(date_divider.is_date_divider());
 
     // When the remote echo comes in…
     timeline
@@ -168,52 +177,18 @@ async fn test_remote_echo_new_position() {
         .await;
 
     // … the remote echo replaces the previous event.
-    let item = assert_next_matches!(stream, VectorDiff::Set { index: 3, value } => value);
+    assert_next_matches!(stream, VectorDiff::Remove { index: 3 });
+    let item = assert_next_matches!(stream, VectorDiff::Insert { index: 2, value} => value);
     assert!(!item.as_event().unwrap().is_local_echo());
 
-    // … the day divider is removed (because both bob's and alice's message are from
-    // the same day according to server timestamps).
-    assert_next_matches!(stream, VectorDiff::Remove { index: 2 });
+    // Date divider is updated.
+    assert_next_matches!(stream, VectorDiff::Remove { index: 3 });
+
+    assert_pending!(stream);
 }
 
 #[async_test]
-async fn test_day_divider_duplication() {
-    let timeline = TestTimeline::new();
-
-    // Given two remote events from one day, and a local event from another day…
-    let f = EventFactory::new().sender(&BOB);
-    timeline.handle_live_event(f.text_msg("A")).await;
-    timeline.handle_live_event(f.text_msg("B")).await;
-    timeline
-        .handle_local_event(AnyMessageLikeEventContent::RoomMessage(
-            RoomMessageEventContent::text_plain("C"),
-        ))
-        .await;
-
-    let items = timeline.controller.items().await;
-    assert_eq!(items.len(), 5);
-    assert!(items[0].is_day_divider());
-    assert!(items[1].is_remote_event());
-    assert!(items[2].is_remote_event());
-    assert!(items[3].is_day_divider());
-    assert!(items[4].is_local_echo());
-
-    // … when the second remote event is re-received (day still the same)
-    let event_id = items[2].as_event().unwrap().event_id().unwrap();
-    timeline.handle_live_event(f.text_msg("B").event_id(event_id).server_ts(1)).await;
-
-    // … it should not impact the day dividers.
-    let items = timeline.controller.items().await;
-    assert_eq!(items.len(), 5);
-    assert!(items[0].is_day_divider());
-    assert!(items[1].is_remote_event());
-    assert!(items[2].is_remote_event());
-    assert!(items[3].is_day_divider());
-    assert!(items[4].is_local_echo());
-}
-
-#[async_test]
-async fn test_day_divider_removed_after_local_echo_disappeared() {
+async fn test_date_divider_removed_after_local_echo_disappeared() {
     let timeline = TestTimeline::new();
 
     let f = &timeline.factory;
@@ -225,7 +200,7 @@ async fn test_day_divider_removed_after_local_echo_disappeared() {
     let items = timeline.controller.items().await;
 
     assert_eq!(items.len(), 2);
-    assert!(items[0].is_day_divider());
+    assert!(items[0].is_date_divider());
     assert!(items[1].is_remote_event());
 
     // Add a local echo.
@@ -237,9 +212,9 @@ async fn test_day_divider_removed_after_local_echo_disappeared() {
     let items = timeline.controller.items().await;
 
     assert_eq!(items.len(), 4);
-    assert!(items[0].is_day_divider());
+    assert!(items[0].is_date_divider());
     assert!(items[1].is_remote_event());
-    assert!(items[2].is_day_divider());
+    assert!(items[2].is_date_divider());
     assert!(items[3].is_local_echo());
 
     // Cancel the local echo.
@@ -252,7 +227,7 @@ async fn test_day_divider_removed_after_local_echo_disappeared() {
     let items = timeline.controller.items().await;
 
     assert_eq!(items.len(), 2);
-    assert!(items[0].is_day_divider());
+    assert!(items[0].is_date_divider());
     assert!(items[1].is_remote_event());
 }
 
@@ -260,10 +235,10 @@ async fn test_day_divider_removed_after_local_echo_disappeared() {
 async fn test_no_read_marker_with_local_echo() {
     let event_id = event_id!("$1");
 
-    let timeline = TestTimeline::with_room_data_provider(
-        TestRoomDataProvider::default().with_fully_read_marker(event_id.to_owned()),
-    )
-    .with_settings(TimelineSettings { track_read_receipts: true, ..Default::default() });
+    let timeline = TestTimelineBuilder::new()
+        .provider(TestRoomDataProvider::default().with_fully_read_marker(event_id.to_owned()))
+        .settings(TimelineSettings { track_read_receipts: true, ..Default::default() })
+        .build();
 
     let f = &timeline.factory;
 
@@ -276,7 +251,7 @@ async fn test_no_read_marker_with_local_echo() {
                 .sender(user_id!("@a:b.c"))
                 .event_id(event_id)
                 .server_ts(MilliSecondsSinceUnixEpoch::now())
-                .into_sync()]
+                .into_event()]
             .into_iter(),
             RemoteEventOrigin::Sync,
         )
@@ -285,7 +260,7 @@ async fn test_no_read_marker_with_local_echo() {
     let items = timeline.controller.items().await;
 
     assert_eq!(items.len(), 2);
-    assert!(items[0].is_day_divider());
+    assert!(items[0].is_date_divider());
     assert!(items[1].is_remote_event());
 
     // Add a local echo.
@@ -297,7 +272,7 @@ async fn test_no_read_marker_with_local_echo() {
     let items = timeline.controller.items().await;
 
     assert_eq!(items.len(), 3);
-    assert!(items[0].is_day_divider());
+    assert!(items[0].is_date_divider());
     assert!(items[1].is_remote_event());
     assert!(items[2].is_local_echo());
 
@@ -311,7 +286,7 @@ async fn test_no_read_marker_with_local_echo() {
     let items = timeline.controller.items().await;
 
     assert_eq!(items.len(), 2);
-    assert!(items[0].is_day_divider());
+    assert!(items[0].is_date_divider());
     assert!(items[1].is_remote_event());
 }
 
@@ -339,10 +314,10 @@ async fn test_no_reuse_of_counters() {
         item.unique_id().to_owned()
     });
 
-    // The day divider comes in late.
-    // Timeline = [day-divider local]
+    // The date divider comes in late.
+    // Timeline = [date-divider local]
     assert_next_matches_with_timeout!(stream, VectorDiff::PushFront { value } => {
-        assert!(value.is_day_divider());
+        assert!(value.is_date_divider());
     });
 
     // Add a remote event now.
@@ -357,19 +332,19 @@ async fn test_no_reuse_of_counters() {
         )
         .await;
 
-    // Timeline = [remote day-divider local]
+    // Timeline = [remote date-divider local]
     assert_next_matches_with_timeout!(stream, VectorDiff::PushFront { value: item } => {
         assert!(!item.as_event().unwrap().is_local_echo());
         // Both items have a different unique id.
         assert_ne!(local_id, item.unique_id().to_owned());
     });
 
-    // Day divider shenanigans.
-    // Timeline = [day-divider remote day-divider local]
+    // Date divider shenanigans.
+    // Timeline = [date-divider remote date-divider local]
     assert_next_matches_with_timeout!(stream, VectorDiff::PushFront { value } => {
-        assert!(value.is_day_divider());
+        assert!(value.is_date_divider());
     });
-    // Timeline = [day-divider remote local]
+    // Timeline = [date-divider remote local]
     assert_next_matches_with_timeout!(stream, VectorDiff::Remove { index: 2 });
 
     // When clearing the timeline, the local echo remains.

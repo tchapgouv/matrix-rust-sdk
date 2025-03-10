@@ -254,7 +254,7 @@ impl Encryption {
     /// Therefore it is necessary to poll the server for an answer every time
     /// you want to differentiate between those two states.
     pub async fn backup_exists_on_server(&self) -> Result<bool, ClientError> {
-        Ok(self.inner.backups().exists_on_server().await?)
+        Ok(self.inner.backups().fetch_exists_on_server().await?)
     }
 
     pub fn recovery_state(&self) -> RecoveryState {
@@ -281,7 +281,7 @@ impl Encryption {
     }
 
     pub async fn is_last_device(&self) -> Result<bool> {
-        Ok(self.inner.recovery().are_we_the_last_man_standing().await?)
+        Ok(self.inner.recovery().is_last_device().await?)
     }
 
     pub async fn wait_for_backup_upload_steady_state(
@@ -494,6 +494,28 @@ impl UserIdentity {
     /// be verified as well for the identity to be considered to be verified.
     pub fn is_verified(&self) -> bool {
         self.inner.is_verified()
+    }
+
+    /// True if we verified this identity at some point in the past.
+    ///
+    /// To reset this latch back to `false`, one must call
+    /// [`UserIdentity::withdraw_verification()`].
+    pub fn was_previously_verified(&self) -> bool {
+        self.inner.was_previously_verified()
+    }
+
+    /// Remove the requirement for this identity to be verified.
+    ///
+    /// If an identity was previously verified and is not anymore it will be
+    /// reported to the user. In order to remove this notice users have to
+    /// verify again or to withdraw the verification requirement.
+    pub(crate) async fn withdraw_verification(&self) -> Result<(), ClientError> {
+        Ok(self.inner.withdraw_verification().await?)
+    }
+
+    /// Was this identity previously verified, and is no longer?
+    pub fn has_verification_violation(&self) -> bool {
+        self.inner.has_verification_violation()
     }
 }
 
