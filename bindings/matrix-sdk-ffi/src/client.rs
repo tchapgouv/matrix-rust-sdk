@@ -15,6 +15,7 @@ use matrix_sdk::{
         MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequestParameters,
         MediaRetentionPolicy, MediaThumbnailSettings,
     },
+    room::access_rules::{AccessRule, RoomAccessRulesEventContent},
     ruma::{
         api::client::{
             discovery::get_authorization_server_metadata::msc2965::Prompt as RumaOidcPrompt,
@@ -1404,6 +1405,8 @@ impl From<PowerLevels> for RoomPowerLevelsEventContent {
 
 #[derive(uniffi::Record)]
 pub struct CreateRoomParameters {
+    #[uniffi(default = None)]
+    pub access_rules_override: Option<AccessRule>,
     pub name: Option<String>,
     #[uniffi(default = None)]
     pub topic: Option<String>,
@@ -1452,6 +1455,11 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
         };
 
         let mut initial_state: Vec<Raw<AnyInitialStateEvent>> = vec![];
+
+        if let Some(access_rules_override) = value.access_rules_override {
+            let content = RoomAccessRulesEventContent::new(access_rules_override);
+            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+        }
 
         if value.is_encrypted {
             let content =

@@ -391,7 +391,7 @@ pub enum OtherState {
     RoomTopic { topic: Option<String> },
     SpaceChild,
     SpaceParent,
-    Custom { event_type: String },
+    Custom { event_type: String, event_value: String },
 }
 
 impl From<&matrix_sdk_ui::timeline::AnyOtherFullStateEventContent> for OtherState {
@@ -459,7 +459,9 @@ impl From<&matrix_sdk_ui::timeline::AnyOtherFullStateEventContent> for OtherStat
             }
             Content::SpaceChild(_) => Self::SpaceChild,
             Content::SpaceParent(_) => Self::SpaceParent,
-            Content::_Custom { event_type, .. } => Self::Custom { event_type: event_type.clone() },
+            Content::_Custom { event_type, event_value, .. } => {
+                Self::Custom { event_type: event_type.clone(), event_value: event_value.clone() }
+            }
         }
     }
 }

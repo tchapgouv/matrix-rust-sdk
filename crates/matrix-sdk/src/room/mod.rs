@@ -22,6 +22,7 @@ use std::{
     time::Duration,
 };
 
+use access_rules::{AccessRule, RoomAccessRulesEventContent};
 use async_stream::stream;
 use eyeball::SharedObservable;
 use futures_core::Stream;
@@ -169,6 +170,8 @@ pub mod power_levels;
 
 /// Contains all the functionality for modifying the privacy settings in a room.
 pub mod privacy_settings;
+
+pub mod access_rules;
 
 /// A struct containing methods that are common for Joined, Invited and Left
 /// Rooms
@@ -2302,6 +2305,74 @@ impl Room {
         user_power_levels
     }
 
+    /// Sets the access rules for this room.
+    pub async fn set_access_rules(
+        &self,
+        access_rule: AccessRule,
+    ) -> Result<send_state_event::v3::Response> {
+        self.send_state_event(RoomAccessRulesEventContent::new(access_rule)).await
+    }
+
+    /// Get the access rules for this room.
+    pub fn get_access_rules(&self) -> Result<AccessRule, Error> {
+        Err(Error::InsufficientData)
+        /*
+        let t = self
+            .store
+            .get_state_event_static::<RoomAccessRulesEventContent>(self.room_id())
+            .await?
+            .ok_or(Error::InsufficientData)?
+            .deserialize()?;
+
+            match t {
+                SyncOrStrippedState::Sync(SyncStateEvent::Original(e)) => {
+                    return Ok(e.content.access_rule.clone());
+                },
+                SyncOrStrippedState::Sync(SyncStateEvent::Redacted(e)) => {
+                    return Err(Error::InsufficientData);
+                },
+                SyncOrStrippedState::Stripped(e) => {
+                    return Err(Error::InsufficientData);
+                },
+            }
+            */
+
+        /*
+        self
+            .get_state_event_static::<RoomAccessRulesEventContent>()
+            .await?
+            .ok_or(Error::AuthenticationRequired)?
+            .deserialize()?
+            .access_rules()
+            .ok_or(Error::InsufficientData)
+            */
+
+        // Err(Error::InsufficientData)
+    }
+
+    /// Load pinned state events for a room from the `/state` endpoint in the
+    /// home server.
+    pub async fn load_access_rules(&self) -> Result<Option<AccessRule>> {
+        let response = self
+            .client
+            .send(get_state_events_for_key::v3::Request::new(
+                self.room_id().to_owned(),
+                StateEventType::RoomJoinRules,
+                "".to_owned(),
+            ))
+            .await;
+
+        match response {
+            Ok(response) => Ok(Some(
+                response.content.deserialize_as::<RoomAccessRulesEventContent>()?.access_rule,
+            )),
+            Err(http_error) => match http_error.as_client_api_error() {
+                Some(error) if error.status_code == StatusCode::NOT_FOUND => Ok(None),
+                _ => Err(http_error.into()),
+            },
+        }
+    }
+
     /// Sets the name of this room.
     pub async fn set_name(&self, name: String) -> Result<send_state_event::v3::Response> {
         self.send_state_event(RoomNameEventContent::new(name)).await
@@ -3771,6 +3842,7 @@ mod tests {
     use super::ReportedContentScore;
     use crate::{
         config::RequestConfig,
+        room::AccessRule,
         test_utils::{client::mock_matrix_session, logged_in_client, mocks::MatrixMockServer},
         Client,
     };
@@ -4098,5 +4170,46 @@ mod tests {
         // And also the sender info from the /members endpoint
         assert!(sender.is_some());
         assert_eq!(sender.unwrap().event().user_id(), sender_id);
+    }
+
+    #[async_test]
+    async fn test_own_room_access_rules() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!a:b.c");
+        let sender_id = user_id!("@alice:b.c");
+        let user_id = user_id!("@example:localhost");
+
+        let f = EventFactory::new().room(room_id).sender(sender_id);
+        let joined_room_builder = JoinedRoomBuilder::new(room_id)
+            .add_state_bulk(vec![f.member(user_id).into_raw_sync().cast()]);
+        let room = server.sync_room(&client, joined_room_builder).await;
+
+        let set_access_rules_result = room.set_access_rules(AccessRule::Restricted).await;
+        println!("Hello");
+        assert!(set_access_rules_result.is_err(), "set_access_rules_result is an Err!");
+
+        // let get_access_rules_result = room.get_access_rules().await;
+
+        // assert!(!get_access_rules_result.is_err());
+
+        // // We'll receive the member info through the /members endpoint
+        // server
+        //     .mock_get_members()
+        //     .ok(vec![f.member(sender_id).into_raw_timeline().cast()])
+        //     .mock_once()
+        //     .mount()
+        //     .await;
+
+        // // We get the current user's member info
+        // let ret = room.own_membership_details().await;
+        // assert_matches!(ret, Ok((member, sender)));
+
+        // // We get the current user's member info
+        // assert_eq!(member.event().user_id(), user_id);
+
+        // // And also the sender info from the /members endpoint
+        // assert!(sender.is_some());
+        // assert_eq!(sender.unwrap().event().user_id(), sender_id);
     }
 }
