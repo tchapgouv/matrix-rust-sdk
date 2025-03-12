@@ -19,7 +19,6 @@ use matrix_sdk::{
         MediaRetentionPolicy, MediaThumbnailSettings,
     },
     room::access_rules::{AccessRule, RoomAccessRulesEventContent},
-    reqwest::StatusCode,
     ruma::{
         api::client::{
             push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},

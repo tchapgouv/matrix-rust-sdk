@@ -1,15 +1,9 @@
 //! Types for the [`im.vector.room.access_rules`] event.
-//!
-//!
-//! 
 
 use ruma::events::{macros::EventContent, EmptyStateKey};
-use serde::{
-    Deserialize, Serialize,
-};
+use serde::{Deserialize, Serialize};
 
 /// The rule used for Tchap external users wishing to join this room.
-///
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 //#[cfg_attr(not(ruma_unstable_exhaustive_types), non_exhaustive)]
@@ -18,8 +12,8 @@ pub enum AccessRule {
     /// For Direct message, a room between only 2 users.
     Direct,
 
-    /// A external user who wishes to join the room must first receive an invite to the room from someone
-    /// already inside of the room.
+    /// A external user who wishes to join the room must first receive an invite
+    /// to the room from someone already inside of the room.
     Restricted,
 
     /// External users can join the room if they are invited.
@@ -28,7 +22,7 @@ pub enum AccessRule {
     Unrestricted,
 }
 
-impl AccessRule { }
+impl AccessRule {}
 
 /// The content of an `im.vector.room.access_rules` event.
 ///
@@ -50,24 +44,26 @@ impl RoomAccessRulesEventContent {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use assert_matches2::assert_matches;
 
-    use super::{
-        AccessRule, RoomAccessRulesEventContent,
-    };
+    use super::{AccessRule, RoomAccessRulesEventContent};
 
     #[test]
     fn unrestricted_access_rule_room() {
-        // let a = RoomAccessRulesEventContent { access_rule: AccessRule::Unrestricted };
-        // println!("RoomAccessRulesEventContent: {}", serde_json::to_string(&a).unwrap_or("???".to_owned()));
+        // let a = RoomAccessRulesEventContent { access_rule: AccessRule::Unrestricted
+        // }; println!("RoomAccessRulesEventContent: {}",
+        // serde_json::to_string(&a).unwrap_or("???".to_owned()));
         // let a = AccessRule::Unrestricted;
-        // println!("AccessRule: {}", serde_json::to_string(&a).unwrap_or("???".to_owned()));
+        // println!("AccessRule: {}",
+        // serde_json::to_string(&a).unwrap_or("???".to_owned()));
         let json = r#"{"rule":"unrestricted"}"#;
         let event: RoomAccessRulesEventContent = serde_json::from_str(json).unwrap();
-        assert_matches!(event, RoomAccessRulesEventContent { access_rule: AccessRule::Unrestricted });
+        assert_matches!(
+            event,
+            RoomAccessRulesEventContent { access_rule: AccessRule::Unrestricted }
+        );
     }
 
     #[test]
