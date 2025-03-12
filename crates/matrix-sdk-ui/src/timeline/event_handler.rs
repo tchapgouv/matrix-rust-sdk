@@ -248,10 +248,33 @@ impl TimelineEventKind {
                         sender: ev.sender,
                     },
                 },
-                ev => Self::OtherState {
-                    state_key: ev.state_key().to_owned(),
-                    content: AnyOtherFullStateEventContent::with_event_content(ev.content()),
-                },
+                ev => {
+                    let ev_content = ev.content();
+                    let event_type_str = ev_content.event_type().to_string();
+                    match event_type_str.as_str() {
+                        "im.vector.room.access_rules" => {
+                            // let t: StateEventContent<RoomAccessRulesEventContent> = ev.into();
+                            // let src_event: RoomAccessRulesEventContent = ev.into();
+                            debug!("im.vector.room.access_rules - ev: {:?}", ev);
+
+                            debug!("im.vector.room.access_rules - ev_content: {:?}", ev_content);
+
+                            Self::OtherState {
+                                state_key: ev.state_key().to_owned(),
+                                content: AnyOtherFullStateEventContent::with_event_content(
+                                    ev_content,
+                                    Some("my-own-value".to_owned()),
+                                ),
+                            }
+                        }
+                        _ => Self::OtherState {
+                            state_key: ev.state_key().to_owned(),
+                            content: AnyOtherFullStateEventContent::with_event_content(
+                                ev_content, None,
+                            ),
+                        },
+                    }
+                }
             },
         }
     }
