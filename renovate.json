@@ -1,4 +1,18 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["local>bwmessenger/gitlab-pipelines//renovate/app"]
+  "extends": [
+    "local>platform42common/ci-cd/swe-pipeline-templates//renovate/app"
+  ],
+  "packageRules": [
+    {
+      "groupName": "all patch dependencies",
+      "groupSlug": "all-patch",
+      "matchPackageNames": [
+        "*"
+      ],
+      "matchUpdateTypes": [
+        "patch"
+      ]
+    }
+  ]
 }
