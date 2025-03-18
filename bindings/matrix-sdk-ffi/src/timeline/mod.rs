@@ -82,6 +82,7 @@ mod content;
 pub use content::MessageContent;
 use matrix_sdk::utils::formatted_body_from;
 
+use crate::client::BWIScanState;
 use crate::error::QueueWedgeError;
 
 #[derive(uniffi::Object)]
@@ -935,6 +936,13 @@ impl TimelineItem {
         match self.0.as_virtual()? {
             VItem::DateDivider(ts) => Some(VirtualTimelineItem::DateDivider { ts: (*ts).into() }),
             VItem::ReadMarker => Some(VirtualTimelineItem::ReadMarker),
+            // BWI-specific
+            VItem::ScanStateChanged(event_id, new_scan_state) => {
+                Some(VirtualTimelineItem::ScanStateChanged {
+                    event_id: event_id.0.clone(),
+                    new_scan_state: BWIScanState::from(new_scan_state.clone()),
+                })
+            } // end BWI-specific
         }
     }
 
@@ -1215,6 +1223,13 @@ pub enum VirtualTimelineItem {
 
     /// The user's own read marker.
     ReadMarker,
+
+        // BWI-specific
+        ScanStateChanged {
+            event_id: String,
+            new_scan_state: BWIScanState,
+        },
+        // end BWI-specific    
 }
 
 /// A [`TimelineItem`](super::TimelineItem) that doesn't correspond to an event.

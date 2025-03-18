@@ -656,6 +656,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79296716171880943b8470b5f8d03aa55eb2e645a4874bdbb28adb49162e012c"
 
 [[package]]
+name = "bwi-example"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "eyeball-im 0.5.1",
+ "futures-util",
+ "log",
+ "matrix-sdk",
+ "matrix-sdk-ui",
+ "mime",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "bytemuck"
 version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3211,6 +3229,7 @@ dependencies = [
  "language-tags",
  "mas-oidc-client",
  "matrix-sdk-base",
+ "matrix-sdk-bwi",
  "matrix-sdk-common",
  "matrix-sdk-ffi-macros",
  "matrix-sdk-indexeddb",
@@ -3286,6 +3305,45 @@ dependencies = [
  "unicode-normalization",
  "uniffi",
  "wasm-bindgen-test",
+]
+
+[[package]]
+name = "matrix-sdk-base-bwi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "jsonwebtoken",
+ "log",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.11",
+ "tokio",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "matrix-sdk-bwi"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "http",
+ "matrix-sdk-base",
+ "matrix-sdk-base-bwi",
+ "reqwest",
+ "ruma-common",
+ "rusty-hook",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.11",
+ "tokio",
+ "tracing",
+ "url",
+ "wiremock",
+ "zxcvbn",
 ]
 
 [[package]]
@@ -3413,6 +3471,7 @@ dependencies = [
  "language-tags",
  "log-panics",
  "matrix-sdk",
+ "matrix-sdk-base-bwi",
  "matrix-sdk-ffi-macros",
  "matrix-sdk-ui",
  "mime",
@@ -3628,6 +3687,8 @@ dependencies = [
  "itertools 0.14.0",
  "matrix-sdk",
  "matrix-sdk-base",
+ "matrix-sdk-base-bwi",
+ "matrix-sdk-bwi",
  "matrix-sdk-test",
  "mime",
  "once_cell",
@@ -3646,6 +3707,17 @@ dependencies = [
  "uniffi",
  "url",
  "wiremock",
+]
+
+[[package]]
+name = "media_content-scanner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "matrix-sdk",
+ "tokio",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

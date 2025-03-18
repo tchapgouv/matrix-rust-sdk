@@ -166,12 +166,18 @@ impl TimelineBuilder {
         let is_pinned_events = matches!(focus, TimelineFocus::PinnedEvents { .. });
         let is_room_encrypted = room.is_encrypted().await.ok().unwrap_or_default();
 
+        // BWI-specific
+        let client = room.client();
+        let content_scanner = client.content_scanner();
+        // end BWI-specific
+
         let controller = TimelineController::new(
             room,
             focus.clone(),
             internal_id_prefix.clone(),
             unable_to_decrypt_hook,
             is_room_encrypted,
+            content_scanner.to_owned(),
         )
         .with_settings(settings);
 

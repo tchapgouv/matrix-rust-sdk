@@ -870,6 +870,11 @@ impl App {
                     VirtualTimelineItem::ReadMarker => {
                         content.push("Read marker".to_owned());
                     }
+                    // TCHAP-specific code
+                    VirtualTimelineItem::ScanStateChanged(_, _) => {
+                        content.push("Scan state changed".to_owned());
+                    }
+                    // end TCHAP-specific code
                 },
             }
         }
