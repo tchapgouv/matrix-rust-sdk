@@ -1,18 +1,5 @@
 {
-  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "local>platform42common/ci-cd/swe-pipeline-templates//renovate/app"
-  ],
-  "packageRules": [
-    {
-      "groupName": "all patch dependencies",
-      "groupSlug": "all-patch",
-      "matchPackageNames": [
-        "*"
-      ],
-      "matchUpdateTypes": [
-        "patch"
-      ]
-    }
+  "baseBranches": [
+    "feature/7088_renovate_bot"
   ]
 }
