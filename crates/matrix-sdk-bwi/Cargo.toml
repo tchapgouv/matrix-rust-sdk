@@ -3,6 +3,7 @@ name = "matrix-sdk-bwi"
 version = "0.8.0"
 edition = "2021"
 rust-version.workspace = true
+license = "Apache-2.0"
 
 [features]
 client = [] # needed for creating ruma like requests
