@@ -197,7 +197,7 @@ impl BWIContentScanner {
         match body.clean {
             true => BWIScanState::Trusted,
             false => {
-                warn!("###BWI### inconsistent response from the content scanner. Maybe an old version of the content scanner ist used");
+                warn!("###BWI### inconsistent response from the content scanner. Maybe an old version of the content scanner is used");
                 BWIScanState::Infected
             }
         }
