@@ -77,8 +77,8 @@ mod url_helper {
 
     impl BWIUrlHelper {
         fn with_base_url_without_schema(base_url: &str) -> Result<Self, ParseError> {
-            let formated_url = format!("https://{url}", url = base_url);
-            let parsed_url = Url::parse(formated_url.as_str())?;
+            let formatted_url = format!("https://{url}", url = base_url);
+            let parsed_url = Url::parse(formatted_url.as_str())?;
             let builder = BWIUrlHelper { url: parsed_url };
             Ok(builder)
         }

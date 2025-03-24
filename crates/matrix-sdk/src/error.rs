@@ -338,7 +338,6 @@ pub enum Error {
     UserTagName(#[from] InvalidUserTagName),
 
     /// An error occurred within sliding-sync
-    #[cfg(feature = "experimental-sliding-sync")]
     #[error(transparent)]
     SlidingSync(#[from] crate::sliding_sync::Error),
 
@@ -355,7 +354,7 @@ pub enum Error {
     /// An error occurred interacting with the OpenID Connect API.
     #[cfg(feature = "experimental-oidc")]
     #[error(transparent)]
-    Oidc(#[from] crate::oidc::OidcError),
+    Oidc(#[from] crate::authentication::oidc::OidcError),
 
     /// A concurrent request to a deduplicated request has failed.
     #[error("a concurrent request failed; see logs for details")]
@@ -383,6 +382,21 @@ pub enum Error {
     /// An error happened during handling of a media subrequest.
     #[error(transparent)]
     Media(#[from] MediaError),
+
+    // BWI-specific
+    /// The attachment could not be sent because it exceeded the maximal size allowed by the server.
+    #[error("Attachment exceeded the maximal allowed size")]
+    AttachmentSizeExceededMaxSize,
+
+    /// The attachment could not be sent because it exceeded the maximal size allowed by the server.
+    #[error("Attachment provides no size")]
+    AttachmentSizeNotDefined,
+
+    /// Error indicating that a specific error was raised
+    /// Used as a workaround as we don't want to extend the Error Enum each time something new happens
+    #[error("bwi specific error: {0}")]
+    BWIError(Box<dyn std::error::Error + Send + Sync>),
+    // end BWI-specific
 }
 
 #[rustfmt::skip] // stop rustfmt breaking the `<code>` in docs across multiple lines
@@ -562,7 +576,7 @@ pub enum RefreshTokenError {
     /// An error occurred interacting with the OpenID Connect API.
     #[cfg(feature = "experimental-oidc")]
     #[error(transparent)]
-    Oidc(#[from] Arc<crate::oidc::OidcError>),
+    Oidc(#[from] Arc<crate::authentication::oidc::OidcError>),
 }
 
 /// Errors that can occur when manipulating push notification settings.

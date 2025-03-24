@@ -18,6 +18,7 @@ use anyhow::Result;
 use assert_matches::assert_matches;
 use futures_util::{pin_mut, FutureExt, StreamExt};
 use matrix_sdk::{
+    authentication::matrix::{MatrixSession, MatrixSessionTokens},
     config::RequestConfig,
     crypto::{
         olm::{InboundGroupSession, SenderData, SessionCreationError},
@@ -29,7 +30,6 @@ use matrix_sdk::{
         secret_storage::SecretStore,
         BackupDownloadStrategy, EncryptionSettings,
     },
-    matrix_auth::{MatrixSession, MatrixSessionTokens},
     test_utils::{no_retry_test_client_with_server, test_client_builder_with_server},
     Client,
 };
@@ -721,7 +721,6 @@ async fn test_incremental_upload_of_keys() -> Result<()> {
 }
 
 #[async_test]
-#[cfg(feature = "experimental-sliding-sync")]
 async fn test_incremental_upload_of_keys_sliding_sync() -> Result<()> {
     use tokio::task::spawn_blocking;
 
@@ -1597,6 +1596,7 @@ async fn inbound_session_from_outbound_session(
         SenderData::unknown(),
         EventEncryptionAlgorithm::MegolmV1AesSha2,
         None,
+        false,
     )
 }
 

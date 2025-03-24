@@ -1,4 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["local>bwmessenger/gitlab-pipelines//renovate/app"]
+  "baseBranches": [
+    "feature/7088_renovate_bot"
+  ],
+  "useBaseBranchConfig": "merge"
 }

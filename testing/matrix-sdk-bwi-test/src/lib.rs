@@ -15,3 +15,5 @@
  */
 
 pub mod jwt_token;
+pub mod media;
+pub mod wiremock_ext;

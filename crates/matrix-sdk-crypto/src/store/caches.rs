@@ -22,19 +22,17 @@ use std::{
     fmt::Display,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, RwLock as StdRwLock, Weak,
+        Arc, Weak,
     },
 };
 
-use ruma::{DeviceId, OwnedDeviceId, OwnedRoomId, OwnedUserId, RoomId, UserId};
+use matrix_sdk_common::locks::RwLock as StdRwLock;
+use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{field::display, instrument, trace, Span};
 
-use crate::{
-    identities::DeviceData,
-    olm::{InboundGroupSession, Session},
-};
+use crate::{identities::DeviceData, olm::Session};
 
 /// In-memory store for Olm Sessions.
 #[derive(Debug, Default, Clone)]
@@ -85,53 +83,6 @@ impl SessionStore {
     }
 }
 
-#[derive(Debug, Default)]
-/// In-memory store that holds inbound group sessions.
-pub struct GroupSessionStore {
-    entries: StdRwLock<BTreeMap<OwnedRoomId, HashMap<String, InboundGroupSession>>>,
-}
-
-impl GroupSessionStore {
-    /// Create a new empty store.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add an inbound group session to the store.
-    ///
-    /// Returns true if the session was added, false if the session was
-    /// already in the store.
-    pub fn add(&self, session: InboundGroupSession) -> bool {
-        self.entries
-            .write()
-            .unwrap()
-            .entry(session.room_id().to_owned())
-            .or_default()
-            .insert(session.session_id().to_owned(), session)
-            .is_none()
-    }
-
-    /// Get all the group sessions the store knows about.
-    pub fn get_all(&self) -> Vec<InboundGroupSession> {
-        self.entries.read().unwrap().values().flat_map(HashMap::values).cloned().collect()
-    }
-
-    /// Get the number of `InboundGroupSession`s we have.
-    pub fn count(&self) -> usize {
-        self.entries.read().unwrap().values().map(HashMap::len).sum()
-    }
-
-    /// Get a inbound group session from our store.
-    ///
-    /// # Arguments
-    /// * `room_id` - The room id of the room that the session belongs to.
-    ///
-    /// * `session_id` - The unique id of the session.
-    pub fn get(&self, room_id: &RoomId, session_id: &str) -> Option<InboundGroupSession> {
-        self.entries.read().unwrap().get(room_id)?.get(session_id).cloned()
-    }
-}
-
 /// In-memory store holding the devices of users.
 #[derive(Debug, Default)]
 pub struct DeviceStore {
@@ -151,7 +102,6 @@ impl DeviceStore {
         let user_id = device.user_id();
         self.entries
             .write()
-            .unwrap()
             .entry(user_id.to_owned())
             .or_default()
             .insert(device.device_id().into(), device)
@@ -160,7 +110,7 @@ impl DeviceStore {
 
     /// Get the device with the given device_id and belonging to the given user.
     pub fn get(&self, user_id: &UserId, device_id: &DeviceId) -> Option<DeviceData> {
-        Some(self.entries.read().unwrap().get(user_id)?.get(device_id)?.clone())
+        Some(self.entries.read().get(user_id)?.get(device_id)?.clone())
     }
 
     /// Remove the device with the given device_id and belonging to the given
@@ -168,14 +118,13 @@ impl DeviceStore {
     ///
     /// Returns the device if it was removed, None if it wasn't in the store.
     pub fn remove(&self, user_id: &UserId, device_id: &DeviceId) -> Option<DeviceData> {
-        self.entries.write().unwrap().get_mut(user_id)?.remove(device_id)
+        self.entries.write().get_mut(user_id)?.remove(device_id)
     }
 
     /// Get a read-only view over all devices of the given user.
     pub fn user_devices(&self, user_id: &UserId) -> HashMap<OwnedDeviceId, DeviceData> {
         self.entries
             .write()
-            .unwrap()
             .entry(user_id.to_owned())
             .or_default()
             .iter()
@@ -383,13 +332,10 @@ impl UsersForKeyQuery {
 mod tests {
     use matrix_sdk_test::async_test;
     use proptest::prelude::*;
-    use ruma::room_id;
-    use vodozemac::{Curve25519PublicKey, Ed25519PublicKey};
 
-    use super::{DeviceStore, GroupSessionStore, SequenceNumber, SessionStore};
+    use super::{DeviceStore, SequenceNumber, SessionStore};
     use crate::{
-        identities::device::testing::get_device,
-        olm::{tests::get_account_and_session_test_helper, InboundGroupSession, SenderData},
+        identities::device::testing::get_device, olm::tests::get_account_and_session_test_helper,
     };
 
     #[async_test]
@@ -422,37 +368,6 @@ mod tests {
         let loaded_session = &sessions[0];
 
         assert_eq!(&session, loaded_session);
-    }
-
-    #[async_test]
-    async fn test_group_session_store() {
-        let (account, _) = get_account_and_session_test_helper();
-        let room_id = room_id!("!test:localhost");
-        let curve_key = "Nn0L2hkcCMFKqynTjyGsJbth7QrVmX3lbrksMkrGOAw";
-
-        let (outbound, _) = account.create_group_session_pair_with_defaults(room_id).await;
-
-        assert_eq!(0, outbound.message_index().await);
-        assert!(!outbound.shared());
-        outbound.mark_as_shared();
-        assert!(outbound.shared());
-
-        let inbound = InboundGroupSession::new(
-            Curve25519PublicKey::from_base64(curve_key).unwrap(),
-            Ed25519PublicKey::from_base64("ee3Ek+J2LkkPmjGPGLhMxiKnhiX//xcqaVL4RP6EypE").unwrap(),
-            room_id,
-            &outbound.session_key().await,
-            SenderData::unknown(),
-            outbound.settings().algorithm.to_owned(),
-            None,
-        )
-        .unwrap();
-
-        let store = GroupSessionStore::new();
-        store.add(inbound.clone());
-
-        let loaded_session = store.get(room_id, outbound.session_id()).unwrap();
-        assert_eq!(inbound, loaded_session);
     }
 
     #[async_test]

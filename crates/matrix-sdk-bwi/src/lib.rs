@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+pub mod attachment;
 pub mod content_scanner;
 pub mod federation;
 pub mod password_evaluator;
 pub mod regulatory;
+pub mod settings_cache;

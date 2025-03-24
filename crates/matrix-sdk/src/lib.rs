@@ -24,7 +24,7 @@ pub use bytes;
 pub use matrix_sdk_base::crypto;
 pub use matrix_sdk_base::{
     deserialized_responses,
-    store::{DynStateStore, MemoryStore, StateStoreExt},
+    store::{self, DynStateStore, MemoryStore, StateStoreExt},
     ComposerDraft, ComposerDraftType, QueueWedgeError, Room as BaseRoom,
     RoomCreateWithCreatorEventContent, RoomDisplayName, RoomHero, RoomInfo,
     RoomMember as BaseRoomMember, RoomMemberships, RoomState, SessionMeta, StateChanges,
@@ -35,7 +35,12 @@ pub use reqwest;
 
 mod account;
 pub mod attachment;
+
+pub mod bwi_extensions;
+
 pub mod authentication;
+
+pub mod bwi_content_scanner;
 mod client;
 pub mod config;
 mod deduplicating_handler;
@@ -45,11 +50,8 @@ mod error;
 pub mod event_cache;
 pub mod event_handler;
 mod http_client;
-pub mod matrix_auth;
 pub mod media;
 pub mod notification_settings;
-#[cfg(feature = "experimental-oidc")]
-pub mod oidc;
 pub mod pusher;
 pub mod room;
 pub mod room_directory_search;
@@ -61,7 +63,6 @@ pub mod futures {
 
     pub use super::client::futures::SendRequest;
 }
-#[cfg(feature = "experimental-sliding-sync")]
 pub mod sliding_sync;
 pub mod sync;
 #[cfg(feature = "experimental-widgets")]
@@ -85,7 +86,6 @@ pub use media::Media;
 pub use pusher::Pusher;
 pub use room::Room;
 pub use ruma::{IdParseError, OwnedServerName, ServerName};
-#[cfg(feature = "experimental-sliding-sync")]
 pub use sliding_sync::{
     SlidingSync, SlidingSyncBuilder, SlidingSyncList, SlidingSyncListBuilder,
     SlidingSyncListLoadingState, SlidingSyncMode, SlidingSyncRoom, UpdateSummary,
@@ -94,6 +94,7 @@ pub use sliding_sync::{
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
+pub mod live_location_share;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_utils;
 

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ops::ControlFlow;
-
 use async_rx::StreamExt as _;
 use async_stream::stream;
 use futures_core::Stream;
@@ -21,42 +19,51 @@ use futures_util::{pin_mut, StreamExt as _};
 use matrix_sdk::event_cache::{
     self,
     paginator::{PaginatorError, PaginatorState},
-    BackPaginationOutcome, EventCacheError, RoomPagination,
+    EventCacheError, RoomPagination,
 };
-use tracing::{instrument, trace, warn};
+use tracing::{instrument, warn};
 
 use super::Error;
-use crate::timeline::{controller::TimelineNewItemPosition, event_item::RemoteEventOrigin};
 
 impl super::Timeline {
     /// Add more events to the start of the timeline.
     ///
     /// Returns whether we hit the start of the timeline.
     #[instrument(skip_all, fields(room_id = ?self.room().room_id()))]
-    pub async fn paginate_backwards(&self, num_events: u16) -> Result<bool, Error> {
+    pub async fn paginate_backwards(&self, mut num_events: u16) -> Result<bool, Error> {
         if self.controller.is_live().await {
+            match self.controller.live_lazy_paginate_backwards(num_events).await {
+                Some(needed_num_events) => {
+                    num_events = needed_num_events.try_into().expect(
+                        "failed to cast `needed_num_events` (`usize`) into `num_events` (`usize`)",
+                    );
+                }
+                None => {
+                    // We could adjust the skip count to a lower value, while passing the requested
+                    // number of events. We *may* have reached the start of the timeline, but since
+                    // we're fulfilling the caller's request, assume it's not the case and return
+                    // false here. A subsequent call will go to the `Some()` arm of this match, and
+                    // cause a call to the event cache's pagination.
+                    return Ok(false);
+                }
+            }
+
             Ok(self.live_paginate_backwards(num_events).await?)
         } else {
-            Ok(self.focused_paginate_backwards(num_events).await?)
+            Ok(self.controller.focused_paginate_backwards(num_events).await?)
         }
     }
 
-    /// Assuming the timeline is focused on an event, starts a forwards
-    /// pagination.
+    /// Add more events to the end of the timeline.
     ///
     /// Returns whether we hit the end of the timeline.
-    #[instrument(skip_all)]
-    pub async fn focused_paginate_forwards(&self, num_events: u16) -> Result<bool, Error> {
-        Ok(self.controller.focused_paginate_forwards(num_events).await?)
-    }
-
-    /// Assuming the timeline is focused on an event, starts a backwards
-    /// pagination.
-    ///
-    /// Returns whether we hit the start of the timeline.
-    #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
-    pub async fn focused_paginate_backwards(&self, num_events: u16) -> Result<bool, Error> {
-        Ok(self.controller.focused_paginate_backwards(num_events).await?)
+    #[instrument(skip_all, fields(room_id = ?self.room().room_id()))]
+    pub async fn paginate_forwards(&self, num_events: u16) -> Result<bool, Error> {
+        if self.controller.is_live().await {
+            Ok(true)
+        } else {
+            Ok(self.controller.focused_paginate_forwards(num_events).await?)
+        }
     }
 
     /// Paginate backwards in live mode.
@@ -65,47 +72,31 @@ impl super::Timeline {
     /// on a specific event.
     ///
     /// Returns whether we hit the start of the timeline.
-    #[instrument(skip_all, fields(room_id = ?self.room().room_id()))]
-    pub async fn live_paginate_backwards(&self, batch_size: u16) -> event_cache::Result<bool> {
-        let pagination = self.event_cache.pagination();
-
-        let result = pagination
-            .run_backwards(
-                batch_size,
-                |BackPaginationOutcome { events, reached_start },
-                 _timeline_has_been_reset| async move {
-                    let num_events = events.len();
-                    trace!("Back-pagination succeeded with {num_events} events");
-
-                    // TODO(hywan): Remove, and let spread events via
-                    // `matrix_sdk::event_cache::RoomEventCacheUpdate` from
-                    // `matrix_sdk::event_cache::RoomPagination::run_backwards`.
-                    self.controller
-                        .add_events_at(events.into_iter(), TimelineNewItemPosition::Start { origin: RemoteEventOrigin::Pagination })
-                        .await;
-
-                    if num_events == 0 && !reached_start {
-                        // As an exceptional contract: if there were no events in the response,
-                        // and we've not hit the start of the timeline, retry until we get
-                        // some events or reach the start of the timeline.
-                        return ControlFlow::Continue(());
+    async fn live_paginate_backwards(&self, batch_size: u16) -> event_cache::Result<bool> {
+        loop {
+            match self.event_cache.pagination().run_backwards_once(batch_size).await {
+                Ok(outcome) => {
+                    // As an exceptional contract, restart the back-pagination if we received an
+                    // empty chunk.
+                    if outcome.reached_start || !outcome.events.is_empty() {
+                        return Ok(outcome.reached_start);
                     }
+                }
 
-                    ControlFlow::Break(reached_start)
-                },
-            )
-            .await;
+                Err(EventCacheError::BackpaginationError(
+                    PaginatorError::InvalidPreviousState {
+                        actual: PaginatorState::Paginating, ..
+                    },
+                )) => {
+                    // Treat an already running pagination exceptionally, returning false so that
+                    // the caller retries later.
+                    warn!("Another pagination request is already happening, returning early");
+                    return Ok(false);
+                }
 
-        match result {
-            Err(EventCacheError::BackpaginationError(PaginatorError::InvalidPreviousState {
-                actual: PaginatorState::Paginating,
-                ..
-            })) => {
-                warn!("Another pagination request is already happening, returning early");
-                Ok(false)
+                // Propagate other errors as such.
+                Err(err) => return Err(err),
             }
-
-            result => result,
         }
     }
 

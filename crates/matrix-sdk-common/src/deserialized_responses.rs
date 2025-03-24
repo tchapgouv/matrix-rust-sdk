@@ -14,8 +14,10 @@
 
 use std::{collections::BTreeMap, fmt};
 
+#[cfg(doc)]
+use ruma::events::AnyTimelineEvent;
 use ruma::{
-    events::{AnyMessageLikeEvent, AnySyncTimelineEvent, AnyTimelineEvent},
+    events::{AnyMessageLikeEvent, AnySyncTimelineEvent},
     push::Action,
     serde::{
         AsRefStr, AsStrAsRefStr, DebugAsRefStr, DeserializeFromCowStr, FromString, JsonObject, Raw,
@@ -179,6 +181,7 @@ pub enum VerificationLevel {
 
     /// The message was sent by a user identity we have not verified, but the
     /// user was previously verified.
+    #[serde(alias = "PreviouslyVerified")]
     VerificationViolation,
 
     /// The message was sent by a device not linked to (signed by) any user
@@ -262,6 +265,7 @@ pub enum ShieldStateCode {
     /// An unencrypted event in an encrypted room.
     SentInClear,
     /// The sender was previously verified but changed their identity.
+    #[serde(alias = "PreviouslyVerified")]
     VerificationViolation,
 }
 
@@ -306,26 +310,61 @@ pub struct EncryptionInfo {
 /// Previously, this differed from [`TimelineEvent`] by wrapping an
 /// [`AnySyncTimelineEvent`] instead of an [`AnyTimelineEvent`], but nowadays
 /// they are essentially identical, and one of them should probably be removed.
+//
+// 🚨 Note about this type, please read! 🚨
+//
+// `TimelineEvent` is heavily used across the SDK crates. In some cases, we
+// are reaching a [`recursion_limit`] when the compiler is trying to figure out
+// if `TimelineEvent` implements `Sync` when it's embedded in other types.
+//
+// We want to help the compiler so that one doesn't need to increase the
+// `recursion_limit`. We stop the recursive check by (un)safely implement `Sync`
+// and `Send` on `TimelineEvent` directly.
+//
+// See
+// https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823
+// which has addressed this issue first
+//
+// [`recursion_limit`]: https://doc.rust-lang.org/reference/attributes/limits.html#the-recursion_limit-attribute
 #[derive(Clone, Debug, Serialize)]
-pub struct SyncTimelineEvent {
+pub struct TimelineEvent {
     /// The event itself, together with any information on decryption.
     pub kind: TimelineEventKind,
 
     /// The push actions associated with this event.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub push_actions: Vec<Action>,
+    ///
+    /// If it's set to `None`, then it means we couldn't compute those actions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub push_actions: Option<Vec<Action>>,
 }
 
-impl SyncTimelineEvent {
-    /// Create a new `SyncTimelineEvent` from the given raw event.
+// See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
+#[cfg(not(feature = "test-send-sync"))]
+unsafe impl Send for TimelineEvent {}
+
+// See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
+#[cfg(not(feature = "test-send-sync"))]
+unsafe impl Sync for TimelineEvent {}
+
+#[cfg(feature = "test-send-sync")]
+#[test]
+// See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
+fn test_send_sync_for_sync_timeline_event() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<TimelineEvent>();
+}
+
+impl TimelineEvent {
+    /// Create a new [`TimelineEvent`] from the given raw event.
     ///
     /// This is a convenience constructor for a plaintext event when you don't
     /// need to set `push_action`, for example inside a test.
     pub fn new(event: Raw<AnySyncTimelineEvent>) -> Self {
-        Self { kind: TimelineEventKind::PlainText { event }, push_actions: vec![] }
+        Self { kind: TimelineEventKind::PlainText { event }, push_actions: None }
     }
 
-    /// Create a new `SyncTimelineEvent` from the given raw event and push
+    /// Create a new [`TimelineEvent`] from the given raw event and push
     /// actions.
     ///
     /// This is a convenience constructor for a plaintext event, for example
@@ -334,140 +373,38 @@ impl SyncTimelineEvent {
         event: Raw<AnySyncTimelineEvent>,
         push_actions: Vec<Action>,
     ) -> Self {
-        Self { kind: TimelineEventKind::PlainText { event }, push_actions }
+        Self { kind: TimelineEventKind::PlainText { event }, push_actions: Some(push_actions) }
     }
 
-    /// Create a new `SyncTimelineEvent` to represent the given decryption
+    /// Create a new [`TimelineEvent`] to represent the given decryption
     /// failure.
     pub fn new_utd_event(event: Raw<AnySyncTimelineEvent>, utd_info: UnableToDecryptInfo) -> Self {
-        Self { kind: TimelineEventKind::UnableToDecrypt { event, utd_info }, push_actions: vec![] }
+        Self { kind: TimelineEventKind::UnableToDecrypt { event, utd_info }, push_actions: None }
     }
 
-    /// Get the event id of this `SyncTimelineEvent` if the event has any valid
+    /// Get the event id of this [`TimelineEvent`] if the event has any valid
     /// id.
     pub fn event_id(&self) -> Option<OwnedEventId> {
         self.kind.event_id()
     }
 
     /// Returns a reference to the (potentially decrypted) Matrix event inside
-    /// this `TimelineEvent`.
+    /// this [`TimelineEvent`].
     pub fn raw(&self) -> &Raw<AnySyncTimelineEvent> {
         self.kind.raw()
     }
 
-    /// If the event was a decrypted event that was successfully decrypted, get
-    /// its encryption info. Otherwise, `None`.
-    pub fn encryption_info(&self) -> Option<&EncryptionInfo> {
-        self.kind.encryption_info()
-    }
-
-    /// Takes ownership of this `TimelineEvent`, returning the (potentially
-    /// decrypted) Matrix event within.
-    pub fn into_raw(self) -> Raw<AnySyncTimelineEvent> {
-        self.kind.into_raw()
-    }
-}
-
-impl From<TimelineEvent> for SyncTimelineEvent {
-    fn from(o: TimelineEvent) -> Self {
-        Self { kind: o.kind, push_actions: o.push_actions.unwrap_or_default() }
-    }
-}
-
-impl From<DecryptedRoomEvent> for SyncTimelineEvent {
-    fn from(decrypted: DecryptedRoomEvent) -> Self {
-        let timeline_event: TimelineEvent = decrypted.into();
-        timeline_event.into()
-    }
-}
-
-impl<'de> Deserialize<'de> for SyncTimelineEvent {
-    /// Custom deserializer for [`SyncTimelineEvent`], to support older formats.
-    ///
-    /// Ideally we might use an untagged enum and then convert from that;
-    /// however, that doesn't work due to a [serde bug](https://github.com/serde-rs/json/issues/497).
-    ///
-    /// Instead, we first deserialize into an unstructured JSON map, and then
-    /// inspect the json to figure out which format we have.
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde_json::{Map, Value};
-
-        // First, deserialize to an unstructured JSON map
-        let value = Map::<String, Value>::deserialize(deserializer)?;
-
-        // If we have a top-level `event`, it's V0
-        if value.contains_key("event") {
-            let v0: SyncTimelineEventDeserializationHelperV0 =
-                serde_json::from_value(Value::Object(value)).map_err(|e| {
-                    serde::de::Error::custom(format!(
-                        "Unable to deserialize V0-format SyncTimelineEvent: {}",
-                        e
-                    ))
-                })?;
-            Ok(v0.into())
+    /// Replace the raw event included in this item by another one.
+    pub fn replace_raw(&mut self, replacement: Raw<AnyMessageLikeEvent>) {
+        match &mut self.kind {
+            TimelineEventKind::Decrypted(decrypted) => decrypted.event = replacement,
+            TimelineEventKind::UnableToDecrypt { event, .. }
+            | TimelineEventKind::PlainText { event } => {
+                // It's safe to cast `AnyMessageLikeEvent` into `AnySyncMessageLikeEvent`,
+                // because the former contains a superset of the fields included in the latter.
+                *event = replacement.cast();
+            }
         }
-        // Otherwise, it's V1
-        else {
-            let v1: SyncTimelineEventDeserializationHelperV1 =
-                serde_json::from_value(Value::Object(value)).map_err(|e| {
-                    serde::de::Error::custom(format!(
-                        "Unable to deserialize V1-format SyncTimelineEvent: {}",
-                        e
-                    ))
-                })?;
-            Ok(v1.into())
-        }
-    }
-}
-
-/// Represents a matrix room event that has been returned from a Matrix
-/// client-server API endpoint such as `/messages`, after initial processing.
-///
-/// The "initial processing" includes an attempt to decrypt encrypted events, so
-/// the main thing this adds over [`AnyTimelineEvent`] is information on
-/// encryption.
-///
-/// Previously, this differed from [`SyncTimelineEvent`] by wrapping an
-/// [`AnyTimelineEvent`] instead of an [`AnySyncTimelineEvent`], but nowadays
-/// they are essentially identical, and one of them should probably be removed.
-#[derive(Clone, Debug)]
-pub struct TimelineEvent {
-    /// The event itself, together with any information on decryption.
-    pub kind: TimelineEventKind,
-
-    /// The push actions associated with this event, if we had sufficient
-    /// context to compute them.
-    pub push_actions: Option<Vec<Action>>,
-}
-
-impl TimelineEvent {
-    /// Create a new `TimelineEvent` from the given raw event.
-    ///
-    /// This is a convenience constructor for a plaintext event when you don't
-    /// need to set `push_action`, for example inside a test.
-    pub fn new(event: Raw<AnyTimelineEvent>) -> Self {
-        Self {
-            // This conversion is unproblematic since a `SyncTimelineEvent` is just a
-            // `TimelineEvent` without the `room_id`. By converting the raw value in
-            // this way, we simply cause the `room_id` field in the json to be
-            // ignored by a subsequent deserialization.
-            kind: TimelineEventKind::PlainText { event: event.cast() },
-            push_actions: None,
-        }
-    }
-
-    /// Create a new `TimelineEvent` to represent the given decryption failure.
-    pub fn new_utd_event(event: Raw<AnySyncTimelineEvent>, utd_info: UnableToDecryptInfo) -> Self {
-        Self { kind: TimelineEventKind::UnableToDecrypt { event, utd_info }, push_actions: None }
-    }
-
-    /// Returns a reference to the (potentially decrypted) Matrix event inside
-    /// this `TimelineEvent`.
-    pub fn raw(&self) -> &Raw<AnySyncTimelineEvent> {
-        self.kind.raw()
     }
 
     /// If the event was a decrypted event that was successfully decrypted, get
@@ -489,8 +426,49 @@ impl From<DecryptedRoomEvent> for TimelineEvent {
     }
 }
 
-/// The event within a [`TimelineEvent`] or [`SyncTimelineEvent`], together with
-/// encryption data.
+impl<'de> Deserialize<'de> for TimelineEvent {
+    /// Custom deserializer for [`TimelineEvent`], to support older formats.
+    ///
+    /// Ideally we might use an untagged enum and then convert from that;
+    /// however, that doesn't work due to a [serde bug](https://github.com/serde-rs/json/issues/497).
+    ///
+    /// Instead, we first deserialize into an unstructured JSON map, and then
+    /// inspect the json to figure out which format we have.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde_json::{Map, Value};
+
+        // First, deserialize to an unstructured JSON map
+        let value = Map::<String, Value>::deserialize(deserializer)?;
+
+        // If we have a top-level `event`, it's V0
+        if value.contains_key("event") {
+            let v0: SyncTimelineEventDeserializationHelperV0 =
+                serde_json::from_value(Value::Object(value)).map_err(|e| {
+                    serde::de::Error::custom(format!(
+                        "Unable to deserialize V0-format TimelineEvent: {}",
+                        e
+                    ))
+                })?;
+            Ok(v0.into())
+        }
+        // Otherwise, it's V1
+        else {
+            let v1: SyncTimelineEventDeserializationHelperV1 =
+                serde_json::from_value(Value::Object(value)).map_err(|e| {
+                    serde::de::Error::custom(format!(
+                        "Unable to deserialize V1-format TimelineEvent: {}",
+                        e
+                    ))
+                })?;
+            Ok(v1.into())
+        }
+    }
+}
+
+/// The event within a [`TimelineEvent`], together with encryption data.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum TimelineEventKind {
     /// A successfully-decrypted encrypted event.
@@ -829,9 +807,9 @@ impl fmt::Debug for PrivOwnedStr {
     }
 }
 
-/// Deserialization helper for [`SyncTimelineEvent`], for the modern format.
+/// Deserialization helper for [`TimelineEvent`], for the modern format.
 ///
-/// This has the exact same fields as [`SyncTimelineEvent`] itself, but has a
+/// This has the exact same fields as [`TimelineEvent`] itself, but has a
 /// regular `Deserialize` implementation.
 #[derive(Debug, Deserialize)]
 struct SyncTimelineEventDeserializationHelperV1 {
@@ -843,14 +821,14 @@ struct SyncTimelineEventDeserializationHelperV1 {
     push_actions: Vec<Action>,
 }
 
-impl From<SyncTimelineEventDeserializationHelperV1> for SyncTimelineEvent {
+impl From<SyncTimelineEventDeserializationHelperV1> for TimelineEvent {
     fn from(value: SyncTimelineEventDeserializationHelperV1) -> Self {
         let SyncTimelineEventDeserializationHelperV1 { kind, push_actions } = value;
-        SyncTimelineEvent { kind, push_actions }
+        TimelineEvent { kind, push_actions: Some(push_actions) }
     }
 }
 
-/// Deserialization helper for [`SyncTimelineEvent`], for an older format.
+/// Deserialization helper for [`TimelineEvent`], for an older format.
 #[derive(Deserialize)]
 struct SyncTimelineEventDeserializationHelperV0 {
     /// The actual event.
@@ -871,7 +849,7 @@ struct SyncTimelineEventDeserializationHelperV0 {
     unsigned_encryption_info: Option<BTreeMap<UnsignedEventLocation, UnsignedDecryptionResult>>,
 }
 
-impl From<SyncTimelineEventDeserializationHelperV0> for SyncTimelineEvent {
+impl From<SyncTimelineEventDeserializationHelperV0> for TimelineEvent {
     fn from(value: SyncTimelineEventDeserializationHelperV0) -> Self {
         let SyncTimelineEventDeserializationHelperV0 {
             event,
@@ -898,7 +876,7 @@ impl From<SyncTimelineEventDeserializationHelperV0> for SyncTimelineEvent {
             None => TimelineEventKind::PlainText { event },
         };
 
-        SyncTimelineEvent { kind, push_actions }
+        TimelineEvent { kind, push_actions: Some(push_actions) }
     }
 }
 
@@ -907,21 +885,20 @@ mod tests {
     use std::collections::BTreeMap;
 
     use assert_matches::assert_matches;
+    use insta::{assert_json_snapshot, with_settings};
     use ruma::{
-        event_id,
-        events::{room::message::RoomMessageEventContent, AnySyncTimelineEvent},
-        serde::Raw,
-        user_id,
+        device_id, event_id, events::room::message::RoomMessageEventContent, serde::Raw, user_id,
+        DeviceKeyAlgorithm,
     };
     use serde::Deserialize;
     use serde_json::json;
 
     use super::{
-        AlgorithmInfo, DecryptedRoomEvent, EncryptionInfo, SyncTimelineEvent, TimelineEvent,
-        TimelineEventKind, UnableToDecryptInfo, UnableToDecryptReason, UnsignedDecryptionResult,
-        UnsignedEventLocation, VerificationState, WithheldCode,
+        AlgorithmInfo, DecryptedRoomEvent, DeviceLinkProblem, EncryptionInfo, ShieldState,
+        ShieldStateCode, TimelineEvent, TimelineEventKind, UnableToDecryptInfo,
+        UnableToDecryptReason, UnsignedDecryptionResult, UnsignedEventLocation, VerificationLevel,
+        VerificationState, WithheldCode,
     };
-    use crate::deserialized_responses::{DeviceLinkProblem, VerificationLevel};
 
     fn example_event() -> serde_json::Value {
         json!({
@@ -936,24 +913,12 @@ mod tests {
 
     #[test]
     fn sync_timeline_debug_content() {
-        let room_event = SyncTimelineEvent::new(Raw::new(&example_event()).unwrap().cast());
+        let room_event = TimelineEvent::new(Raw::new(&example_event()).unwrap().cast());
         let debug_s = format!("{room_event:?}");
         assert!(
             !debug_s.contains("secret"),
             "Debug representation contains event content!\n{debug_s}"
         );
-    }
-
-    #[test]
-    fn room_event_to_sync_room_event() {
-        let room_event = TimelineEvent::new(Raw::new(&example_event()).unwrap().cast());
-        let converted_room_event: SyncTimelineEvent = room_event.into();
-
-        let converted_event: AnySyncTimelineEvent =
-            converted_room_event.raw().deserialize().unwrap();
-
-        assert_eq!(converted_event.event_id(), "$xxxxx:example.org");
-        assert_eq!(converted_event.sender(), "@carl:example.com");
     }
 
     #[test]
@@ -997,8 +962,76 @@ mod tests {
     }
 
     #[test]
+    fn test_verification_level_deserializes() {
+        // Given a JSON VerificationLevel
+        #[derive(Deserialize)]
+        struct Container {
+            verification_level: VerificationLevel,
+        }
+        let container = json!({ "verification_level": "VerificationViolation" });
+
+        // When we deserialize it
+        let deserialized: Container = serde_json::from_value(container)
+            .expect("We can deserialize the old PreviouslyVerified value");
+
+        // Then it is populated correctly
+        assert_eq!(deserialized.verification_level, VerificationLevel::VerificationViolation);
+    }
+
+    #[test]
+    fn test_verification_level_deserializes_from_old_previously_verified_value() {
+        // Given a JSON VerificationLevel with the old value PreviouslyVerified
+        #[derive(Deserialize)]
+        struct Container {
+            verification_level: VerificationLevel,
+        }
+        let container = json!({ "verification_level": "PreviouslyVerified" });
+
+        // When we deserialize it
+        let deserialized: Container = serde_json::from_value(container)
+            .expect("We can deserialize the old PreviouslyVerified value");
+
+        // Then it is migrated to the new value
+        assert_eq!(deserialized.verification_level, VerificationLevel::VerificationViolation);
+    }
+
+    #[test]
+    fn test_shield_state_code_deserializes() {
+        // Given a JSON ShieldStateCode with value VerificationViolation
+        #[derive(Deserialize)]
+        struct Container {
+            shield_state_code: ShieldStateCode,
+        }
+        let container = json!({ "shield_state_code": "VerificationViolation" });
+
+        // When we deserialize it
+        let deserialized: Container = serde_json::from_value(container)
+            .expect("We can deserialize the old PreviouslyVerified value");
+
+        // Then it is populated correctly
+        assert_eq!(deserialized.shield_state_code, ShieldStateCode::VerificationViolation);
+    }
+
+    #[test]
+    fn test_shield_state_code_deserializes_from_old_previously_verified_value() {
+        // Given a JSON ShieldStateCode with the old value PreviouslyVerified
+        #[derive(Deserialize)]
+        struct Container {
+            shield_state_code: ShieldStateCode,
+        }
+        let container = json!({ "shield_state_code": "PreviouslyVerified" });
+
+        // When we deserialize it
+        let deserialized: Container = serde_json::from_value(container)
+            .expect("We can deserialize the old PreviouslyVerified value");
+
+        // Then it is migrated to the new value
+        assert_eq!(deserialized.shield_state_code, ShieldStateCode::VerificationViolation);
+    }
+
+    #[test]
     fn sync_timeline_event_serialisation() {
-        let room_event = SyncTimelineEvent {
+        let room_event = TimelineEvent {
             kind: TimelineEventKind::Decrypted(DecryptedRoomEvent {
                 event: Raw::new(&example_event()).unwrap().cast(),
                 encryption_info: EncryptionInfo {
@@ -1060,7 +1093,7 @@ mod tests {
         );
 
         // And it can be properly deserialized from the new format.
-        let event: SyncTimelineEvent = serde_json::from_value(serialized).unwrap();
+        let event: TimelineEvent = serde_json::from_value(serialized).unwrap();
         assert_eq!(event.event_id(), Some(event_id!("$xxxxx:example.org").to_owned()));
         assert_matches!(
             event.encryption_info().unwrap().algorithm_info,
@@ -1089,7 +1122,7 @@ mod tests {
                 "verification_state": "Verified",
             },
         });
-        let event: SyncTimelineEvent = serde_json::from_value(serialized).unwrap();
+        let event: TimelineEvent = serde_json::from_value(serialized).unwrap();
         assert_eq!(event.event_id(), Some(event_id!("$xxxxx:example.org").to_owned()));
         assert_matches!(
             event.encryption_info().unwrap().algorithm_info,
@@ -1122,7 +1155,7 @@ mod tests {
                 "RelationsReplace": {"UnableToDecrypt": {"session_id": "xyz"}}
             }
         });
-        let event: SyncTimelineEvent = serde_json::from_value(serialized).unwrap();
+        let event: TimelineEvent = serde_json::from_value(serialized).unwrap();
         assert_eq!(event.event_id(), Some(event_id!("$xxxxx:example.org").to_owned()));
         assert_matches!(
             event.encryption_info().unwrap().algorithm_info,
@@ -1188,7 +1221,7 @@ mod tests {
         assert!(result.is_ok());
 
         // should have migrated to the new format
-        let event: SyncTimelineEvent = result.unwrap();
+        let event: TimelineEvent = result.unwrap();
         assert_matches!(
             event.kind,
             TimelineEventKind::UnableToDecrypt { utd_info, .. }=> {
@@ -1246,5 +1279,130 @@ mod tests {
 
         let reason = UnableToDecryptReason::UnknownMegolmMessageIndex;
         assert!(reason.is_missing_room_key());
+    }
+
+    #[test]
+    fn snapshot_test_verification_level() {
+        assert_json_snapshot!(VerificationLevel::VerificationViolation);
+        assert_json_snapshot!(VerificationLevel::UnsignedDevice);
+        assert_json_snapshot!(VerificationLevel::None(DeviceLinkProblem::InsecureSource));
+        assert_json_snapshot!(VerificationLevel::None(DeviceLinkProblem::MissingDevice));
+        assert_json_snapshot!(VerificationLevel::UnverifiedIdentity);
+    }
+
+    #[test]
+    fn snapshot_test_verification_states() {
+        assert_json_snapshot!(VerificationState::Unverified(VerificationLevel::UnsignedDevice));
+        assert_json_snapshot!(VerificationState::Unverified(
+            VerificationLevel::VerificationViolation
+        ));
+        assert_json_snapshot!(VerificationState::Unverified(VerificationLevel::None(
+            DeviceLinkProblem::InsecureSource,
+        )));
+        assert_json_snapshot!(VerificationState::Unverified(VerificationLevel::None(
+            DeviceLinkProblem::MissingDevice,
+        )));
+        assert_json_snapshot!(VerificationState::Verified);
+    }
+
+    #[test]
+    fn snapshot_test_shield_states() {
+        assert_json_snapshot!(ShieldState::None);
+        assert_json_snapshot!(ShieldState::Red {
+            code: ShieldStateCode::UnverifiedIdentity,
+            message: "a message"
+        });
+        assert_json_snapshot!(ShieldState::Grey {
+            code: ShieldStateCode::AuthenticityNotGuaranteed,
+            message: "authenticity of this message cannot be guaranteed",
+        });
+    }
+
+    #[test]
+    fn snapshot_test_shield_codes() {
+        assert_json_snapshot!(ShieldStateCode::AuthenticityNotGuaranteed);
+        assert_json_snapshot!(ShieldStateCode::UnknownDevice);
+        assert_json_snapshot!(ShieldStateCode::UnsignedDevice);
+        assert_json_snapshot!(ShieldStateCode::UnverifiedIdentity);
+        assert_json_snapshot!(ShieldStateCode::SentInClear);
+        assert_json_snapshot!(ShieldStateCode::VerificationViolation);
+    }
+
+    #[test]
+    fn snapshot_test_algorithm_info() {
+        let mut map = BTreeMap::new();
+        map.insert(DeviceKeyAlgorithm::Curve25519, "claimedclaimedcurve25519".to_owned());
+        map.insert(DeviceKeyAlgorithm::Ed25519, "claimedclaimeded25519".to_owned());
+        let info = AlgorithmInfo::MegolmV1AesSha2 {
+            curve25519_key: "curvecurvecurve".into(),
+            sender_claimed_keys: BTreeMap::from([
+                (DeviceKeyAlgorithm::Curve25519, "claimedclaimedcurve25519".to_owned()),
+                (DeviceKeyAlgorithm::Ed25519, "claimedclaimeded25519".to_owned()),
+            ]),
+        };
+
+        assert_json_snapshot!(info)
+    }
+
+    #[test]
+    fn snapshot_test_encryption_info() {
+        let info = EncryptionInfo {
+            sender: user_id!("@alice:localhost").to_owned(),
+            sender_device: Some(device_id!("ABCDEFGH").to_owned()),
+            algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                curve25519_key: "curvecurvecurve".into(),
+                sender_claimed_keys: Default::default(),
+            },
+            verification_state: VerificationState::Verified,
+        };
+
+        with_settings!({sort_maps =>true}, {
+            assert_json_snapshot!(info)
+        })
+    }
+
+    #[test]
+    fn snapshot_test_sync_timeline_event() {
+        let room_event = TimelineEvent {
+            kind: TimelineEventKind::Decrypted(DecryptedRoomEvent {
+                event: Raw::new(&example_event()).unwrap().cast(),
+                encryption_info: EncryptionInfo {
+                    sender: user_id!("@sender:example.com").to_owned(),
+                    sender_device: Some(device_id!("ABCDEFGHIJ").to_owned()),
+                    algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                        curve25519_key: "xxx".to_owned(),
+                        sender_claimed_keys: BTreeMap::from([
+                            (
+                                DeviceKeyAlgorithm::Ed25519,
+                                "I3YsPwqMZQXHkSQbjFNEs7b529uac2xBpI83eN3LUXo".to_owned(),
+                            ),
+                            (
+                                DeviceKeyAlgorithm::Curve25519,
+                                "qzdW3F5IMPFl0HQgz5w/L5Oi/npKUFn8Um84acIHfPY".to_owned(),
+                            ),
+                        ]),
+                    },
+                    verification_state: VerificationState::Verified,
+                },
+                unsigned_encryption_info: Some(BTreeMap::from([(
+                    UnsignedEventLocation::RelationsThreadLatestEvent,
+                    UnsignedDecryptionResult::UnableToDecrypt(UnableToDecryptInfo {
+                        session_id: Some("xyz".to_owned()),
+                        reason: UnableToDecryptReason::MissingMegolmSession {
+                            withheld_code: Some(WithheldCode::Unverified),
+                        },
+                    }),
+                )])),
+            }),
+            push_actions: Default::default(),
+        };
+
+        with_settings!({sort_maps =>true}, {
+            // We use directly the serde_json formatter here, because of a bug in insta
+            // not serializing custom BTreeMap key enum https://github.com/mitsuhiko/insta/issues/689
+            assert_json_snapshot! {
+                serde_json::to_value(&room_event).unwrap(),
+            }
+        });
     }
 }

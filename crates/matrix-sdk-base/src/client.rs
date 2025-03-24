@@ -63,17 +63,17 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::sync::{RwLock, RwLockReadGuard};
 use tracing::{debug, error, info, instrument, trace, warn};
 
-#[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
+#[cfg(feature = "e2e-encryption")]
 use crate::latest_event::{is_suitable_for_latest_event, LatestEvent, PossibleLatestEvent};
 #[cfg(feature = "e2e-encryption")]
 use crate::RoomMemberships;
 use crate::{
-    deserialized_responses::{DisplayName, RawAnySyncOrStrippedTimelineEvent, SyncTimelineEvent},
+    deserialized_responses::{DisplayName, RawAnySyncOrStrippedTimelineEvent, TimelineEvent},
     error::{Error, Result},
     event_cache::store::EventCacheStoreLock,
     response_processors::AccountDataProcessor,
     rooms::{
-        normal::{RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons},
+        normal::{RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomMembersUpdate},
         Room, RoomInfo, RoomState,
     },
     store::{
@@ -129,7 +129,7 @@ pub struct BaseClient {
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for BaseClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Client")
+        f.debug_struct("BaseClient")
             .field("session_meta", &self.store.session_meta())
             .field("sync_token", &self.store.sync_token)
             .finish_non_exhaustive()
@@ -347,9 +347,9 @@ impl BaseClient {
         Ok(())
     }
 
-    /// Attempt to decrypt the given raw event into a `SyncTimelineEvent`.
+    /// Attempt to decrypt the given raw event into a [`TimelineEvent`].
     ///
-    /// In the case of a decryption error, returns a `SyncTimelineEvent`
+    /// In the case of a decryption error, returns a [`TimelineEvent`]
     /// representing the decryption error; in the case of problems with our
     /// application, returns `Err`.
     ///
@@ -359,7 +359,7 @@ impl BaseClient {
         &self,
         event: &Raw<AnySyncTimelineEvent>,
         room_id: &RoomId,
-    ) -> Result<Option<SyncTimelineEvent>> {
+    ) -> Result<Option<TimelineEvent>> {
         let olm = self.olm_machine().await;
         let Some(olm) = olm.as_ref() else { return Ok(None) };
 
@@ -372,7 +372,7 @@ impl BaseClient {
             .await?
         {
             RoomEventDecryptionResult::Decrypted(decrypted) => {
-                let event: SyncTimelineEvent = decrypted.into();
+                let event: TimelineEvent = decrypted.into();
 
                 if let Ok(AnySyncTimelineEvent::MessageLike(e)) = event.raw().deserialize() {
                     match &e {
@@ -394,7 +394,7 @@ impl BaseClient {
                 event
             }
             RoomEventDecryptionResult::UnableToDecrypt(utd_info) => {
-                SyncTimelineEvent::new_utd_event(event.clone(), utd_info)
+                TimelineEvent::new_utd_event(event.clone(), utd_info)
             }
         };
 
@@ -423,7 +423,7 @@ impl BaseClient {
         for raw_event in events {
             // Start by assuming we have a plaintext event. We'll replace it with a
             // decrypted or UTD event below if necessary.
-            let mut event = SyncTimelineEvent::new(raw_event);
+            let mut event = TimelineEvent::new(raw_event);
 
             match event.raw().deserialize() {
                 Ok(e) => {
@@ -535,7 +535,7 @@ impl BaseClient {
                                 },
                             );
                         }
-                        event.push_actions = actions.to_owned();
+                        event.push_actions = Some(actions.to_owned());
                     }
                 }
                 Err(e) => {
@@ -766,15 +766,11 @@ impl BaseClient {
             let (events, room_key_updates) =
                 o.receive_sync_changes(encryption_sync_changes).await?;
 
-            #[cfg(feature = "experimental-sliding-sync")]
             for room_key_update in room_key_updates {
                 if let Some(room) = self.get_room(&room_key_update.room_id) {
                     self.decrypt_latest_events(&room, changes, room_info_notable_updates).await;
                 }
             }
-
-            #[cfg(not(feature = "experimental-sliding-sync"))] // Silence unused variable warnings.
-            let _ = (room_key_updates, changes, room_info_notable_updates);
 
             Ok(events)
         } else {
@@ -789,7 +785,7 @@ impl BaseClient {
     /// that we can and if we can, change latest_event to reflect what we
     /// found, and remove any older encrypted events from
     /// latest_encrypted_events.
-    #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
+    #[cfg(feature = "e2e-encryption")]
     async fn decrypt_latest_events(
         &self,
         room: &Room,
@@ -810,7 +806,7 @@ impl BaseClient {
     /// (i.e. we can usefully display it as a message preview). Returns the
     /// decrypted event if we found one, along with its index in the
     /// latest_encrypted_events list, or None if we didn't find one.
-    #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
+    #[cfg(feature = "e2e-encryption")]
     async fn decrypt_latest_suitable_event(
         &self,
         room: &Room,
@@ -983,6 +979,9 @@ impl BaseClient {
         let mut new_rooms = RoomUpdates::default();
         let mut notifications = Default::default();
 
+        let mut updated_members_in_room: BTreeMap<OwnedRoomId, BTreeSet<OwnedUserId>> =
+            BTreeMap::new();
+
         for (room_id, new_info) in response.rooms.join {
             let room = self.store.get_or_create_room(
                 &room_id,
@@ -1010,6 +1009,8 @@ impl BaseClient {
                     &mut ambiguity_cache,
                 )
                 .await?;
+
+            updated_members_in_room.insert(room_id.to_owned(), user_ids.clone());
 
             for raw in &new_info.ephemeral.events {
                 match raw.deserialize() {
@@ -1252,6 +1253,13 @@ impl BaseClient {
         // above. Oh well.
         new_rooms.update_in_memory_caches(&self.store).await;
 
+        for (room_id, member_ids) in updated_members_in_room {
+            if let Some(room) = self.get_room(&room_id) {
+                let _ =
+                    room.room_member_updates_sender.send(RoomMembersUpdate::Partial(member_ids));
+            }
+        }
+
         info!("Processed a sync response in {:?}", now.elapsed());
 
         let response = SyncResponse {
@@ -1401,6 +1409,8 @@ impl BaseClient {
         self.store.save_changes(&changes).await?;
         self.apply_changes(&changes, Default::default());
 
+        let _ = room.room_member_updates_sender.send(RoomMembersUpdate::FullReload);
+
         Ok(())
     }
 
@@ -1506,8 +1516,14 @@ impl BaseClient {
     /// # Arguments
     ///
     /// * `room_id` - The id of the room that should be forgotten.
-    pub async fn forget_room(&self, room_id: &RoomId) -> StoreResult<()> {
-        self.store.forget_room(room_id).await
+    pub async fn forget_room(&self, room_id: &RoomId) -> Result<()> {
+        // Forget the room in the state store.
+        self.store.forget_room(room_id).await?;
+
+        // Remove the room in the event cache store too.
+        self.event_cache_store().lock().await?.remove_room(room_id).await?;
+
+        Ok(())
     }
 
     /// Get the olm machine.
@@ -1730,10 +1746,13 @@ fn handle_room_member_event_for_profiles(
 #[cfg(test)]
 mod tests {
     use matrix_sdk_test::{
-        async_test, ruma_response_from_json, sync_timeline_event, InvitedRoomBuilder,
+        async_test, event_factory::EventFactory, ruma_response_from_json, InvitedRoomBuilder,
         LeftRoomBuilder, StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder,
     };
-    use ruma::{api::client as api, room_id, serde::Raw, user_id, UserId};
+    use ruma::{
+        api::client as api, event_id, events::room::member::MembershipState, room_id, serde::Raw,
+        user_id,
+    };
     use serde_json::{json, value::to_raw_value};
 
     use super::BaseClient;
@@ -1753,17 +1772,15 @@ mod tests {
         let mut sync_builder = SyncResponseBuilder::new();
 
         let response = sync_builder
-            .add_left_room(LeftRoomBuilder::new(room_id).add_timeline_event(sync_timeline_event!({
-                "content": {
-                    "displayname": "Alice",
-                    "membership": "left",
-                },
-                "event_id": "$994173582443PhrSn:example.org",
-                "origin_server_ts": 1432135524678u64,
-                "sender": user_id,
-                "state_key": user_id,
-                "type": "m.room.member",
-            })))
+            .add_left_room(
+                LeftRoomBuilder::new(room_id).add_timeline_event(
+                    EventFactory::new()
+                        .member(user_id)
+                        .membership(MembershipState::Leave)
+                        .display_name("Alice")
+                        .event_id(event_id!("$994173582443PhrSn:example.org")),
+                ),
+            )
             .build_sync_response();
         client.receive_sync_response(response).await.unwrap();
         assert_eq!(client.get_room(room_id).unwrap().state(), RoomState::Left);
@@ -1875,10 +1892,13 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "e2e-encryption", feature = "experimental-sliding-sync"))]
+    #[cfg(feature = "e2e-encryption")]
     #[async_test]
     async fn test_when_there_are_no_latest_encrypted_events_decrypting_them_does_nothing() {
         use std::collections::BTreeMap;
+
+        use matrix_sdk_test::event_factory::EventFactory;
+        use ruma::{event_id, events::room::member::MembershipState};
 
         use crate::{rooms::normal::RoomInfoNotableUpdateReasons, StateChanges};
 
@@ -1886,7 +1906,23 @@ mod tests {
         let user_id = user_id!("@u:u.to");
         let room_id = room_id!("!r:u.to");
         let client = logged_in_base_client(Some(user_id)).await;
-        let room = process_room_join_test_helper(&client, room_id, "$1", user_id).await;
+
+        let mut sync_builder = SyncResponseBuilder::new();
+
+        let response = sync_builder
+            .add_joined_room(
+                matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    EventFactory::new()
+                        .member(user_id)
+                        .display_name("Alice")
+                        .membership(MembershipState::Join)
+                        .event_id(event_id!("$1")),
+                ),
+            )
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+
+        let room = client.get_room(room_id).expect("Just-created room not found!");
 
         // Sanity: it has no latest_encrypted_events or latest_event
         assert!(room.latest_encrypted_events().is_empty());
@@ -1906,40 +1942,6 @@ mod tests {
             .copied()
             .unwrap_or_default()
             .contains(RoomInfoNotableUpdateReasons::LATEST_EVENT));
-    }
-
-    // TODO: I wanted to write more tests here for decrypt_latest_events but I got
-    // lost trying to set up my OlmMachine to be able to encrypt and decrypt
-    // events. In the meantime, there are tests for the most difficult logic
-    // inside Room.  --andyb
-
-    #[cfg(feature = "e2e-encryption")]
-    async fn process_room_join_test_helper(
-        client: &BaseClient,
-        room_id: &ruma::RoomId,
-        event_id: &str,
-        user_id: &UserId,
-    ) -> crate::Room {
-        let mut sync_builder = SyncResponseBuilder::new();
-        let response = sync_builder
-            .add_joined_room(matrix_sdk_test::JoinedRoomBuilder::new(room_id).add_timeline_event(
-                sync_timeline_event!({
-                    "content": {
-                        "displayname": "Alice",
-                        "membership": "join",
-                    },
-                    "event_id": event_id,
-                    "origin_server_ts": 1432135524678u64,
-                    "sender": user_id,
-                    "state_key": user_id,
-                    "type": "m.room.member",
-                }),
-            ))
-            .build_sync_response();
-
-        client.receive_sync_response(response).await.unwrap();
-
-        client.get_room(room_id).expect("Just-created room not found!")
     }
 
     #[async_test]

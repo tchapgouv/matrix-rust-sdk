@@ -1,6 +1,6 @@
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
-use matrix_sdk_base::deserialized_responses::{ShieldState, ShieldStateCode, SyncTimelineEvent};
+use matrix_sdk_base::deserialized_responses::{ShieldState, ShieldStateCode, TimelineEvent};
 use matrix_sdk_test::{async_test, sync_timeline_event, ALICE};
 use ruma::{
     event_id,
@@ -14,9 +14,12 @@ use ruma::{
         AnyMessageLikeEventContent,
     },
 };
-use stream_assert::assert_next_matches;
+use stream_assert::{assert_next_matches, assert_pending};
 
-use crate::timeline::{tests::TestTimeline, EventSendState};
+use crate::timeline::{
+    tests::{TestTimeline, TestTimelineBuilder},
+    EventSendState,
+};
 
 #[async_test]
 async fn test_no_shield_in_unencrypted_room() {
@@ -33,7 +36,7 @@ async fn test_no_shield_in_unencrypted_room() {
 
 #[async_test]
 async fn test_sent_in_clear_shield() {
-    let timeline = TestTimeline::with_is_room_encrypted(true);
+    let timeline = TestTimelineBuilder::new().room_encrypted(true).build();
     let mut stream = timeline.subscribe().await;
 
     let f = &timeline.factory;
@@ -55,7 +58,7 @@ async fn test_sent_in_clear_shield() {
 /// sure the shield only appears once the remote echo is received.
 async fn test_local_sent_in_clear_shield() {
     // Given an encrypted timeline.
-    let timeline = TestTimeline::with_is_room_encrypted(true);
+    let timeline = TestTimelineBuilder::new().room_encrypted(true).build();
     let mut stream = timeline.subscribe().await;
 
     // When sending an unencrypted event.
@@ -75,9 +78,9 @@ async fn test_local_sent_in_clear_shield() {
     assert_eq!(shield, None);
 
     {
-        // The day divider comes in late.
-        let day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
-        assert!(day_divider.is_day_divider());
+        // The date divider comes in late.
+        let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+        assert!(date_divider.is_date_divider());
     }
 
     // When the event is sent (but without a remote echo).
@@ -97,7 +100,7 @@ async fn test_local_sent_in_clear_shield() {
 
     // When the remote echo comes in.
     timeline
-        .handle_live_event(SyncTimelineEvent::new(sync_timeline_event!({
+        .handle_live_event(TimelineEvent::new(sync_timeline_event!({
             "content": {
                 "body": "Local message",
                 "msgtype": "m.text",
@@ -108,7 +111,8 @@ async fn test_local_sent_in_clear_shield() {
             "type": "m.room.message",
         })))
         .await;
-    let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
+    assert_next_matches!(stream, VectorDiff::Remove { index: 1 });
+    let item = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
     let event_item = item.as_event().unwrap();
 
     // Then the remote echo should now be showing the shield.
@@ -118,6 +122,13 @@ async fn test_local_sent_in_clear_shield() {
         shield,
         Some(ShieldState::Red { code: ShieldStateCode::SentInClear, message: "Not encrypted." })
     );
+
+    // Date divider is adjusted.
+    let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    assert!(date_divider.is_date_divider());
+    assert_next_matches!(stream, VectorDiff::Remove { index: 2 });
+
+    assert_pending!(stream);
 }
 
 #[async_test]
@@ -125,7 +136,7 @@ async fn test_local_sent_in_clear_shield() {
 /// sent in clear` red warning.
 async fn test_utd_shield() {
     // Given we are in an encrypted room
-    let timeline = TestTimeline::with_is_room_encrypted(true);
+    let timeline = TestTimelineBuilder::new().room_encrypted(true).build();
     let mut stream = timeline.subscribe().await;
 
     let f = &timeline.factory;

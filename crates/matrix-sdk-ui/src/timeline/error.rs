@@ -45,6 +45,15 @@ pub enum Error {
     #[error("Failed sending attachment")]
     FailedSendingAttachment,
 
+    // BWI-specific
+    /// The attachment could not be sent because it exceeded the maximal size allowed by the server.
+    #[error("Attachment size not valid")]
+    AttachmentSizeExceededLimit,
+
+    /// The attachment could not be sent because it exceeded the maximal size allowed by the server.
+    #[error("Attachment size not available")]
+    AttachmentSizeNotAvailable,
+    // end BWI-specific
     /// The reaction could not be toggled.
     #[error("Failed toggling reaction")]
     FailedToToggleReaction,

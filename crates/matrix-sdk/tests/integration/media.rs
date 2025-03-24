@@ -1,18 +1,28 @@
+use matrix_sdk::bwi_content_scanner::BWIScanMediaExt;
 use matrix_sdk::{
+    authentication::matrix::{MatrixSession, MatrixSessionTokens},
     config::RequestConfig,
-    matrix_auth::{MatrixSession, MatrixSessionTokens},
     media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
     test_utils::logged_in_client_with_server,
     Client, SessionMeta,
 };
+use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState;
+use matrix_sdk_bwi_test::media::mock_server::content_scanner::{
+    clean_state_response_body, infected_state_response_body, provide_encrypted_download_endpoint,
+    provide_encrypted_scan_endpoint, provide_public_key_endpoint,
+    provide_supported_versions_endpoint,
+};
 use matrix_sdk_test::async_test;
+use rstest::rstest;
+use ruma::events::room::MediaSource::Encrypted;
 use ruma::{
     api::client::media::get_content_thumbnail::v3::Method,
     assign, device_id,
     events::room::{message::ImageMessageEventContent, ImageInfo, MediaSource},
-    mxc_uri, owned_mxc_uri, uint, user_id,
+    mxc_uri, uint, user_id,
 };
 use serde_json::json;
+use std::borrow::ToOwned;
 use wiremock::{
     matchers::{header, method, path, query_param},
     Mock, ResponseTemplate,
@@ -425,49 +435,122 @@ async fn test_get_media_file_with_auth_matrix_stable_feature() {
 }
 
 #[async_test]
-async fn test_async_media_upload() {
+async fn test_download_media_v1_7() {
+    // Arrange
+    const CONTENT: &str = "Hello World!";
     let (client, server) = logged_in_client_with_server().await;
-
     client.reset_server_capabilities().await.unwrap();
 
     // Declare Matrix version v1.7.
-    Mock::given(method("GET"))
-        .and(path("/_matrix/client/versions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "versions": [
-                "v1.7"
-            ],
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
+    provide_supported_versions_endpoint(&server, vec!["v1.7".to_owned()]).await;
+    provide_public_key_endpoint(&server).await;
+    let encrypted_file = provide_encrypted_download_endpoint(&server, CONTENT).await;
 
-    Mock::given(method("POST"))
-        .and(path("/_matrix/media/v1/create"))
-        .and(header("authorization", "Bearer 1234"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-          "content_uri": "mxc://example.com/AQwafuaFswefuhsfAFAgsw"
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
+    // Act
+    let media_request = MediaRequestParameters {
+        source: Encrypted(encrypted_file.into()),
+        format: MediaFormat::File,
+    };
+    let content = client.media().get_media_content(&media_request, false).await.unwrap();
 
-    Mock::given(method("PUT"))
-        .and(path("/_matrix/media/v3/upload/example.com/AQwafuaFswefuhsfAFAgsw"))
-        .and(header("authorization", "Bearer 1234"))
-        .and(header("content-type", "image/jpeg"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server)
-        .await;
+    // Assert
+    assert_eq!(content.as_slice(), CONTENT.as_bytes());
+}
 
-    let mxc_uri = client.media().create_content_uri().await.unwrap();
+#[async_test]
+async fn test_download_media_v1_11() {
+    // Arrange
+    const CONTENT: &str = "Hello World!";
+    let (client, server) = logged_in_client_with_server().await;
+    client.reset_server_capabilities().await.unwrap();
+    provide_supported_versions_endpoint(
+        &server,
+        (7..12).map(|version| format!("v1.{version}")).collect(),
+    )
+    .await;
+    provide_public_key_endpoint(&server).await;
+    let encrypted_file = provide_encrypted_download_endpoint(&server, CONTENT).await;
 
-    assert_eq!(mxc_uri.uri, owned_mxc_uri!("mxc://example.com/AQwafuaFswefuhsfAFAgsw"));
+    // Act
+    let media_request = MediaRequestParameters {
+        source: Encrypted(encrypted_file.into()),
+        format: MediaFormat::File,
+    };
+    let content = client.media().get_media_content(&media_request, false).await.unwrap();
 
-    client
-        .media()
-        .upload_preallocated(mxc_uri, &mime::IMAGE_JPEG, b"hello world".to_vec())
-        .await
-        .unwrap();
+    // Assert
+    assert_eq!(content.as_slice(), CONTENT.as_bytes());
+}
+
+#[rstest]
+#[case(ResponseTemplate::new(200).set_body_json(clean_state_response_body()), BWIScanState::Trusted)]
+#[case(ResponseTemplate::new(200).set_body_json(infected_state_response_body()), BWIScanState::Infected)]
+#[case(ResponseTemplate::new(403).set_body_json(infected_state_response_body()), BWIScanState::Error)]
+#[case(ResponseTemplate::new(403).set_body_json(clean_state_response_body()), BWIScanState::Error)]
+#[case(ResponseTemplate::new(403).set_body_json(json!({
+                "reason": "MCS_MIME_TYPE_FORBIDDEN",
+                "info": "File could not be decrypted"
+            })), BWIScanState::MimeTypeNotAllowed
+)]
+#[case(ResponseTemplate::new(403).set_body_json(json!({
+                "reason": "MCS_BAD_DECRYPTION",
+                "info": "File type: application/octet-stream not allowed"
+            })), BWIScanState::Error
+)]
+#[case(ResponseTemplate::new(404).set_body_json(json!({
+                "reason": "M_NOT_FOUND",
+                "info": "File could not be found"
+            })), BWIScanState::NotFound
+)]
+#[tokio::test]
+async fn test_scan_media_v1_7(
+    #[case] response: ResponseTemplate,
+    #[case] expected_state: BWIScanState,
+) {
+    // Arrange
+    const CONTENT: &str = "Hello World!";
+    let (client, server) = logged_in_client_with_server().await;
+    client.reset_server_capabilities().await.unwrap();
+
+    provide_supported_versions_endpoint(
+        &server,
+        (7..12).map(|version| format!("v1.{version}")).collect(),
+    )
+    .await;
+    provide_public_key_endpoint(&server).await;
+    let encrypted_file = provide_encrypted_scan_endpoint(&server, CONTENT, response).await;
+
+    // Act
+    let scan_state = client.scan_media(&encrypted_file).await.unwrap();
+
+    // Assert
+    assert_eq!(scan_state, expected_state);
+}
+
+#[async_test]
+async fn test_scan_media_cache() {
+    // Arrange
+    const CONTENT: &str = "Hello World!";
+    let (client, server) = logged_in_client_with_server().await;
+    client.reset_server_capabilities().await.unwrap();
+
+    provide_supported_versions_endpoint(
+        &server,
+        (7..12).map(|version| format!("v1.{version}")).collect(),
+    )
+    .await;
+    provide_public_key_endpoint(&server).await;
+    let encrypted_file = provide_encrypted_scan_endpoint(
+        &server,
+        CONTENT,
+        ResponseTemplate::new(200).set_body_json(clean_state_response_body()),
+    )
+    .await;
+
+    // Act
+    let _scan_state = client.scan_media(&encrypted_file.clone()).await.unwrap();
+    let scan_state = client.scan_media(&encrypted_file).await.unwrap();
+
+    // Assert
+    assert_eq!(scan_state, BWIScanState::Trusted);
 }

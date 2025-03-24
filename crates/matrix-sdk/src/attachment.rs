@@ -14,8 +14,8 @@
 
 //! Types and traits for attachments.
 
-use std::time::Duration;
-
+use crate::bwi_extensions::attachment::FileSize;
+use crate::Error::{AttachmentSizeExceededMaxSize, AttachmentSizeNotDefined};
 use ruma::{
     assign,
     events::{
@@ -27,9 +27,10 @@ use ruma::{
     },
     OwnedTransactionId, TransactionId, UInt,
 };
+use std::time::Duration;
 
 /// Base metadata about an image.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BaseImageInfo {
     /// The height of the image in pixels.
     pub height: Option<UInt>,
@@ -39,10 +40,12 @@ pub struct BaseImageInfo {
     pub size: Option<UInt>,
     /// The [BlurHash](https://blurha.sh/) for this image.
     pub blurhash: Option<String>,
+    /// Whether this image is animated.
+    pub is_animated: Option<bool>,
 }
 
 /// Base metadata about a video.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BaseVideoInfo {
     /// The duration of the video.
     pub duration: Option<Duration>,
@@ -57,7 +60,7 @@ pub struct BaseVideoInfo {
 }
 
 /// Base metadata about an audio clip.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BaseAudioInfo {
     /// The duration of the audio clip.
     pub duration: Option<Duration>,
@@ -66,7 +69,7 @@ pub struct BaseAudioInfo {
 }
 
 /// Base metadata about a file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BaseFileInfo {
     /// The size of the file in bytes.
     pub size: Option<UInt>,
@@ -100,6 +103,7 @@ impl From<AttachmentInfo> for ImageInfo {
                 width: info.width,
                 size: info.size,
                 blurhash: info.blurhash,
+                is_animated: info.is_animated,
             }),
             _ => ImageInfo::new(),
         }
@@ -177,6 +181,7 @@ impl Thumbnail {
 }
 
 /// Configuration for sending an attachment.
+/// TODO Technical Debt: Default is a miss-use as it creates an uninitialized object (error-prone)
 #[derive(Debug, Default)]
 pub struct AttachmentConfig {
     pub(crate) txn_id: Option<OwnedTransactionId>,
@@ -188,21 +193,21 @@ pub struct AttachmentConfig {
 }
 
 impl AttachmentConfig {
-    /// Create a new default `AttachmentConfig` without providing a thumbnail.
-    ///
-    /// To provide a thumbnail use [`AttachmentConfig::with_thumbnail()`].
+    /// Create a new empty `AttachmentConfig`.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create a new default `AttachmentConfig` with a `thumbnail`.
+    /// Set the thumbnail to send.
     ///
     /// # Arguments
     ///
     /// * `thumbnail` - The thumbnail of the media. If the `content_type` does
-    ///   not support it (eg audio clips), it is ignored.
-    pub fn with_thumbnail(thumbnail: Thumbnail) -> Self {
-        Self { thumbnail: Some(thumbnail), ..Default::default() }
+    ///   not support it (e.g. audio clips), it is ignored.
+    #[must_use]
+    pub fn thumbnail(mut self, thumbnail: Option<Thumbnail>) -> Self {
+        self.thumbnail = thumbnail;
+        self
     }
 
     /// Set the transaction ID to send.
@@ -259,4 +264,80 @@ impl AttachmentConfig {
         self.mentions = mentions;
         self
     }
+
+    // BWI-specific
+    /// TODO Technical Debt: needed as this class can not usefully initialized outside of this crate
+    pub fn set_info(&mut self, info: AttachmentInfo) {
+        self.info = Some(info);
+    }
+
+    /// Assert, that the file does not exceed the maximal file size
+    pub fn assert_valid_file_size(
+        &self,
+        max_valid_file_size: FileSize,
+    ) -> Result<(), crate::Error> {
+        let file_size_is_allowed = self.get_attachment_size()? < max_valid_file_size;
+        if file_size_is_allowed {
+            Ok(())
+        } else {
+            Err(AttachmentSizeExceededMaxSize)
+        }
+    }
+
+    /// Get the size of the attachment
+    pub fn get_attachment_size(&self) -> Result<FileSize, crate::Error> {
+        FileSize::try_from(self)
+    }
+    // end BWI-specific
 }
+
+// BWI-specific
+impl TryFrom<&AttachmentConfig> for FileSize {
+    type Error = crate::Error;
+
+    fn try_from(value: &AttachmentConfig) -> Result<Self, Self::Error> {
+        match &value.info {
+            Some(AttachmentInfo::Image(info)) => FileSize::try_from(info),
+            Some(AttachmentInfo::Video(info)) => FileSize::try_from(info),
+            Some(AttachmentInfo::Audio(info)) => FileSize::try_from(info),
+            Some(AttachmentInfo::File(info)) => FileSize::try_from(info),
+            Some(AttachmentInfo::Voice { audio_info: info, waveform: _ }) => {
+                FileSize::try_from(info)
+            }
+            _ => Err(AttachmentSizeNotDefined),
+        }
+    }
+}
+
+impl TryFrom<&BaseImageInfo> for FileSize {
+    type Error = crate::Error;
+
+    fn try_from(value: &BaseImageInfo) -> Result<Self, Self::Error> {
+        Ok(FileSize::new(value.size.ok_or(AttachmentSizeNotDefined)?.into()))
+    }
+}
+
+impl TryFrom<&BaseVideoInfo> for FileSize {
+    type Error = crate::Error;
+
+    fn try_from(value: &BaseVideoInfo) -> Result<Self, Self::Error> {
+        Ok(FileSize::new(value.size.ok_or(AttachmentSizeNotDefined)?.into()))
+    }
+}
+
+impl TryFrom<&BaseAudioInfo> for FileSize {
+    type Error = crate::Error;
+
+    fn try_from(value: &BaseAudioInfo) -> Result<Self, Self::Error> {
+        Ok(FileSize::new(value.size.ok_or(AttachmentSizeNotDefined)?.into()))
+    }
+}
+
+impl TryFrom<&BaseFileInfo> for FileSize {
+    type Error = crate::Error;
+
+    fn try_from(value: &BaseFileInfo) -> Result<Self, Self::Error> {
+        Ok(FileSize::new(value.size.ok_or(AttachmentSizeNotDefined)?.into()))
+    }
+}
+// end BWI-specific

@@ -23,7 +23,8 @@ use ruma::{
         AnyMessageLikeEventContent, EventContent as _, RawExt as _,
     },
     serde::Raw,
-    OwnedDeviceId, OwnedEventId, OwnedTransactionId, OwnedUserId, TransactionId, UInt,
+    MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedEventId, OwnedTransactionId, OwnedUserId,
+    TransactionId, UInt,
 };
 use serde::{Deserialize, Serialize};
 
@@ -131,6 +132,9 @@ pub struct QueuedRequest {
     /// The bigger the value, the higher the priority at which this request
     /// should be handled.
     pub priority: usize,
+
+    /// The time that the request was originally attempted.
+    pub created_at: MilliSecondsSinceUnixEpoch,
 }
 
 impl QueuedRequest {
@@ -248,9 +252,15 @@ pub struct FinishUploadThumbnailInfo {
     /// Transaction id for the thumbnail upload.
     pub txn: OwnedTransactionId,
     /// Thumbnail's width.
-    pub width: UInt,
+    ///
+    /// Used previously, kept for backwards compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<UInt>,
     /// Thumbnail's height.
-    pub height: UInt,
+    ///
+    /// Used previously, kept for backwards compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<UInt>,
 }
 
 /// A transaction id identifying a [`DependentQueuedRequest`] rather than its
@@ -365,6 +375,9 @@ pub struct DependentQueuedRequest {
     /// If the parent request has been sent, the parent's request identifier
     /// returned by the server once the local echo has been sent out.
     pub parent_key: Option<SentRequestKey>,
+
+    /// The time that the request was originally attempted.
+    pub created_at: MilliSecondsSinceUnixEpoch,
 }
 
 impl DependentQueuedRequest {

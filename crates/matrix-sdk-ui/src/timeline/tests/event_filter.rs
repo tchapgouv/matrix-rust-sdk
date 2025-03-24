@@ -17,14 +17,12 @@ use std::sync::Arc;
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
-use matrix_sdk::deserialized_responses::SyncTimelineEvent;
+use matrix_sdk::deserialized_responses::TimelineEvent;
 use matrix_sdk_test::{async_test, sync_timeline_event, ALICE, BOB};
 use ruma::events::{
     room::{
-        member::{MembershipState, RoomMemberEventContent},
+        member::MembershipState,
         message::{MessageType, RedactedRoomMessageEventContent},
-        name::RoomNameEventContent,
-        topic::RoomTopicEventContent,
     },
     AnySyncTimelineEvent, TimelineEventType,
 };
@@ -32,8 +30,8 @@ use stream_assert::assert_next_matches;
 
 use super::TestTimeline;
 use crate::timeline::{
-    controller::TimelineSettings, AnyOtherFullStateEventContent, TimelineEventTypeFilter,
-    TimelineItem, TimelineItemContent, TimelineItemKind,
+    controller::TimelineSettings, tests::TestTimelineBuilder, AnyOtherFullStateEventContent,
+    TimelineEventTypeFilter, TimelineItem, TimelineItemContent, TimelineItemKind,
 };
 
 #[async_test]
@@ -47,7 +45,7 @@ async fn test_default_filter() {
     timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    let _date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
     let first_event_id = item.as_event().unwrap().event_id().unwrap();
 
     timeline
@@ -82,10 +80,10 @@ async fn test_default_filter() {
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let third_event_id = item.as_event().unwrap().event_id().unwrap();
 
-    timeline.handle_live_event(f.reaction(third_event_id, "+1".to_owned()).sender(&BOB)).await;
+    timeline.handle_live_event(f.reaction(third_event_id, "+1").sender(&BOB)).await;
     timeline.handle_live_event(f.redaction(second_event_id).sender(&BOB)).await;
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 3, value } => value);
-    assert_eq!(item.as_event().unwrap().reactions().len(), 1);
+    assert_eq!(item.as_event().unwrap().content().reactions().len(), 1);
 
     // TODO: After adding raw timeline items, check for one here.
 
@@ -94,30 +92,18 @@ async fn test_default_filter() {
 
 #[async_test]
 async fn test_filter_always_false() {
-    let timeline = TestTimeline::new().with_settings(TimelineSettings {
-        event_filter: Arc::new(|_, _| false),
-        ..Default::default()
-    });
+    let timeline = TestTimelineBuilder::new()
+        .settings(TimelineSettings { event_filter: Arc::new(|_, _| false), ..Default::default() })
+        .build();
 
     let f = &timeline.factory;
     timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
 
-    timeline
-        .handle_live_redacted_message_event(&ALICE, RedactedRoomMessageEventContent::new())
-        .await;
+    timeline.handle_live_event(f.redacted(&ALICE, RedactedRoomMessageEventContent::new())).await;
 
-    timeline
-        .handle_live_state_event_with_state_key(
-            &ALICE,
-            ALICE.to_owned(),
-            RoomMemberEventContent::new(MembershipState::Join),
-            None,
-        )
-        .await;
+    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
 
-    timeline
-        .handle_live_state_event(&ALICE, RoomNameEventContent::new("Alice's room".to_owned()), None)
-        .await;
+    timeline.handle_live_event(f.room_name("Alice's room").sender(&ALICE)).await;
 
     assert_eq!(timeline.controller.items().await.len(), 0);
 }
@@ -125,47 +111,39 @@ async fn test_filter_always_false() {
 #[async_test]
 async fn test_custom_filter() {
     // Filter out all state events.
-    let timeline = TestTimeline::new().with_settings(TimelineSettings {
-        event_filter: Arc::new(|ev, _| matches!(ev, AnySyncTimelineEvent::MessageLike(_))),
-        ..Default::default()
-    });
+    let timeline = TestTimelineBuilder::new()
+        .settings(TimelineSettings {
+            event_filter: Arc::new(|ev, _| matches!(ev, AnySyncTimelineEvent::MessageLike(_))),
+            ..Default::default()
+        })
+        .build();
     let mut stream = timeline.subscribe().await;
 
     let f = &timeline.factory;
     timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
     let _item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    let _day_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
+    let _date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
 
-    timeline
-        .handle_live_redacted_message_event(&ALICE, RedactedRoomMessageEventContent::new())
-        .await;
+    timeline.handle_live_event(f.redacted(&ALICE, RedactedRoomMessageEventContent::new())).await;
     let _item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
 
-    timeline
-        .handle_live_state_event_with_state_key(
-            &ALICE,
-            ALICE.to_owned(),
-            RoomMemberEventContent::new(MembershipState::Join),
-            None,
-        )
-        .await;
+    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
 
-    timeline
-        .handle_live_state_event(&ALICE, RoomNameEventContent::new("Alice's room".to_owned()), None)
-        .await;
+    timeline.handle_live_event(f.room_name("Alice's room").sender(&ALICE)).await;
 
     assert_eq!(timeline.controller.items().await.len(), 3);
 }
 
 #[async_test]
 async fn test_hide_failed_to_parse() {
-    let timeline = TestTimeline::new()
-        .with_settings(TimelineSettings { add_failed_to_parse: false, ..Default::default() });
+    let timeline = TestTimelineBuilder::new()
+        .settings(TimelineSettings { add_failed_to_parse: false, ..Default::default() })
+        .build();
 
     // m.room.message events must have a msgtype and body in content, so this
     // event with an empty content object should fail to deserialize.
     timeline
-        .handle_live_event(SyncTimelineEvent::new(sync_timeline_event!({
+        .handle_live_event(TimelineEvent::new(sync_timeline_event!({
             "content": {},
             "event_id": "$eeG0HA0FAZ37wP8kXlNkxx3I",
             "origin_server_ts": 10,
@@ -177,7 +155,7 @@ async fn test_hide_failed_to_parse() {
     // Similar to above, the m.room.member state event must also not have an
     // empty content object.
     timeline
-        .handle_live_event(SyncTimelineEvent::new(sync_timeline_event!({
+        .handle_live_event(TimelineEvent::new(sync_timeline_event!({
             "content": {},
             "event_id": "$d5G0HA0FAZ37wP8kXlNkxx3I",
             "origin_server_ts": 2179,
@@ -195,37 +173,21 @@ async fn test_event_type_filter_include_only_room_names() {
     // Only return room name events
     let event_filter = TimelineEventTypeFilter::Include(vec![TimelineEventType::RoomName]);
 
-    let timeline = TestTimeline::new().with_settings(TimelineSettings {
-        event_filter: Arc::new(move |event, _| event_filter.filter(event)),
-        ..Default::default()
-    });
+    let timeline = TestTimelineBuilder::new()
+        .settings(TimelineSettings {
+            event_filter: Arc::new(move |event, _| event_filter.filter(event)),
+            ..Default::default()
+        })
+        .build();
     let f = &timeline.factory;
 
     // Add a non-encrypted message event
     timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
     // Add a couple of room name events
-    timeline
-        .handle_live_state_event(
-            &ALICE,
-            RoomNameEventContent::new("A new room name".to_owned()),
-            None,
-        )
-        .await;
-    timeline
-        .handle_live_state_event(
-            &ALICE,
-            RoomNameEventContent::new("A new room name (again)".to_owned()),
-            None,
-        )
-        .await;
+    timeline.handle_live_event(f.room_name("A new room name").sender(&ALICE)).await;
+    timeline.handle_live_event(f.room_name("A new room name (again)").sender(&ALICE)).await;
     // And a different state event
-    timeline
-        .handle_live_state_event(
-            &ALICE,
-            RoomTopicEventContent::new("A new room topic".to_owned()),
-            None,
-        )
-        .await;
+    timeline.handle_live_event(f.room_topic("A new room topic").sender(&ALICE)).await;
 
     // The timeline should contain only the room name events
     let event_items: Vec<Arc<TimelineItem>> = timeline.get_event_items().await;
@@ -243,37 +205,21 @@ async fn test_event_type_filter_exclude_messages() {
     // Don't return any messages
     let event_filter = TimelineEventTypeFilter::Exclude(vec![TimelineEventType::RoomMessage]);
 
-    let timeline = TestTimeline::new().with_settings(TimelineSettings {
-        event_filter: Arc::new(move |event, _| event_filter.filter(event)),
-        ..Default::default()
-    });
+    let timeline = TestTimelineBuilder::new()
+        .settings(TimelineSettings {
+            event_filter: Arc::new(move |event, _| event_filter.filter(event)),
+            ..Default::default()
+        })
+        .build();
     let f = &timeline.factory;
 
     // Add a message event
     timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
     // Add a couple of room name state events
-    timeline
-        .handle_live_state_event(
-            &ALICE,
-            RoomNameEventContent::new("A new room name".to_owned()),
-            None,
-        )
-        .await;
-    timeline
-        .handle_live_state_event(
-            &ALICE,
-            RoomNameEventContent::new("A new room name (again)".to_owned()),
-            None,
-        )
-        .await;
+    timeline.handle_live_event(f.room_name("A new room name").sender(&ALICE)).await;
+    timeline.handle_live_event(f.room_name("A new room name (again)").sender(&ALICE)).await;
     // And a different state event
-    timeline
-        .handle_live_state_event(
-            &ALICE,
-            RoomTopicEventContent::new("A new room topic".to_owned()),
-            None,
-        )
-        .await;
+    timeline.handle_live_event(f.room_topic("A new room topic").sender(&ALICE)).await;
 
     // The timeline should contain everything except for the message event.
     let event_items: Vec<Arc<TimelineItem>> = timeline.get_event_items().await;

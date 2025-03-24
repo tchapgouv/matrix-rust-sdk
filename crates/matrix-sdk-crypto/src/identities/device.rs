@@ -17,11 +17,11 @@ use std::{
     ops::Deref,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, RwLock,
+        Arc,
     },
 };
 
-use matrix_sdk_common::deserialized_responses::WithheldCode;
+use matrix_sdk_common::{deserialized_responses::WithheldCode, locks::RwLock};
 use ruma::{
     api::client::keys::upload_signatures::v3::Request as SignatureUploadRequest,
     events::{key::verification::VerificationMethod, AnyToDeviceEventContent},
@@ -31,7 +31,7 @@ use ruma::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{instrument, trace, warn};
+use tracing::{debug, instrument, trace, warn};
 use vodozemac::{olm::SessionConfig, Curve25519PublicKey, Ed25519PublicKey};
 
 use super::{atomic_bool_deserializer, atomic_bool_serializer};
@@ -425,18 +425,19 @@ impl Device {
         session: InboundGroupSession,
         message_index: Option<u32>,
     ) -> OlmResult<(Session, Raw<ToDeviceEncryptedEventContent>)> {
-        let (event_type, content) = {
+        let content: ForwardedRoomKeyContent = {
             let export = if let Some(index) = message_index {
                 session.export_at_index(index).await
             } else {
                 session.export().await
             };
-            let content: ForwardedRoomKeyContent = export.try_into()?;
 
-            (content.event_type(), content)
+            export.try_into()?
         };
 
-        self.encrypt(event_type, content).await
+        let event_type = content.event_type().to_owned();
+
+        self.encrypt(&event_type, content).await
     }
 
     /// Encrypt an event for this device.
@@ -470,7 +471,7 @@ impl Device {
     ) -> OlmResult<Raw<ToDeviceEncryptedEventContent>> {
         let (used_session, raw_encrypted) = self.encrypt(event_type, content).await?;
 
-        // perist the used session
+        // Persist the used session
         self.verification_machine
             .store
             .save_changes(Changes { sessions: vec![used_session], ..Default::default() })
@@ -479,9 +480,9 @@ impl Device {
         Ok(raw_encrypted)
     }
 
-    /// Whether or not the device is a dehydrated device.
+    /// True if this device is an [MSC3814](https://github.com/matrix-org/matrix-spec-proposals/pull/3814) dehydrated device.
     pub fn is_dehydrated(&self) -> bool {
-        self.inner.device_keys.dehydrated.unwrap_or(false)
+        self.inner.is_dehydrated()
     }
 }
 
@@ -626,7 +627,7 @@ impl DeviceData {
 
     /// Get the trust state of the device.
     pub fn local_trust_state(&self) -> LocalTrust {
-        *self.trust_state.read().unwrap()
+        *self.trust_state.read()
     }
 
     /// Is the device locally marked as trusted.
@@ -646,7 +647,7 @@ impl DeviceData {
     /// Note: This should only done in the crypto store where the trust state
     /// can be stored.
     pub(crate) fn set_trust_state(&self, state: LocalTrust) {
-        *self.trust_state.write().unwrap() = state;
+        *self.trust_state.write() = state;
     }
 
     pub(crate) fn mark_withheld_code_as_sent(&self) {
@@ -832,9 +833,9 @@ impl DeviceData {
     ) -> OlmResult<MaybeEncryptedRoomKey> {
         let content = session.as_content().await;
         let message_index = session.message_index().await;
-        let event_type = content.event_type();
+        let event_type = content.event_type().to_owned();
 
-        match self.encrypt(store, event_type, content).await {
+        match self.encrypt(store, &event_type, content).await {
             Ok((session, encrypted)) => Ok(MaybeEncryptedRoomKey::Encrypted {
                 share_info: ShareInfo::new_shared(
                     session.sender_key().to_owned(),
@@ -869,6 +870,13 @@ impl DeviceData {
                 device_keys.ed25519_key().map(Box::new),
             ))
         } else if self.device_keys.as_ref() != device_keys {
+            debug!(
+                user_id = ?self.user_id(),
+                device_id = ?self.device_id(),
+                keys = ?self.keys(),
+                "Updated a device",
+            );
+
             self.device_keys = device_keys.clone().into();
 
             Ok(true)
@@ -965,6 +973,11 @@ impl DeviceData {
     /// milliseconds since epoch (client local time).
     pub fn first_time_seen_ts(&self) -> MilliSecondsSinceUnixEpoch {
         self.first_time_seen_ts
+    }
+
+    /// True if this device is an [MSC3814](https://github.com/matrix-org/matrix-spec-proposals/pull/3814) dehydrated device.
+    pub fn is_dehydrated(&self) -> bool {
+        self.device_keys.dehydrated.unwrap_or(false)
     }
 }
 

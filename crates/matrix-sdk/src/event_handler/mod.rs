@@ -50,7 +50,7 @@ use eyeball::{SharedObservable, Subscriber};
 use futures_core::Stream;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use matrix_sdk_base::{
-    deserialized_responses::{EncryptionInfo, SyncTimelineEvent},
+    deserialized_responses::{EncryptionInfo, TimelineEvent},
     SendOutsideWasm, SyncOutsideWasm,
 };
 use pin_project_lite::pin_project;
@@ -380,7 +380,7 @@ impl Client {
     pub(crate) async fn handle_sync_timeline_events(
         &self,
         room: Option<&Room>,
-        timeline_events: &[SyncTimelineEvent],
+        timeline_events: &[TimelineEvent],
     ) -> serde_json::Result<()> {
         #[derive(Deserialize)]
         struct TimelineEventDetails<'a> {
@@ -402,7 +402,7 @@ impl Client {
 
             let raw_event = item.raw().json();
             let encryption_info = item.encryption_info();
-            let push_actions = &item.push_actions;
+            let push_actions = item.push_actions.as_deref().unwrap_or(&[]);
 
             // Event handlers for possibly-redacted timeline events
             self.call_event_handlers(
@@ -672,7 +672,9 @@ where
 #[cfg(test)]
 mod tests {
     use matrix_sdk_test::{
-        async_test, InvitedRoomBuilder, JoinedRoomBuilder, DEFAULT_TEST_ROOM_ID,
+        async_test,
+        event_factory::{EventFactory, PreviousMembership},
+        InvitedRoomBuilder, JoinedRoomBuilder, DEFAULT_TEST_ROOM_ID,
     };
     use stream_assert::{assert_closed, assert_pending, assert_ready};
     #[cfg(target_arch = "wasm32")]
@@ -686,14 +688,14 @@ mod tests {
     };
 
     use matrix_sdk_test::{
-        sync_timeline_event, EphemeralTestEvent, StateTestEvent, StrippedStateTestEvent,
-        SyncResponseBuilder,
+        EphemeralTestEvent, StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder,
     };
     use once_cell::sync::Lazy;
     use ruma::{
+        event_id,
         events::{
             room::{
-                member::{OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
+                member::{MembershipState, OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
                 name::OriginalSyncRoomNameEvent,
                 power_levels::OriginalSyncRoomPowerLevelsEvent,
             },
@@ -702,6 +704,7 @@ mod tests {
         },
         room_id,
         serde::Raw,
+        user_id,
     };
     use serde_json::json;
 
@@ -712,28 +715,13 @@ mod tests {
     };
 
     static MEMBER_EVENT: Lazy<Raw<AnySyncTimelineEvent>> = Lazy::new(|| {
-        sync_timeline_event!({
-            "content": {
-                "avatar_url": null,
-                "displayname": "example",
-                "membership": "join"
-            },
-            "event_id": "$151800140517rfvjc:localhost",
-            "membership": "join",
-            "origin_server_ts": 151800140,
-            "sender": "@example:localhost",
-            "state_key": "@example:localhost",
-            "type": "m.room.member",
-            "prev_content": {
-                "avatar_url": null,
-                "displayname": "example",
-                "membership": "invite"
-            },
-            "unsigned": {
-                "age": 297036,
-                "replaces_state": "$151800111315tsynI:localhost"
-            }
-        })
+        EventFactory::new()
+            .member(user_id!("@example:localhost"))
+            .membership(MembershipState::Join)
+            .display_name("example")
+            .event_id(event_id!("$151800140517rfvjc:localhost"))
+            .previous(PreviousMembership::new(MembershipState::Invite).display_name("example"))
+            .into()
     });
 
     #[async_test]
@@ -1159,6 +1147,80 @@ mod tests {
 
         assert_eq!(room_name.event_id.as_str(), "$ev1");
         assert_eq!(room.name().unwrap(), "Name 1");
+
+        assert_pending!(subscriber_for_room);
+
+        drop(observable_for_room);
+        assert_closed!(subscriber_for_room);
+
+        Ok(())
+    }
+
+    #[async_test]
+    async fn test_observe_several_room_events() -> crate::Result<()> {
+        let client = logged_in_client(None).await;
+
+        let room_id = room_id!("!r0.matrix.org");
+
+        let observable_for_room =
+            client.observe_room_events::<OriginalSyncRoomNameEvent, (Room, Client)>(room_id);
+
+        let mut subscriber_for_room = observable_for_room.subscribe();
+
+        assert_pending!(subscriber_for_room);
+
+        let mut response_builder = SyncResponseBuilder::new();
+        let response = response_builder
+            .add_joined_room(
+                JoinedRoomBuilder::new(room_id)
+                    .add_state_event(StateTestEvent::Custom(json!({
+                        "content": {
+                            "name": "Name 0"
+                        },
+                        "event_id": "$ev0",
+                        "origin_server_ts": 1,
+                        "sender": "@mnt_io:matrix.org",
+                        "state_key": "",
+                        "type": "m.room.name",
+                        "unsigned": {
+                            "age": 1,
+                        }
+                    })))
+                    .add_state_event(StateTestEvent::Custom(json!({
+                        "content": {
+                            "name": "Name 1"
+                        },
+                        "event_id": "$ev1",
+                        "origin_server_ts": 2,
+                        "sender": "@mnt_io:matrix.org",
+                        "state_key": "",
+                        "type": "m.room.name",
+                        "unsigned": {
+                            "age": 1,
+                        }
+                    })))
+                    .add_state_event(StateTestEvent::Custom(json!({
+                        "content": {
+                            "name": "Name 2"
+                        },
+                        "event_id": "$ev2",
+                        "origin_server_ts": 3,
+                        "sender": "@mnt_io:matrix.org",
+                        "state_key": "",
+                        "type": "m.room.name",
+                        "unsigned": {
+                            "age": 1,
+                        }
+                    }))),
+            )
+            .build_sync_response();
+        client.process_sync(response).await?;
+
+        let (room_name, (room, _client)) = assert_ready!(subscriber_for_room);
+
+        // Check we only get notified about the latest received event
+        assert_eq!(room_name.event_id.as_str(), "$ev2");
+        assert_eq!(room.name().unwrap(), "Name 2");
 
         assert_pending!(subscriber_for_room);
 
