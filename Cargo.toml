@@ -126,7 +126,6 @@ matrix-sdk-ui = { path = "crates/matrix-sdk-ui", version = "0.10.0", default-fea
 # Default release profile, select with `--release`
 [profile.release]
 lto = true
-strip = "symbols"
 
 # Default development profile; default for most Cargo commands, otherwise
 # selected with `--debug`
