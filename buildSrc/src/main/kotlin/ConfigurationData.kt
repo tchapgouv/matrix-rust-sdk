@@ -2,7 +2,7 @@ object ConfigurationData {
     const val compileSdk = 34
     const val targetSdk = 33
     const val minSdk = 21
-    const val publishGroupId = "org.matrix.rustcomponents"
+    const val publishGroupId = "de.bwi.messenger"
     const val versionNameCrypto =
         "${BuildVersionsCrypto.majorVersion}.${BuildVersionsCrypto.minorVersion}.${BuildVersionsCrypto.patchVersion}"
     const val versionNameSdk =

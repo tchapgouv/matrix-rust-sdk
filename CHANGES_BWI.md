@@ -1,3 +1,10 @@
+Changes in BWI project 0.8.1 (2025-04-02)
+===================================================
+
+Bugfix 🐛:
+- MESSENGER-7076 Fix version number and publisher infos of the Android bindings, 
+  uniffi could not create bindings when debug symbols are not present
+
 Changes in BWI project 0.8.0 (2024-02-25)
 
 Upstream merge ✨:

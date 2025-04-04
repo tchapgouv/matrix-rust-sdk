@@ -7,9 +7,9 @@ plugins {
 
 ext {
     PUBLISH_GROUP_ID = ConfigurationData.publishGroupId
-    PUBLISH_ARTIFACT_ID = 'sdk-android'
+    PUBLISH_ARTIFACT_ID = 'rust-sdk'
     PUBLISH_VERSION = ConfigurationData.versionNameSdk
-    PUBLISH_DESCRIPTION = 'Android Bindings to the Matrix Rust SDK'
+    PUBLISH_DESCRIPTION = 'Android Bindings to the BWI Rust SDK'
 }
 
 android {
