@@ -2487,7 +2487,7 @@ async fn test_room_empty_timeline() {
         .mount(&server)
         .await;
 
-    let room = client.create_room(CreateRoomRequest::default(), false).await.unwrap();
+    let room = client.create_room(CreateRoomRequest::default()).await.unwrap();
     let room_id = room.room_id().to_owned();
 
     // The room wasn't synced, but it will be available

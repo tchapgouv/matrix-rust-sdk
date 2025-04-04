@@ -8,12 +8,8 @@ use syn::parse_macro_input;
 pub fn async_test(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let fun = parse_macro_input!(item as syn::ItemFn);
 
-    let starts_with_test = !fun.sig.ident.to_string().starts_with("test_");
-    // see naming convention of https://github.com/la10736/rstest?tab=readme-ov-file
-    let is_parameterized_test = !fun.sig.ident.to_string().starts_with("case_");
-
-    if !starts_with_test && !is_parameterized_test {
-        panic!("test function names must start with test_ or with case_ (parameterized)");
+    if !fun.sig.ident.to_string().starts_with("test_") {
+        panic!("test function names must start with test_");
     }
 
     // on the regular return-case, we can just use cfg_attr and quit early

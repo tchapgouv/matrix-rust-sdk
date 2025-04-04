@@ -40,7 +40,7 @@ async fn test_room_directory_search_filter() -> Result<()> {
         let name = format!("{}_{}", search_string, index);
         warn!("room name: {}", name);
         request.name = Some(name);
-        alice.create_room(request, false).await?;
+        alice.create_room(request).await?;
     }
     sleep(Duration::from_secs(1)).await;
     let mut room_directory_search = RoomDirectorySearch::new(alice);

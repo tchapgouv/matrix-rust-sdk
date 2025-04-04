@@ -1,13 +1,9 @@
 use std::{fs, num::NonZeroUsize, path::Path, sync::Arc, time::Duration};
 
-use super::{client::Client, RUNTIME};
-use crate::{
-    authentication::OidcConfiguration, client::ClientSessionDelegate, error::ClientError,
-    helpers::unwrap_or_clone_arc, task_handle::TaskHandle,
-};
+use async_compat::get_runtime_handle;
 use futures_util::StreamExt;
 use matrix_sdk::{
-    authentication::oidc::qrcode::{self, DeviceCodeErrorResponseType, LoginFailureReason},
+    authentication::oauth::qrcode::{self, DeviceCodeErrorResponseType, LoginFailureReason},
     crypto::{
         types::qr_login::{LoginQrCodeDecodeError, QrCodeModeData},
         CollectStrategy, TrustRequirement,
@@ -26,6 +22,12 @@ use matrix_sdk::{
 use ruma::api::error::{DeserializationError, FromHttpResponseError};
 use tracing::{debug, error};
 use zeroize::Zeroizing;
+
+use super::client::Client;
+use crate::{
+    authentication::OidcConfiguration, client::ClientSessionDelegate, error::ClientError,
+    helpers::unwrap_or_clone_arc, task_handle::TaskHandle,
+};
 
 /// A list of bytes containing a certificate in DER or PEM form.
 pub type CertificateBytes = Vec<u8>;
@@ -102,7 +104,7 @@ impl From<qrcode::QRCodeLoginError> for HumanQrLoginError {
                 _ => HumanQrLoginError::Unknown,
             },
 
-            QRCodeLoginError::Oauth(e) => {
+            QRCodeLoginError::OAuth(e) => {
                 if let Some(e) = e.as_request_token_error() {
                     match e {
                         DeviceCodeErrorResponseType::AccessDenied => HumanQrLoginError::Declined,
@@ -205,10 +207,6 @@ pub enum ClientBuildError {
     EventCache(#[from] EventCacheError),
     #[error("Failed to build the client: {message}")]
     Generic { message: String },
-    // BWI specific
-    #[error("None of the provided public keys verifies the signature of the server")]
-    ServerIsNotVerified,
-    // end BWI specific
 }
 
 impl From<MatrixClientBuildError> for ClientBuildError {
@@ -225,7 +223,6 @@ impl From<MatrixClientBuildError> for ClientBuildError {
             MatrixClientBuildError::SlidingSyncVersion(e) => {
                 ClientBuildError::SlidingSyncVersion(e)
             }
-            MatrixClientBuildError::ServerIsNotVerified => ClientBuildError::ServerIsNotVerified,
             _ => ClientBuildError::Sdk(e),
         }
     }
@@ -257,9 +254,6 @@ impl From<ClientError> for ClientBuildError {
 
 #[derive(Clone, uniffi::Object)]
 pub struct ClientBuilder {
-    // BWI specific
-    public_keys_for_jwt_token_validation: Option<Vec<String>>,
-    // end BWI specific
     session_paths: Option<SessionPaths>,
     username: Option<String>,
     homeserver_cfg: Option<HomeserverConfig>,
@@ -289,9 +283,6 @@ impl ClientBuilder {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            // BWI specific
-            public_keys_for_jwt_token_validation: Some(Vec::new()),
-            // end BWI specific
             session_paths: None,
             username: None,
             homeserver_cfg: None,
@@ -371,26 +362,6 @@ impl ClientBuilder {
         builder.session_paths = Some(SessionPaths { data_path, cache_path });
         Arc::new(builder)
     }
-
-    // BWI specific
-    /// Set the public keys that could be used for validating
-    /// the identity of the server via the jwt token flow
-    pub fn public_keys_for_jwt_token_validation(
-        self: Arc<Self>,
-        public_keys_for_jwt: Vec<String>,
-    ) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.public_keys_for_jwt_token_validation = Some(public_keys_for_jwt);
-        Arc::new(builder)
-    }
-
-    /// Disable Jwt-Token validation
-    pub fn without_jwt_token_validation(self: Arc<Self>) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.public_keys_for_jwt_token_validation = None;
-        Arc::new(builder)
-    }
-    // end BWI specific
 
     pub fn username(self: Arc<Self>, username: String) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
@@ -603,17 +574,6 @@ impl ClientBuilder {
 
         inner_builder = inner_builder.add_root_certificates(certificates);
 
-        // BWI-specific
-        inner_builder = match builder.public_keys_for_jwt_token_validation {
-            None => Ok::<_, ClientBuildError>(inner_builder.without_server_jwt_token_validation()),
-            Some(keys) => Ok({
-                inner_builder
-                    .public_keys_for_jwt_from_strings(&keys)
-                    .map_err(|_| ClientBuildError::ServerIsNotVerified)?
-            }),
-        }?;
-        // end BWI specific
-
         if builder.disable_built_in_root_certificates {
             inner_builder = inner_builder.disable_built_in_root_certificates();
         }
@@ -728,17 +688,19 @@ impl ClientBuilder {
             }
         })?;
 
-        let client_metadata =
-            oidc_configuration.try_into().map_err(|_| HumanQrLoginError::OidcMetadataInvalid)?;
+        let registrations = oidc_configuration
+            .registrations()
+            .await
+            .map_err(|_| HumanQrLoginError::OidcMetadataInvalid)?;
 
-        let oidc = client.inner.oidc();
-        let login = oidc.login_with_qr_code(&qr_code_data.inner, client_metadata);
+        let oauth = client.inner.oauth();
+        let login = oauth.login_with_qr_code(&qr_code_data.inner, registrations.into());
 
         let mut progress = login.subscribe_to_progress();
 
         // We create this task, which will get cancelled once it's dropped, just in case
         // the progress stream doesn't end.
-        let _progress_task = TaskHandle::new(RUNTIME.spawn(async move {
+        let _progress_task = TaskHandle::new(get_runtime_handle().spawn(async move {
             while let Some(state) = progress.next().await {
                 progress_listener.on_update(state.into());
             }

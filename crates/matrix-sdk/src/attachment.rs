@@ -16,6 +16,8 @@
 
 use crate::bwi_extensions::attachment::FileSize;
 use crate::Error::{AttachmentSizeExceededMaxSize, AttachmentSizeNotDefined};
+use std::time::Duration;
+
 use ruma::{
     assign,
     events::{
@@ -27,7 +29,6 @@ use ruma::{
     },
     OwnedTransactionId, TransactionId, UInt,
 };
-use std::time::Duration;
 
 /// Base metadata about an image.
 #[derive(Debug, Clone, Default)]

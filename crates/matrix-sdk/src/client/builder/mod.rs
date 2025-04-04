@@ -17,22 +17,6 @@ mod homeserver_config;
 
 use std::{fmt, sync::Arc};
 
-use super::{Client, ClientInner};
-#[cfg(feature = "experimental-oidc")]
-use crate::authentication::oidc::OidcCtx;
-#[cfg(feature = "e2e-encryption")]
-use crate::crypto::{CollectStrategy, TrustRequirement};
-#[cfg(feature = "e2e-encryption")]
-use crate::encryption::EncryptionSettings;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::http_client::HttpSettings;
-
-use crate::ClientBuildError::ServerIsNotVerified;
-use crate::{
-    authentication::AuthCtx, client::ClientServerCapabilities, config::RequestConfig,
-    error::RumaApiError, http_client::HttpClient, send_queue::SendQueueData,
-    sliding_sync::VersionBuilder as SlidingSyncVersionBuilder, HttpError, IdParseError,
-};
 use homeserver_config::*;
 use matrix_sdk_base::{store::StoreConfig, BaseClient};
 use matrix_sdk_base_bwi::jwt_token::{
@@ -49,6 +33,22 @@ use tokio::sync::{broadcast, Mutex, OnceCell};
 use tracing::log::warn;
 use tracing::{debug, field::debug, instrument, Span};
 use url::Url;
+
+use super::{Client, ClientInner};
+#[cfg(feature = "experimental-oidc")]
+use crate::authentication::oauth::OAuthCtx;
+#[cfg(feature = "e2e-encryption")]
+use crate::crypto::{CollectStrategy, TrustRequirement};
+#[cfg(feature = "e2e-encryption")]
+use crate::encryption::EncryptionSettings;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::http_client::HttpSettings;
+use crate::ClientBuildError::ServerIsNotVerified;
+use crate::{
+    authentication::AuthCtx, client::ClientServerCapabilities, config::RequestConfig,
+    error::RumaApiError, http_client::HttpClient, send_queue::SendQueueData,
+    sliding_sync::VersionBuilder as SlidingSyncVersionBuilder, HttpError, IdParseError,
+};
 
 /// Builder that allows creating and configuring various parts of a [`Client`].
 ///
@@ -114,7 +114,7 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
-    const DEFAULT_CROSS_PROCESS_STORE_LOCKS_HOLDER_NAME: &'static str = "main";
+    const DEFAULT_CROSS_PROCESS_STORE_LOCKS_HOLDER_NAME: &str = "main";
 
     pub(crate) fn new() -> Self {
         Self {
@@ -174,8 +174,8 @@ impl ClientBuilder {
     }
 
     /// Set the server name to discover the homeserver from, assuming an HTTP
-    /// (not secured) scheme. This also relaxes OIDC discovery checks to allow
-    /// HTTP schemes.
+    /// (not secured) scheme. This also relaxes OAuth 2.0 discovery checks to
+    /// allow HTTP schemes.
     ///
     /// The following methods are mutually exclusive: [`Self::homeserver_url`],
     /// [`Self::server_name`] [`Self::insecure_server_name_no_tls`],
@@ -548,9 +548,9 @@ impl ClientBuilder {
             homeserver_cfg.discover(&http_client).await?;
 
         // BWI specific
-        Self::verify_jwt_token(self.public_keys_for_jwt_validation, &homeserver)
-            .await
-            .map_err(|_err| ServerIsNotVerified)?;
+        // Self::verify_jwt_token(self.public_keys_for_jwt_validation, &homeserver)
+        //     .await
+        //     .map_err(|_err| ServerIsNotVerified)?;
 
         let sliding_sync_version = {
             let supported_versions = match supported_versions {
@@ -569,17 +569,18 @@ impl ClientBuilder {
         };
 
         #[cfg(feature = "experimental-oidc")]
-        let allow_insecure_oidc = homeserver.scheme() == "http";
+        let allow_insecure_oauth = homeserver.scheme() == "http";
 
         let auth_ctx = Arc::new(AuthCtx {
             handle_refresh_tokens: self.handle_refresh_tokens,
             refresh_token_lock: Arc::new(Mutex::new(Ok(()))),
             session_change_sender: broadcast::Sender::new(1),
             auth_data: OnceCell::default(),
+            tokens: OnceCell::default(),
             reload_session_callback: OnceCell::default(),
             save_session_callback: OnceCell::default(),
             #[cfg(feature = "experimental-oidc")]
-            oidc: OidcCtx::new(allow_insecure_oidc),
+            oauth: OAuthCtx::new(allow_insecure_oauth),
         });
 
         // Enable the send queue by default.
@@ -945,41 +946,6 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-
-    async fn test_discovery_direct_legacy_custom_proxy() {
-        // Given a homeserver without a well-known file and with a custom sliding sync
-        // proxy injected.
-        let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new()
-            // BWI-specific
-            .without_server_jwt_token_validation();
-        // end BWI-specific
-        #[cfg(feature = "experimental-sliding-sync")]
-        let url = {
-            let url = Url::parse("https://localhost:1234").unwrap();
-            builder = builder.sliding_sync_version_builder(SlidingSyncVersionBuilder::Proxy {
-                url: url.clone(),
-            });
-
-            url
-        };
-
-        // When building a client with the server's URL.
-        builder = builder.server_name_or_homeserver_url(homeserver.uri());
-        let _client = builder.build().await.unwrap();
-
-        // Then a client should be built with support for sliding sync.
-        #[cfg(feature = "experimental-sliding-sync")]
-        assert_matches!(
-            _client.sliding_sync_version(),
-            SlidingSyncVersion::Proxy { url: given_url } => {
-                assert_eq!(given_url, url);
-            }
-        );
-    }
-
-    #[async_test]
-
     async fn test_discovery_well_known_parse_error() {
         // Given a base server with a well-known file that has errors.
         let server = MockServer::start().await;
@@ -1034,125 +1000,6 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    #[cfg(feature = "experimental-sliding-sync")]
-    async fn test_discovery_well_known_with_sliding_sync() {
-        // Given a base server with a well-known file that points to a homeserver with a
-        // sliding sync proxy.
-        let server = MockServer::start().await;
-        let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new()
-            // BWI-specific
-            .without_server_jwt_token_validation();
-        // end BWI-specific
-
-        Mock::given(method("GET"))
-            .and(path("/.well-known/matrix/client"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(make_well_known_json(
-                &homeserver.uri(),
-                Some("https://localhost:1234"),
-            )))
-            .mount(&server)
-            .await;
-
-        // When building a client with the base server, with sliding sync to
-        // auto-discover the proxy.
-        builder = builder
-            .server_name_or_homeserver_url(server.uri())
-            .sliding_sync_version_builder(SlidingSyncVersionBuilder::DiscoverProxy);
-        let _client = builder.build().await.unwrap();
-
-        // Then a client should be built with support for sliding sync.
-        #[cfg(feature = "experimental-sliding-sync")]
-        assert_matches!(
-            _client.sliding_sync_version(),
-            SlidingSyncVersion::Proxy { url } => {
-                assert_eq!(url, Url::parse("https://localhost:1234").unwrap());
-            }
-        );
-    }
-
-    #[async_test]
-    #[cfg(feature = "experimental-sliding-sync")]
-    async fn test_discovery_well_known_with_sliding_sync_override() {
-        // Given a base server with a well-known file that points to a homeserver with a
-        // sliding sync proxy.
-        let server = MockServer::start().await;
-        let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new()
-            // BWI-specific
-            .without_server_jwt_token_validation();
-        // end BWI-specific
-
-        Mock::given(method("GET"))
-            .and(path("/.well-known/matrix/client"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(make_well_known_json(
-                &homeserver.uri(),
-                Some("https://localhost:1234"),
-            )))
-            .mount(&server)
-            .await;
-
-        // When building a client with the base server and a custom sliding sync proxy
-        // set.
-        let url = Url::parse("https://localhost:9012").unwrap();
-
-        builder = builder
-            .sliding_sync_version_builder(SlidingSyncVersionBuilder::Proxy { url: url.clone() })
-            .server_name_or_homeserver_url(server.uri());
-
-        let client = builder.build().await.unwrap();
-
-        // Then a client should be built and configured with the custom sliding sync
-        // proxy.
-        assert_matches!(
-            client.sliding_sync_version(),
-            SlidingSyncVersion::Proxy { url: given_url } => {
-                assert_eq!(url, given_url);
-            }
-        );
-    }
-
-    #[async_test]
-    #[cfg(feature = "experimental-sliding-sync")]
-    async fn test_sliding_sync_discover_proxy() {
-        // Given a homeserver with a `.well-known` file.
-        let homeserver = make_mock_homeserver().await;
-        let mut builder = ClientBuilder::new()
-            // BWI-specific
-            .without_server_jwt_token_validation();
-        // end BWI-specific
-
-        let expected_url = Url::parse("https://localhost:1234").unwrap();
-
-        Mock::given(method("GET"))
-            .and(path("/.well-known/matrix/client"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(make_well_known_json(
-                &homeserver.uri(),
-                Some(expected_url.as_str()),
-            )))
-            .mount(&homeserver)
-            .await;
-
-        // When building the client with sliding sync to auto-discover the
-        // proxy version.
-        builder = builder
-            .server_name_or_homeserver_url(homeserver.uri())
-            .sliding_sync_version_builder(SlidingSyncVersionBuilder::DiscoverProxy);
-
-        let client = builder.build().await.unwrap();
-
-        // Then, sliding sync has the correct proxy URL.
-        assert_matches!(
-            client.sliding_sync_version(),
-            SlidingSyncVersion::Proxy { url } => {
-                assert_eq!(url, expected_url);
-            }
-        );
-    }
-
-    #[async_test]
-    #[cfg(feature = "experimental-sliding-sync")]
-
     async fn test_sliding_sync_discover_native() {
         // Given a homeserver with a `/versions` file.
         let homeserver = make_mock_homeserver().await;

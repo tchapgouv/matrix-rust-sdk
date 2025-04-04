@@ -58,6 +58,7 @@ fn get_clang_major_version(clang_path: &Path) -> String {
 
 fn main() -> Result<(), Box<dyn Error>> {
     setup_x86_64_android_workaround();
+
     EmitBuilder::builder().git_sha(true).git_describe(true, false, None).emit()?;
 
     Ok(())

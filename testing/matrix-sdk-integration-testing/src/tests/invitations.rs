@@ -18,7 +18,7 @@ async fn test_invitation_details() -> Result<()> {
         is_direct: true,
     });
 
-    let room = tamatoa.create_room(request, false).await?;
+    let room = tamatoa.create_room(request).await?;
     let room_id = room.room_id().to_owned();
 
     // the actual test

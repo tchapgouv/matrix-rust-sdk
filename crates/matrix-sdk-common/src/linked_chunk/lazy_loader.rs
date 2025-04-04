@@ -96,7 +96,8 @@ where
             }
         }
 
-        let expected_next_chunk = linked_chunk.links.first_chunk().identifier();
+        let first_chunk = linked_chunk.links.first_chunk();
+        let expected_next_chunk = first_chunk.identifier();
 
         // New chunk has a next chunk.
         let Some(next_chunk) = new_first_chunk.next else {
@@ -108,6 +109,15 @@ where
             return Err(LazyLoaderError::CannotConnectTwoChunks {
                 new_chunk: new_first_chunk.identifier,
                 with_chunk: expected_next_chunk,
+            });
+        }
+
+        // Same check as before, but in reverse: the first chunk has a `lazy_previous`
+        // to the new first chunk.
+        if first_chunk.lazy_previous() != Some(new_first_chunk.identifier) {
+            return Err(LazyLoaderError::CannotConnectTwoChunks {
+                new_chunk: first_chunk.identifier,
+                with_chunk: new_first_chunk.identifier,
             });
         }
 
@@ -252,8 +262,11 @@ where
     linked_chunk.links.replace_with(chunk_ptr);
 
     if let Some(updates) = linked_chunk.updates.as_mut() {
-        // TODO: clear updates first? (see same comment in `clear`).
+        // Clear the previous updates, as we're about to insert a clear they would be
+        // useless.
+        updates.clear_pending();
         updates.push(Update::Clear);
+
         emit_new_first_chunk_updates(linked_chunk.links.first_chunk(), updates);
     }
 
@@ -522,6 +535,26 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_new_first_chunk_err_cannot_connect_two_chunks_before_no_lazy_previous() {
+        let new_first_chunk = RawChunk {
+            previous: None,
+            identifier: ChunkIdentifier::new(1),
+            next: Some(ChunkIdentifier::new(0)),
+            content: ChunkContent::Gap(()),
+        };
+
+        let mut linked_chunk = LinkedChunk::<2, char, ()>::new();
+        linked_chunk.push_gap_back(());
+
+        let result = insert_new_first_chunk(&mut linked_chunk, new_first_chunk);
+
+        assert_matches!(result, Err(LazyLoaderError::CannotConnectTwoChunks { new_chunk, with_chunk }) => {
+            assert_eq!(new_chunk, 0);
+            assert_eq!(with_chunk, 1);
+        });
+    }
+
+    #[test]
     fn test_insert_new_first_chunk_gap() {
         let new_first_chunk = RawChunk {
             previous: None,
@@ -532,6 +565,7 @@ mod tests {
 
         let mut linked_chunk = LinkedChunk::<5, char, ()>::new_with_update_history();
         linked_chunk.push_items_back(vec!['a', 'b']);
+        linked_chunk.links.first_chunk_mut().lazy_previous = Some(ChunkIdentifier::new(1));
 
         // Drain initial updates.
         let _ = linked_chunk.updates().unwrap().take();
@@ -590,6 +624,7 @@ mod tests {
 
         let mut linked_chunk = LinkedChunk::<5, char, ()>::new_with_update_history();
         linked_chunk.push_items_back(vec!['a', 'b']);
+        linked_chunk.links.first_chunk_mut().lazy_previous = Some(ChunkIdentifier::new(1));
 
         // Drain initial updates.
         let _ = linked_chunk.updates().unwrap().take();

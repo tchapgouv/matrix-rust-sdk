@@ -33,7 +33,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use eyeball::Subscriber;
+use eyeball::{SharedObservable, Subscriber};
 use eyeball_im::VectorDiff;
 use matrix_sdk_base::{
     deserialized_responses::{AmbiguityChange, TimelineEvent},
@@ -69,8 +69,8 @@ mod pagination;
 mod room;
 
 pub mod paginator;
-pub use pagination::{PaginationToken, RoomPagination};
-pub use room::RoomEventCache;
+pub use pagination::{PaginationToken, RoomPagination, RoomPaginationStatus};
+pub use room::{RoomEventCache, RoomEventCacheListener};
 
 /// An error observed in the [`EventCache`].
 #[derive(thiserror::Error, Debug)]
@@ -82,20 +82,14 @@ pub enum EventCacheError {
     )]
     NotSubscribedYet,
 
-    /// The room hasn't been found in the client.
-    ///
-    /// Technically, it's possible to request a [`RoomEventCache`] for a room
-    /// that is not known to the client, leading to this error.
-    #[error("Room {0} hasn't been found in the Client.")]
-    RoomNotFound(OwnedRoomId),
-
-    /// The given back-pagination token is unknown to the event cache.
-    #[error("The given back-pagination token is unknown to the event cache.")]
-    UnknownBackpaginationToken,
-
     /// An error has been observed while back-paginating.
-    #[error("Error observed while back-paginating: {0}")]
+    #[error(transparent)]
     BackpaginationError(#[from] PaginatorError),
+
+    /// Back-pagination was already happening in a given room, where we tried to
+    /// back-paginate again.
+    #[error("We were already back-paginating.")]
+    AlreadyBackpaginating,
 
     /// An error happening when interacting with storage.
     #[error(transparent)]
@@ -432,7 +426,13 @@ impl EventCache {
 
         room_cache
             .inner
-            .replace_all_events_by(events, prev_batch, Default::default(), Default::default())
+            .replace_all_events_by(
+                events,
+                prev_batch,
+                Default::default(),
+                Default::default(),
+                EventsOrigin::Cache,
+            )
             .await?;
 
         Ok(())
@@ -646,15 +646,7 @@ impl EventCacheInner {
 
         let rooms = self.by_room.write().await;
         for room in rooms.values() {
-            // Clear all the room state.
-            let updates_as_vector_diffs = room.inner.state.write().await.reset().await?;
-
-            // Notify all the observers that we've lost track of state. (We ignore the
-            // error if there aren't any.)
-            let _ = room.inner.sender.send(RoomEventCacheUpdate::UpdateTimelineEvents {
-                diffs: updates_as_vector_diffs,
-                origin: EventsOrigin::Sync,
-            });
+            room.clear().await?;
         }
 
         Ok(())
@@ -687,7 +679,7 @@ impl EventCacheInner {
                 room.inner.handle_joined_room_update(self.has_storage(), joined_room_update).await
             {
                 // Non-fatal error, try to continue to the next room.
-                error!("handling joined room update: {err}");
+                error!(%room_id, "handling joined room update: {err}");
             }
         }
 
@@ -720,18 +712,27 @@ impl EventCacheInner {
                     return Ok(room.clone());
                 }
 
-                let room_state =
-                    RoomEventCacheState::new(room_id.to_owned(), self.store.clone()).await?;
+                let pagination_status =
+                    SharedObservable::new(RoomPaginationStatus::Idle { hit_timeline_start: false });
 
                 let room_version = self
                     .client
                     .get()
                     .and_then(|client| client.get_room(room_id))
+                    .as_ref()
                     .map(|room| room.clone_info().room_version_or_default())
                     .unwrap_or_else(|| {
                         warn!("unknown room version for {room_id}, using default V1");
                         RoomVersionId::V1
                     });
+
+                let room_state = RoomEventCacheState::new(
+                    room_id.to_owned(),
+                    room_version,
+                    self.store.clone(),
+                    pagination_status.clone(),
+                )
+                .await?;
 
                 // SAFETY: we must have subscribed before reaching this coed, otherwise
                 // something is very wrong.
@@ -743,8 +744,8 @@ impl EventCacheInner {
                 let room_event_cache = RoomEventCache::new(
                     self.client.clone(),
                     room_state,
+                    pagination_status,
                     room_id.to_owned(),
-                    room_version,
                     self.all_events.clone(),
                     auto_shrink_sender,
                 );

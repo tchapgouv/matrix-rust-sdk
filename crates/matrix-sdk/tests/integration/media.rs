@@ -1,10 +1,9 @@
 use matrix_sdk::bwi_content_scanner::BWIScanMediaExt;
 use matrix_sdk::{
-    authentication::matrix::{MatrixSession, MatrixSessionTokens},
     config::RequestConfig,
     media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
-    test_utils::logged_in_client_with_server,
-    Client, SessionMeta,
+    test_utils::{client::mock_matrix_session, logged_in_client_with_server},
+    Client,
 };
 use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState;
 use matrix_sdk_bwi_test::media::mock_server::content_scanner::{
@@ -13,16 +12,14 @@ use matrix_sdk_bwi_test::media::mock_server::content_scanner::{
     provide_supported_versions_endpoint,
 };
 use matrix_sdk_test::async_test;
-use rstest::rstest;
 use ruma::events::room::MediaSource::Encrypted;
 use ruma::{
     api::client::media::get_content_thumbnail::v3::Method,
-    assign, device_id,
+    assign,
     events::room::{message::ImageMessageEventContent, ImageInfo, MediaSource},
-    mxc_uri, uint, user_id,
+    mxc_uri, owned_mxc_uri, uint,
 };
 use serde_json::json;
-use std::borrow::ToOwned;
 use wiremock::{
     matchers::{header, method, path, query_param},
     Mock, ResponseTemplate,
@@ -229,17 +226,7 @@ async fn test_get_media_file_with_auth_matrix_1_11() {
         .unwrap();
 
     // Restore session.
-    client
-        .matrix_auth()
-        .restore_session(MatrixSession {
-            meta: SessionMeta {
-                user_id: user_id!("@example:localhost").to_owned(),
-                device_id: device_id!("DEVICEID").to_owned(),
-            },
-            tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
-        })
-        .await
-        .unwrap();
+    client.matrix_auth().restore_session(mock_matrix_session()).await.unwrap();
 
     // Build event content.
     let event_content = ImageMessageEventContent::plain(
@@ -347,17 +334,7 @@ async fn test_get_media_file_with_auth_matrix_stable_feature() {
         .unwrap();
 
     // Restore session.
-    client
-        .matrix_auth()
-        .restore_session(MatrixSession {
-            meta: SessionMeta {
-                user_id: user_id!("@example:localhost").to_owned(),
-                device_id: device_id!("DEVICEID").to_owned(),
-            },
-            tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
-        })
-        .await
-        .unwrap();
+    client.matrix_auth().restore_session(mock_matrix_session()).await.unwrap();
 
     // Build event content.
     let event_content = ImageMessageEventContent::plain(
@@ -553,4 +530,50 @@ async fn test_scan_media_cache() {
 
     // Assert
     assert_eq!(scan_state, BWIScanState::Trusted);
+}
+async fn test_async_media_upload() {
+    let (client, server) = logged_in_client_with_server().await;
+
+    client.reset_server_capabilities().await.unwrap();
+
+    // Declare Matrix version v1.7.
+    Mock::given(method("GET"))
+        .and(path("/_matrix/client/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "versions": [
+                "v1.7"
+            ],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/_matrix/media/v1/create"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+          "content_uri": "mxc://example.com/AQwafuaFswefuhsfAFAgsw"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path("/_matrix/media/v3/upload/example.com/AQwafuaFswefuhsfAFAgsw"))
+        .and(header("authorization", "Bearer 1234"))
+        .and(header("content-type", "image/jpeg"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mxc_uri = client.media().create_content_uri().await.unwrap();
+
+    assert_eq!(mxc_uri.uri, owned_mxc_uri!("mxc://example.com/AQwafuaFswefuhsfAFAgsw"));
+
+    client
+        .media()
+        .upload_preallocated(mxc_uri, &mime::IMAGE_JPEG, b"hello world".to_vec())
+        .await
+        .unwrap();
 }

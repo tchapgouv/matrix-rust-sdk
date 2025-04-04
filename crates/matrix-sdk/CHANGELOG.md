@@ -8,7 +8,18 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- [**breaking**]: The `RoomPagination::run_backwards` method has been removed, and replaced by two
+- [**breaking**]: The element call widget URL configuration struct (`VirtualElementCallWidgetOptions`) and URL generation
+  have changed.
+  - It supports the new fields: `hide_screensharing`, `posthog_api_host`, `posthog_api_key`,
+  `rageshake_submit_url`, `sentry_dsn`, `sentry_environment`.
+  - The widget URL will no longer automatically add `/room` to the base domain. For backward compatibility
+  the app itself would need to add `/room` to the `element_call_url`.
+  - And replaced:
+    - `analytics_id` -> `posthog_user_id` (The widget URL query parameters will include `analytics_id` & `posthog_user_id`
+    for backward compatibility)
+    - `skip_lobby` -> `intent` (`Intent.StartCall`, `Intent.JoinExisting`. The widget URL query parameters will include `skip_lobby` if `intent` is `Intent.StartCall` for backward compatibility)
+  - `VirtualElementCallWidgetOptions` now implements `Default`.
+- [**breaking**]: The `RoomPagination::run_backwards` method has been removed and replaced by two
 simpler methods:
   - `RoomPagination::run_backwards_until()`, which will retrigger back-paginations until a certain
   number of events have been received (and retry if the timeline has been reset in the background).
@@ -21,13 +32,38 @@ simpler methods:
   this URI is not desirable, the `Oidc::fetch_account_management_url` method
   can be used.
   ([#4663](https://github.com/matrix-org/matrix-rust-sdk/pull/4663))
-
 - The `MediaRetentionPolicy` can now trigger regular cleanups with its new
   `cleanup_frequency` setting.
   ([#4603](https://github.com/matrix-org/matrix-rust-sdk/pull/4603))
 - [**breaking**] The HTTP client only allows TLS 1.2 or newer, as recommended by
   [BCP 195](https://datatracker.ietf.org/doc/bcp195/).
   ([#4647](https://github.com/matrix-org/matrix-rust-sdk/pull/4647))
+- Add `Room::report_room` api. ([#4713](https://github.com/matrix-org/matrix-rust-sdk/pull/4713))
+- `Client::notification_client` will create a copy of the existing `Client`,
+  but now it'll make sure  it doesn't handle any verification events to
+  avoid an issue with these events being received and  processed twice if
+  `NotificationProcessSetup` was `SingleSetup`.
+- [**breaking**] `Room::is_encrypted` is replaced by
+  `Room::latest_encryption_state` which returns a value of the new
+  `EncryptionState` enum; another `Room::encryption_state` non-async and
+  infallible method is added to get the `EncryptionState` without calling
+  `Room::request_encryption_state`. This latter method is also now public.
+  ([#4777](https://github.com/matrix-org/matrix-rust-sdk/pull/4777)). One can
+  safely replace:
+
+  ```rust
+  room.is_encrypted().await?
+  ```
+
+  by
+
+  ```rust
+  room.latest_encryption_state().await?.is_encrypted()
+  ```
+- `LocalServerBuilder`, behind the `local-server` feature, can be used to spawn
+  a server when the end-user needs to be redirected to an address on localhost.
+  It was used for `SsoLoginBuilder` and can now be used in other cases, like for
+  login with the OAuth 2.0 API.
 
 ### Bug Fixes
 
@@ -39,6 +75,9 @@ simpler methods:
 
 ### Refactor
 
+- [**breaking**] We now require Rust 1.85 as the minimum supported Rust version to compile.
+  Yay for async closures!
+  ([#4745](https://github.com/matrix-org/matrix-rust-sdk/pull/4745)
 - [**breaking**]: The `Oidc` API only supports public clients, i.e. clients
   without a secret.
   ([#4634](https://github.com/matrix-org/matrix-rust-sdk/pull/4634))
@@ -66,7 +105,7 @@ simpler methods:
   - `Oidc::fetch_authentication_issuer()` was removed. To check if the
     homeserver supports OAuth 2.0, use `Oidc::provider_metadata()`. To get the
     issuer, use `VerifiedProviderMetadata::issuer()`.
-  - `Oidc::provider_metadata()` returns an `OauthDiscoveryError`. It has a
+  - `Oidc::provider_metadata()` returns an `OAuthDiscoveryError`. It has a
     `NotSupported` variant and an `is_not_supported()` method to check if the
     error is due to the server not supporting OAuth 2.0.
   - `OidcError::MissingAuthenticationIssuer` was removed.
@@ -84,6 +123,99 @@ simpler methods:
   `OidcAuthCodeUrlBuilder`, since they were parameters defined in OpenID
   Connect. Only the `prompt` and `user_id_hint` parameters are still supported.
   ([#4699](https://github.com/matrix-org/matrix-rust-sdk/pull/4699))
+- [**breaking**]: Remove support for ID tokens in the `Oidc` API.
+  ([#4726](https://github.com/matrix-org/matrix-rust-sdk/pull/4726))
+  - The `latest_id_token` field of `OidcSessionTokens` was removed. (De)
+    serialization of the type should be backwards-compatible.
+  - `Oidc::restore_registered_client()` doesn't take a `VerifiedClientMetadata`
+    anymore.
+  - `Oidc::latest_id_token()` and `Oidc::client_metadata()` were removed.
+- [**breaking**]: The `Oidc` API makes use of the oauth2 and ruma crates rather
+  than mas-oidc-client.
+  ([#4761](https://github.com/matrix-org/matrix-rust-sdk/pull/4761))
+  ([#4789](https://github.com/matrix-org/matrix-rust-sdk/pull/4789))
+  - `ClientId` is a different type reexported from the oauth2 crate.
+  - The error types that were in the `oidc` module have been moved to the
+    `oidc::error` module.
+  - The `prompt` parameter of `Oidc::url_for_oidc()` is now optional, and
+    `Prompt` is a different type reexported from Ruma, that only supports the
+    `create` value.
+  - The `device_id` parameter of `Oidc::login` is now an `Option<OwnedDeviceId>`.
+  - The `state` field of `OidcAuthorizationData` and `AuthorizationCode`, and
+    the parameter of the same name in `Oidc::abort_authorization()` now use
+    `CsrfToken`.
+  - The `error` field of `AuthorizationError` uses an error type from the oauth2
+    crate rather than one from mas-oidc-client.
+  - The `types` and `requests` modules are gone and the necessary types are
+    exported from the `oidc` module or available from `ruma`.
+  - `AccountManagementUrlFull` now takes an `OwnedDeviceId` when a device ID is
+    required.
+  - `(Verified)ProviderMetadata` was replaced by `AuthorizationServerMetadata`.
+  - The `issuer` is now a `Url`.
+  - `Oidc::register()` doesn't accept a software statement anymore.
+  - `(Verified)ClientMetadata` was replaced by the opinionated `ClientMetadata`.
+- [**breaking**]: `OidcSessionTokens` and `MatrixSessionTokens` have been merged
+  into `SessionTokens`. Methods to get and watch session tokens are now
+  available directly on `Client`.
+  `(MatrixAuth/Oidc)::session_tokens_stream()`, can be replaced by
+  `Client::subscribe_to_session_changes()` and then calling
+  `Client::session_tokens()` on a `SessionChange::TokenRefreshed`.
+- [**breaking**] `Oidc::url_for_oidc()` doesn't take the `VerifiedClientMetadata`
+  to register as an argument, the one in `OidcRegistrations` is used instead.
+  However it now takes the redirect URI to use, instead of always using the
+  first one in the client metadata.
+  ([#4771](https://github.com/matrix-org/matrix-rust-sdk/pull/4771))
+- [**breaking**] The `server_url` and `server_response` methods of
+  `SsoLoginBuilder` are replaced by `server_builder()`, which allows more
+  fine-grained settings for the server.
+- [**breaking**]: Rename the `Oidc` API to `OAuth`, since it's using almost
+  exclusively OAuth 2.0 rather than OpenID Connect.
+  ([#4805](https://github.com/matrix-org/matrix-rust-sdk/pull/4805))
+  - The `oidc` module was renamed to `oauth`.
+  - `Client::oidc()` was renamed to `Client::oauth()` and the `AuthApi::Oidc`
+    variant was renamed to `AuthApi::OAuth`.
+  - `OidcSession` was renamed to `OAuthSession` and the `AuthSession::Oidc`
+    variant was renamed to `AuthSession::OAuth`.
+  - `OidcAuthCodeUrlBuilder` and `OidcAuthorizationData` were renamed to
+    `OAuthAuthCodeUrlBuilder` and `OAuthAuthorizationData`.
+  - `OidcError` was renamed to `OAuthError` and the `RefreshTokenError::Oidc`
+    variant was renamed to `RefreshTokenError::OAuth`.
+  - `Oidc::provider_metadata()` was renamed to `OAuth::server_metadata()`.
+- [**breaking**]: `OAuth::finish_login()` must always be called, instead of `OAuth::finish_authorization()`
+  ([#4817](https://github.com/matrix-org/matrix-rust-sdk/pull/4817))
+  - `OAuth::abort_authorization()` was renamed to `OAuth::abort_login()`.
+  - `OAuth::finish_login()` can be called several times for the same session,
+    but it will return an error if it is called with a new session.
+  - `OAuthError::MissingDeviceId` was removed, it cannot occur anymore.
+- [**breaking**] `OidcRegistrations` was renamed to `OAuthRegistrationStore`.
+  ([#4814](https://github.com/matrix-org/matrix-rust-sdk/pull/4814))
+  - `OidcRegistrationsError` was renamed to `OAuthRegistrationStoreError`. 
+  - The `registrations` module was renamed and is now private.
+    `OAuthRegistrationStore` and `ClientId` are exported from `oauth`, and
+    `OAuthRegistrationStoreError` is exported from `oauth::error`.
+  - All the methods of `OAuthRegistrationStore` are now `async` and return a
+    `Result`: errors when reading the file are no longer ignored, and blocking
+    I/O is performed in a separate thread.
+  - `OAuthRegistrationStore::new()` takes a `PathBuf` instead of a `Path`.
+  - `OAuthRegistrationStore::new()` no longer takes a `static_registrations`
+    parameter. It should be provided if needed with
+    `OAuthRegistrationStore::with_static_registrations()`.
+- [**breaking**] Allow to use any registration method with `OAuth::login()` and
+  `OAuth::login_with_qr_code()`.
+  ([#4827](https://github.com/matrix-org/matrix-rust-sdk/pull/4827))
+  - `OAuth::login` takes an `ClientRegistrationMethod` to be able to register
+    and login with a single function call.
+  - `OAuth::url_for_oidc()` was removed, it can be replaced by a call to
+    `OAuth::login()`.
+  - `OAuth::login_with_qr_code()` takes a `ClientRegistrationMethod` instead of
+    the client metadata.
+  - `OAuth::finish_login` takes a `UrlOrQuery` instead of an
+    `AuthorizationCode`. The deserialization of the query string will occur
+    inside the method and eventual errors will be handled.
+  - `OAuth::login_with_oidc_callback()` was removed, it can be replaced by a
+    call to `OAuth::finish_login()`.
+  - `AuthorizationResponse`, `AuthorizationCode` and `AuthorizationError` are
+    now private.
 
 ## [0.10.0] - 2025-02-04
 
@@ -107,10 +239,16 @@ simpler methods:
 - Enable HTTP/2 support in the HTTP client.
   ([#4566](https://github.com/matrix-org/matrix-rust-sdk/pull/4566))
 
+- Add support for creating custom conditional push rules in `NotificationSettings::create_custom_conditional_push_rule`.
+  ([#4587](https://github.com/matrix-org/matrix-rust-sdk/pull/4587))
+
 - The media contents stored in the media cache can now be controlled with a
   `MediaRetentionPolicy` and the new `Media` methods `media_retention_policy()`,
   `set_media_retention_policy()`, `clean_up_media_cache()`.
   ([#4571](https://github.com/matrix-org/matrix-rust-sdk/pull/4571))
+
+- Add support for creating custom conditional push rules in `NotificationSettings::create_custom_conditional_push_rule`.
+  ([#4587](https://github.com/matrix-org/matrix-rust-sdk/pull/4587))
 
 ### Refactor
 
@@ -199,22 +337,24 @@ simpler methods:
 
 - Improve documentation of `Client::observe_events`.
 
+
 ### Features
+
 
 - Add `create_room_alias` function.
 
 - `Client::cross_process_store_locks_holder_name` is used everywhere:
-- `StoreConfig::new()` now takes a
-  `cross_process_store_locks_holder_name` argument.
-- `StoreConfig` no longer implements `Default`.
-- `BaseClient::new()` has been removed.
-- `BaseClient::clone_with_in_memory_state_store()` now takes a
-  `cross_process_store_locks_holder_name` argument.
-- `BaseClient` no longer implements `Default`.
-- `EventCacheStoreLock::new()` no longer takes a `key` argument.
-- `BuilderStoreConfig` no longer has
-  `cross_process_store_locks_holder_name` field for `Sqlite` and
-  `IndexedDb`.
+ - `StoreConfig::new()` now takes a
+   `cross_process_store_locks_holder_name` argument.
+ - `StoreConfig` no longer implements `Default`.
+ - `BaseClient::new()` has been removed.
+ - `BaseClient::clone_with_in_memory_state_store()` now takes a
+   `cross_process_store_locks_holder_name` argument.
+ - `BaseClient` no longer implements `Default`.
+ - `EventCacheStoreLock::new()` no longer takes a `key` argument.
+ - `BuilderStoreConfig` no longer has
+   `cross_process_store_locks_holder_name` field for `Sqlite` and
+   `IndexedDb`.
 
 - `EncryptionSyncService` and `Notification` are using `Client::cross_process_store_locks_holder_name`.
 
@@ -230,24 +370,23 @@ simpler methods:
 
  ```rust
  // Get an observer.
-let observer =
-client.observe_events::<SyncRoomMessageEvent, (Room, Vec<Action>) > ();
+ let observer =
+     client.observe_events::<SyncRoomMessageEvent, (Room, Vec<Action>)>();
 
-// Subscribe to the observer.
-let mut subscriber = observer.subscribe();
+ // Subscribe to the observer.
+ let mut subscriber = observer.subscribe();
 
-// Use the subscriber as a `Stream`.
-let (message_event, (room, push_actions)) = subscriber.next().await.unwrap();
+ // Use the subscriber as a `Stream`.
+ let (message_event, (room, push_actions)) = subscriber.next().await.unwrap();
  ```
 
-When calling `observe_events`, one has to specify the type of event (in the
-example, `SyncRoomMessageEvent`) and a context (in the example, `(Room,
+ When calling `observe_events`, one has to specify the type of event (in the
+ example, `SyncRoomMessageEvent`) and a context (in the example, `(Room,
  Vec<Action>)`, respectively for the room and the push actions).
 
 - Implement unwedging for media uploads.
 
-- Send state from state sync and not from timeline to
-  widget ([#4254](https://github.com/matrix-org/matrix-rust-sdk/pull/4254))
+- Send state from state sync and not from timeline to widget ([#4254](https://github.com/matrix-org/matrix-rust-sdk/pull/4254))
 
 - Allow aborting media uploads.
 
@@ -280,8 +419,8 @@ example, `SyncRoomMessageEvent`) and a context (in the example, `(Room,
 - Implement proper redact handling in the widget driver. This allows the Rust
   SDK widget driver to support widgets that rely on redacting.
 
-### Refactor
 
+### Refactor
 - [**breaking**] Rename `DisplayName` to `RoomDisplayName`.
 
 - Improve `is_room_alias_format_valid` so it's more strict.
@@ -362,34 +501,34 @@ Breaking changes:
   the `Client::sync_once()` method instead ([#1216](https://github.com/matrix-org/matrix-rust-sdk/pull/1216)).
 - `Common::members` and `Common::members_no_sync` take a `RoomMemberships` to be able to filter the
   results by any membership state.
-    - `Common::active_members(_no_sync)` and `Common::joined_members(_no_sync)` are deprecated.
+  - `Common::active_members(_no_sync)` and `Common::joined_members(_no_sync)` are deprecated.
 - `matrix-sdk-sqlite` is the new default store implementation outside of WASM, behind the `sqlite` feature.
-    - The `sled` feature was removed. The `matrix-sdk-sled` crate is deprecated and no longer maintained.
+  - The `sled` feature was removed. The `matrix-sdk-sled` crate is deprecated and no longer maintained.
 - Replace `Client::authentication_issuer` with `Client::authentication_server_info` that contains
   all the fields discovered from the homeserver for authenticating with OIDC
 - Remove `HttpSend` trait in favor of allowing a custom `reqwest::Client` instance to be supplied
 - Move all the types and methods using the native Matrix login and registration APIs from `Client`
   to the new `matrix_auth::MatrixAuth` API that is accessible via `Client::matrix_auth()`.
 - Move `Session` and `SessionTokens` to the `matrix_auth` module.
-    - Move the session methods on `Client` to the `MatrixAuth` API.
-    - Split `Session`'s content into several types. Its (de)serialization is still backwards
-      compatible.
+  - Move the session methods on `Client` to the `MatrixAuth` API.
+  - Split `Session`'s content into several types. Its (de)serialization is still backwards
+    compatible.
 - The room API has been simplified
-    - Removed the previous `Room`, `Joined`, `Invited` and `Left` types
-    - Merged all of the functionality from `Joined`, `Invited` and `Left` into `room::Common`
-    - Renamed `room::Common` to just `Room` and made it accessible as `matrix_sdk::Room`
+  - Removed the previous `Room`, `Joined`, `Invited` and `Left` types
+  - Merged all of the functionality from `Joined`, `Invited` and `Left` into `room::Common`
+  - Renamed `room::Common` to just `Room` and made it accessible as `matrix_sdk::Room`
 - Event handler closures now need to implement `FnOnce` + `Clone` instead of `Fn`
-    - As a consequence, you no longer need to explicitly need to `clone` variables they capture
-      before constructing an `async move {}` block inside
+  - As a consequence, you no longer need to explicitly need to `clone` variables they capture
+    before constructing an `async move {}` block inside
 - `Room::sync_members` doesn't return the underlying Ruma response anymore. If you need to get the
   room members, you can use `Room::members` or `Room::get_member` which will make sure that the
   members are up to date.
 - The `transaction_id` parameter of `Room::{send, send_raw}` was removed
-    - Instead, both methods now return types that implement `IntoFuture` (so can be awaited like
-      before) and have a `with_transaction_id` builder-style method
+  - Instead, both methods now return types that implement `IntoFuture` (so can be awaited like
+    before) and have a `with_transaction_id` builder-style method
 - The parameter order of `Room::{send_raw, send_state_event_raw}` has changed, `content` is now last
-    - The parameter type of `content` has also changed to a generic; `serde_json::Value` arguments
-      are still allowed, but so are other types like `Box<serde_json::value::RawValue>`
+  - The parameter type of `content` has also changed to a generic; `serde_json::Value` arguments
+    are still allowed, but so are other types like `Box<serde_json::value::RawValue>`
 - All "named futures" (structs implementing `IntoFuture`) are now exported from modules named
   `futures` instead of directly in the respective parent module
 - `Verification` is non-exhaustive, to make the `qrcode` cargo feature additive

@@ -1406,21 +1406,21 @@ impl CryptoStore for SqliteCryptoStore {
 
 #[cfg(test)]
 mod tests {
-    use super::SqliteCryptoStore;
+    use std::path::Path;
+
     use matrix_sdk_common::deserialized_responses::WithheldCode;
-    //    #[cfg(not(target_os = "macos"))]
     use matrix_sdk_crypto::{
         cryptostore_integration_tests, cryptostore_integration_tests_time, olm::SenderDataType,
         store::CryptoStore,
     };
-    //    #[cfg(not(target_os = "macos"))]
     use matrix_sdk_test::async_test;
     use once_cell::sync::Lazy;
     use ruma::{device_id, room_id, user_id};
     use similar_asserts::assert_eq;
-    use std::path::Path;
     use tempfile::{tempdir, TempDir};
     use tokio::fs;
+
+    use super::SqliteCryptoStore;
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
 
@@ -1452,12 +1452,7 @@ mod tests {
 
     /// Test that we didn't regress in our storage layer by loading data from a
     /// pre-filled database, or in other words use a test vector for this.
-    // BWI-specific
-    // error occurs only in tests on macos https://github.com/tekartik/sqflite/issues/827
-    #[cfg(not(target_os = "macos"))]
-    // end BWI-specific
     #[async_test]
-    #[ignore] // test later
     async fn test_open_test_vector_store() {
         let TestDb { _dir: _, database } = get_test_db("testing/data/storage", None).await;
 
@@ -1818,9 +1813,6 @@ mod encrypted_tests {
     use once_cell::sync::Lazy;
     use tempfile::{tempdir, TempDir};
     use tokio::fs;
-
-    #[cfg(not(target_os = "macos"))]
-    use matrix_sdk_test::async_test;
 
     use super::SqliteCryptoStore;
 

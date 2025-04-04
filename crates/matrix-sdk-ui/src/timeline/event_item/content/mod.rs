@@ -325,6 +325,12 @@ impl TimelineItemContent {
         as_variant!(self, Self::UnableToDecrypt)
     }
 
+    /// Check whether this item's content is a
+    /// [`UnableToDecrypt`][Self::UnableToDecrypt].
+    pub fn is_unable_to_decrypt(&self) -> bool {
+        matches!(self, Self::UnableToDecrypt(_))
+    }
+
     // These constructors could also be `From` implementations, but that would
     // allow users to call them directly, which should not be supported
     pub(crate) fn message(
@@ -549,6 +555,16 @@ impl EncryptedMessage {
                 Self::MegolmV1AesSha2 { sender_key, device_id, session_id, cause }
             }
             _ => Self::Unknown,
+        }
+    }
+
+    /// Return the ID of the Megolm session used to encrypt this message, if it
+    /// was received via a Megolm session.
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        match self {
+            EncryptedMessage::OlmV1Curve25519AesSha2 { .. } => None,
+            EncryptedMessage::MegolmV1AesSha2 { session_id, .. } => Some(session_id),
+            EncryptedMessage::Unknown => None,
         }
     }
 }
@@ -798,7 +814,7 @@ pub enum AnyOtherFullStateEventContent {
     SpaceParent(FullStateEventContent<SpaceParentEventContent>),
 
     #[doc(hidden)]
-    _Custom { event_type: String },
+    _Custom { event_type: String, event_value: String },
 }
 
 impl AnyOtherFullStateEventContent {
@@ -807,7 +823,10 @@ impl AnyOtherFullStateEventContent {
     ///
     /// Panics if the event content does not match one of the variants.
     // This could be a `From` implementation but we don't want it in the public API.
-    pub(crate) fn with_event_content(content: AnyFullStateEventContent) -> Self {
+    pub(crate) fn with_event_content(
+        content: AnyFullStateEventContent,
+        associated_event_value: Option<String>,
+    ) -> Self {
         let event_type = content.event_type();
 
         match content {
@@ -832,7 +851,19 @@ impl AnyOtherFullStateEventContent {
             AnyFullStateEventContent::SpaceChild(c) => Self::SpaceChild(c),
             AnyFullStateEventContent::SpaceParent(c) => Self::SpaceParent(c),
             AnyFullStateEventContent::RoomMember(_) => unreachable!(),
-            _ => Self::_Custom { event_type: event_type.to_string() },
+            _ => {
+                let event_type_str = event_type.to_string();
+                match event_type_str.as_str() {
+                    "im.vector.room.access_rules" => Self::_Custom {
+                        event_type: event_type.to_string(),
+                        event_value: associated_event_value.unwrap_or("".to_owned()),
+                    },
+                    _ => Self::_Custom {
+                        event_type: event_type.to_string(),
+                        event_value: "".to_owned(),
+                    },
+                }
+            }
         }
     }
 
@@ -859,7 +890,7 @@ impl AnyOtherFullStateEventContent {
             Self::RoomTopic(c) => c.event_type(),
             Self::SpaceChild(c) => c.event_type(),
             Self::SpaceParent(c) => c.event_type(),
-            Self::_Custom { event_type } => event_type.as_str().into(),
+            Self::_Custom { event_type, .. } => event_type.as_str().into(),
         }
     }
 
@@ -925,7 +956,9 @@ impl AnyOtherFullStateEventContent {
             Self::SpaceParent(c) => {
                 Self::SpaceParent(FullStateEventContent::Redacted(c.clone().redact(room_version)))
             }
-            Self::_Custom { event_type } => Self::_Custom { event_type: event_type.clone() },
+            Self::_Custom { event_type, event_value } => {
+                Self::_Custom { event_type: event_type.clone(), event_value: event_value.clone() }
+            }
         }
     }
 }

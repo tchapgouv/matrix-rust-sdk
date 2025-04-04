@@ -101,8 +101,8 @@ impl HttpClient {
                 for (header_name, header_value) in response.headers() {
                     let header_name = header_name.as_str().to_lowercase();
 
-                    // Header added in case of OIDC authentication failure, so we can correlate
-                    // failures with a Sentry event emitted by the OIDC authentication server.
+                    // Header added in case of OAuth 2.0 authentication failure, so we can correlate
+                    // failures with a Sentry event emitted by the OAuth 2.0 authentication server.
                     if header_name == "x-sentry-event-id" {
                         tracing::Span::current()
                             .record("sentry_event_id", header_value.to_str().unwrap_or("<???>"));
@@ -195,7 +195,7 @@ pub(super) async fn send_request(
 
     use futures_util::stream;
 
-    let request = clone_request(request);
+    let request = request.clone();
     let request = {
         let mut request = if send_progress.subscriber_count() != 0 {
             let content_length = request.body().len();
@@ -232,17 +232,6 @@ pub(super) async fn send_request(
 
     let response = client.execute(request).await?;
     Ok(response_to_http_response(response).await?)
-}
-
-// Clones all request parts except the extensions which can't be cloned.
-// See also https://github.com/hyperium/http/issues/395
-fn clone_request(request: &http::Request<Bytes>) -> http::Request<Bytes> {
-    let mut builder = http::Request::builder()
-        .version(request.version())
-        .method(request.method())
-        .uri(request.uri());
-    *builder.headers_mut().unwrap() = request.headers().clone();
-    builder.body(request.body().clone()).unwrap()
 }
 
 struct BytesChunks {

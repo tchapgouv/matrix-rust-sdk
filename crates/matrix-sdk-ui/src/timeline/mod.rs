@@ -93,7 +93,6 @@ pub use self::{
     },
     event_type_filter::TimelineEventTypeFilter,
     item::{TimelineItem, TimelineItemKind, TimelineUniqueId},
-    pagination::LiveBackPaginationStatus,
     traits::RoomExt,
     virtual_item::VirtualTimelineItem,
 };
@@ -232,10 +231,7 @@ impl Timeline {
         session_ids: impl IntoIterator<Item = S>,
     ) {
         self.controller
-            .retry_event_decryption(
-                self.room(),
-                Some(session_ids.into_iter().map(Into::into).collect()),
-            )
+            .retry_event_decryption(Some(session_ids.into_iter().map(Into::into).collect()))
             .await;
     }
 
@@ -306,7 +302,7 @@ impl Timeline {
 
     #[tracing::instrument(skip(self))]
     async fn retry_decryption_for_all_events(&self) {
-        self.controller.retry_event_decryption(self.room(), None).await;
+        self.controller.retry_event_decryption(None).await;
     }
 
     /// Get the current timeline item for the given event ID, if any.

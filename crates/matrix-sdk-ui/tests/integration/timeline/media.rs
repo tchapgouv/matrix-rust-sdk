@@ -104,7 +104,6 @@ async fn test_send_attachment_from_file() {
     let (_tmp_dir, file_path) = create_temporary_file("test.bin");
 
     // Set up mocks for the file upload.
-
     mock.mock_upload()
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)).set_body_json(
             json!({

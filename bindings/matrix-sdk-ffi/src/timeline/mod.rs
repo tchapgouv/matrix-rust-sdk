@@ -16,6 +16,7 @@ use std::{collections::HashMap, fmt::Write as _, fs, panic, sync::Arc};
 
 use anyhow::{Context, Result};
 use as_variant::as_variant;
+use async_compat::get_runtime_handle;
 use content::{InReplyToDetails, RepliedToEventDetails};
 use eyeball_im::VectorDiff;
 use futures_util::{pin_mut, StreamExt as _};
@@ -25,12 +26,13 @@ use matrix_sdk::{
         BaseVideoInfo, Thumbnail,
     },
     deserialized_responses::{ShieldState as SdkShieldState, ShieldStateCode},
+    event_cache::RoomPaginationStatus,
     room::edit::EditedContent as SdkEditedContent,
     Error as MatrixSdkError,
 };
 use matrix_sdk_ui::timeline::{
-    self, Error, EventItemOrigin, LiveBackPaginationStatus, Profile, RepliedToEvent,
-    TimelineDetails, TimelineUniqueId as SdkTimelineUniqueId,
+    self, Error, EventItemOrigin, Profile, RepliedToEvent, TimelineDetails,
+    TimelineUniqueId as SdkTimelineUniqueId,
 };
 use mime::Mime;
 use ruma::{
@@ -72,7 +74,6 @@ use crate::{
     },
     task_handle::TaskHandle,
     utils::Timestamp,
-    RUNTIME,
 };
 
 pub mod configuration;
@@ -125,7 +126,7 @@ impl Timeline {
             .formatted_caption(formatted_caption)
             .mentions(params.mentions.map(Into::into));
 
-        let handle = SendAttachmentJoinHandle::new(RUNTIME.spawn(async move {
+        let handle = SendAttachmentJoinHandle::new(get_runtime_handle().spawn(async move {
             let mut request =
                 self.inner.send_attachment(params.filename, mime_type, attachment_config);
 
@@ -135,7 +136,7 @@ impl Timeline {
 
             if let Some(progress_watcher) = progress_watcher {
                 let mut subscriber = request.subscribe_to_send_progress();
-                RUNTIME.spawn(async move {
+                get_runtime_handle().spawn(async move {
                     while let Some(progress) = subscriber.next().await {
                         progress_watcher.transmission_progress(progress.into());
                     }
@@ -223,7 +224,7 @@ impl Timeline {
     pub async fn add_listener(&self, listener: Box<dyn TimelineListener>) -> Arc<TaskHandle> {
         let (timeline_items, timeline_stream) = self.inner.subscribe().await;
 
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             pin_mut!(timeline_stream);
 
             // It's important that the initial items are passed *before* we forward the
@@ -245,7 +246,7 @@ impl Timeline {
     }
 
     pub fn retry_decryption(self: Arc<Self>, session_ids: Vec<String>) {
-        RUNTIME.spawn(async move {
+        get_runtime_handle().spawn(async move {
             self.inner.retry_decryption(&session_ids).await;
         });
     }
@@ -264,10 +265,14 @@ impl Timeline {
             .await
             .context("can't subscribe to the back-pagination status on a focused timeline")?;
 
-        Ok(Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
-            // Send the current state even if it hasn't changed right away.
-            listener.on_update(initial);
+        // Send the current state even if it hasn't changed right away.
+        //
+        // Note: don't do it in the spawned function, so that the caller is immediately
+        // aware of the current state, and this doesn't depend on the async runtime
+        // having an available worker
+        listener.on_update(initial);
 
+        Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             while let Some(status) = subscriber.next().await {
                 listener.on_update(status);
             }
@@ -474,7 +479,7 @@ impl Timeline {
         let poll_end_event_content = UnstablePollEndEventContent::new(text, poll_start_event_id);
         let event_content = AnyMessageLikeEventContent::UnstablePollEnd(poll_end_event_content);
 
-        RUNTIME.spawn(async move {
+        get_runtime_handle().spawn(async move {
             if let Err(err) = self.inner.send(event_content).await {
                 error!("unable to end poll: {err}");
             }
@@ -780,7 +785,7 @@ pub trait TimelineListener: Sync + Send {
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait PaginationStatusListener: Sync + Send {
-    fn on_update(&self, status: LiveBackPaginationStatus);
+    fn on_update(&self, status: RoomPaginationStatus);
 }
 
 #[derive(Clone, uniffi::Object)]

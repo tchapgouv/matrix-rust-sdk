@@ -54,7 +54,7 @@ async fn test_notification() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request, false).await?;
+    let alice_room = alice.create_room(request).await?;
     let room_id = alice_room.room_id().to_owned();
 
     // Bob receives a notification about it.
@@ -100,7 +100,7 @@ async fn test_notification() -> Result<()> {
         assert_matches!(notification.event, NotificationEvent::Invite(_));
         assert_eq!(notification.event.sender(), alice.user_id().unwrap());
         assert_eq!(notification.joined_members_count, 0);
-        assert_eq!(notification.is_room_encrypted, None);
+        assert_eq!(notification.is_room_encrypted, Some(false));
         assert!(notification.is_direct_message_room);
 
         assert_matches!(notification.event, NotificationEvent::Invite(observed_invite) => {

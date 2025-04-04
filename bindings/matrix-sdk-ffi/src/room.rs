@@ -1,19 +1,21 @@
 use std::{collections::HashMap, pin::pin, sync::Arc};
 
 use anyhow::{Context, Result};
+use async_compat::get_runtime_handle;
 use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
     crypto::LocalTrust,
     room::{
-        edit::EditedContent, power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole,
+        access_rules::AccessRule, edit::EditedContent, power_levels::RoomPowerLevelChanges,
+        Room as SdkRoom, RoomMemberRole,
     },
-    ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType,
+    ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType, EncryptionState,
     RoomHero as SdkRoomHero, RoomMemberships, RoomState,
 };
 use matrix_sdk_ui::timeline::{default_event_filter, RoomExt};
 use mime::Mime;
 use ruma::{
-    api::client::room::report_content,
+    api::client::room::{report_content, report_room},
     assign,
     events::{
         call::notify,
@@ -30,7 +32,6 @@ use ruma::{
 use tokio::sync::RwLock;
 use tracing::{error, warn};
 
-use super::RUNTIME;
 use crate::{
     chunk_iterator::ChunkIterator,
     client::{JoinRule, RoomVisibility},
@@ -42,7 +43,7 @@ use crate::{
     room_member::RoomMember,
     ruma::{ImageInfo, LocationContent, Mentions, NotifyType},
     timeline::{
-        configuration::{AllowedMessageTypes, TimelineConfiguration},
+        configuration::{TimelineConfiguration, TimelineFilter},
         ReceiptType, SendHandle, Timeline,
     },
     utils::u64_to_uint,
@@ -110,8 +111,8 @@ impl Room {
         self.inner.avatar_url().map(|m| m.to_string())
     }
 
-    pub fn is_direct(&self) -> bool {
-        RUNTIME.block_on(self.inner.is_direct()).unwrap_or(false)
+    pub async fn is_direct(&self) -> bool {
+        self.inner.is_direct().await.unwrap_or(false)
     }
 
     pub fn is_public(&self) -> bool {
@@ -161,21 +162,6 @@ impl Room {
         self.inner.active_room_call_participants().iter().map(|u| u.to_string()).collect()
     }
 
-    /// For rooms one is invited to, retrieves the room member information for
-    /// the user who invited the logged-in user to a room.
-    pub async fn inviter(&self) -> Option<RoomMember> {
-        if self.inner.state() == RoomState::Invited {
-            self.inner
-                .invite_details()
-                .await
-                .ok()
-                .and_then(|a| a.inviter)
-                .and_then(|m| m.try_into().ok())
-        } else {
-            None
-        }
-    }
-
     /// Forces the currently active room key, which is used to encrypt messages,
     /// to be rotated.
     ///
@@ -206,30 +192,50 @@ impl Room {
     ) -> Result<Arc<Timeline>, ClientError> {
         let mut builder = matrix_sdk_ui::timeline::Timeline::builder(&self.inner);
 
-        builder = builder.with_focus(configuration.focus.try_into()?);
+        builder = builder
+            .with_focus(configuration.focus.try_into()?)
+            .with_date_divider_mode(configuration.date_divider_mode.into());
 
-        if let AllowedMessageTypes::Only { types } = configuration.allowed_message_types {
-            builder = builder.event_filter(move |event, room_version_id| {
-                default_event_filter(event, room_version_id)
-                    && match event {
-                        AnySyncTimelineEvent::MessageLike(msg) => match msg.original_content() {
-                            Some(AnyMessageLikeEventContent::RoomMessage(content)) => {
-                                types.contains(&content.msgtype.into())
+        if configuration.track_read_receipts {
+            builder = builder.track_read_marker_and_receipts();
+        }
+
+        match configuration.filter {
+            TimelineFilter::All => {
+                // #nofilter.
+            }
+
+            TimelineFilter::OnlyMessage { types } => {
+                builder = builder.event_filter(move |event, room_version_id| {
+                    default_event_filter(event, room_version_id)
+                        && match event {
+                            AnySyncTimelineEvent::MessageLike(msg) => {
+                                match msg.original_content() {
+                                    Some(AnyMessageLikeEventContent::RoomMessage(content)) => {
+                                        types.contains(&content.msgtype.into())
+                                    }
+                                    _ => false,
+                                }
                             }
                             _ => false,
-                        },
-                        _ => false,
-                    }
-            });
+                        }
+                });
+            }
+
+            TimelineFilter::EventTypeFilter { filter: event_type_filter } => {
+                builder = builder.event_filter(move |event, room_version_id| {
+                    // Always perform the default filter first
+                    default_event_filter(event, room_version_id) && event_type_filter.filter(event)
+                });
+            }
         }
 
         if let Some(internal_id_prefix) = configuration.internal_id_prefix {
             builder = builder.with_internal_id_prefix(internal_id_prefix);
         }
 
-        builder = builder.with_date_divider_mode(configuration.date_divider_mode.into());
-
         let timeline = builder.build().await?;
+
         Ok(Timeline::new(timeline))
     }
 
@@ -237,8 +243,12 @@ impl Room {
         self.inner.room_id().to_string()
     }
 
-    pub fn is_encrypted(&self) -> Result<bool, ClientError> {
-        Ok(RUNTIME.block_on(self.inner.is_encrypted())?)
+    pub fn encryption_state(&self) -> EncryptionState {
+        self.inner.encryption_state()
+    }
+
+    pub async fn latest_encryption_state(&self) -> Result<EncryptionState, ClientError> {
+        Ok(self.inner.latest_encryption_state().await?)
     }
 
     pub async fn members(&self) -> Result<Arc<RoomMembersIterator>, ClientError> {
@@ -283,7 +293,7 @@ impl Room {
         listener: Box<dyn RoomInfoListener>,
     ) -> Arc<TaskHandle> {
         let mut subscriber = self.inner.subscribe_info();
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             while subscriber.next().await.is_some() {
                 match self.room_info().await {
                     Ok(room_info) => listener.call(room_info),
@@ -389,6 +399,24 @@ impl Room {
         Ok(())
     }
 
+    /// Reports a room as inappropriate to the server.
+    /// The caller is not required to be joined to the room to report it.
+    ///
+    /// # Arguments
+    ///
+    /// * `reason` - The reason the room is being reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the room is not found or on rate limit
+    pub async fn report_room(&self, reason: Option<String>) -> Result<(), ClientError> {
+        let mut request = report_room::v3::Request::new(self.inner.room_id().into());
+        request.reason = reason;
+
+        self.inner.client().send(request).await?;
+        Ok(())
+    }
+
     /// Ignores a user.
     ///
     /// # Arguments
@@ -414,6 +442,18 @@ impl Room {
     pub async fn join(&self) -> Result<(), ClientError> {
         self.inner.join().await?;
         Ok(())
+    }
+
+    /// Sets the room access rules.
+    pub async fn set_access_rules(&self, rule: AccessRule) -> Result<(), ClientError> {
+        self.inner.set_access_rules(rule).await?;
+        Ok(())
+    }
+
+    /// Get the room access rules
+    pub fn get_access_rules(&self) -> Result<AccessRule, ClientError> {
+        let access_rules = self.inner.get_access_rules()?;
+        Ok(access_rules)
     }
 
     /// Sets a new name to the room.
@@ -569,7 +609,7 @@ impl Room {
         self: Arc<Self>,
         listener: Box<dyn TypingNotificationsListener>,
     ) -> Arc<TaskHandle> {
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             let (_event_handler_drop_guard, mut subscriber) =
                 self.inner.subscribe_to_typing_notifications();
             while let Ok(typing_user_ids) = subscriber.recv().await {
@@ -585,7 +625,7 @@ impl Room {
         listener: Box<dyn IdentityStatusChangeListener>,
     ) -> Arc<TaskHandle> {
         let room = self.inner.clone();
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             let status_changes = room.subscribe_to_identity_status_changes().await;
             if let Ok(status_changes) = status_changes {
                 // TODO: what to do with failures?
@@ -853,7 +893,7 @@ impl Room {
     ) -> Result<Arc<TaskHandle>, ClientError> {
         let (stream, seen_ids_cleanup_handle) = self.inner.subscribe_to_knock_requests().await?;
 
-        let handle = Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        let handle = Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             pin_mut!(stream);
             while let Some(requests) = stream.next().await {
                 listener.call(requests.into_iter().map(Into::into).collect());
@@ -1003,7 +1043,7 @@ impl Room {
     ) -> Arc<TaskHandle> {
         let room = self.inner.clone();
 
-        Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             let subscription = room.observe_live_location_shares();
             let mut stream = subscription.subscribe();
             let mut pinned_stream = pin!(stream);

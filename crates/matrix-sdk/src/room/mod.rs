@@ -22,6 +22,7 @@ use std::{
     time::Duration,
 };
 
+use access_rules::{AccessRule, RoomAccessRulesEventContent};
 use async_stream::stream;
 use eyeball::SharedObservable;
 use futures_core::Stream;
@@ -32,10 +33,13 @@ use futures_util::{
 use http::StatusCode;
 #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
 pub use identity_status_changes::IdentityStatusChanges;
-#[cfg(feature = "e2e-encryption")]
-use matrix_sdk_base::crypto::{DecryptionSettings, RoomEventDecryptionResult};
 #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
 use matrix_sdk_base::crypto::{IdentityStatusChange, RoomIdentityProvider, UserIdentity};
+#[cfg(feature = "e2e-encryption")]
+use matrix_sdk_base::{
+    crypto::{DecryptionSettings, RoomEventDecryptionResult},
+    deserialized_responses::EncryptionInfo,
+};
 use matrix_sdk_base::{
     deserialized_responses::{
         RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState,
@@ -43,8 +47,8 @@ use matrix_sdk_base::{
     event_cache::store::media::IgnoreMediaRetentionPolicy,
     media::MediaThumbnailSettings,
     store::StateStoreExt,
-    ComposerDraft, RoomInfoNotableUpdateReasons, RoomMemberships, StateChanges, StateStoreDataKey,
-    StateStoreDataValue,
+    ComposerDraft, EncryptionState, RoomInfoNotableUpdateReasons, RoomMemberships, StateChanges,
+    StateStoreDataKey, StateStoreDataValue,
 };
 #[cfg(all(feature = "e2e-encryption", not(target_arch = "wasm32")))]
 use matrix_sdk_common::BoxFuture;
@@ -74,7 +78,7 @@ use ruma::{
         read_marker::set_read_marker,
         receipt::create_receipt,
         redact::redact_event,
-        room::{get_room_event, report_content},
+        room::{get_room_event, report_content, report_room},
         state::{get_state_events_for_key, send_state_event},
         tag::{create_tag, delete_tag},
         typing::create_typing_event::{self, v3::Typing},
@@ -166,6 +170,8 @@ pub mod power_levels;
 
 /// Contains all the functionality for modifying the privacy settings in a room.
 pub mod privacy_settings;
+
+pub mod access_rules;
 
 /// A struct containing methods that are common for Joined, Invited and Left
 /// Rooms
@@ -585,7 +591,15 @@ impl Room {
             .await
     }
 
-    async fn request_encryption_state(&self) -> Result<()> {
+    /// Request to update the encryption state for this room.
+    ///
+    /// It does nothing if the encryption state is already
+    /// [`EncryptionState::Encrypted`] or [`EncryptionState::NotEncrypted`].
+    pub async fn request_encryption_state(&self) -> Result<()> {
+        if !self.inner.encryption_state().is_unknown() {
+            return Ok(());
+        }
+
         self.client
             .locks()
             .encryption_state_deduplicated_handler
@@ -622,16 +636,23 @@ impl Room {
             .await
     }
 
-    /// Check whether this room is encrypted. If the room encryption state is
-    /// not synced yet, it will send a request to fetch it.
+    /// Check the encryption state of this room.
     ///
-    /// Returns true if the room is encrypted, otherwise false.
-    pub async fn is_encrypted(&self) -> Result<bool> {
-        if !self.is_encryption_state_synced() {
-            self.request_encryption_state().await?;
-        }
+    /// If the result is [`EncryptionState::Unknown`], one might want to call
+    /// [`Room::request_encryption_state`].
+    pub fn encryption_state(&self) -> EncryptionState {
+        self.inner.encryption_state()
+    }
 
-        Ok(self.inner.is_encrypted())
+    /// Force to update the encryption state by calling
+    /// [`Room::request_encryption_state`], and then calling
+    /// [`Room::encryption_state`].
+    ///
+    /// This method is useful to ensure the encryption state is up-to-date.
+    pub async fn latest_encryption_state(&self) -> Result<EncryptionState> {
+        self.request_encryption_state().await?;
+
+        Ok(self.encryption_state())
     }
 
     /// Gets additional context info about the client crypto.
@@ -1308,6 +1329,23 @@ impl Room {
         Ok(event)
     }
 
+    /// Fetches the [`EncryptionInfo`] for the supplied session_id.
+    ///
+    /// This may be used when we receive an update for a session, and we want to
+    /// reflect the changes in messages we have received that were encrypted
+    /// with that session, e.g. to remove a warning shield because a device is
+    /// now verified.
+    #[cfg(feature = "e2e-encryption")]
+    pub async fn get_encryption_info(
+        &self,
+        session_id: &str,
+        sender: &UserId,
+    ) -> Option<EncryptionInfo> {
+        let machine = self.client.olm_machine().await;
+        let machine = machine.as_ref()?;
+        machine.get_session_encryption_info(self.room_id(), session_id, sender).await.ok()
+    }
+
     /// Forces the currently active room key, which is used to encrypt messages,
     /// to be rotated.
     ///
@@ -1615,7 +1653,7 @@ impl Room {
         };
         const SYNC_WAIT_TIME: Duration = Duration::from_secs(3);
 
-        if !self.is_encrypted().await? {
+        if !self.latest_encryption_state().await?.is_encrypted() {
             let content =
                 RoomEncryptionEventContent::new(EventEncryptionAlgorithm::MegolmV1AesSha2);
             self.send_state_event(content).await?;
@@ -1630,7 +1668,7 @@ impl Room {
             // the SDK to re-request it later for confirmation, instead of
             // assuming it's sync'd and correct (and not encrypted).
             let _sync_lock = self.client.base_client().sync_lock().lock().await;
-            if !self.inner.is_encrypted() {
+            if !self.inner.encryption_state().is_encrypted() {
                 debug!("still not marked as encrypted, marking encryption state as missing");
 
                 let mut room_info = self.clone_info();
@@ -2004,7 +2042,7 @@ impl Room {
         };
 
         #[cfg(feature = "e2e-encryption")]
-        let (media_source, thumbnail) = if self.is_encrypted().await? {
+        let (media_source, thumbnail) = if self.latest_encryption_state().await?.is_encrypted() {
             self.client
                 .upload_encrypted_media_and_thumbnail(content_type, &data, thumbnail, send_progress)
                 .await?
@@ -2265,6 +2303,74 @@ impl Room {
             }
         }
         user_power_levels
+    }
+
+    /// Sets the access rules for this room.
+    pub async fn set_access_rules(
+        &self,
+        access_rule: AccessRule,
+    ) -> Result<send_state_event::v3::Response> {
+        self.send_state_event(RoomAccessRulesEventContent::new(access_rule)).await
+    }
+
+    /// Get the access rules for this room.
+    pub fn get_access_rules(&self) -> Result<AccessRule, Error> {
+        Err(Error::InsufficientData)
+        /*
+        let t = self
+            .store
+            .get_state_event_static::<RoomAccessRulesEventContent>(self.room_id())
+            .await?
+            .ok_or(Error::InsufficientData)?
+            .deserialize()?;
+
+            match t {
+                SyncOrStrippedState::Sync(SyncStateEvent::Original(e)) => {
+                    return Ok(e.content.access_rule.clone());
+                },
+                SyncOrStrippedState::Sync(SyncStateEvent::Redacted(e)) => {
+                    return Err(Error::InsufficientData);
+                },
+                SyncOrStrippedState::Stripped(e) => {
+                    return Err(Error::InsufficientData);
+                },
+            }
+            */
+
+        /*
+        self
+            .get_state_event_static::<RoomAccessRulesEventContent>()
+            .await?
+            .ok_or(Error::AuthenticationRequired)?
+            .deserialize()?
+            .access_rules()
+            .ok_or(Error::InsufficientData)
+            */
+
+        // Err(Error::InsufficientData)
+    }
+
+    /// Load pinned state events for a room from the `/state` endpoint in the
+    /// home server.
+    pub async fn load_access_rules(&self) -> Result<Option<AccessRule>> {
+        let response = self
+            .client
+            .send(get_state_events_for_key::v3::Request::new(
+                self.room_id().to_owned(),
+                StateEventType::RoomJoinRules,
+                "".to_owned(),
+            ))
+            .await;
+
+        match response {
+            Ok(response) => Ok(Some(
+                response.content.deserialize_as::<RoomAccessRulesEventContent>()?.access_rule,
+            )),
+            Err(http_error) => match http_error.as_client_api_error() {
+                Some(error) if error.status_code == StatusCode::NOT_FOUND => Ok(None),
+                _ => Err(http_error.into()),
+            },
+        }
     }
 
     /// Sets the name of this room.
@@ -2946,7 +3052,9 @@ impl Room {
 
         if notification_mode.is_some() {
             notification_mode
-        } else if let Ok(is_encrypted) = self.is_encrypted().await {
+        } else if let Ok(is_encrypted) =
+            self.latest_encryption_state().await.map(|state| state.is_encrypted())
+        {
             // Otherwise, if encrypted status is available, get the default mode for this
             // type of room.
             // From the point of view of notification settings, a `one-to-one` room is one
@@ -3018,6 +3126,23 @@ impl Room {
             score.map(Into::into),
             reason,
         );
+        Ok(self.client.send(request).await?)
+    }
+
+    /// Reports a room as inappropriate to the server.
+    /// The caller is not required to be joined to the room to report it.
+    ///
+    /// # Arguments
+    ///
+    /// * `reason` - The reason the room is being reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the room is not found or on rate limit
+    pub async fn report_room(&self, reason: Option<String>) -> Result<report_room::v3::Response> {
+        let mut request = report_room::v3::Request::new(self.inner.room_id().to_owned());
+        request.reason = reason;
+
         Ok(self.client.send(request).await?)
     }
 
@@ -3703,12 +3828,12 @@ pub struct TryFromReportedContentScoreError(());
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use assert_matches2::assert_matches;
-    use matrix_sdk_base::{store::ComposerDraftType, ComposerDraft, SessionMeta};
+    use matrix_sdk_base::{store::ComposerDraftType, ComposerDraft};
     use matrix_sdk_test::{
         async_test, event_factory::EventFactory, test_json, JoinedRoomBuilder, StateTestEvent,
         SyncResponseBuilder,
     };
-    use ruma::{device_id, event_id, events::room::member::MembershipState, int, room_id, user_id};
+    use ruma::{event_id, events::room::member::MembershipState, int, room_id, user_id};
     use wiremock::{
         matchers::{header, method, path_regex},
         Mock, MockServer, ResponseTemplate,
@@ -3716,9 +3841,9 @@ mod tests {
 
     use super::ReportedContentScore;
     use crate::{
-        authentication::matrix::{MatrixSession, MatrixSessionTokens},
         config::RequestConfig,
-        test_utils::{logged_in_client, mocks::MatrixMockServer},
+        room::AccessRule,
+        test_utils::{client::mock_matrix_session, logged_in_client, mocks::MatrixMockServer},
         Client,
     };
 
@@ -3728,21 +3853,12 @@ mod tests {
         use matrix_sdk_test::{message_like_event_content, DEFAULT_TEST_ROOM_ID};
 
         let sqlite_path = std::env::temp_dir().join("cache_invalidation_while_encrypt.db");
-        let session = MatrixSession {
-            meta: SessionMeta {
-                user_id: user_id!("@example:localhost").to_owned(),
-                device_id: device_id!("DEVICEID").to_owned(),
-            },
-            tokens: MatrixSessionTokens { access_token: "1234".to_owned(), refresh_token: None },
-        };
+        let session = mock_matrix_session();
 
         let client = Client::builder()
             .homeserver_url("http://localhost:1234")
             .request_config(RequestConfig::new().disable_retry())
             .sqlite_store(&sqlite_path, None)
-            // BWI-specific
-            .without_server_jwt_token_validation()
-            // end BWI-specific
             .build()
             .await
             .unwrap();
@@ -3785,9 +3901,6 @@ mod tests {
                 .homeserver_url("http://localhost:1234")
                 .request_config(RequestConfig::new().disable_retry())
                 .sqlite_store(&sqlite_path, None)
-                // BWI-specific
-                .without_server_jwt_token_validation()
-                // end BWI-specific
                 .build()
                 .await
                 .unwrap();
@@ -4057,5 +4170,46 @@ mod tests {
         // And also the sender info from the /members endpoint
         assert!(sender.is_some());
         assert_eq!(sender.unwrap().event().user_id(), sender_id);
+    }
+
+    #[async_test]
+    async fn test_own_room_access_rules() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!a:b.c");
+        let sender_id = user_id!("@alice:b.c");
+        let user_id = user_id!("@example:localhost");
+
+        let f = EventFactory::new().room(room_id).sender(sender_id);
+        let joined_room_builder = JoinedRoomBuilder::new(room_id)
+            .add_state_bulk(vec![f.member(user_id).into_raw_sync().cast()]);
+        let room = server.sync_room(&client, joined_room_builder).await;
+
+        let set_access_rules_result = room.set_access_rules(AccessRule::Restricted).await;
+        println!("Hello");
+        assert!(set_access_rules_result.is_err(), "set_access_rules_result is an Err!");
+
+        // let get_access_rules_result = room.get_access_rules().await;
+
+        // assert!(!get_access_rules_result.is_err());
+
+        // // We'll receive the member info through the /members endpoint
+        // server
+        //     .mock_get_members()
+        //     .ok(vec![f.member(sender_id).into_raw_timeline().cast()])
+        //     .mock_once()
+        //     .mount()
+        //     .await;
+
+        // // We get the current user's member info
+        // let ret = room.own_membership_details().await;
+        // assert_matches!(ret, Ok((member, sender)));
+
+        // // We get the current user's member info
+        // assert_eq!(member.event().user_id(), user_id);
+
+        // // And also the sender info from the /members endpoint
+        // assert!(sender.is_some());
+        // assert_eq!(sender.unwrap().event().user_id(), sender_id);
     }
 }
