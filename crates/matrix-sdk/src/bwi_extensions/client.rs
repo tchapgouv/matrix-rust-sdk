@@ -62,7 +62,7 @@ impl BWIInnerClientSetup for crate::Client {
     }
 
     async fn save_size_limit(&self, size_limit: &FileSize) {
-        if let Err(err) = self.store().store(&FILE_SIZE_LIMIT, size_limit.0).await {
+        if let Err(err) = self.state_store().store(&FILE_SIZE_LIMIT, size_limit.0).await {
             warn!("###BWI### could not save value: {}", err);
         };
     }

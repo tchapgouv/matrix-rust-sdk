@@ -87,7 +87,7 @@ async fn test_mutual_sas_verification_with_notification_client_ignores_verificat
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room_federated(request).await?;
     alice_room.enable_encryption().await?;
     let room_id = alice_room.room_id();
 
@@ -184,7 +184,7 @@ async fn test_mutual_sas_verification() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room_federated(request).await?;
     alice_room.enable_encryption().await?;
     let room_id = alice_room.room_id();
 
@@ -446,7 +446,7 @@ async fn test_mutual_qrcode_verification() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room_federated(request).await?;
     alice_room.enable_encryption().await?;
     let room_id = alice_room.room_id();
 
@@ -670,7 +670,7 @@ async fn test_encryption_missing_member_keys() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room_federated(request).await?;
     alice_room.enable_encryption().await?;
     alice.sync_once().await?;
 
@@ -788,7 +788,7 @@ async fn test_failed_members_response() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = alice.create_room(request).await?;
+    let alice_room = alice.create_room_federated(request).await?;
     alice_room.enable_encryption().await?;
     alice.sync_once().await?;
 
@@ -925,7 +925,7 @@ async fn test_secret_gossip_after_interactive_verification() -> Result<()> {
     let user_id = first_client.user_id().expect("We should have access to the user id now");
 
     let request = CreateRoomRequest::new();
-    let room_first_client = first_client.create_room(request).await?;
+    let room_first_client = first_client.create_room_federated(request).await?;
     room_first_client.enable_encryption().await?;
     first_client.sync_once().await?;
 

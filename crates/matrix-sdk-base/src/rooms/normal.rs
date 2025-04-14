@@ -2247,7 +2247,9 @@ mod tests {
     use crate::{
         latest_event::LatestEvent,
         rooms::RoomNotableTags,
-        store::{IntoStateStore, MemoryStore, StateChanges, StateStore, StoreConfig},
+        store::{
+            IntoStateStore, MemoryStore, RoomLoadSettings, StateChanges, StateStore, StoreConfig,
+        },
         test_utils::logged_in_base_client,
         BaseClient, MinimalStateEvent, OriginalMinimalStateEvent, RoomDisplayName,
         RoomInfoNotableUpdateReasons, RoomStateFilter, SessionMeta,
@@ -2534,16 +2536,16 @@ mod tests {
     #[async_test]
     async fn test_is_favourite() {
         // Given a room,
-        let client = BaseClient::with_store_config(StoreConfig::new(
-            "cross-process-store-locks-holder-name".to_owned(),
-        ));
+        let client =
+            BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
 
         client
-            .set_session_meta(
+            .activate(
                 SessionMeta {
                     user_id: user_id!("@alice:example.org").into(),
                     device_id: ruma::device_id!("AYEAYEAYE").into(),
                 },
+                RoomLoadSettings::default(),
                 #[cfg(feature = "e2e-encryption")]
                 None,
             )
@@ -2614,16 +2616,16 @@ mod tests {
     #[async_test]
     async fn test_is_low_priority() {
         // Given a room,
-        let client = BaseClient::with_store_config(StoreConfig::new(
-            "cross-process-store-locks-holder-name".to_owned(),
-        ));
+        let client =
+            BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
 
         client
-            .set_session_meta(
+            .activate(
                 SessionMeta {
                     user_id: user_id!("@alice:example.org").into(),
                     device_id: ruma::device_id!("AYEAYEAYE").into(),
                 },
+                RoomLoadSettings::default(),
                 #[cfg(feature = "e2e-encryption")]
                 None,
             )
@@ -3199,16 +3201,16 @@ mod tests {
         use crate::{RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons};
 
         // Given a room,
-        let client = BaseClient::with_store_config(StoreConfig::new(
-            "cross-process-store-locks-holder-name".to_owned(),
-        ));
+        let client =
+            BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
 
         client
-            .set_session_meta(
+            .activate(
                 SessionMeta {
                     user_id: user_id!("@alice:example.org").into(),
                     device_id: ruma::device_id!("AYEAYEAYE").into(),
                 },
+                RoomLoadSettings::default(),
                 None,
             )
             .await

@@ -87,7 +87,7 @@ use super::{
     traits::{Decryptor, RoomDataProvider},
     DateDividerMode, Error, EventSendState, EventTimelineItem, InReplyToDetails, PaginationError,
     Profile, RepliedToEvent, TimelineDetails, TimelineEventItemId, TimelineFocus, TimelineItem,
-    TimelineItemContent, TimelineItemKind,
+    TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
 };
 use crate::{
     timeline::{
@@ -95,7 +95,7 @@ use crate::{
         date_dividers::DateDividerAdjuster,
         event_item::EventTimelineItemKind,
         pinned_events_loader::{PinnedEventsLoader, PinnedEventsLoaderError},
-        TimelineEventFilterFn,
+        MsgLikeContent, MsgLikeKind, TimelineEventFilterFn,
     },
     unable_to_decrypt_hook::UtdHookManager,
 };
@@ -1051,12 +1051,15 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
 
         // Replace the local-related state (kind) and the content state.
         let prev_reactions = prev_item.content().reactions();
+        let prev_thread_root = prev_item.content().thread_root();
+        let prev_in_reply_to = prev_item.content().in_reply_to();
         let new_item = TimelineItem::new(
             prev_item.with_kind(ti_kind).with_content(TimelineItemContent::message(
                 content,
                 None,
-                &txn.items,
                 prev_reactions,
+                prev_thread_root,
+                prev_in_reply_to,
             )),
             prev_item.internal_id.to_owned(),
         );
@@ -1238,7 +1241,9 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
                     self.update_event_send_state(
                         &echo.transaction_id,
                         EventSendState::SendingFailed {
-                            error: Arc::new(matrix_sdk::Error::SendQueueWedgeError(send_error)),
+                            error: Arc::new(matrix_sdk::Error::SendQueueWedgeError(Box::new(
+                                send_error,
+                            ))),
                             is_recoverable: false,
                         },
                     )
@@ -1333,6 +1338,18 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
             }
         }
     }
+
+    /// Insert a timeline start item at the beginning of the room, if it's
+    /// missing.
+    pub async fn insert_timeline_start_if_missing(&self) {
+        let mut state = self.state.write().await;
+        let mut txn = state.transaction();
+        if txn.items.get(0).is_some_and(|item| item.is_timeline_start()) {
+            return;
+        }
+        txn.items.push_front(txn.meta.new_timeline_item(VirtualTimelineItem::TimelineStart), None);
+        txn.commit();
+    }
 }
 
 impl TimelineController {
@@ -1352,11 +1369,11 @@ impl TimelineController {
             .ok_or(Error::EventNotInTimeline(TimelineEventItemId::EventId(event_id.to_owned())))?
             .clone();
 
-        let TimelineItemContent::Message(message) = item.content().clone() else {
+        let TimelineItemContent::MsgLike(msglike) = item.content().clone() else {
             debug!("Event is not a message");
             return Ok(());
         };
-        let Some(in_reply_to) = message.in_reply_to() else {
+        let Some(in_reply_to) = msglike.in_reply_to.clone() else {
             debug!("Event is not a reply");
             return Ok(());
         };
@@ -1376,7 +1393,7 @@ impl TimelineController {
             index,
             &item,
             internal_id,
-            &message,
+            &msglike,
             &in_reply_to.event_id,
             self.room(),
         )
@@ -1390,11 +1407,17 @@ impl TimelineController {
 
         // Check the state of the event again, it might have been redacted while
         // the request was in-flight.
-        let TimelineItemContent::Message(message) = item.content().clone() else {
+        let TimelineItemContent::MsgLike(MsgLikeContent {
+            kind: MsgLikeKind::Message(message),
+            reactions,
+            thread_root,
+            in_reply_to,
+        }) = item.content().clone()
+        else {
             info!("Event is no longer a message (redacted?)");
             return Ok(());
         };
-        let Some(in_reply_to) = message.in_reply_to() else {
+        let Some(in_reply_to) = in_reply_to else {
             warn!("Event no longer has a reply (bug?)");
             return Ok(());
         };
@@ -1404,12 +1427,12 @@ impl TimelineController {
         trace!("Updating in-reply-to details");
         let internal_id = item.internal_id.to_owned();
         let mut item = item.clone();
-        item.set_content(TimelineItemContent::Message(
-            message.with_in_reply_to(InReplyToDetails {
-                event_id: in_reply_to.event_id.clone(),
-                event,
-            }),
-        ));
+        item.set_content(TimelineItemContent::MsgLike(MsgLikeContent {
+            kind: MsgLikeKind::Message(message),
+            reactions,
+            thread_root,
+            in_reply_to: Some(InReplyToDetails { event_id: in_reply_to.event_id, event }),
+        }));
         state.items.replace(index, TimelineItem::new(item, internal_id));
 
         Ok(())
@@ -1523,14 +1546,16 @@ impl TimelineController {
 
     fn filter_for_media_events(&self, diff: &Arc<TimelineItem>) -> Option<MediaSource> {
         if let Some(item) = diff.as_event() {
-            if let TimelineItemContent::Message(message) = item.content() {
-                return match message.msgtype() {
-                    MessageType::Image(content) => content.source(),
-                    MessageType::Video(content) => content.source(),
-                    MessageType::Audio(content) => content.source(),
-                    MessageType::File(content) => content.source(),
-                    _ => None,
-                };
+            if let TimelineItemContent::MsgLike(message_like_content) = &item.content {
+                if let MsgLikeKind::Message(message) = &message_like_content.kind {
+                    return match message.msgtype() {
+                        MessageType::Image(content) => content.source(),
+                        MessageType::Video(content) => content.source(),
+                        MessageType::Audio(content) => content.source(),
+                        MessageType::File(content) => content.source(),
+                        _ => None,
+                    };
+                }
             }
         }
         None
@@ -1585,17 +1610,12 @@ async fn fetch_replied_to_event(
     index: usize,
     item: &EventTimelineItem,
     internal_id: TimelineUniqueId,
-    message: &crate::timeline::event_item::Message,
+    msglike: &MsgLikeContent,
     in_reply_to: &EventId,
     room: &Room,
 ) -> Result<TimelineDetails<Box<RepliedToEvent>>, Error> {
     if let Some((_, item)) = rfind_event_by_id(&state.items, in_reply_to) {
-        let details = TimelineDetails::Ready(Box::new(RepliedToEvent {
-            content: item.content.clone(),
-            sender: item.sender().to_owned(),
-            sender_profile: item.sender_profile().clone(),
-        }));
-
+        let details = TimelineDetails::Ready(Box::new(RepliedToEvent::from_timeline_item(&item)));
         trace!("Found replied-to event locally");
         return Ok(details);
     };
@@ -1603,11 +1623,11 @@ async fn fetch_replied_to_event(
     // Replace the item with a new timeline item that has the fetching status of the
     // replied-to event to pending.
     trace!("Setting in-reply-to details to pending");
-    let reply = message.with_in_reply_to(InReplyToDetails {
-        event_id: in_reply_to.to_owned(),
-        event: TimelineDetails::Pending,
-    });
-    let event_item = item.with_content(TimelineItemContent::Message(reply));
+    let in_reply_to_details =
+        InReplyToDetails { event_id: in_reply_to.to_owned(), event: TimelineDetails::Pending };
+
+    let event_item = item
+        .with_content(TimelineItemContent::MsgLike(msglike.with_in_reply_to(in_reply_to_details)));
 
     let new_timeline_item = TimelineItem::new(event_item, internal_id);
     state.items.replace(index, new_timeline_item);
@@ -1616,7 +1636,7 @@ async fn fetch_replied_to_event(
     drop(state);
 
     trace!("Fetching replied-to event");
-    let res = match room.event(in_reply_to, None).await {
+    let res = match room.load_or_fetch_event(in_reply_to, None).await {
         Ok(timeline_event) => TimelineDetails::Ready(Box::new(
             RepliedToEvent::try_from_timeline_event(timeline_event, room).await?,
         )),

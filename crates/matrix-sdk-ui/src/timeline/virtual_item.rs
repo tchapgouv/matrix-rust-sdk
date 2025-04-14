@@ -29,6 +29,10 @@ pub enum VirtualTimelineItem {
     /// The user's own read marker.
     ReadMarker,
 
+    /// The timeline start, that is, an indication that we've seen all the
+    /// events for that timeline.
+    TimelineStart,
+
     // BWI-specific
     /// Indicates that the scan state for a specific Item has changed
     ScanStateChanged(TimelineUniqueId, BWIScanState),

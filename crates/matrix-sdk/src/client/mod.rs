@@ -31,7 +31,7 @@ use futures_util::StreamExt;
 use matrix_sdk_base::crypto::store::LockableCryptoStore;
 use matrix_sdk_base::{
     event_cache::store::EventCacheStoreLock,
-    store::{DynStateStore, ServerCapabilities},
+    store::{DynStateStore, RoomLoadSettings, ServerCapabilities},
     sync::{Notification, RoomUpdates},
     BaseClient, RoomInfoNotableUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
     StateStoreDataKey, StateStoreDataValue, SyncOutsideWasm,
@@ -39,7 +39,6 @@ use matrix_sdk_base::{
 use matrix_sdk_base_bwi::room_alias::BWIRoomAlias;
 use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 use matrix_sdk_bwi::federation::BWIFederationHandler;
-#[cfg(feature = "experimental-oidc")]
 use matrix_sdk_common::ttl_cache::TtlCache;
 use ruma::events::room::history_visibility::{
     HistoryVisibility, RoomHistoryVisibilityEventContent,
@@ -83,11 +82,10 @@ use tracing::{debug, error, instrument, trace, warn, Instrument, Span};
 use url::Url;
 
 use self::futures::SendRequest;
-#[cfg(feature = "experimental-oidc")]
-use crate::authentication::oauth::OAuth;
 use crate::{
     authentication::{
-        matrix::MatrixAuth, AuthCtx, AuthData, ReloadSessionCallback, SaveSessionCallback,
+        matrix::MatrixAuth, oauth::OAuth, AuthCtx, AuthData, ReloadSessionCallback,
+        SaveSessionCallback,
     },
     config::RequestConfig,
     deduplicating_handler::DeduplicatingHandler,
@@ -369,7 +367,6 @@ impl ClientInner {
     ) -> Arc<Self> {
         let caches = ClientCaches {
             server_capabilities: server_capabilities.into(),
-            #[cfg(feature = "experimental-oidc")]
             server_metadata: Mutex::new(TtlCache::new()),
         };
 
@@ -526,9 +523,17 @@ impl Client {
         self.inner.http_client.request_config
     }
 
-    /// Is the client logged in.
-    pub fn logged_in(&self) -> bool {
-        self.inner.base_client.logged_in()
+    /// Check whether the client has been activated.
+    ///
+    /// A client is considered active when:
+    ///
+    /// 1. It has a `SessionMeta` (user ID, device ID and access token), i.e. it
+    ///    is logged in,
+    /// 2. Has loaded cached data from storage,
+    /// 3. If encryption is enabled, it also initialized or restored its
+    ///    `OlmMachine`.
+    pub fn is_active(&self) -> bool {
+        self.inner.base_client.is_active()
     }
 
     /// The server used by the client.
@@ -627,7 +632,6 @@ impl Client {
     pub fn auth_api(&self) -> Option<AuthApi> {
         match self.auth_ctx().auth_data.get()? {
             AuthData::Matrix => Some(AuthApi::Matrix(self.matrix_auth())),
-            #[cfg(feature = "experimental-oidc")]
             AuthData::OAuth(_) => Some(AuthApi::OAuth(self.oauth())),
         }
     }
@@ -641,14 +645,13 @@ impl Client {
     pub fn session(&self) -> Option<AuthSession> {
         match self.auth_api()? {
             AuthApi::Matrix(api) => api.session().map(Into::into),
-            #[cfg(feature = "experimental-oidc")]
             AuthApi::OAuth(api) => api.full_session().map(Into::into),
         }
     }
 
     /// Get a reference to the state store.
-    pub fn store(&self) -> &DynStateStore {
-        self.base_client().store()
+    pub fn state_store(&self) -> &DynStateStore {
+        self.base_client().state_store()
     }
 
     /// Get a reference to the event cache store.
@@ -683,7 +686,6 @@ impl Client {
     }
 
     /// Access the OAuth 2.0 API of the client.
-    #[cfg(feature = "experimental-oidc")]
     pub fn oauth(&self) -> OAuth {
         OAuth::new(self.clone())
     }
@@ -1280,8 +1282,20 @@ impl Client {
         }
     }
 
+    /// Similar to [`Client::restore_session_with`], with
+    /// [`RoomLoadSettings::default()`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a session was already restored or logged in.
+    #[instrument(skip_all)]
+    pub async fn restore_session(&self, session: impl Into<AuthSession>) -> Result<()> {
+        self.restore_session_with(session, RoomLoadSettings::default()).await
+    }
+
     /// Restore a session previously logged-in using one of the available
-    /// authentication APIs.
+    /// authentication APIs. The number of rooms to restore is controlled by
+    /// [`RoomLoadSettings`].
     ///
     /// See the documentation of the corresponding authentication API's
     /// `restore_session` method for more information.
@@ -1290,29 +1304,20 @@ impl Client {
     ///
     /// Panics if a session was already restored or logged in.
     #[instrument(skip_all)]
-    pub async fn restore_session(&self, session: impl Into<AuthSession>) -> Result<()> {
+    pub async fn restore_session_with(
+        &self,
+        session: impl Into<AuthSession>,
+        room_load_settings: RoomLoadSettings,
+    ) -> Result<()> {
         let session = session.into();
         match session {
-            AuthSession::Matrix(s) => Box::pin(self.matrix_auth().restore_session(s)).await,
-            #[cfg(feature = "experimental-oidc")]
-            AuthSession::OAuth(s) => Box::pin(self.oauth().restore_session(*s)).await,
+            AuthSession::Matrix(session) => {
+                Box::pin(self.matrix_auth().restore_session(session, room_load_settings)).await
+            }
+            AuthSession::OAuth(session) => {
+                Box::pin(self.oauth().restore_session(*session, room_load_settings)).await
+            }
         }
-    }
-
-    pub(crate) async fn set_session_meta(
-        &self,
-        session_meta: SessionMeta,
-        #[cfg(feature = "e2e-encryption")] custom_account: Option<vodozemac::olm::Account>,
-    ) -> Result<()> {
-        self.base_client()
-            .set_session_meta(
-                session_meta,
-                #[cfg(feature = "e2e-encryption")]
-                custom_account,
-            )
-            .await?;
-
-        Ok(())
     }
 
     /// Refresh the access token using the authentication API used to log into
@@ -1330,7 +1335,6 @@ impl Client {
                 trace!("Token refresh: Using the homeserver.");
                 Box::pin(api.refresh_access_token()).await?;
             }
-            #[cfg(feature = "experimental-oidc")]
             AuthApi::OAuth(api) => {
                 trace!("Token refresh: Using OAuth 2.0.");
                 Box::pin(api.refresh_access_token()).await?;
@@ -1338,6 +1342,23 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    /// Log out the current session using the proper authentication API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session is not authenticated or if an error
+    /// occurred while making the request to the server.
+    pub async fn logout(&self) -> Result<(), Error> {
+        let auth_api = self.auth_api().ok_or(Error::AuthenticationRequired)?;
+        match auth_api {
+            AuthApi::Matrix(matrix_auth) => {
+                matrix_auth.logout().await?;
+                Ok(())
+            }
+            AuthApi::OAuth(oauth) => Ok(oauth.logout().await?),
+        }
     }
 
     /// Get or upload a sync filter.
@@ -1516,7 +1537,15 @@ impl Client {
     /// let client = Client::new(homeserver).await.unwrap();
     /// assert!(client.create_room(request, false).await.is_ok());
     /// # };
-    /// ```
+    /// ```  
+
+    pub async fn create_room_federated(
+        &self,
+        mut request: create_room::v3::Request
+    ) -> Result<Room> {
+            self.create_room(request, true).await
+        }
+
     pub async fn create_room(
         &self,
         mut request: create_room::v3::Request,
@@ -1783,7 +1812,7 @@ impl Client {
     async fn load_or_fetch_server_capabilities(
         &self,
     ) -> HttpResult<(Box<[MatrixVersion]>, BTreeMap<String, bool>)> {
-        match self.store().get_kv_data(StateStoreDataKey::ServerCapabilities).await {
+        match self.state_store().get_kv_data(StateStoreDataKey::ServerCapabilities).await {
             Ok(Some(stored)) => {
                 if let Some((versions, unstable_features)) =
                     stored.into_server_capabilities().and_then(|cap| cap.maybe_decode())
@@ -1806,7 +1835,7 @@ impl Client {
         {
             let encoded = ServerCapabilities::new(&versions, unstable_features.clone());
             if let Err(err) = self
-                .store()
+                .state_store()
                 .set_kv_data(
                     StateStoreDataKey::ServerCapabilities,
                     StateStoreDataValue::ServerCapabilities(encoded),
@@ -1901,7 +1930,7 @@ impl Client {
         guard.unstable_features = None;
 
         // Empty the store cache.
-        Ok(self.store().remove_kv_data(StateStoreDataKey::ServerCapabilities).await?)
+        Ok(self.state_store().remove_kv_data(StateStoreDataKey::ServerCapabilities).await?)
     }
 
     /// Check whether MSC 4028 is enabled on the homeserver.

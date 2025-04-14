@@ -2,6 +2,7 @@ use matrix_sdk::bwi_content_scanner::BWIScanMediaExt;
 use matrix_sdk::{
     config::RequestConfig,
     media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
+    store::RoomLoadSettings,
     test_utils::{client::mock_matrix_session, logged_in_client_with_server},
     Client,
 };
@@ -12,6 +13,7 @@ use matrix_sdk_bwi_test::media::mock_server::content_scanner::{
     provide_supported_versions_endpoint,
 };
 use matrix_sdk_test::async_test;
+use rstest::rstest;
 use ruma::events::room::MediaSource::Encrypted;
 use ruma::{
     api::client::media::get_content_thumbnail::v3::Method,
@@ -226,7 +228,11 @@ async fn test_get_media_file_with_auth_matrix_1_11() {
         .unwrap();
 
     // Restore session.
-    client.matrix_auth().restore_session(mock_matrix_session()).await.unwrap();
+    client
+        .matrix_auth()
+        .restore_session(mock_matrix_session(), RoomLoadSettings::default())
+        .await
+        .unwrap();
 
     // Build event content.
     let event_content = ImageMessageEventContent::plain(
@@ -334,7 +340,11 @@ async fn test_get_media_file_with_auth_matrix_stable_feature() {
         .unwrap();
 
     // Restore session.
-    client.matrix_auth().restore_session(mock_matrix_session()).await.unwrap();
+    client
+        .matrix_auth()
+        .restore_session(mock_matrix_session(), RoomLoadSettings::default())
+        .await
+        .unwrap();
 
     // Build event content.
     let event_content = ImageMessageEventContent::plain(

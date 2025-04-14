@@ -22,14 +22,20 @@ use matrix_sdk::attachment::{AttachmentInfo, BaseFileInfo};
 use matrix_sdk::bwi_extensions::client::BWIClientSetupExt;
 use matrix_sdk::test_utils::client::TEST_BEARER_TOKEN;
 use matrix_sdk::{
-    assert_let_timeout, attachment::AttachmentConfig, test_utils::mocks::MatrixMockServer,
+    assert_let_timeout,
+    attachment::AttachmentConfig,
+    room::reply::{EnforceThread, Reply},
+    test_utils::mocks::MatrixMockServer,
 };
 use matrix_sdk_test::{async_test, event_factory::EventFactory, JoinedRoomBuilder, ALICE};
 use matrix_sdk_ui::timeline::Error::AttachmentSizeExceededLimit;
 use matrix_sdk_ui::timeline::{AttachmentSource, EventSendState, RoomExt, TimelineItemContent};
 use ruma::{
     event_id,
-    events::room::{message::MessageType, MediaSource},
+    events::room::{
+        message::{MessageType, ReplyWithinThread},
+        MediaSource,
+    },
     room_id, uint, UInt,
 };
 use serde_json::json;
@@ -85,16 +91,18 @@ async fn test_send_attachment_from_file() {
 
     assert!(items.is_empty());
 
+    let event_id = event_id!("$event");
     let f = EventFactory::new();
     mock.sync_room(
         &client,
-        JoinedRoomBuilder::new(room_id).add_timeline_event(f.text_msg("hello").sender(&ALICE)),
+        JoinedRoomBuilder::new(room_id)
+            .add_timeline_event(f.text_msg("hello").sender(&ALICE).event_id(event_id)),
     )
     .await;
 
     // Sanity check.
     assert_let_timeout!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next());
-    assert_let!(TimelineItemContent::Message(msg) = item.content());
+    assert_let!(Some(msg) = item.content().as_message());
     assert_eq!(msg.body(), "hello");
 
     // No other updates.
@@ -127,7 +135,7 @@ async fn test_send_attachment_from_file() {
     {
         assert_let_timeout!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next());
         assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
-        assert_let!(TimelineItemContent::Message(msg) = item.content());
+        assert_let!(Some(msg) = item.content().as_message());
 
         // Body is the caption, because there's both a caption and filename.
         assert_eq!(msg.body(), "caption");
@@ -137,6 +145,10 @@ async fn test_send_attachment_from_file() {
         assert_let!(MessageType::File(file) = msg.msgtype());
         assert_let!(MediaSource::Plain(uri) = &file.source);
         assert!(uri.to_string().contains("localhost"));
+
+        // The message should be considered part of the thread.
+        let aggregated = item.content().as_msglike().unwrap();
+        assert!(aggregated.is_threaded());
     }
 
     // Eventually, the media is updated with the final MXC IDs…
@@ -146,7 +158,7 @@ async fn test_send_attachment_from_file() {
         assert_let_timeout!(
             Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next()
         );
-        assert_let!(TimelineItemContent::Message(msg) = item.content());
+        assert_let!(Some(msg) = item.content().as_message());
         assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
         assert_eq!(get_filename_and_caption(msg.msgtype()), ("test.bin", Some("caption")));
 
@@ -195,7 +207,7 @@ async fn test_send_attachment_from_bytes() {
 
     // Sanity check.
     assert_let_timeout!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next());
-    assert_let!(TimelineItemContent::Message(msg) = item.content());
+    assert_let!(Some(msg) = item.content().as_message());
     assert_eq!(msg.body(), "hello");
 
     // No other updates.
@@ -230,7 +242,7 @@ async fn test_send_attachment_from_bytes() {
     {
         assert_let_timeout!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next());
         assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
-        assert_let!(TimelineItemContent::Message(msg) = item.content());
+        assert_let!(Some(msg) = item.content().as_message());
 
         // Body is the caption, because there's both a caption and filename.
         assert_eq!(msg.body(), "caption");
@@ -249,7 +261,7 @@ async fn test_send_attachment_from_bytes() {
         assert_let_timeout!(
             Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next()
         );
-        assert_let!(TimelineItemContent::Message(msg) = item.content());
+        assert_let!(Some(msg) = item.content().as_message());
         assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
         assert_eq!(get_filename_and_caption(msg.msgtype()), (filename, Some("caption")));
 
@@ -319,7 +331,7 @@ async fn test_react_to_local_media() {
 
     let item_id = {
         assert_let_timeout!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next());
-        assert_let!(TimelineItemContent::Message(msg) = item.content());
+        assert_let!(Some(msg) = item.content().as_message());
         assert_eq!(get_filename_and_caption(msg.msgtype()), ("test.bin", None));
 
         // The item starts with no reactions.
@@ -332,7 +344,7 @@ async fn test_react_to_local_media() {
     timeline.toggle_reaction(&item_id, "🤪").await.unwrap();
 
     assert_let_timeout!(Some(VectorDiff::Set { index: 0, value: item }) = timeline_stream.next());
-    assert_let!(TimelineItemContent::Message(msg) = item.content());
+    assert_let!(Some(msg) = item.content().as_message());
     assert_eq!(get_filename_and_caption(msg.msgtype()), ("test.bin", None));
 
     // There's a reaction for the current user for the given emoji.

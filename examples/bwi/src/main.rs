@@ -10,7 +10,7 @@ use matrix_sdk::media::{MediaEventContent, MediaFormat, MediaRequestParameters};
 use matrix_sdk::ruma::events::room::message::{ImageMessageEventContent, MessageType};
 use matrix_sdk::ruma::push::ComparisonOperator::Le;
 use matrix_sdk::{config::SyncSettings, ruma::OwnedRoomId, Client, Room};
-use matrix_sdk_ui::timeline::{RoomExt, TimelineItem, TimelineItemContent, TimelineItemKind};
+use matrix_sdk_ui::timeline::{MsgLikeKind, RoomExt, TimelineItem, TimelineItemContent, TimelineItemKind};
 use std::fs;
 use std::path::{absolute, Path};
 use std::sync::Arc;
@@ -182,14 +182,14 @@ async fn main() -> Result<()> {
         while let Some(diff) = timeline_stream.next().await {
             info!(target: BWI_TARGET, "received diff: {diff:?}");
             match diff {
-                VectorDiff::PushFront { value } => handle_timeline_item(&value, &client_copy).await,
-                VectorDiff::PushBack { value } => handle_timeline_item(&value, &client_copy).await,
-                VectorDiff::Insert { index: _, value } => {
-                    handle_timeline_item(&value, &client_copy).await
-                }
-                VectorDiff::Set { index: _, value } => {
-                    handle_timeline_item(&value, &client_copy).await
-                }
+                // VectorDiff::PushFront { value } => handle_timeline_item(&value, &client_copy).await,
+                // VectorDiff::PushBack { value } => handle_timeline_item(&value, &client_copy).await,
+                // VectorDiff::Insert { index: _, value } => {
+                //     handle_timeline_item(&value, &client_copy).await
+                // }
+                // VectorDiff::Set { index: _, value } => {
+                //     handle_timeline_item(&value, &client_copy).await
+                // }
                 _ => {}
             }
         }
@@ -243,11 +243,13 @@ fn setup_logging(verbose: bool) {
 
 async fn handle_timeline_item(item: &Arc<TimelineItem>, _client: &Client) {
     if let TimelineItemKind::Event(e) = item.kind() {
-        if let TimelineItemContent::Message(m) = e.content() {
-            match m.msgtype() {
-                MessageType::Image(_content) => {}
-                // MessageType::Image(content) => handle_image_content(content, client).await,
-                _ => {}
+        if let TimelineItemContent::MsgLike(message_like_content) = e.content() {
+            if let MsgLikeKind::Message(m) = &message_like_content.kind {
+                match m.msgtype() {
+                    MessageType::Image(_content) => {}
+                    // MessageType::Image(content) => handle_image_content(content, client).await,
+                    _ => {}
+                }
             }
         }
     }

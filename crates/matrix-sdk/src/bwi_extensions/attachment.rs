@@ -54,6 +54,6 @@ trait InnerClientAttachmentExt {
 #[async_trait]
 impl InnerClientAttachmentExt for Client {
     async fn try_load_size_limit_from_cache(&self) -> Option<FileSize> {
-        self.store().try_load(&FILE_SIZE_LIMIT).await.map(FileSize::new)
+        self.state_store().try_load(&FILE_SIZE_LIMIT).await.map(FileSize::new)
     }
 }
