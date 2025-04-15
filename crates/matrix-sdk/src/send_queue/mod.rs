@@ -455,7 +455,7 @@ impl RoomSendQueue {
         let send_handle = SendHandle {
             room: self.clone(),
             transaction_id: transaction_id.clone(),
-            media_handles: None,
+            media_handles: vec![],
             created_at,
         };
 
@@ -1338,7 +1338,7 @@ impl QueueStorage {
                             send_handle: SendHandle {
                                 room: room.clone(),
                                 transaction_id: queued.transaction_id,
-                                media_handles: None,
+                                media_handles: vec![],
                                 created_at: queued.created_at,
                             },
                             send_error: queued.error,
@@ -1368,7 +1368,7 @@ impl QueueStorage {
                             key,
                             send_handle: SendReactionHandle {
                                 room: room.clone(),
-                                transaction_id: dep.own_transaction_id,
+                                transaction_id: dep.own_transaction_id.into(),
                             },
                             applies_to: dep.parent_transaction_id,
                         },
@@ -1393,8 +1393,8 @@ impl QueueStorage {
                                 send_handle: SendHandle {
                                     room: room.clone(),
                                     transaction_id: dep.own_transaction_id.into(),
-                                    media_handles: Some(MediaHandles {
-                                        upload_thumbnail_txn: thumbnail_info.map(|info| info.txn),
+                                    media_handles: vec!(MediaHandles {
+                                        upload_thumbnail_txn: None, // thumbnail_info.map(|info| info.txn),
                                         upload_file_txn: file_upload,
                                     }),
                                     created_at: dep.created_at,
@@ -1910,7 +1910,7 @@ pub struct SendHandle {
     transaction_id: OwnedTransactionId,
 
     /// Additional handles for a media upload.
-    media_handles: Option<MediaHandles>,
+    media_handles: Vec<MediaHandles>,
 
     /// The time at which the event to be sent has been created.
     pub created_at: MilliSecondsSinceUnixEpoch,
@@ -1918,7 +1918,7 @@ pub struct SendHandle {
 
 impl SendHandle {
     fn nyi_for_uploads(&self) -> Result<(), RoomSendQueueStorageError> {
-        if self.media_handles.is_some() {
+        if !self.media_handles.is_empty() {
             Err(RoomSendQueueStorageError::OperationNotImplementedYet)
         } else {
             Ok(())
@@ -1935,7 +1935,7 @@ impl SendHandle {
 
         let queue = &self.room.inner.queue;
 
-        if let Some(handles) = &self.media_handles {
+        for handles in &self.media_handles {
             if queue.abort_upload(&self.transaction_id, handles).await? {
                 // Propagate a cancelled update.
                 let _ = self.room.inner.updates.send(RoomSendQueueUpdate::CancelledLocalEvent {
@@ -2068,7 +2068,7 @@ impl SendHandle {
         // one entry will be updated in the store. The other two are either
         // done, or dependent requests.
 
-        if let Some(handles) = &self.media_handles {
+        for handles in &self.media_handles {
             room.queue
                 .mark_as_unwedged(&handles.upload_file_txn)
                 .await
@@ -2165,7 +2165,7 @@ impl SendReactionHandle {
         let handle = SendHandle {
             room: self.room.clone(),
             transaction_id: self.transaction_id.clone().into(),
-            media_handles: None,
+            media_handles: vec![],
             created_at: MilliSecondsSinceUnixEpoch::now(),
         };
 

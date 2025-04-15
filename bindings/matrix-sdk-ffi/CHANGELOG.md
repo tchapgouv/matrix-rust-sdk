@@ -1,4 +1,12 @@
-# unreleased
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+<!-- next-header -->
+
+## [Unreleased] - ReleaseDate
+
+## [0.11.0] - 2025-04-11
 
 Breaking changes:
 
@@ -73,6 +81,8 @@ Breaking changes:
 - The `dynamic_registrations_file` field of `OidcConfiguration` was removed.
   Clients are supposed to re-register with the homeserver for every login.
 
+- `RoomPreview::own_membership_details` is now `RoomPreview::member_with_sender_info`, takes any user id and returns an `Option<RoomMemberWithSenderInfo>`.
+
 Additions:
 
 - Add `Encryption::get_user_identity` which returns `UserIdentity`
@@ -91,3 +101,4 @@ Additions:
 - Add `ClientBuilder::system_is_memory_constrained` to indicate that the system
   has less memory available than the current standard
   ([#4894](https://github.com/matrix-org/matrix-rust-sdk/pull/4894))
+- Add `Room::member_with_sender_info` to get both a room member's info and for the user who sent the `m.room.member` event the `RoomMember` is based on.

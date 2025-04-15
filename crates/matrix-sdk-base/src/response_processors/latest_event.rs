@@ -16,16 +16,9 @@ use matrix_sdk_common::deserialized_responses::TimelineEvent;
 use matrix_sdk_crypto::{
     DecryptionSettings, OlmMachine, RoomEventDecryptionResult, TrustRequirement,
 };
-use ruma::{
-    events::{
-        room::message::MessageType, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
-        SyncMessageLikeEvent,
-    },
-    serde::Raw,
-    RoomId,
-};
+use ruma::{events::AnySyncTimelineEvent, serde::Raw, RoomId};
 
-use super::Context;
+use super::{verification, Context};
 use crate::{
     latest_event::{is_suitable_for_latest_event, LatestEvent, PossibleLatestEvent},
     Result, Room,
@@ -37,7 +30,7 @@ use crate::{
 /// If we can decrypt them, change [`Room::latest_event`] to reflect what we
 /// found, and remove any older encrypted events from
 /// [`Room::latest_encrypted_events`].
-pub async fn decrypt_latest_events(
+pub async fn decrypt_from_rooms(
     context: &mut Context,
     rooms: Vec<Room>,
     olm_machine: Option<&OlmMachine>,
@@ -52,7 +45,7 @@ pub async fn decrypt_latest_events(
         // Try to find a message we can decrypt and is suitable for using as the latest
         // event. If we found one, set it as the latest and delete any older
         // encrypted events
-        if let Some((found, found_index)) = decrypt_latest_suitable_event(
+        if let Some((found, found_index)) = find_suitable_and_decrypt(
             context,
             olm_machine,
             &room,
@@ -73,7 +66,7 @@ pub async fn decrypt_latest_events(
     Ok(())
 }
 
-async fn decrypt_latest_suitable_event(
+async fn find_suitable_and_decrypt(
     context: &mut Context,
     olm_machine: &OlmMachine,
     room: &Room,
@@ -145,35 +138,15 @@ async fn decrypt_sync_room_event(
         RoomEventDecryptionResult::Decrypted(decrypted) => {
             let event: TimelineEvent = decrypted.into();
 
-            if let Ok(AnySyncTimelineEvent::MessageLike(event)) = event.raw().deserialize() {
-                match &event {
-                    AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(
-                        original_event,
-                    )) => {
-                        if let MessageType::VerificationRequest(_) = &original_event.content.msgtype
-                        {
-                            super::verification(
-                                context,
-                                verification_is_allowed,
-                                Some(olm_machine),
-                                &event,
-                                room_id,
-                            )
-                            .await?;
-                        }
-                    }
-                    _ if event.event_type().to_string().starts_with("m.key.verification") => {
-                        super::verification(
-                            context,
-                            verification_is_allowed,
-                            Some(olm_machine),
-                            &event,
-                            room_id,
-                        )
-                        .await?;
-                    }
-                    _ => (),
-                }
+            if let Ok(sync_timeline_event) = event.raw().deserialize() {
+                verification::process_if_relevant(
+                    context,
+                    &sync_timeline_event,
+                    verification_is_allowed,
+                    Some(olm_machine),
+                    room_id,
+                )
+                .await?;
             }
 
             event
@@ -194,7 +167,7 @@ mod tests {
     };
     use ruma::{event_id, events::room::member::MembershipState, room_id, user_id};
 
-    use super::{decrypt_latest_events, Context};
+    use super::{decrypt_from_rooms, Context};
     use crate::{
         rooms::normal::RoomInfoNotableUpdateReasons, test_utils::logged_in_base_client,
         StateChanges,
@@ -232,7 +205,7 @@ mod tests {
         // When I tell it to do some decryption
         let mut context = Context::new(StateChanges::default(), Default::default());
 
-        decrypt_latest_events(
+        decrypt_from_rooms(
             &mut context,
             vec![room.clone()],
             client.olm_machine().await.as_ref(),

@@ -3031,17 +3031,20 @@ impl Room {
     /// Get the membership details for the current user.
     ///
     /// Returns:
-    ///     - If the current user was present in the room, a tuple of the
-    ///       current user's [`RoomMember`] info and the member info of the
-    ///       sender of that member event.
+    ///     - If the user was present in the room, a
+    ///       [`RoomMemberWithSenderInfo`] containing both the user info and the
+    ///       member info of the sender of the `m.room.member` event.
     ///     - If the current user is not present, an error.
-    pub async fn own_membership_details(&self) -> Result<(RoomMember, Option<RoomMember>)> {
-        let Some(own_member) = self.get_member_no_sync(self.own_user_id()).await? else {
+    pub async fn member_with_sender_info(
+        &self,
+        user_id: &UserId,
+    ) -> Result<RoomMemberWithSenderInfo> {
+        let Some(member) = self.get_member_no_sync(user_id).await? else {
             return Err(Error::InsufficientData);
         };
 
         let sender_member =
-            if let Some(member) = self.get_member_no_sync(own_member.event().sender()).await? {
+            if let Some(member) = self.get_member_no_sync(member.event().sender()).await? {
                 // If the sender room member info is already available, return it
                 Some(member)
             } else if self.are_members_synced() {
@@ -3049,12 +3052,12 @@ impl Room {
                 None
             } else if self.sync_members().await.is_ok() {
                 // Try getting the sender room member info again after syncing
-                self.get_member_no_sync(own_member.event().sender()).await?
+                self.get_member_no_sync(member.event().sender()).await?
             } else {
                 None
             };
 
-        Ok((own_member, sender_member))
+        Ok(RoomMemberWithSenderInfo { room_member: member, sender_info: sender_member })
     }
 
     /// Forget this room.
@@ -3900,9 +3903,19 @@ impl EventSource for &Room {
 #[error("out of range conversion attempted")]
 pub struct TryFromReportedContentScoreError(());
 
+/// Contains the current user's room member info and the optional room member
+/// info of the sender of the `m.room.member` event that this info represents.
+#[derive(Debug)]
+pub struct RoomMemberWithSenderInfo {
+    /// The actual room member.
+    pub room_member: RoomMember,
+    /// The info of the sender of the event `room_member` is based on, if
+    /// available.
+    pub sender_info: Option<RoomMember>,
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use assert_matches2::assert_matches;
     use matrix_sdk_base::{store::ComposerDraftType, ComposerDraft};
     use matrix_sdk_test::{
         async_test, event_factory::EventFactory, test_json, JoinedRoomBuilder, StateTestEvent,
@@ -4144,7 +4157,7 @@ mod tests {
 
         // Since there is no member event for the own user, the method fails.
         // This should never happen in an actual room.
-        let error = room.own_membership_details().await.err();
+        let error = room.member_with_sender_info(client.user_id().unwrap()).await.err();
         assert!(error.is_some());
     }
 
@@ -4161,14 +4174,16 @@ mod tests {
         let room = server.sync_room(&client, joined_room_builder).await;
 
         // When we load the membership details
-        let ret = room.own_membership_details().await;
-        assert_matches!(ret, Ok((member, sender)));
+        let ret = room
+            .member_with_sender_info(client.user_id().unwrap())
+            .await
+            .expect("Room member info should be available");
 
         // We get the member info for the current user
-        assert_eq!(member.event().user_id(), user_id);
+        assert_eq!(ret.room_member.event().user_id(), user_id);
 
         // But there is no info for the sender
-        assert!(sender.is_none());
+        assert!(ret.sender_info.is_none());
     }
 
     #[async_test]
@@ -4184,15 +4199,17 @@ mod tests {
         let room = server.sync_room(&client, joined_room_builder).await;
 
         // When we load the membership details
-        let ret = room.own_membership_details().await;
-        assert_matches!(ret, Ok((member, sender)));
+        let ret = room
+            .member_with_sender_info(client.user_id().unwrap())
+            .await
+            .expect("Room member info should be available");
 
         // We get the current user's member info
-        assert_eq!(member.event().user_id(), user_id);
+        assert_eq!(ret.room_member.event().user_id(), user_id);
 
         // And the sender has the same info, since it's also the current user
-        assert!(sender.is_some());
-        assert_eq!(sender.unwrap().event().user_id(), user_id);
+        assert!(ret.sender_info.is_some());
+        assert_eq!(ret.sender_info.unwrap().event().user_id(), user_id);
     }
 
     #[async_test]
@@ -4212,15 +4229,17 @@ mod tests {
         let room = server.sync_room(&client, joined_room_builder).await;
 
         // When we load the membership details
-        let ret = room.own_membership_details().await;
-        assert_matches!(ret, Ok((member, sender)));
+        let ret = room
+            .member_with_sender_info(client.user_id().unwrap())
+            .await
+            .expect("Room member info should be available");
 
         // We get the current user's member info
-        assert_eq!(member.event().user_id(), user_id);
+        assert_eq!(ret.room_member.event().user_id(), user_id);
 
         // And also the sender info from the events received in the sync
-        assert!(sender.is_some());
-        assert_eq!(sender.unwrap().event().user_id(), sender_id);
+        assert!(ret.sender_info.is_some());
+        assert_eq!(ret.sender_info.unwrap().event().user_id(), sender_id);
     }
 
     #[async_test]
@@ -4245,15 +4264,17 @@ mod tests {
             .await;
 
         // We get the current user's member info
-        let ret = room.own_membership_details().await;
-        assert_matches!(ret, Ok((member, sender)));
+        let ret = room
+            .member_with_sender_info(client.user_id().unwrap())
+            .await
+            .expect("Room member info should be available");
 
         // We get the current user's member info
-        assert_eq!(member.event().user_id(), user_id);
+        assert_eq!(ret.room_member.event().user_id(), user_id);
 
         // And also the sender info from the /members endpoint
-        assert!(sender.is_some());
-        assert_eq!(sender.unwrap().event().user_id(), sender_id);
+        assert!(ret.sender_info.is_some());
+        assert_eq!(ret.sender_info.unwrap().event().user_id(), sender_id);
     }
 
     #[async_test]

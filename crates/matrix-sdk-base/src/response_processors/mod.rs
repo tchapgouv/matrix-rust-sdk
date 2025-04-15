@@ -13,31 +13,26 @@
 // limitations under the License.
 
 pub mod account_data;
+pub mod changes;
 #[cfg(feature = "e2e-encryption")]
 pub mod e2ee;
 #[cfg(feature = "e2e-encryption")]
 pub mod latest_event;
+pub mod profiles;
+pub mod state_events;
+pub mod timeline;
 #[cfg(feature = "e2e-encryption")]
 pub mod verification;
 
 use std::collections::BTreeMap;
 
-#[cfg(feature = "e2e-encryption")]
-mod with_e2ee {
-    pub use super::{
-        e2ee::{e2ee_from_msc4186, e2ee_from_sync_v3},
-        latest_event::decrypt_latest_events,
-        verification::verification,
-    };
-}
 use ruma::OwnedRoomId;
-#[cfg(feature = "e2e-encryption")]
-pub use with_e2ee::*;
 
 use crate::{RoomInfoNotableUpdateReasons, StateChanges};
 
 type RoomInfoNotableUpdates = BTreeMap<OwnedRoomId, RoomInfoNotableUpdateReasons>;
 
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct Context {
     pub(super) state_changes: StateChanges,
     pub(super) room_info_notable_updates: RoomInfoNotableUpdates,
