@@ -162,7 +162,7 @@ async fn set_all_rooms_to_growing_sync_mode(sliding_sync: &SlidingSync) -> Resul
     sliding_sync
         .on_list(ALL_ROOMS_LIST_NAME, |list| {
             list.set_sync_mode(SlidingSyncMode::new_growing(ALL_ROOMS_DEFAULT_GROWING_BATCH_SIZE));
-
+            list.set_timeline_limit(5);
             ready(())
         })
         .await
@@ -175,6 +175,7 @@ async fn set_all_rooms_to_selective_sync_mode(sliding_sync: &SlidingSync) -> Res
             list.set_sync_mode(
                 SlidingSyncMode::new_selective().add_range(ALL_ROOMS_DEFAULT_SELECTIVE_RANGE),
             );
+            list.set_timeline_limit(1);
 
             ready(())
         })
@@ -188,7 +189,7 @@ pub const ALL_ROOMS_DEFAULT_SELECTIVE_RANGE: Range = 0..=19;
 
 /// Default `batch_size` for the growing sync-mode of the `ALL_ROOMS_LIST_NAME`
 /// list.
-pub const ALL_ROOMS_DEFAULT_GROWING_BATCH_SIZE: u32 = 100;
+pub const ALL_ROOMS_DEFAULT_GROWING_BATCH_SIZE: u32 = 25;
 
 #[cfg(test)]
 mod tests {
