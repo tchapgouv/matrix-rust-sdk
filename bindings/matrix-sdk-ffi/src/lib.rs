@@ -32,6 +32,9 @@ mod ruma;
 mod session_verification;
 mod sync_service;
 mod task_handle;
+/// Tchap extension
+mod tchap_bindings;
+/// Tchap end
 mod timeline;
 mod tracing;
 mod utils;

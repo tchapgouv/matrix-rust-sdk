@@ -1,0 +1,31 @@
+[package]
+name = "matrix-sdk-tchap"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+license = "Apache-2.0"
+
+[features]
+client = [] # needed for creating ruma like requests
+server = [] # needed for creating ruma like requests
+unstable-exhaustive-types = [] # needed for creating ruma like requests
+
+[dependencies]
+async-trait = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+ruma = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "macros"] }
+url = { workspace = true }
+uniffi = { workspace = true, features = ["cli"] }
+
+[build-dependencies]
+uniffi = { workspace = true, features = [ "build" ] }
+
+[lints]
+workspace = true
