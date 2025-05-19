@@ -45,8 +45,8 @@ impl From<TchapGetInstanceError> for TchapGetInstanceErrorBridged {
 ///   * if successful: the homeServer to use for this user's email (e.g. "agent.agriculture.tchap.gouv.fr")
 ///   * If failure: the explanation of the failure
 #[uniffi::export]
-pub async fn tchap_get_instance(config: &TchapGetInstanceConfig, for_email: String) -> Result<String, TchapGetInstanceErrorBridged> {
-   match TchapGetInstance::new(config).get_instance(for_email).await {
+pub fn tchap_get_instance(config: &TchapGetInstanceConfig, for_email: String) -> Result<String, TchapGetInstanceErrorBridged> {
+   match TchapGetInstance::new(config).get_instance(for_email) {
     Ok(result) => Ok(result.hs),
     Err(error) => Err(error.into()),
    }
@@ -57,14 +57,14 @@ mod tests {
     use matrix_sdk_tchap::get_instance_from_email::TchapGetInstanceConfig;
     use crate::tchap_bindings::tchap_get_instance;
     
-    #[tokio::test]
-    async fn test_tchap_get_instance() {
+    #[test]
+    fn test_tchap_get_instance() {
         let config = TchapGetInstanceConfig { 
             home_server: "agent.dinum.tchap.gouv.fr".to_string(),
             user_agent: "Tchap-own-user-agent".to_string(),
         };
 
-        assert_eq!("agent.dinum.tchap.gouv.fr", tchap_get_instance(&config, "testeur@dinum.tchap.beta.gouv.fr".to_string()).await.unwrap());
-        assert_eq!("agent.externe.tchap.gouv.fr", tchap_get_instance(&config, "testeur@gmail.com".to_string()).await.unwrap());
+        assert_eq!("agent.dinum.tchap.gouv.fr", tchap_get_instance(&config, "testeur@dinum.tchap.beta.gouv.fr".to_string()).unwrap());
+        assert_eq!("agent.externe.tchap.gouv.fr", tchap_get_instance(&config, "testeur@gmail.com".to_string()).unwrap());
     }
 }

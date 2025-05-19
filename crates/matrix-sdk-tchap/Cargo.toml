@@ -1,6 +1,7 @@
 [package]
 name = "matrix-sdk-tchap"
 version = "0.1.0"
+authors = ["Nicolas Buquet <nbuquet@buquet-net.com>"]
 edition = "2021"
 rust-version.workspace = true
 license = "Apache-2.0"
@@ -20,7 +21,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time", "macros"] }
+tokio = { workspace = true, features = ["full"] }
 url = { workspace = true }
 uniffi = { workspace = true, features = ["cli"] }
 

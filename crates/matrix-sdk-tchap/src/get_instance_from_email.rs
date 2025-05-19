@@ -1,15 +1,20 @@
 use reqwest::{self, Client};
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::runtime::Builder;
 use url::Url;
 
 //--------------------------------------------------------------------------------
 // Definitions
 //--------------------------------------------------------------------------------
-#[derive(Debug, Clone, uniffi::Object)]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct TchapGetInstanceConfig {
     pub home_server: String, // host name without `https://matrix.`
     pub user_agent: String,
+}
+
+impl TchapGetInstanceConfig {
+// `impl` needed to generate uniffi init() for the struct (iOS side at least).
 }
 
 impl Default for TchapGetInstanceConfig {
@@ -75,34 +80,48 @@ impl TchapGetInstance {
         Url::parse(format!("{}/{}/{}", home_server_address, kmxidentity_apiprefix_path_v1, info_path_and_query).as_str())
     }
 
-    /// Request the backend for the HoneServer associated with the given email, if possible.
-    pub async fn get_instance(&self, for_email: String) -> Result<TchapGetInstanceResult, TchapGetInstanceError> {
-        // CHeck if the client is available.
-        if let Some(client) = &self.client {
-            match self.url(&for_email) {
-                // If the request URL can't be build, return an error.
-                Err(_) => Err(TchapGetInstanceError::BadUrl),
-                Ok(request_url) => {
-                    // The client is available and the URL is built, request the backend.
-                    match client.get(request_url)
-                        .send()
-                        .await
-                        .map_err(|_| TchapGetInstanceError::InvalidResult)?
-                        .json::<TchapGetInstanceResult>()
-                        .await {
-                            // If the request failed, return an error.
-                            Err(_) => Err(TchapGetInstanceError::InvalidResult),
-                            // Else, return the value from the backend.
-                            Ok(value) => Ok(value)
+    /// Request the backend for the HomeServer associated with the given email, if possible.
+    // #[tokio::main]
+    pub fn get_instance(&self, for_email: String) -> Result<TchapGetInstanceResult, TchapGetInstanceError> {
+        let cloned_client = self.client.clone();
+        let url = self.url(&for_email);
+
+        // Create the runtime
+        let runtime = Builder::new_multi_thread()
+            .enable_time()
+            .enable_io()
+            .build()
+            .expect("Can't create runtime");
+
+        // Spawn a future onto the runtime
+        runtime.block_on(async move {
+            // Check if the client is available.
+            if let Some(client) = &cloned_client {
+                match url {
+                    // If the request URL can't be build, return an error.
+                    Err(_) => Err(TchapGetInstanceError::BadUrl),
+                    Ok(request_url) => {
+                        // The client is available and the URL is built, request the backend.
+                        match client.get(request_url)
+                            .send()
+                            .await
+                            .map_err(|_| TchapGetInstanceError::InvalidResult)?
+                            .json::<TchapGetInstanceResult>()
+                            .await {
+                                // If the request failed, return an error.
+                                Err(_) => Err(TchapGetInstanceError::InvalidResult),
+                                // Else, return the value from the backend.
+                                Ok(value) => Ok(value)
+                        }
                     }
                 }
             }
-        }
-        else {
-            // If the client is not available, return an error.
-            Err(TchapGetInstanceError::NoClient)
-        }
-     }
+            else {
+                // If the client is not available, return an error.
+                Err(TchapGetInstanceError::NoClient)
+            }
+        })
+    }
 }
 
 //--------------------------------------------------------------------------------
@@ -112,27 +131,27 @@ impl TchapGetInstance {
 mod tests {
     use crate::get_instance_from_email::*;
 
-    #[tokio::test]
-    async fn test_instance_lookup_from_email() {
+    #[test]
+    fn test_instance_lookup_from_email() {
         let config = TchapGetInstanceConfig::default();
         let client = TchapGetInstance::new(&config);
 
-        assert_eq!("agent.dinum.tchap.gouv.fr", client.get_instance("testeur@dinum.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.tchap.gouv.fr", client.get_instance("testeur@agent.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.agriculture.tchap.gouv.fr", client.get_instance("testeur@agriculture.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.diplomatie.tchap.gouv.fr", client.get_instance("testeur@diplomatie.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.pm.tchap.gouv.fr", client.get_instance("testeur@pm.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.elysee.tchap.gouv.fr", client.get_instance("testeur@elysee.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.finances.tchap.gouv.fr", client.get_instance("testeur@finances.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.interieur.tchap.gouv.fr", client.get_instance("testeur@interieur.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.intradef.tchap.gouv.fr", client.get_instance("testeur@intradef.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.justice.tchap.gouv.fr", client.get_instance("testeur@justice.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.dev-durable.tchap.gouv.fr", client.get_instance("testeur@dev-durable.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.social.tchap.gouv.fr", client.get_instance("testeur@social.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.education.tchap.gouv.fr", client.get_instance("testeur@education.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.culture.tchap.gouv.fr", client.get_instance("testeur@culture.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.collectivites.tchap.gouv.fr", client.get_instance("testeur@collectivites.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.externe.tchap.gouv.fr", client.get_instance("testeur@externe.tchap.beta.gouv.fr".to_string()).await.unwrap().hs);
-        assert_eq!("agent.externe.tchap.gouv.fr", client.get_instance("testeur@gmail.com".to_string()).await.unwrap().hs);
+        assert_eq!("agent.dinum.tchap.gouv.fr", client.get_instance("testeur@dinum.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.tchap.gouv.fr", client.get_instance("testeur@agent.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.agriculture.tchap.gouv.fr", client.get_instance("testeur@agriculture.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.diplomatie.tchap.gouv.fr", client.get_instance("testeur@diplomatie.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.pm.tchap.gouv.fr", client.get_instance("testeur@pm.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.elysee.tchap.gouv.fr", client.get_instance("testeur@elysee.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.finances.tchap.gouv.fr", client.get_instance("testeur@finances.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.interieur.tchap.gouv.fr", client.get_instance("testeur@interieur.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.intradef.tchap.gouv.fr", client.get_instance("testeur@intradef.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.justice.tchap.gouv.fr", client.get_instance("testeur@justice.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.dev-durable.tchap.gouv.fr", client.get_instance("testeur@dev-durable.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.social.tchap.gouv.fr", client.get_instance("testeur@social.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.education.tchap.gouv.fr", client.get_instance("testeur@education.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.culture.tchap.gouv.fr", client.get_instance("testeur@culture.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.collectivites.tchap.gouv.fr", client.get_instance("testeur@collectivites.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.externe.tchap.gouv.fr", client.get_instance("testeur@externe.tchap.beta.gouv.fr".to_string()).unwrap().hs);
+        assert_eq!("agent.externe.tchap.gouv.fr", client.get_instance("testeur@gmail.com".to_string()).unwrap().hs);
     }
 }
