@@ -114,6 +114,7 @@ ruma = { workspace = true, features = [
 serde.workspace = true
 serde_html_form.workspace = true
 serde_json.workspace = true
+seshat = { workspace = true, features = ["bundled-sqlcipher"] }
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

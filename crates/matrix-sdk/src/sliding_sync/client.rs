@@ -9,7 +9,7 @@ use ruma::{
 use tracing::error;
 
 use super::{SlidingSync, SlidingSyncBuilder};
-use crate::{Client, Result};
+use crate::{sliding_sync::Error, Client, Result};
 
 /// A sliding sync version.
 #[derive(Clone, Debug)]
@@ -212,6 +212,8 @@ impl SlidingSyncResponseProcessor {
 
         update_in_memory_caches(&self.client, response).await?;
 
+        update_search_index(&self.client, response).await?;
+
         Ok(())
     }
 
@@ -239,6 +241,20 @@ async fn update_in_memory_caches(client: &Client, response: &SyncResponse) -> Re
         room.user_defined_notification_mode().await;
     }
 
+    Ok(())
+}
+
+pub async fn update_search_index(client: &Client, response: &SyncResponse) -> Result<()> {
+    if let Some(search_indexer) = client.search_indexer() {
+        for (room_id, room_update) in response.rooms.joined.iter() {
+            let room = client.get_room(room_id).unwrap();
+
+            for event in room_update.timeline.events.iter() {
+                let _ = search_indexer.add_live_event(&room, event).await;
+            }
+        }
+        search_indexer.commit().map_err(|e| Error::SearchIndexer(e))?;
+    }
     Ok(())
 }
 

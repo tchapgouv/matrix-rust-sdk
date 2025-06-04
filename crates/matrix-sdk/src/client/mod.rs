@@ -80,6 +80,7 @@ use crate::{
         matrix::MatrixAuth, oauth::OAuth, AuthCtx, AuthData, ReloadSessionCallback,
         SaveSessionCallback,
     },
+    client::search_indexer::SearchIndexer,
     config::RequestConfig,
     deduplicating_handler::DeduplicatingHandler,
     error::HttpResult,
@@ -106,6 +107,7 @@ use crate::{
 mod builder;
 pub(crate) mod caches;
 pub(crate) mod futures;
+pub(crate) mod search_indexer;
 
 pub use self::builder::{sanitize_server_name, ClientBuildError, ClientBuilder};
 
@@ -317,6 +319,9 @@ pub(crate) struct ClientInner {
     /// It becomes active when [`EventCache::subscribe`] is called.
     pub(crate) event_cache: OnceCell<EventCache>,
 
+    /// The search indexer.
+    pub(crate) search_indexer: Option<Arc<SearchIndexer>>,
+
     /// End-to-end encryption related state.
     #[cfg(feature = "e2e-encryption")]
     pub(crate) e2ee: EncryptionData,
@@ -348,6 +353,7 @@ impl ClientInner {
         server_capabilities: ClientServerCapabilities,
         respect_login_well_known: bool,
         event_cache: OnceCell<EventCache>,
+        search_indexer: Option<Arc<SearchIndexer>>,
         send_queue: Arc<SendQueueData>,
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
         cross_process_store_locks_holder_name: String,
@@ -377,6 +383,7 @@ impl ClientInner {
             respect_login_well_known,
             sync_beat: event_listener::Event::new(),
             event_cache,
+            search_indexer,
             send_queue_data: send_queue,
             #[cfg(feature = "e2e-encryption")]
             e2ee: EncryptionData::new(encryption_settings),
@@ -636,6 +643,11 @@ impl Client {
     /// Get a reference to the state store.
     pub fn state_store(&self) -> &DynStateStore {
         self.base_client().state_store()
+    }
+
+    /// Get a reference to the search indexer.
+    pub fn search_indexer(&self) -> Option<&SearchIndexer> {
+        self.inner.search_indexer.as_ref().map(|s| s.as_ref())
     }
 
     /// Get a reference to the event cache store.
@@ -2490,6 +2502,7 @@ impl Client {
                 self.inner.caches.server_capabilities.read().await.clone(),
                 self.inner.respect_login_well_known,
                 self.inner.event_cache.clone(),
+                self.inner.search_indexer.clone(),
                 self.inner.send_queue_data.clone(),
                 #[cfg(feature = "e2e-encryption")]
                 self.inner.e2ee.encryption_settings,

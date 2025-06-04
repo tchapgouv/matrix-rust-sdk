@@ -82,6 +82,7 @@ sentry-tracing = "0.36.0"
 serde = { version = "1.0.217", features = ["rc"] }
 serde_html_form = "0.2.7"
 serde_json = "1.0.138"
+seshat = { path = "../seshat" }
 sha2 = "0.10.8"
 similar-asserts = "1.6.1"
 stream_assert = "0.1.1"

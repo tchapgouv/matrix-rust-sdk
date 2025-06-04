@@ -46,7 +46,7 @@ matrix_sdk_test::init_tracing_for_tests!();
 #[derive(Clone)]
 pub struct SqliteStoreConfig {
     /// Path to the database, without the file name.
-    path: PathBuf,
+    pub path: PathBuf,
     /// Passphrase to open the store, if any.
     passphrase: Option<String>,
     /// The pool configuration for [`deadpool_sqlite`].

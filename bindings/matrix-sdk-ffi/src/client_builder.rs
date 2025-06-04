@@ -613,6 +613,10 @@ impl ClientBuilder {
             None
         };
 
+        if let Some(store_path) = store_path.clone() {
+            inner_builder = inner_builder.search_index_path(store_path);
+        }
+
         // Determine server either from URL, server name or user ID.
         inner_builder = match builder.homeserver_cfg {
             Some(HomeserverConfig::Url(url)) => inner_builder.homeserver_url(url),

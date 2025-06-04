@@ -63,4 +63,8 @@ pub enum Error {
     #[cfg(feature = "e2e-encryption")]
     #[error(transparent)]
     CryptoStoreError(#[from] matrix_sdk_base::crypto::CryptoStoreError),
+
+    /// An error occurred in the search indexer.
+    #[error(transparent)]
+    SearchIndexer(#[from] crate::client::search_indexer::Error),
 }

@@ -1553,6 +1553,21 @@ impl Client {
     ) -> Result<Option<MediaPreviewConfig>, ClientError> {
         Ok(self.inner.account().fetch_media_preview_config_event_content().await?.map(Into::into))
     }
+
+    pub fn search_events(
+        &self,
+        query: String,
+        limit: u32,
+        room_id: Option<String>,
+    ) -> Result<Vec<String>, ClientError> {
+        if let Some(search_indexer) = self.inner.search_indexer() {
+            Ok(search_indexer
+                .search(&query, limit, room_id.as_deref())
+                .map_err(ClientError::from_err)?)
+        } else {
+            Ok(Vec::new())
+        }
+    }
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]

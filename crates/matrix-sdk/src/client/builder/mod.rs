@@ -17,7 +17,7 @@ mod homeserver_config;
 
 #[cfg(feature = "sqlite")]
 use std::path::Path;
-use std::{fmt, sync::Arc};
+use std::{fmt, path::PathBuf, sync::Arc};
 
 use homeserver_config::*;
 use matrix_sdk_base::{store::StoreConfig, BaseClient};
@@ -40,7 +40,7 @@ use crate::encryption::EncryptionSettings;
 use crate::http_client::HttpSettings;
 use crate::{
     authentication::{oauth::OAuthCtx, AuthCtx},
-    client::ClientServerCapabilities,
+    client::{search_indexer::SearchIndexer, ClientServerCapabilities},
     config::RequestConfig,
     error::RumaApiError,
     http_client::HttpClient,
@@ -94,6 +94,7 @@ pub struct ClientBuilder {
     sliding_sync_version_builder: SlidingSyncVersionBuilder,
     http_cfg: Option<HttpConfig>,
     store_config: BuilderStoreConfig,
+    search_index_path: Option<PathBuf>,
     request_config: RequestConfig,
     respect_login_well_known: bool,
     server_versions: Option<Box<[MatrixVersion]>>,
@@ -119,6 +120,7 @@ impl ClientBuilder {
             store_config: BuilderStoreConfig::Custom(StoreConfig::new(
                 Self::DEFAULT_CROSS_PROCESS_STORE_LOCKS_HOLDER_NAME.to_owned(),
             )),
+            search_index_path: None,
             request_config: Default::default(),
             respect_login_well_known: true,
             server_versions: None,
@@ -283,6 +285,12 @@ impl ClientBuilder {
     /// ```
     pub fn store_config(mut self, store_config: StoreConfig) -> Self {
         self.store_config = BuilderStoreConfig::Custom(store_config);
+        self
+    }
+
+    /// Set up the search indexer path.
+    pub fn search_index_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.search_index_path = Some(path.as_ref().to_owned());
         self
     }
 
@@ -492,8 +500,11 @@ impl ClientBuilder {
         } else {
             #[allow(unused_mut)]
             let mut client = BaseClient::new(
-                build_store_config(self.store_config, &self.cross_process_store_locks_holder_name)
-                    .await?,
+                build_store_config(
+                    self.store_config.clone(),
+                    &self.cross_process_store_locks_holder_name,
+                )
+                .await?,
             );
 
             #[cfg(feature = "e2e-encryption")]
@@ -543,6 +554,15 @@ impl ClientBuilder {
         // Enable the send queue by default.
         let send_queue = Arc::new(SendQueueData::new(true));
 
+        let search_indexer = if let Some(search_index_path) = self.search_index_path {
+            Some(Arc::new(
+                SearchIndexer::new(search_index_path, false)
+                    .map_err(|e| ClientBuildError::SearchIndexer(e))?,
+            ))
+        } else {
+            None
+        };
+
         let server_capabilities = ClientServerCapabilities {
             server_versions: self.server_versions,
             unstable_features: None,
@@ -559,6 +579,7 @@ impl ClientBuilder {
             server_capabilities,
             self.respect_login_well_known,
             event_cache,
+            search_indexer,
             send_queue,
             #[cfg(feature = "e2e-encryption")]
             self.encryption_settings,
@@ -708,7 +729,7 @@ enum BuilderStoreConfig {
     #[cfg(feature = "sqlite")]
     Sqlite {
         config: SqliteStoreConfig,
-        cache_path: Option<std::path::PathBuf>,
+        cache_path: Option<PathBuf>,
     },
     #[cfg(feature = "indexeddb")]
     IndexedDb {
@@ -776,6 +797,10 @@ pub enum ClientBuildError {
     #[cfg(feature = "sqlite")]
     #[error(transparent)]
     SqliteStore(#[from] matrix_sdk_sqlite::OpenStoreError),
+
+    /// Error opening the search indexer.
+    #[error(transparent)]
+    SearchIndexer(#[from] crate::client::search_indexer::Error),
 }
 
 // The http mocking library is not supported for wasm32
