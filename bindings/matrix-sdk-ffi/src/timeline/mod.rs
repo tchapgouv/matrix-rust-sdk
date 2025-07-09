@@ -30,7 +30,6 @@ use matrix_sdk::{
         edit::EditedContent as SdkEditedContent,
         reply::{EnforceThread, Reply},
     },
-    Error as MatrixSdkError,
 };
 use matrix_sdk_ui::timeline::{
     self, Error, AttachmentSource, EventItemOrigin, Profile, RepliedToEvent, TimelineDetails,
@@ -391,7 +390,7 @@ impl Timeline {
             .get_size_limit_for_file_upload()
             .await
             .map(|size| size.0)
-            .ok_or(ClientError::Generic { msg: "File size limit not synced".to_string() })
+            .ok_or(ClientError::Generic { msg: "File size limit not synced".to_string(), details: None, })
     }
     // end BWI-specific
 

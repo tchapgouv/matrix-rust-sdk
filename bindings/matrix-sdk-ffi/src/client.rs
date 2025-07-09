@@ -776,7 +776,7 @@ impl Client {
             .get_size_limit_for_file_upload()
             .await
             .map(|size| size.0)
-            .ok_or(ClientError::Generic { msg: "File size limit not synced".to_string() })
+            .ok_or(ClientError::Generic { msg: "File size limit not synced".to_string(), details: None, })
     }
     // end BWI-specific
 

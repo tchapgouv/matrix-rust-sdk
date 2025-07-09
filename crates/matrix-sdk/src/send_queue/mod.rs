@@ -1397,47 +1397,24 @@ impl QueueStorage {
                     // Materialize as an event local echo.
                     Some(LocalEcho {
                         transaction_id: dep.own_transaction_id.clone().into(),
-                        content: LocalEchoContent::React {
-                            key,
-                            send_handle: SendReactionHandle {
+                        content: LocalEchoContent::Event {
+                            serialized_event: SerializableEventContent::new(&(*local_echo).into())
+                                .ok()?,
+                            send_handle: SendHandle {
                                 room: room.clone(),
                                 transaction_id: dep.own_transaction_id.into(),
+                                media_handles: vec!(MediaHandles {
+                                    upload_thumbnail_txn: None, // thumbnail_info.map(|info| info.txn),
+                                    upload_file_txn: file_upload,
+                                }),
+                                created_at: dep.created_at,
                             },
-                            applies_to: dep.parent_transaction_id,
+                            send_error: None,
                         },
-                    }),
-
-                    DependentQueuedRequestKind::UploadFileWithThumbnail { .. } => {
-                        // Don't reflect these: only the associated event is interesting to observers.
-                        None
-                    }
-
-                    DependentQueuedRequestKind::FinishUpload {
-                        local_echo,
-                        file_upload,
-                        thumbnail_info,
-                    } => {
-                        // Materialize as an event local echo.
-                        Some(LocalEcho {
-                            transaction_id: dep.own_transaction_id.clone().into(),
-                            content: LocalEchoContent::Event {
-                                serialized_event: SerializableEventContent::new(&(*local_echo).into())
-                                    .ok()?,
-                                send_handle: SendHandle {
-                                    room: room.clone(),
-                                    transaction_id: dep.own_transaction_id.into(),
-                                    media_handles: vec!(MediaHandles {
-                                        upload_thumbnail_txn: None, // thumbnail_info.map(|info| info.txn),
-                                        upload_file_txn: file_upload,
-                                    }),
-                                    created_at: dep.created_at,
-                                },
-                                send_error: None,
-                            },
-                        })
-                    }
-                },
-            );
+                    })
+                }
+            },
+        );
 
         Ok(local_requests.chain(reactions_and_medias).collect())
     }

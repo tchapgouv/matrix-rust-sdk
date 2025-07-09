@@ -29,6 +29,7 @@ pub async fn get_imprint_as_url(homeserver_url: &str) -> Result<String, ClientEr
                 "Unable to fetch the imprint from the homeserver with url {url}",
                 url = homeserver_url
             ),
+            details: None,
         })?;
     Ok(String::from(organization.get_imprint().as_url()))
 }
@@ -41,6 +42,7 @@ pub async fn get_data_privacy_as_url(homeserver_url: &str) -> Result<String, Cli
                 "Unable to fetch the privacy policy from the homeserver with url {url}",
                 url = homeserver_url
             ),
+            details: None,
         })?;
     Ok(String::from(organization.get_data_privacy().as_url()))
 }
