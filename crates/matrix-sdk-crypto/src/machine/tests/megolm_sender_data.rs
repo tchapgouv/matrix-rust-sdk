@@ -33,7 +33,10 @@ use crate::{
     },
     olm::{InboundGroupSession, SenderData},
     store::RoomKeyInfo,
-    types::events::{room::encrypted::ToDeviceEncryptedEventContent, EventType, ToDeviceEvent},
+    types::{
+        events::{room::encrypted::ToDeviceEncryptedEventContent, EventType, ToDeviceEvent},
+        ProcessedToDeviceEvent,
+    },
     DeviceData, EncryptionSettings, EncryptionSyncChanges, OlmMachine, Session,
 };
 
@@ -283,7 +286,10 @@ async fn create_and_share_session_without_sender_data(
 }
 
 /// Pipe a to-device event into an [`OlmMachine`].
-async fn receive_to_device_event<C>(machine: &OlmMachine, event: &ToDeviceEvent<C>)
+pub async fn receive_to_device_event<C>(
+    machine: &OlmMachine,
+    event: &ToDeviceEvent<C>,
+) -> (Vec<ProcessedToDeviceEvent>, Vec<RoomKeyInfo>)
 where
     C: EventType + Serialize + Debug,
 {
@@ -298,7 +304,7 @@ where
             next_batch_token: None,
         })
         .await
-        .expect("Error receiving to-device event");
+        .expect("Error receiving to-device event")
 }
 
 /// Given the `room_keys_received_stream`, check that there is a pending update,

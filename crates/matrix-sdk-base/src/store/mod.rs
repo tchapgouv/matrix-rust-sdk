@@ -71,6 +71,8 @@ mod send_queue;
 
 #[cfg(any(test, feature = "testing"))]
 pub use self::integration_tests::StateStoreIntegrationTests;
+#[cfg(feature = "unstable-msc4274")]
+pub use self::send_queue::AccumulatedSentMediaInfo;
 pub use self::{
     memory_store::MemoryStore,
     send_queue::{
@@ -321,7 +323,7 @@ impl BaseStateStore {
     pub fn get_or_create_room(
         &self,
         room_id: &RoomId,
-        room_type: RoomState,
+        room_state: RoomState,
         room_info_notable_update_sender: broadcast::Sender<RoomInfoNotableUpdate>,
     ) -> Room {
         let user_id =
@@ -335,7 +337,7 @@ impl BaseStateStore {
                     user_id,
                     self.inner.clone(),
                     room_id,
-                    room_type,
+                    room_state,
                     room_info_notable_update_sender,
                 )
             })

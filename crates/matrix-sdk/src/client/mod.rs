@@ -2291,7 +2291,7 @@ impl Client {
     /// client
     ///     .sync_with_callback(sync_settings, |response| async move {
     ///         let channel = sync_channel;
-    ///         for (room_id, room) in response.rooms.join {
+    ///         for (room_id, room) in response.rooms.joined {
     ///             for event in room.timeline.events {
     ///                 channel.send(event).await.unwrap();
     ///             }
@@ -2371,7 +2371,7 @@ impl Client {
     ///     .sync_with_result_callback(sync_settings, |response| async move {
     ///         let channel = sync_channel;
     ///         let sync_response = response?;
-    ///         for (room_id, room) in sync_response.rooms.join {
+    ///         for (room_id, room) in sync_response.rooms.joined {
     ///              for event in room.timeline.events {
     ///                  channel.send(event).await.unwrap();
     ///               }
@@ -2444,7 +2444,7 @@ impl Client {
     ///     Box::pin(client.sync_stream(SyncSettings::default()).await);
     ///
     /// while let Some(Ok(response)) = sync_stream.next().await {
-    ///     for room in response.rooms.join.values() {
+    ///     for room in response.rooms.joined.values() {
     ///         for e in &room.timeline.events {
     ///             if let Ok(event) = e.raw().deserialize() {
     ///                 println!("Received event {:?}", event);

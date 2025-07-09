@@ -6,9 +6,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- [**breaking**] Move `session_id` from `EncryptionInfo` to `AlgorithmInfo` as it is megolm specific. 
+  Use `EncryptionInfo::session_id()` helper for quick access.
+
+- Send stable identifier `sender_device_keys` for MSC4147 (Including device
+  keys with Olm-encrypted events).
+  ([#4964](https://github.com/matrix-org/matrix-rust-sdk/pull/4964))
+
+- Add experimental APIs for sharing encrypted room key history with new members, `Store::build_room_key_bundle` and `OlmMachine::share_room_key_bundle_data`.
+  ([#4775](https://github.com/matrix-org/matrix-rust-sdk/pull/4775), [#4864](https://github.com/matrix-org/matrix-rust-sdk/pull/4864))
+
+- Check the `sender_device_keys` field on *all* incoming Olm-encrypted to-device messages
+  and ignore any to-device messages which include the field but whose data is invalid
+  (as per [MSC4147](https://github.com/matrix-org/matrix-spec-proposals/pull/4147)).
+  ([#4922](https://github.com/matrix-org/matrix-rust-sdk/pull/4922))
+
+- Fix bug which caused room keys to be unnecessarily rotated on every send in the
+  presence of blacklisted/withheld devices in the room.
+  ([#4954](https://github.com/matrix-org/matrix-rust-sdk/pull/4954))
+
+- Fix [#2729](https://github.com/matrix-org/matrix-rust-sdk/issues/2729) which in rare
+  cases can cause room key oversharing.
+  ([#4975](https://github.com/matrix-org/matrix-rust-sdk/pull/4975))
+
 ## [0.11.0] - 2025-04-11
 
 ### Features
+
+- [**breaking**] `OlmMachine.receive_sync_changes` returns now a list of `ProcessedToDeviceEvent` 
+  instead of a list of `Raw<AnyToDeviceEvent>`. With variants like `Decrypted`|`UnableToDecrypt`|`PlainText`|`NotProcessed`.
+  This allows for example to make the difference between an event sent in clear and an event successfully decrypted.
+  For quick compatibility a helper `ProcessedToDeviceEvent::to_raw` allows to map back to the previous behaviour.
 
 - [**breaking**] Add support for the shared history flag defined in
   [MSC3061](https://github.com/matrix-org/matrix-spec-proposals/pull/3061).
@@ -19,6 +49,10 @@ All notable changes to this project will be documented in this file.
   has been added and `PickledInboundGroupSession` has received a new
   `shared_history` field that defaults to `false.`
   ([#4700](https://github.com/matrix-org/matrix-rust-sdk/pull/4700))
+
+- Have the `RoomIdentityProvider` return processing changes when identities transition
+  to `IdentityState::Verified` too.
+  ([#4670](https://github.com/matrix-org/matrix-rust-sdk/pull/4670))
 
 ## [0.10.0] - 2025-02-04
 
@@ -36,10 +70,6 @@ All notable changes to this project will be documented in this file.
 - Room keys are not shared with unsigned dehydrated devices.
   ([#4551](https://github.com/matrix-org/matrix-rust-sdk/pull/4551))
   
-- Have the `RoomIdentityProvider` return processing changes when identities transition
-  to `IdentityState::Verified` too.
-  ([#4670](https://github.com/matrix-org/matrix-rust-sdk/pull/4670))
-
 ## [0.9.0] - 2024-12-18
 
 ### Features

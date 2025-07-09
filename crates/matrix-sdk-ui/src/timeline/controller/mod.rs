@@ -1050,16 +1050,14 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
         };
 
         // Replace the local-related state (kind) and the content state.
-        let prev_reactions = prev_item.content().reactions();
-        let prev_thread_root = prev_item.content().thread_root();
-        let prev_in_reply_to = prev_item.content().in_reply_to();
         let new_item = TimelineItem::new(
             prev_item.with_kind(ti_kind).with_content(TimelineItemContent::message(
                 content,
                 None,
-                prev_reactions,
-                prev_thread_root,
-                prev_in_reply_to,
+                prev_item.content().reactions(),
+                prev_item.content().thread_root(),
+                prev_item.content().in_reply_to(),
+                prev_item.content().thread_summary(),
             )),
             prev_item.internal_id.to_owned(),
         );
@@ -1412,6 +1410,7 @@ impl TimelineController {
             reactions,
             thread_root,
             in_reply_to,
+            thread_summary,
         }) = item.content().clone()
         else {
             info!("Event is no longer a message (redacted?)");
@@ -1432,6 +1431,7 @@ impl TimelineController {
             reactions,
             thread_root,
             in_reply_to: Some(InReplyToDetails { event_id: in_reply_to.event_id, event }),
+            thread_summary,
         }));
         state.items.replace(index, TimelineItem::new(item, internal_id));
 
@@ -1589,7 +1589,7 @@ impl TimelineController {
 
     #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
     pub(super) async fn retry_event_decryption(&self, session_ids: Option<BTreeSet<String>>) {
-        self.retry_event_decryption_inner(self.room().to_owned(), session_ids).await
+        self.retry_event_decryption_inner(self.room().clone(), session_ids).await
     }
 }
 
