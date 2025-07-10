@@ -223,18 +223,12 @@ impl TryFrom<HttpError> for BWIScanStateResult {
         // } else {
         //     Err(BWIContentScannerError::ScanResponseParseFailed)
         // }
-
-        let mut result: Option<BWIScanStateResult> = None;
         
         if let Api(response_error) = value {
-            if let Server(server_error) = *response_error {
-                if let Other(matrix_error) = server_error {
-                    if let MatrixError { status_code: status, body: Json(value) } = matrix_error {
-                        let value = serde_json::from_value(value)
-                            .map_err(|_| BWIContentScannerError::ScanResponseParseFailed)?;
-                        return Ok(BWIScanStateResult::Error(status, value));
-                    }
-                }
+            if let Server(Other(MatrixError { status_code: status, body: Json(value) })) = *response_error {
+                let value = serde_json::from_value(value)
+                    .map_err(|_| BWIContentScannerError::ScanResponseParseFailed)?;
+                return Ok(BWIScanStateResult::Error(status, value));
             }
         }
 
