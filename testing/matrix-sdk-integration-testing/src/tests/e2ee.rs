@@ -1213,7 +1213,7 @@ async fn test_history_share_on_invite() -> Result<()> {
         // TODO: get rid of all of this: history sharing should work even if Bob and
         //   Alice do not share a room
         let alice_shared_room = alice
-            .create_room(assign!(CreateRoomRequest::new(), {preset: Some(RoomPreset::PublicChat)}))
+            .create_room(assign!(CreateRoomRequest::new(), {preset: Some(RoomPreset::PublicChat)}), false)
             .await?;
         let shared_room_id = alice_shared_room.room_id();
         alice_shared_room.enable_encryption().await?;
@@ -1277,7 +1277,8 @@ async fn test_history_share_on_invite() -> Result<()> {
     let alice_room = alice
         .create_room(assign!(CreateRoomRequest::new(), {
             preset: Some(RoomPreset::PublicChat),
-        }))
+        }),
+        false)
         .await?;
     alice_room.enable_encryption().await?;
 

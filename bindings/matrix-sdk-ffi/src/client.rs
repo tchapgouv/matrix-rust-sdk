@@ -51,9 +51,9 @@ use matrix_sdk_ui::{
         NotificationProcessSetup as MatrixNotificationProcessSetup,
     },
     unable_to_decrypt_hook::UtdHookManager,
-# BWI imports
-use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState as SDKScanState;
 };
+// BWI imports
+use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState as SDKScanState;
 use mime::Mime;
 use ruma::{
     api::client::{alias::get_alias, error::ErrorKind, uiaa::UserIdentifier},

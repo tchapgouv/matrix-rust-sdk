@@ -32,7 +32,7 @@ use matrix_sdk::{
     },
 };
 use matrix_sdk_ui::timeline::{
-    self, AttachmentSource, EventItemOrigin, Profile, TimelineDetails,
+    self, Error, AttachmentSource, EventItemOrigin, Profile, TimelineDetails,
     TimelineUniqueId as SdkTimelineUniqueId,
 };
 use mime::Mime;

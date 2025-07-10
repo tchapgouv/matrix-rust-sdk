@@ -301,6 +301,7 @@ impl TimelineAction {
                         ))
                     }
                 },
+                // Tchap: tests for Access rules.
                 ev => {
                     let ev_content = ev.content();
                     let event_type_str = ev_content.event_type().to_string();
@@ -319,6 +320,7 @@ impl TimelineAction {
                                     Some("my-own-value".to_owned()),
                                 ),
                             }
+                        ))
                         }
                         _ => Self::add_item(TimelineItemContent::OtherState(OtherState {
                             state_key: ev.state_key().to_owned(),
@@ -326,6 +328,7 @@ impl TimelineAction {
                                 ev_content, None,
                             ),
                         },
+                    ))
                     }
                 }
             },

@@ -47,7 +47,6 @@ once_cell.workspace = true
 pin-project-lite.workspace = true
 # BWI-specific
 matrix-sdk-bwi = { workspace = true }
-matrix-sdk-base = { workspace = true }
 matrix-sdk-base-bwi = { workspace = true }
 ruma = { workspace = true, features = ["html", "unstable-msc3381"] }
 serde.workspace = true

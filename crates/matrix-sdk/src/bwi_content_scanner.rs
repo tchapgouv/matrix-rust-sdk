@@ -214,12 +214,30 @@ impl TryFrom<HttpError> for BWIScanStateResult {
     type Error = BWIContentScannerError;
 
     fn try_from(value: HttpError) -> Result<Self, BWIContentScannerError> {
-        if let Api(Server(Other(MatrixError { status_code: status, body: Json(value) }))) = value {
-            let value = serde_json::from_value(value)
-                .map_err(|_| BWIContentScannerError::ScanResponseParseFailed)?;
-            Ok(BWIScanStateResult::Error(status, value))
-        } else {
-            Err(BWIContentScannerError::ScanResponseParseFailed)
+
+        // Tchap: Now that Api contains a boxed FromHttpResponseError, it can't be used in pattern matching.
+        // if let Api(Server(Other(MatrixError { status_code: status, body: Json(value) })))) = value {
+        //     let value = serde_json::from_value(value)
+        //         .map_err(|_| BWIContentScannerError::ScanResponseParseFailed)?;
+        //     Ok(BWIScanStateResult::Error(status, value))
+        // } else {
+        //     Err(BWIContentScannerError::ScanResponseParseFailed)
+        // }
+
+        let mut result: Option<BWIScanStateResult> = None;
+        
+        if let Api(response_error) = value {
+            if let Server(server_error) = *response_error {
+                if let Other(matrix_error) = server_error {
+                    if let MatrixError { status_code: status, body: Json(value) } = matrix_error {
+                        let value = serde_json::from_value(value)
+                            .map_err(|_| BWIContentScannerError::ScanResponseParseFailed)?;
+                        return Ok(BWIScanStateResult::Error(status, value));
+                    }
+                }
+            }
         }
+
+        Err(BWIContentScannerError::ScanResponseParseFailed)
     }
 }
