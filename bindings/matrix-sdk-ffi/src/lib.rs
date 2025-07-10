@@ -37,6 +37,7 @@ mod tchap_bindings;
 /// Tchap end
 mod timeline;
 mod tracing;
+mod utd;
 mod utils;
 mod widget;
 
