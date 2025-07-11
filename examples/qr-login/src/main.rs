@@ -1,15 +1,15 @@
 use std::io::Write;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use futures_util::StreamExt;
 use matrix_sdk::{
+    Client,
     authentication::oauth::{
         qrcode::{LoginProgress, QrCodeData, QrCodeModeData},
         registration::{ApplicationType, ClientMetadata, Localized, OAuthGrantType},
     },
     ruma::serde::Raw,
-    Client,
 };
 use url::Url;
 
@@ -112,10 +112,10 @@ async fn login(proxy: Option<Url>) -> Result<()> {
 
     let client = client.build().await?;
 
-    let metadata = client_metadata();
+    let registration_data = client_metadata().into();
     let oauth = client.oauth();
 
-    let login_client = oauth.login_with_qr_code(&data, metadata.into());
+    let login_client = oauth.login_with_qr_code(&data, Some(&registration_data));
     let mut subscriber = login_client.subscribe_to_progress();
 
     let task = tokio::spawn(async move {

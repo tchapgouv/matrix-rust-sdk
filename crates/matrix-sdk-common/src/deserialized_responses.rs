@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 #[cfg(doc)]
 use ruma::events::AnyTimelineEvent;
 use ruma::{
-    events::{AnyMessageLikeEvent, AnySyncTimelineEvent},
+    events::{AnyMessageLikeEvent, AnySyncTimelineEvent, AnyToDeviceEvent, MessageLikeEventType},
     push::Action,
     serde::{
         AsRefStr, AsStrAsRefStr, DebugAsRefStr, DeserializeFromCowStr, FromString, JsonObject, Raw,
@@ -26,10 +26,14 @@ use ruma::{
     DeviceKeyAlgorithm, OwnedDeviceId, OwnedEventId, OwnedUserId,
 };
 use serde::{Deserialize, Serialize};
-#[cfg(target_arch = "wasm32")]
+use tracing::warn;
+#[cfg(target_family = "wasm")]
 use wasm_bindgen::prelude::*;
 
-use crate::debug::{DebugRawEvent, DebugStructExt};
+use crate::{
+    debug::{DebugRawEvent, DebugStructExt},
+    serde_helpers::extract_bundled_thread_summary,
+};
 
 const AUTHENTICITY_NOT_GUARANTEED: &str =
     "The authenticity of this encrypted message can't be guaranteed on this device.";
@@ -38,6 +42,9 @@ const VERIFICATION_VIOLATION: &str =
     "Encrypted by a previously-verified user who is no longer verified.";
 const UNSIGNED_DEVICE: &str = "Encrypted by a device not verified by its owner.";
 const UNKNOWN_DEVICE: &str = "Encrypted by an unknown or deleted device.";
+const MISMATCHED_SENDER: &str = "\
+    The sender of the event does not match the owner of the device \
+    that created the Megolm session.";
 pub const SENT_IN_CLEAR: &str = "Not encrypted.";
 
 /// Represents the state of verification for a decrypted message sent by a
@@ -113,6 +120,10 @@ impl VerificationState {
                         message: AUTHENTICITY_NOT_GUARANTEED,
                     },
                 },
+                VerificationLevel::MismatchedSender => ShieldState::Red {
+                    code: ShieldStateCode::MismatchedSender,
+                    message: MISMATCHED_SENDER,
+                },
             },
         }
     }
@@ -167,6 +178,10 @@ impl VerificationState {
                         }
                     }
                 },
+                VerificationLevel::MismatchedSender => ShieldState::Red {
+                    code: ShieldStateCode::MismatchedSender,
+                    message: MISMATCHED_SENDER,
+                },
             },
         }
     }
@@ -194,6 +209,10 @@ pub enum VerificationLevel {
     /// deleted) or because the key to decrypt the message was obtained from
     /// an insecure source.
     None(DeviceLinkProblem),
+
+    /// The `sender` field on the event does not match the owner of the device
+    /// that established the Megolm session.
+    MismatchedSender,
 }
 
 impl fmt::Display for VerificationLevel {
@@ -207,8 +226,9 @@ impl fmt::Display for VerificationLevel {
                 "The sending device was not signed by the user's identity"
             }
             VerificationLevel::None(..) => "The sending device is not known",
+            VerificationLevel::MismatchedSender => MISMATCHED_SENDER,
         };
-        write!(f, "{}", display)
+        write!(f, "{display}")
     }
 }
 
@@ -252,7 +272,7 @@ pub enum ShieldState {
 /// A machine-readable representation of the authenticity for a `ShieldState`.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
+#[cfg_attr(target_family = "wasm", wasm_bindgen)]
 pub enum ShieldStateCode {
     /// Not enough information available to check the authenticity.
     AuthenticityNotGuaranteed,
@@ -267,6 +287,9 @@ pub enum ShieldStateCode {
     /// The sender was previously verified but changed their identity.
     #[serde(alias = "PreviouslyVerified")]
     VerificationViolation,
+    /// The `sender` field on the event does not match the owner of the device
+    /// that established the Megolm session.
+    MismatchedSender,
 }
 
 /// The algorithm specific information of a decrypted event.
@@ -281,11 +304,22 @@ pub enum AlgorithmInfo {
         /// decrypt this session. This map will usually contain a single ed25519
         /// key.
         sender_claimed_keys: BTreeMap<DeviceKeyAlgorithm, String>,
+
+        /// The Megolm session ID that was used to encrypt this event, or None
+        /// if this info was stored before we collected this data.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+
+    /// The info if the event was encrypted using m.olm.v1.curve25519-aes-sha2
+    OlmV1Curve25519AesSha2 {
+        // The sender device key, base64 encoded
+        curve25519_public_key_base64: String,
     },
 }
 
 /// Struct containing information on how an event was decrypted.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct EncryptionInfo {
     /// The user ID of the event sender, note this is untrusted data unless the
     /// `verification_state` is `Verified` as well.
@@ -302,12 +336,108 @@ pub struct EncryptionInfo {
     /// Callers that persist this should mark the state as dirty when a device
     /// change is received down the sync.
     pub verification_state: VerificationState,
-    /// The Megolm session ID that was used to encrypt this event, or None if
-    /// this info was stored before we collected this data.
-    pub session_id: Option<String>,
 }
 
-/// Represents a matrix room event that has been returned from `/sync`,
+impl EncryptionInfo {
+    /// Helper to get the megolm session id used to encrypt.
+    pub fn session_id(&self) -> Option<&str> {
+        if let AlgorithmInfo::MegolmV1AesSha2 { session_id, .. } = &self.algorithm_info {
+            session_id.as_deref()
+        } else {
+            None
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EncryptionInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Backwards compatibility: Capture session_id at root if exists. In legacy
+        // EncryptionInfo the session_id was not in AlgorithmInfo
+        #[derive(Deserialize)]
+        struct Helper {
+            pub sender: OwnedUserId,
+            pub sender_device: Option<OwnedDeviceId>,
+            pub algorithm_info: AlgorithmInfo,
+            pub verification_state: VerificationState,
+            #[serde(rename = "session_id")]
+            pub old_session_id: Option<String>,
+        }
+
+        let Helper { sender, sender_device, algorithm_info, verification_state, old_session_id } =
+            Helper::deserialize(deserializer)?;
+
+        let algorithm_info = match algorithm_info {
+            AlgorithmInfo::MegolmV1AesSha2 { curve25519_key, sender_claimed_keys, session_id } => {
+                AlgorithmInfo::MegolmV1AesSha2 {
+                    // Migration, merge the old_session_id in algorithm_info
+                    session_id: session_id.or(old_session_id),
+                    curve25519_key,
+                    sender_claimed_keys,
+                }
+            }
+            other => other,
+        };
+
+        Ok(EncryptionInfo { sender, sender_device, algorithm_info, verification_state })
+    }
+}
+
+/// A simplified thread summary.
+///
+/// A thread summary contains useful information pertaining to a thread, and
+/// that would be usually attached in clients to a thread root event (i.e. the
+/// first event from which the thread originated), along with links into the
+/// thread's view. This summary may include, for instance:
+///
+/// - the number of replies to the thread,
+/// - the full event of the latest reply to the thread,
+/// - whether the user participated or not to this thread.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ThreadSummary {
+    /// The event id for the latest reply to the thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_reply: Option<OwnedEventId>,
+
+    /// The number of replies to the thread.
+    ///
+    /// This doesn't include the thread root event itself. It can be zero if no
+    /// events in the thread are considered to be meaningful (or they've all
+    /// been redacted).
+    pub num_replies: u32,
+}
+
+/// The status of a thread summary.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub enum ThreadSummaryStatus {
+    /// We don't know if the event has a thread summary.
+    #[default]
+    Unknown,
+    /// The event has no thread summary.
+    None,
+    /// The event has a thread summary, which is bundled in the event itself.
+    Some(ThreadSummary),
+}
+
+impl ThreadSummaryStatus {
+    /// Is the thread status of this event unknown?
+    fn is_unknown(&self) -> bool {
+        matches!(self, ThreadSummaryStatus::Unknown)
+    }
+
+    /// Transforms the [`ThreadSummaryStatus`] into an optional thread summary,
+    /// for cases where we don't care about distinguishing unknown and none.
+    pub fn summary(&self) -> Option<&ThreadSummary> {
+        match self {
+            ThreadSummaryStatus::Unknown | ThreadSummaryStatus::None => None,
+            ThreadSummaryStatus::Some(thread_summary) => Some(thread_summary),
+        }
+    }
+}
+
+/// Represents a Matrix room event that has been returned from `/sync`,
 /// after initial processing.
 ///
 /// Previously, this differed from [`TimelineEvent`] by wrapping an
@@ -336,9 +466,26 @@ pub struct TimelineEvent {
 
     /// The push actions associated with this event.
     ///
-    /// If it's set to `None`, then it means we couldn't compute those actions.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub push_actions: Option<Vec<Action>>,
+    /// If it's set to `None`, then it means we couldn't compute those actions,
+    /// or that they could be computed but there were none.
+    #[serde(skip_serializing_if = "skip_serialize_push_actions")]
+    push_actions: Option<Vec<Action>>,
+
+    /// If the event is part of a thread, a thread summary.
+    #[serde(default, skip_serializing_if = "ThreadSummaryStatus::is_unknown")]
+    pub thread_summary: ThreadSummaryStatus,
+
+    /// The bundled latest thread event, if it was provided in the unsigned
+    /// relations of this event.
+    ///
+    /// Not serialized.
+    #[serde(skip)]
+    pub bundled_latest_thread_event: Option<Box<TimelineEvent>>,
+}
+
+// Don't serialize push actions if they're `None` or an empty vec.
+fn skip_serialize_push_actions(push_actions: &Option<Vec<Action>>) -> bool {
+    push_actions.as_ref().is_none_or(|v| v.is_empty())
 }
 
 // See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
@@ -353,7 +500,7 @@ unsafe impl Sync for TimelineEvent {}
 #[test]
 // See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
 fn test_send_sync_for_sync_timeline_event() {
-    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send_sync<T: crate::SendOutsideWasm + crate::SyncOutsideWasm>() {}
 
     assert_send_sync::<TimelineEvent>();
 }
@@ -363,26 +510,127 @@ impl TimelineEvent {
     ///
     /// This is a convenience constructor for a plaintext event when you don't
     /// need to set `push_action`, for example inside a test.
-    pub fn new(event: Raw<AnySyncTimelineEvent>) -> Self {
-        Self { kind: TimelineEventKind::PlainText { event }, push_actions: None }
+    pub fn from_plaintext(event: Raw<AnySyncTimelineEvent>) -> Self {
+        Self::new(TimelineEventKind::PlainText { event }, None)
     }
 
-    /// Create a new [`TimelineEvent`] from the given raw event and push
-    /// actions.
-    ///
-    /// This is a convenience constructor for a plaintext event, for example
-    /// inside a test.
-    pub fn new_with_push_actions(
-        event: Raw<AnySyncTimelineEvent>,
-        push_actions: Vec<Action>,
+    /// Create a new [`TimelineEvent`] from a decrypted event.
+    pub fn from_decrypted(
+        decrypted: DecryptedRoomEvent,
+        push_actions: Option<Vec<Action>>,
     ) -> Self {
-        Self { kind: TimelineEventKind::PlainText { event }, push_actions: Some(push_actions) }
+        Self::new(TimelineEventKind::Decrypted(decrypted), push_actions)
     }
 
     /// Create a new [`TimelineEvent`] to represent the given decryption
     /// failure.
-    pub fn new_utd_event(event: Raw<AnySyncTimelineEvent>, utd_info: UnableToDecryptInfo) -> Self {
-        Self { kind: TimelineEventKind::UnableToDecrypt { event, utd_info }, push_actions: None }
+    pub fn from_utd(event: Raw<AnySyncTimelineEvent>, utd_info: UnableToDecryptInfo) -> Self {
+        Self::new(TimelineEventKind::UnableToDecrypt { event, utd_info }, None)
+    }
+
+    /// Internal only: helps extracting a thread summary and latest thread event
+    /// when creating a new [`TimelineEvent`].
+    fn new(kind: TimelineEventKind, push_actions: Option<Vec<Action>>) -> Self {
+        let (thread_summary, latest_thread_event) = extract_bundled_thread_summary(kind.raw());
+        let bundled_latest_thread_event =
+            Self::from_bundled_latest_event(&kind, latest_thread_event);
+        Self { kind, push_actions, thread_summary, bundled_latest_thread_event }
+    }
+
+    /// Try to create a new [`TimelineEvent`] for the bundled latest thread
+    /// event, if available, and if we have enough information about the
+    /// encryption status for it.
+    fn from_bundled_latest_event(
+        this: &TimelineEventKind,
+        latest_event: Option<Raw<AnyMessageLikeEvent>>,
+    ) -> Option<Box<Self>> {
+        let latest_event = latest_event?;
+
+        match this {
+            TimelineEventKind::Decrypted(decrypted) => {
+                if let Some(unsigned_decryption_result) =
+                    decrypted.unsigned_encryption_info.as_ref().and_then(|unsigned_map| {
+                        unsigned_map.get(&UnsignedEventLocation::RelationsThreadLatestEvent)
+                    })
+                {
+                    match unsigned_decryption_result {
+                        UnsignedDecryptionResult::Decrypted(encryption_info) => {
+                            // The bundled event was encrypted, and we could decrypt it: pass that
+                            // information around.
+                            return Some(Box::new(TimelineEvent::from_decrypted(
+                                DecryptedRoomEvent {
+                                    event: latest_event,
+                                    encryption_info: encryption_info.clone(),
+                                    // A bundled latest event is never a thread root. It could have
+                                    // a replacement event, but we don't carry this information
+                                    // around.
+                                    unsigned_encryption_info: None,
+                                },
+                                None,
+                            )));
+                        }
+
+                        UnsignedDecryptionResult::UnableToDecrypt(utd_info) => {
+                            // The bundled event was a UTD; store that information.
+                            return Some(Box::new(TimelineEvent::from_utd(
+                                latest_event.cast(),
+                                utd_info.clone(),
+                            )));
+                        }
+                    }
+                }
+            }
+
+            TimelineEventKind::UnableToDecrypt { .. } | TimelineEventKind::PlainText { .. } => {
+                // Figure based on the event type below.
+            }
+        }
+
+        match latest_event.get_field::<MessageLikeEventType>("type") {
+            Ok(None) => {
+                let event_id = latest_event.get_field::<OwnedEventId>("event_id").ok().flatten();
+                warn!(
+                    ?event_id,
+                    "couldn't deserialize bundled latest thread event: missing `type` field \
+                     in bundled latest thread event"
+                );
+                None
+            }
+
+            Ok(Some(MessageLikeEventType::RoomEncrypted)) => {
+                // The bundled latest thread event is encrypted, but we didn't have any
+                // information about it in the unsigned map. Provide some dummy
+                // UTD info, since we can't really do much better.
+                Some(Box::new(TimelineEvent::from_utd(
+                    latest_event.cast(),
+                    UnableToDecryptInfo {
+                        session_id: None,
+                        reason: UnableToDecryptReason::Unknown,
+                    },
+                )))
+            }
+
+            Ok(_) => Some(Box::new(TimelineEvent::from_plaintext(latest_event.cast()))),
+
+            Err(err) => {
+                let event_id = latest_event.get_field::<OwnedEventId>("event_id").ok().flatten();
+                warn!(?event_id, "couldn't deserialize bundled latest thread event's type: {err}");
+                None
+            }
+        }
+    }
+
+    /// Read the current push actions.
+    ///
+    /// Returns `None` if they were never computed, or if they could not be
+    /// computed.
+    pub fn push_actions(&self) -> Option<&[Action]> {
+        self.push_actions.as_deref()
+    }
+
+    /// Set the push actions for this event.
+    pub fn set_push_actions(&mut self, push_actions: Vec<Action>) {
+        self.push_actions = Some(push_actions);
     }
 
     /// Get the event id of this [`TimelineEvent`] if the event has any valid
@@ -412,20 +660,14 @@ impl TimelineEvent {
 
     /// If the event was a decrypted event that was successfully decrypted, get
     /// its encryption info. Otherwise, `None`.
-    pub fn encryption_info(&self) -> Option<&EncryptionInfo> {
+    pub fn encryption_info(&self) -> Option<&Arc<EncryptionInfo>> {
         self.kind.encryption_info()
     }
 
-    /// Takes ownership of this `TimelineEvent`, returning the (potentially
+    /// Takes ownership of this [`TimelineEvent`], returning the (potentially
     /// decrypted) Matrix event within.
     pub fn into_raw(self) -> Raw<AnySyncTimelineEvent> {
         self.kind.into_raw()
-    }
-}
-
-impl From<DecryptedRoomEvent> for TimelineEvent {
-    fn from(decrypted: DecryptedRoomEvent) -> Self {
-        Self { kind: TimelineEventKind::Decrypted(decrypted), push_actions: None }
     }
 }
 
@@ -451,8 +693,7 @@ impl<'de> Deserialize<'de> for TimelineEvent {
             let v0: SyncTimelineEventDeserializationHelperV0 =
                 serde_json::from_value(Value::Object(value)).map_err(|e| {
                     serde::de::Error::custom(format!(
-                        "Unable to deserialize V0-format TimelineEvent: {}",
-                        e
+                        "Unable to deserialize V0-format TimelineEvent: {e}",
                     ))
                 })?;
             Ok(v0.into())
@@ -462,8 +703,7 @@ impl<'de> Deserialize<'de> for TimelineEvent {
             let v1: SyncTimelineEventDeserializationHelperV1 =
                 serde_json::from_value(Value::Object(value)).map_err(|e| {
                     serde::de::Error::custom(format!(
-                        "Unable to deserialize V1-format TimelineEvent: {}",
-                        e
+                        "Unable to deserialize V1-format TimelineEvent: {e}",
                     ))
                 })?;
             Ok(v1.into())
@@ -521,11 +761,21 @@ impl TimelineEventKind {
 
     /// If the event was a decrypted event that was successfully decrypted, get
     /// its encryption info. Otherwise, `None`.
-    pub fn encryption_info(&self) -> Option<&EncryptionInfo> {
+    pub fn encryption_info(&self) -> Option<&Arc<EncryptionInfo>> {
         match self {
             TimelineEventKind::Decrypted(d) => Some(&d.encryption_info),
-            TimelineEventKind::UnableToDecrypt { .. } => None,
-            TimelineEventKind::PlainText { .. } => None,
+            TimelineEventKind::UnableToDecrypt { .. } | TimelineEventKind::PlainText { .. } => None,
+        }
+    }
+
+    /// If the event was a decrypted event that was successfully decrypted, get
+    /// the map of decryption metadata related to the bundled events.
+    pub fn unsigned_encryption_map(
+        &self,
+    ) -> Option<&BTreeMap<UnsignedEventLocation, UnsignedDecryptionResult>> {
+        match self {
+            TimelineEventKind::Decrypted(d) => d.unsigned_encryption_info.as_ref(),
+            TimelineEventKind::UnableToDecrypt { .. } | TimelineEventKind::PlainText { .. } => None,
         }
     }
 
@@ -549,12 +799,11 @@ impl TimelineEventKind {
     pub fn session_id(&self) -> Option<&str> {
         match self {
             TimelineEventKind::Decrypted(decrypted_room_event) => {
-                decrypted_room_event.encryption_info.session_id.as_ref()
+                decrypted_room_event.encryption_info.session_id()
             }
-            TimelineEventKind::UnableToDecrypt { utd_info, .. } => utd_info.session_id.as_ref(),
+            TimelineEventKind::UnableToDecrypt { utd_info, .. } => utd_info.session_id.as_deref(),
             TimelineEventKind::PlainText { .. } => None,
         }
-        .map(String::as_str)
     }
 }
 
@@ -592,7 +841,7 @@ pub struct DecryptedRoomEvent {
     pub event: Raw<AnyMessageLikeEvent>,
 
     /// The encryption info about the event.
-    pub encryption_info: EncryptionInfo,
+    pub encryption_info: Arc<EncryptionInfo>,
 
     /// The encryption info about the events bundled in the `unsigned`
     /// object.
@@ -649,9 +898,20 @@ impl UnsignedEventLocation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UnsignedDecryptionResult {
     /// The event was successfully decrypted.
-    Decrypted(EncryptionInfo),
+    Decrypted(Arc<EncryptionInfo>),
     /// The event failed to be decrypted.
     UnableToDecrypt(UnableToDecryptInfo),
+}
+
+impl UnsignedDecryptionResult {
+    /// Returns the encryption info for this bundled event if it was
+    /// successfully decrypted.
+    pub fn encryption_info(&self) -> Option<&Arc<EncryptionInfo>> {
+        match self {
+            Self::Decrypted(info) => Some(info),
+            Self::UnableToDecrypt(_) => None,
+        }
+    }
 }
 
 /// Metadata about an event that could not be decrypted.
@@ -835,12 +1095,22 @@ struct SyncTimelineEventDeserializationHelperV1 {
     /// The push actions associated with this event.
     #[serde(default)]
     push_actions: Vec<Action>,
+
+    /// If the event is part of a thread, a thread summary.
+    #[serde(default)]
+    thread_summary: ThreadSummaryStatus,
 }
 
 impl From<SyncTimelineEventDeserializationHelperV1> for TimelineEvent {
     fn from(value: SyncTimelineEventDeserializationHelperV1) -> Self {
-        let SyncTimelineEventDeserializationHelperV1 { kind, push_actions } = value;
-        TimelineEvent { kind, push_actions: Some(push_actions) }
+        let SyncTimelineEventDeserializationHelperV1 { kind, push_actions, thread_summary } = value;
+        TimelineEvent {
+            kind,
+            push_actions: Some(push_actions),
+            thread_summary,
+            // Bundled latest thread event is not persisted.
+            bundled_latest_thread_event: None,
+        }
     }
 }
 
@@ -850,9 +1120,10 @@ struct SyncTimelineEventDeserializationHelperV0 {
     /// The actual event.
     event: Raw<AnySyncTimelineEvent>,
 
-    /// The encryption info about the event. Will be `None` if the event
-    /// was not encrypted.
-    encryption_info: Option<EncryptionInfo>,
+    /// The encryption info about the event.
+    ///
+    /// Will be `None` if the event was not encrypted.
+    encryption_info: Option<Arc<EncryptionInfo>>,
 
     /// The push actions associated with this event.
     #[serde(default)]
@@ -892,15 +1163,70 @@ impl From<SyncTimelineEventDeserializationHelperV0> for TimelineEvent {
             None => TimelineEventKind::PlainText { event },
         };
 
-        TimelineEvent { kind, push_actions: Some(push_actions) }
+        TimelineEvent {
+            kind,
+            push_actions: Some(push_actions),
+            // No serialized events had a thread summary at this version of the struct.
+            thread_summary: ThreadSummaryStatus::Unknown,
+            // Bundled latest thread event is not persisted.
+            bundled_latest_thread_event: None,
+        }
+    }
+}
+
+/// Represents a to-device event after it has been processed by the Olm machine.
+#[derive(Clone, Debug)]
+pub enum ProcessedToDeviceEvent {
+    /// A successfully-decrypted encrypted event.
+    /// Contains the raw decrypted event and encryption info
+    Decrypted {
+        /// The raw decrypted event
+        raw: Raw<AnyToDeviceEvent>,
+        /// The Olm encryption info
+        encryption_info: EncryptionInfo,
+    },
+
+    /// An encrypted event which could not be decrypted.
+    UnableToDecrypt(Raw<AnyToDeviceEvent>),
+
+    /// An unencrypted event.
+    PlainText(Raw<AnyToDeviceEvent>),
+
+    /// An invalid to device event that was ignored because it is missing some
+    /// required information to be processed (like no event `type` for
+    /// example)
+    Invalid(Raw<AnyToDeviceEvent>),
+}
+
+impl ProcessedToDeviceEvent {
+    /// Converts a ProcessedToDeviceEvent to the `Raw<AnyToDeviceEvent>` it
+    /// encapsulates
+    pub fn to_raw(&self) -> Raw<AnyToDeviceEvent> {
+        match self {
+            ProcessedToDeviceEvent::Decrypted { raw, .. } => raw.clone(),
+            ProcessedToDeviceEvent::UnableToDecrypt(event) => event.clone(),
+            ProcessedToDeviceEvent::PlainText(event) => event.clone(),
+            ProcessedToDeviceEvent::Invalid(event) => event.clone(),
+        }
+    }
+
+    /// Gets the raw to-device event.
+    pub fn as_raw(&self) -> &Raw<AnyToDeviceEvent> {
+        match self {
+            ProcessedToDeviceEvent::Decrypted { raw, .. } => raw,
+            ProcessedToDeviceEvent::UnableToDecrypt(event) => event,
+            ProcessedToDeviceEvent::PlainText(event) => event,
+            ProcessedToDeviceEvent::Invalid(event) => event,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use assert_matches::assert_matches;
+    use assert_matches2::assert_let;
     use insta::{assert_json_snapshot, with_settings};
     use ruma::{
         device_id, event_id, events::room::message::RoomMessageEventContent, serde::Raw, user_id,
@@ -915,6 +1241,7 @@ mod tests {
         UnableToDecryptReason, UnsignedDecryptionResult, UnsignedEventLocation, VerificationLevel,
         VerificationState, WithheldCode,
     };
+    use crate::deserialized_responses::{ThreadSummary, ThreadSummaryStatus};
 
     fn example_event() -> serde_json::Value {
         json!({
@@ -929,7 +1256,7 @@ mod tests {
 
     #[test]
     fn sync_timeline_debug_content() {
-        let room_event = TimelineEvent::new(Raw::new(&example_event()).unwrap().cast());
+        let room_event = TimelineEvent::from_plaintext(Raw::new(&example_event()).unwrap().cast());
         let debug_s = format!("{room_event:?}");
         assert!(
             !debug_s.contains("secret"),
@@ -1050,16 +1377,16 @@ mod tests {
         let room_event = TimelineEvent {
             kind: TimelineEventKind::Decrypted(DecryptedRoomEvent {
                 event: Raw::new(&example_event()).unwrap().cast(),
-                encryption_info: EncryptionInfo {
+                encryption_info: Arc::new(EncryptionInfo {
                     sender: user_id!("@sender:example.com").to_owned(),
                     sender_device: None,
                     algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
                         curve25519_key: "xxx".to_owned(),
                         sender_claimed_keys: Default::default(),
+                        session_id: Some("xyz".to_owned()),
                     },
                     verification_state: VerificationState::Verified,
-                    session_id: Some("xyz".to_owned()),
-                },
+                }),
                 unsigned_encryption_info: Some(BTreeMap::from([(
                     UnsignedEventLocation::RelationsReplace,
                     UnsignedDecryptionResult::UnableToDecrypt(UnableToDecryptInfo {
@@ -1069,6 +1396,8 @@ mod tests {
                 )])),
             }),
             push_actions: Default::default(),
+            thread_summary: ThreadSummaryStatus::Unknown,
+            bundled_latest_thread_event: None,
         };
 
         let serialized = serde_json::to_value(&room_event).unwrap();
@@ -1093,11 +1422,11 @@ mod tests {
                             "algorithm_info": {
                                 "MegolmV1AesSha2": {
                                     "curve25519_key": "xxx",
-                                    "sender_claimed_keys": {}
+                                    "sender_claimed_keys": {},
+                                    "session_id": "xyz",
                                 }
                             },
                             "verification_state": "Verified",
-                            "session_id": "xyz",
                         },
                         "unsigned_encryption_info": {
                             "RelationsReplace": {"UnableToDecrypt": {
@@ -1144,9 +1473,8 @@ mod tests {
         assert_eq!(event.event_id(), Some(event_id!("$xxxxx:example.org").to_owned()));
         assert_matches!(
             event.encryption_info().unwrap().algorithm_info,
-            AlgorithmInfo::MegolmV1AesSha2 { .. }
+            AlgorithmInfo::MegolmV1AesSha2 { session_id: None, .. }
         );
-        assert_eq!(event.encryption_info().unwrap().session_id, None);
 
         // Test that the previous format, with an undecryptable unsigned event, can also
         // be deserialized.
@@ -1191,6 +1519,67 @@ mod tests {
                 })
             });
         });
+    }
+
+    #[test]
+    fn test_creating_or_deserializing_an_event_extracts_summary() {
+        let event = json!({
+            "event_id": "$eid:example.com",
+            "type": "m.room.message",
+            "sender": "@alice:example.com",
+            "origin_server_ts": 42,
+            "content": {
+                "body": "Hello, world!",
+            },
+            "unsigned": {
+                "m.relations": {
+                    "m.thread": {
+                        "latest_event": {
+                            "event_id": "$latest_event:example.com",
+                            "type": "m.room.message",
+                            "sender": "@bob:example.com",
+                            "origin_server_ts": 42,
+                            "content": {
+                                "body": "Hello to you too!",
+                                "msgtype": "m.text",
+                            }
+                        },
+                        "count": 2,
+                        "current_user_participated": true,
+                    }
+                }
+            }
+        });
+
+        let raw = Raw::new(&event).unwrap().cast();
+
+        // When creating a timeline event from a raw event, the thread summary is always
+        // extracted, if available.
+        let timeline_event = TimelineEvent::from_plaintext(raw);
+        assert_matches!(timeline_event.thread_summary, ThreadSummaryStatus::Some(ThreadSummary { num_replies, latest_reply }) => {
+            assert_eq!(num_replies, 2);
+            assert_eq!(latest_reply.as_deref(), Some(event_id!("$latest_event:example.com")));
+        });
+
+        assert!(timeline_event.bundled_latest_thread_event.is_some());
+
+        // When deserializing an old serialized timeline event, the thread summary is
+        // also extracted, if it wasn't serialized.
+        let serialized_timeline_item = json!({
+            "kind": {
+                "PlainText": {
+                    "event": event
+                }
+            }
+        });
+
+        let timeline_event: TimelineEvent =
+            serde_json::from_value(serialized_timeline_item).unwrap();
+        assert_matches!(timeline_event.thread_summary, ThreadSummaryStatus::Unknown);
+
+        // The bundled latest thread event is not persisted, so it should be `None` when
+        // deserialized from a previously serialized `TimelineEvent`.
+        assert!(timeline_event.bundled_latest_thread_event.is_none());
     }
 
     #[test]
@@ -1366,11 +1755,40 @@ mod tests {
                 (DeviceKeyAlgorithm::Curve25519, "claimedclaimedcurve25519".to_owned()),
                 (DeviceKeyAlgorithm::Ed25519, "claimedclaimeded25519".to_owned()),
             ]),
+            session_id: None,
         };
 
         with_settings!({ prepend_module_to_snapshot => false }, {
             assert_json_snapshot!(info)
         });
+    }
+
+    #[test]
+    fn test_encryption_info_migration() {
+        // In the old format the session_id was in the EncryptionInfo, now
+        // it is moved to the `algorithm_info` struct.
+        let old_format = json!({
+          "sender": "@alice:localhost",
+          "sender_device": "ABCDEFGH",
+          "algorithm_info": {
+            "MegolmV1AesSha2": {
+              "curve25519_key": "curvecurvecurve",
+              "sender_claimed_keys": {}
+            }
+          },
+          "verification_state": "Verified",
+          "session_id": "mysessionid76"
+        });
+
+        let deserialized = serde_json::from_value::<EncryptionInfo>(old_format).unwrap();
+        let expected_session_id = Some("mysessionid76".to_owned());
+
+        assert_let!(
+            AlgorithmInfo::MegolmV1AesSha2 { session_id, .. } = deserialized.algorithm_info.clone()
+        );
+        assert_eq!(session_id, expected_session_id);
+
+        assert_json_snapshot!(deserialized);
     }
 
     #[test]
@@ -1381,9 +1799,9 @@ mod tests {
             algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
                 curve25519_key: "curvecurvecurve".into(),
                 sender_claimed_keys: Default::default(),
+                session_id: Some("mysessionid76".to_owned()),
             },
             verification_state: VerificationState::Verified,
-            session_id: Some("mysessionid76".to_owned()),
         };
 
         with_settings!({ sort_maps => true, prepend_module_to_snapshot => false }, {
@@ -1396,7 +1814,7 @@ mod tests {
         let room_event = TimelineEvent {
             kind: TimelineEventKind::Decrypted(DecryptedRoomEvent {
                 event: Raw::new(&example_event()).unwrap().cast(),
-                encryption_info: EncryptionInfo {
+                encryption_info: Arc::new(EncryptionInfo {
                     sender: user_id!("@sender:example.com").to_owned(),
                     sender_device: Some(device_id!("ABCDEFGHIJ").to_owned()),
                     algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
@@ -1411,10 +1829,10 @@ mod tests {
                                 "qzdW3F5IMPFl0HQgz5w/L5Oi/npKUFn8Um84acIHfPY".to_owned(),
                             ),
                         ]),
+                        session_id: Some("mysessionid112".to_owned()),
                     },
                     verification_state: VerificationState::Verified,
-                    session_id: Some("mysessionid112".to_owned()),
-                },
+                }),
                 unsigned_encryption_info: Some(BTreeMap::from([(
                     UnsignedEventLocation::RelationsThreadLatestEvent,
                     UnsignedDecryptionResult::UnableToDecrypt(UnableToDecryptInfo {
@@ -1426,6 +1844,11 @@ mod tests {
                 )])),
             }),
             push_actions: Default::default(),
+            thread_summary: ThreadSummaryStatus::Some(ThreadSummary {
+                num_replies: 2,
+                latest_reply: None,
+            }),
+            bundled_latest_thread_event: None,
         };
 
         with_settings!({ sort_maps => true, prepend_module_to_snapshot => false }, {

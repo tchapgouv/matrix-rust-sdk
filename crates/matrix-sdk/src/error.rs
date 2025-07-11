@@ -45,7 +45,10 @@ use serde_json::Error as JsonError;
 use thiserror::Error;
 use url::ParseError as UrlParseError;
 
-use crate::{event_cache::EventCacheError, media::MediaError, store_locks::LockStoreError};
+use crate::{
+    authentication::oauth::OAuthError, event_cache::EventCacheError, media::MediaError,
+    room::reply::ReplyError, sliding_sync::Error as SlidingSyncError, store_locks::LockStoreError,
+};
 
 /// Result type of the matrix-sdk.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -97,8 +100,9 @@ pub enum HttpError {
     NotClientRequest,
 
     /// API response error (deserialization, or a Matrix-specific error).
+    // `Box` its inner value to reduce the enum size.
     #[error(transparent)]
-    Api(#[from] FromHttpResponseError<RumaApiError>),
+    Api(#[from] Box<FromHttpResponseError<RumaApiError>>),
 
     /// Error when creating an API request (e.g. serialization of
     /// body/headers/query parameters).
@@ -118,7 +122,12 @@ impl HttpError {
     ///
     /// Otherwise, returns `None`.
     pub fn as_ruma_api_error(&self) -> Option<&RumaApiError> {
-        as_variant!(self, Self::Api(FromHttpResponseError::Server(e)) => e)
+        match self {
+            Self::Api(error) => {
+                as_variant!(error.as_ref(), FromHttpResponseError::Server)
+            },
+            _ => None
+        }
     }
 
     /// Shorthand for
@@ -160,11 +169,18 @@ impl HttpError {
             // internet, or that the remote is, so retry a few times.
             HttpError::Reqwest(_) => RetryKind::NetworkFailure,
 
-            HttpError::Api(FromHttpResponseError::Server(api_error)) => {
-                RetryKind::from_api_error(api_error)
-            }
+            HttpError::Api(error) => match error.as_ref() {
+                FromHttpResponseError::Server(api_error) => RetryKind::from_api_error(api_error),
+                _ => RetryKind::Permanent,
+            },
             _ => RetryKind::Permanent,
         }
+    }
+}
+
+impl From<FromHttpResponseError<RumaApiError>> for HttpError {
+    fn from(value: FromHttpResponseError<RumaApiError>) -> Self {
+        Self::Api(Box::new(value))
     }
 }
 
@@ -179,7 +195,7 @@ pub(crate) enum RetryKind {
     /// `retry_after`.
     Transient {
         // This is used only for attempts to retry, so on non-wasm32 code (in the `native` module).
-        #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+        #[cfg_attr(target_family = "wasm", allow(dead_code))]
         retry_after: Option<Duration>,
     },
 
@@ -241,10 +257,14 @@ impl RetryKind {
     /// if we received an error from a reverse proxy while the Matrix
     /// homeserver is down.
     fn from_status_code(status_code: StatusCode) -> Self {
-        // If the status code is 429, this is requesting a retry in HTTP, without the
-        // custom `errcode`. Treat that as a retriable request with no specified
-        // retry_after delay.
-        if status_code == StatusCode::TOO_MANY_REQUESTS || status_code.is_server_error() {
+        if status_code.as_u16() == 520 {
+            // Cloudflare or some other proxy server sent this, meaning the actual
+            // homeserver sent some unknown error back
+            RetryKind::Permanent
+        } else if status_code == StatusCode::TOO_MANY_REQUESTS || status_code.is_server_error() {
+            // If the status code is 429, this is requesting a retry in HTTP, without the
+            // custom `errcode`. Treat that as a retriable request with no specified
+            // retry_after delay.
             RetryKind::Transient { retry_after: None }
         } else {
             RetryKind::Permanent
@@ -258,7 +278,7 @@ impl RetryKind {
 pub enum Error {
     /// Error doing an HTTP request.
     #[error(transparent)]
-    Http(#[from] HttpError),
+    Http(Box<HttpError>),
 
     /// Queried endpoint requires authentication but was called on an anonymous
     /// client.
@@ -291,21 +311,21 @@ pub enum Error {
     /// An error occurred in the crypto store.
     #[cfg(feature = "e2e-encryption")]
     #[error(transparent)]
-    CryptoStoreError(#[from] CryptoStoreError),
+    CryptoStoreError(Box<CryptoStoreError>),
 
     /// An error occurred with a cross-process store lock.
     #[error(transparent)]
-    CrossProcessLockError(#[from] LockStoreError),
+    CrossProcessLockError(Box<LockStoreError>),
 
     /// An error occurred during a E2EE operation.
     #[cfg(feature = "e2e-encryption")]
     #[error(transparent)]
-    OlmError(#[from] OlmError),
+    OlmError(Box<OlmError>),
 
     /// An error occurred during a E2EE group operation.
     #[cfg(feature = "e2e-encryption")]
     #[error(transparent)]
-    MegolmError(#[from] MegolmError),
+    MegolmError(Box<MegolmError>),
 
     /// An error occurred during decryption.
     #[cfg(feature = "e2e-encryption")]
@@ -314,11 +334,11 @@ pub enum Error {
 
     /// An error occurred in the state store.
     #[error(transparent)]
-    StateStore(#[from] StoreError),
+    StateStore(Box<StoreError>),
 
     /// An error occurred in the event cache store.
     #[error(transparent)]
-    EventCacheStore(#[from] EventCacheStoreError),
+    EventCacheStore(Box<EventCacheStoreError>),
 
     /// An error encountered when trying to parse an identifier.
     #[error(transparent)]
@@ -331,7 +351,7 @@ pub enum Error {
     /// An error while scanning a QR code.
     #[cfg(feature = "qrcode")]
     #[error(transparent)]
-    QrCodeScanError(#[from] ScanError),
+    QrCodeScanError(Box<ScanError>),
 
     /// An error encountered when trying to parse a user tag name.
     #[error(transparent)]
@@ -339,22 +359,21 @@ pub enum Error {
 
     /// An error occurred within sliding-sync
     #[error(transparent)]
-    SlidingSync(#[from] crate::sliding_sync::Error),
+    SlidingSync(Box<SlidingSyncError>),
 
     /// Attempted to call a method on a room that requires the user to have a
     /// specific membership state in the room, but the membership state is
     /// different.
     #[error("wrong room state: {0}")]
-    WrongRoomState(WrongRoomState),
+    WrongRoomState(Box<WrongRoomState>),
 
     /// Session callbacks have been set multiple times.
     #[error("session callbacks have been set multiple times")]
     MultipleSessionCallbacks,
 
     /// An error occurred interacting with the OAuth 2.0 API.
-    #[cfg(feature = "experimental-oidc")]
     #[error(transparent)]
-    OAuth(#[from] crate::authentication::oauth::OAuthError),
+    OAuth(Box<OAuthError>),
 
     /// A concurrent request to a deduplicated request has failed.
     #[error("a concurrent request failed; see logs for details")]
@@ -364,24 +383,38 @@ pub enum Error {
     ///
     /// This might happen because encryption was enabled on the base-crate
     /// but not here and that raised.
+    #[cfg(not(target_family = "wasm"))]
     #[error("unknown error: {0}")]
     UnknownError(Box<dyn std::error::Error + Send + Sync>),
 
+    /// An other error was raised.
+    #[cfg(target_family = "wasm")]
+    #[error("unknown error: {0}")]
+    UnknownError(Box<dyn std::error::Error>),
+
     /// An error coming from the event cache subsystem.
     #[error(transparent)]
-    EventCache(#[from] EventCacheError),
+    EventCache(Box<EventCacheError>),
 
     /// An item has been wedged in the send queue.
     #[error(transparent)]
-    SendQueueWedgeError(#[from] QueueWedgeError),
+    SendQueueWedgeError(Box<QueueWedgeError>),
 
     /// Backups are not enabled
     #[error("backups are not enabled")]
     BackupNotEnabled,
 
+    /// It's forbidden to ignore your own user.
+    #[error("can't ignore the logged-in user")]
+    CantIgnoreLoggedInUser,
+
     /// An error happened during handling of a media subrequest.
     #[error(transparent)]
     Media(#[from] MediaError),
+
+    /// An error happened while attempting to reply to an event.
+    #[error(transparent)]
+    ReplyError(#[from] ReplyError),
 }
 
 #[rustfmt::skip] // stop rustfmt breaking the `<code>` in docs across multiple lines
@@ -425,6 +458,82 @@ impl Error {
     }
 }
 
+impl From<HttpError> for Error {
+    fn from(error: HttpError) -> Self {
+        Error::Http(Box::new(error))
+    }
+}
+
+#[cfg(feature = "e2e-encryption")]
+impl From<CryptoStoreError> for Error {
+    fn from(error: CryptoStoreError) -> Self {
+        Error::CryptoStoreError(Box::new(error))
+    }
+}
+
+impl From<LockStoreError> for Error {
+    fn from(error: LockStoreError) -> Self {
+        Error::CrossProcessLockError(Box::new(error))
+    }
+}
+
+#[cfg(feature = "e2e-encryption")]
+impl From<OlmError> for Error {
+    fn from(error: OlmError) -> Self {
+        Error::OlmError(Box::new(error))
+    }
+}
+
+#[cfg(feature = "e2e-encryption")]
+impl From<MegolmError> for Error {
+    fn from(error: MegolmError) -> Self {
+        Error::MegolmError(Box::new(error))
+    }
+}
+
+impl From<StoreError> for Error {
+    fn from(error: StoreError) -> Self {
+        Error::StateStore(Box::new(error))
+    }
+}
+
+impl From<EventCacheStoreError> for Error {
+    fn from(error: EventCacheStoreError) -> Self {
+        Error::EventCacheStore(Box::new(error))
+    }
+}
+
+#[cfg(feature = "qrcode")]
+impl From<ScanError> for Error {
+    fn from(error: ScanError) -> Self {
+        Error::QrCodeScanError(Box::new(error))
+    }
+}
+
+impl From<SlidingSyncError> for Error {
+    fn from(error: SlidingSyncError) -> Self {
+        Error::SlidingSync(Box::new(error))
+    }
+}
+
+impl From<OAuthError> for Error {
+    fn from(error: OAuthError) -> Self {
+        Error::OAuth(Box::new(error))
+    }
+}
+
+impl From<EventCacheError> for Error {
+    fn from(error: EventCacheError) -> Self {
+        Error::EventCache(Box::new(error))
+    }
+}
+
+impl From<QueueWedgeError> for Error {
+    fn from(error: QueueWedgeError) -> Self {
+        Error::SendQueueWedgeError(Box::new(error))
+    }
+}
+
 /// Error for the room key importing functionality.
 #[cfg(feature = "e2e-encryption")]
 #[derive(Error, Debug)]
@@ -455,42 +564,53 @@ pub enum RoomKeyImportError {
 
 impl From<FromHttpResponseError<ruma::api::client::Error>> for HttpError {
     fn from(err: FromHttpResponseError<ruma::api::client::Error>) -> Self {
-        Self::Api(err.map(RumaApiError::ClientApi))
+        Self::Api(Box::new(err.map(RumaApiError::ClientApi)))
     }
 }
 
 impl From<FromHttpResponseError<UiaaResponse>> for HttpError {
     fn from(err: FromHttpResponseError<UiaaResponse>) -> Self {
-        Self::Api(err.map(|e| match e {
+        Self::Api(Box::new(err.map(|e| match e {
             UiaaResponse::AuthResponse(i) => RumaApiError::Uiaa(i),
             UiaaResponse::MatrixError(e) => RumaApiError::ClientApi(e),
-        }))
+        })))
     }
 }
 
 impl From<FromHttpResponseError<ruma::api::error::MatrixError>> for HttpError {
     fn from(err: FromHttpResponseError<ruma::api::error::MatrixError>) -> Self {
-        Self::Api(err.map(RumaApiError::Other))
+        Self::Api(Box::new(err.map(RumaApiError::Other)))
     }
 }
 
 impl From<SdkBaseError> for Error {
     fn from(e: SdkBaseError) -> Self {
         match e {
-            SdkBaseError::StateStore(e) => Self::StateStore(e),
+            SdkBaseError::StateStore(e) => Self::StateStore(Box::new(e)),
             #[cfg(feature = "e2e-encryption")]
-            SdkBaseError::CryptoStore(e) => Self::CryptoStoreError(e),
+            SdkBaseError::CryptoStore(e) => Self::CryptoStoreError(Box::new(e)),
             #[cfg(feature = "e2e-encryption")]
             SdkBaseError::BadCryptoStoreState => Self::BadCryptoStoreState,
             #[cfg(feature = "e2e-encryption")]
-            SdkBaseError::OlmError(e) => Self::OlmError(e),
+            SdkBaseError::OlmError(e) => Self::OlmError(Box::new(e)),
             #[cfg(feature = "eyre")]
             _ => Self::UnknownError(eyre::eyre!(e).into()),
-            #[cfg(all(not(feature = "eyre"), feature = "anyhow"))]
+            #[cfg(all(not(feature = "eyre"), feature = "anyhow", not(target_family = "wasm")))]
             _ => Self::UnknownError(anyhow::anyhow!(e).into()),
-            #[cfg(all(not(feature = "eyre"), not(feature = "anyhow")))]
+            #[cfg(all(not(feature = "eyre"), feature = "anyhow", target_family = "wasm"))]
+            _ => Self::UnknownError(e.into()),
+            #[cfg(all(
+                not(feature = "eyre"),
+                not(feature = "anyhow"),
+                not(target_family = "wasm")
+            ))]
             _ => {
-                let e: Box<dyn std::error::Error + Sync + Send> = format!("{e:?}").into();
+                let e: Box<dyn std::error::Error + Send + Sync> = format!("{e:?}").into();
+                Self::UnknownError(e)
+            }
+            #[cfg(all(not(feature = "eyre"), not(feature = "anyhow"), target_family = "wasm"))]
+            _ => {
+                let e: Box<dyn std::error::Error> = format!("{e:?}").into();
                 Self::UnknownError(e)
             }
         }
@@ -499,7 +619,7 @@ impl From<SdkBaseError> for Error {
 
 impl From<ReqwestError> for Error {
     fn from(e: ReqwestError) -> Self {
-        Error::Http(HttpError::Reqwest(e))
+        Error::Http(Box::new(HttpError::Reqwest(e)))
     }
 }
 
@@ -559,9 +679,8 @@ pub enum RefreshTokenError {
     MatrixAuth(Arc<HttpError>),
 
     /// An error occurred interacting with the OAuth 2.0 API.
-    #[cfg(feature = "experimental-oidc")]
     #[error(transparent)]
-    OAuth(#[from] Arc<crate::authentication::oauth::OAuthError>),
+    OAuth(#[from] Arc<OAuthError>),
 }
 
 /// Errors that can occur when manipulating push notification settings.

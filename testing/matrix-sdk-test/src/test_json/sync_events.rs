@@ -52,7 +52,7 @@ pub static CREATE: Lazy<JsonValue> = Lazy::new(|| {
         "state_key": "",
         "type": "m.room.create",
         "unsigned": {
-          "age": 139298
+            "age": 139298
         }
     })
 });
@@ -596,38 +596,6 @@ pub static PUSH_RULES: Lazy<JsonValue> = Lazy::new(|| {
     })
 });
 
-pub static READ_RECEIPT: Lazy<JsonValue> = Lazy::new(|| {
-    json!({
-        "content": {
-            "$example": {
-                "m.read": {
-                    "@example:localhost": {
-                        "ts": 1436451550
-                    }
-                }
-            }
-        },
-        "room_id": "!test:localhost",
-        "type": "m.receipt"
-    })
-});
-
-pub static READ_RECEIPT_OTHER: Lazy<JsonValue> = Lazy::new(|| {
-    json!({
-        "content": {
-            "$other": {
-                "m.read": {
-                    "@example:localhost": {
-                        "ts": 1436964550
-                    }
-                }
-            }
-        },
-        "room_id": "!test:localhost",
-        "type": "m.receipt"
-    })
-});
-
 pub static REDACTED_INVALID: Lazy<JsonValue> = Lazy::new(|| {
     json!({
         "content": {},
@@ -724,19 +692,6 @@ pub static TOPIC: Lazy<JsonValue> = Lazy::new(|| {
     })
 });
 
-pub static TYPING: Lazy<JsonValue> = Lazy::new(|| {
-    json!({
-        "content": {
-            "user_ids": [
-                "@alice:matrix.org",
-                "@bob:example.com"
-            ]
-        },
-        "room_id": "!jEsUZKDJdhlrceRyVU:example.org",
-        "type": "m.typing"
-    })
-});
-
 pub static TOPIC_REDACTION: Lazy<JsonValue> = Lazy::new(|| {
     json!({
         "content": {},
@@ -749,5 +704,14 @@ pub static TOPIC_REDACTION: Lazy<JsonValue> = Lazy::new(|| {
           "age": 1392990,
           "prev_sender": "@example:localhost",
         }
+    })
+});
+
+pub static MARKED_UNREAD: Lazy<JsonValue> = Lazy::new(|| {
+    json!({
+        "content": {
+            "unread": true,
+        },
+        "type": "m.marked_unread",
     })
 });

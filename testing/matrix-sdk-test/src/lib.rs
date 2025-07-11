@@ -80,7 +80,7 @@ macro_rules! stripped_state_event {
 #[macro_export]
 macro_rules! init_tracing_for_tests {
     () => {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         #[$crate::__macro_support::ctor]
         fn init_logging() {
             use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -105,13 +105,13 @@ macro_rules! init_tracing_for_tests {
 
 #[doc(hidden)]
 pub mod __macro_support {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub use ctor::ctor;
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub use tracing_subscriber;
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub mod mocks;
 
 pub mod event_factory;
@@ -120,9 +120,9 @@ mod sync_builder;
 pub mod test_json;
 
 pub use self::sync_builder::{
-    bulk_room_members, EphemeralTestEvent, GlobalAccountDataTestEvent, InvitedRoomBuilder,
-    JoinedRoomBuilder, KnockedRoomBuilder, LeftRoomBuilder, PresenceTestEvent,
-    RoomAccountDataTestEvent, StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder,
+    bulk_room_members, GlobalAccountDataTestEvent, InvitedRoomBuilder, JoinedRoomBuilder,
+    KnockedRoomBuilder, LeftRoomBuilder, PresenceTestEvent, RoomAccountDataTestEvent,
+    StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder,
 };
 
 pub static ALICE: Lazy<&UserId> = Lazy::new(|| user_id!("@alice:server.name"));

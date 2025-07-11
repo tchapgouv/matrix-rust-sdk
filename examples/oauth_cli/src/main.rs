@@ -22,24 +22,24 @@ use std::{
 use anyhow::bail;
 use futures_util::StreamExt;
 use matrix_sdk::{
+    Client, ClientBuildError, Result, RoomState,
     authentication::oauth::{
+        AccountManagementActionFull, ClientId, OAuthAuthorizationData, OAuthError, OAuthSession,
+        UrlOrQuery, UserSession,
         error::OAuthClientRegistrationError,
         registration::{ApplicationType, ClientMetadata, Localized, OAuthGrantType},
-        AccountManagementActionFull, ClientId, OAuthAuthorizationData, OAuthError,
-        OAuthRegistrationStore, OAuthSession, UrlOrQuery, UserSession,
     },
     config::SyncSettings,
-    encryption::{recovery::RecoveryState, CrossSigningResetAuthType},
+    encryption::{CrossSigningResetAuthType, recovery::RecoveryState},
     room::Room,
     ruma::{
         events::room::message::{MessageType, OriginalSyncRoomMessageEvent},
         serde::Raw,
     },
     utils::local_server::{LocalServerBuilder, LocalServerRedirectHandle, QueryString},
-    Client, ClientBuildError, Result, RoomState,
 };
 use matrix_sdk_ui::sync_service::SyncService;
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use rand::{Rng, distributions::Alphanumeric, thread_rng};
 use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncBufReadExt as _};
 use url::Url;
@@ -139,13 +139,11 @@ impl OAuthCli {
         let (client, client_session) = build_client(data_dir).await?;
         let cli = Self { client, restored: false, session_file };
 
-        if let Err(error) = cli.register_and_login(data_dir).await {
-            if error.downcast_ref::<OAuthError>().is_some_and(|error| {
-                matches!(
-                    error,
-                    OAuthError::ClientRegistration(OAuthClientRegistrationError::NotSupported)
-                )
-            }) {
+        if let Err(error) = cli.register_and_login().await {
+            if let Some(error) = error.downcast_ref::<OAuthError>()
+                && let OAuthError::ClientRegistration(OAuthClientRegistrationError::NotSupported) =
+                    error
+            {
                 // This would require to register with the authorization server manually, which
                 // we don't support here.
                 bail!(
@@ -179,28 +177,18 @@ impl OAuthCli {
 
     /// Register the client and log in the user via the OAuth 2.0 Authorization
     /// Code flow.
-    async fn register_and_login(&self, data_dir: &Path) -> anyhow::Result<()> {
+    async fn register_and_login(&self) -> anyhow::Result<()> {
         let oauth = self.client.oauth();
 
         // We create a loop here so the user can retry if an error happens.
         loop {
-            // The registrations store allows to store the client ID separately
-            // and reuse it between sessions, so we don't need to
-            // re-register each time.
-            // We put it in the parent directory because we remove the data directory on
-            // logout.
-            let registration_file =
-                data_dir.parent().expect("directory has a parent").join("oauth_registrations");
-            let registration_store =
-                OAuthRegistrationStore::new(registration_file, client_metadata()).await?;
-
             // Here we spawn a server to listen on the loopback interface. Another option
             // would be to register a custom URI scheme with the system and handle
             // the redirect when the custom URI scheme is opened.
             let (redirect_uri, server_handle) = LocalServerBuilder::new().spawn().await?;
 
             let OAuthAuthorizationData { url, .. } =
-                oauth.login(registration_store.into(), redirect_uri, None).build().await?;
+                oauth.login(redirect_uri, None, Some(client_metadata().into())).build().await?;
 
             let query_string =
                 use_auth_url(&url, server_handle).await.map(|query| query.0).unwrap_or_default();
@@ -374,29 +362,32 @@ impl OAuthCli {
     /// Get information about this session.
     fn whoami(&self) {
         let client = &self.client;
-        let oauth = client.oauth();
 
         let user_id = client.user_id().expect("A logged in client has a user ID");
         let device_id = client.device_id().expect("A logged in client has a device ID");
         let homeserver = client.homeserver();
-        let issuer = oauth.issuer().expect("A logged in OAuth 2.0 client has an issuer");
 
         println!("\nUser ID: {user_id}");
         println!("Device ID: {device_id}");
         println!("Homeserver URL: {homeserver}");
-        println!("OAuth 2.0 authorization server: {issuer}");
     }
 
     /// Get the account management URL.
     async fn account(&self, action: Option<AccountManagementActionFull>) {
-        match self.client.oauth().fetch_account_management_url(action).await {
-            Ok(Some(url)) => {
-                println!("\nTo manage your account, visit: {url}");
-            }
+        let mut url_builder = match self.client.oauth().fetch_account_management_url().await {
+            Ok(Some(url_builder)) => url_builder,
             _ => {
-                println!("\nThis homeserver does not provide the URL to manage your account")
+                println!("\nThis homeserver does not provide the URL to manage your account");
+                return;
             }
+        };
+
+        if let Some(action) = action {
+            url_builder = url_builder.action(action);
         }
+
+        let url = url_builder.build();
+        println!("\nTo manage your account, visit: {url}");
     }
 
     /// Watch incoming messages.
@@ -566,7 +557,7 @@ impl OAuthCli {
     /// Log out from this session.
     async fn logout(&self) -> anyhow::Result<()> {
         // Log out via OAuth 2.0.
-        self.client.oauth().logout().await?;
+        self.client.logout().await?;
 
         // Delete the stored session and database.
         let data_dir = self.session_file.parent().expect("The file has a parent directory");

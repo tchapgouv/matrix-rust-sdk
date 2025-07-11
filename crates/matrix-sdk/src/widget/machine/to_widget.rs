@@ -14,7 +14,10 @@
 
 use std::marker::PhantomData;
 
-use ruma::{events::AnyTimelineEvent, serde::Raw};
+use ruma::{
+    events::{AnyStateEvent, AnyTimelineEvent, AnyToDeviceEvent},
+    serde::Raw,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
 use tracing::error;
@@ -24,7 +27,7 @@ use crate::widget::Capabilities;
 
 /// A handle to a pending `toWidget` request.
 pub(crate) struct ToWidgetRequestHandle<'m, T> {
-    request_meta: Option<&'m mut ToWidgetRequestMeta>,
+    request_meta: &'m mut ToWidgetRequestMeta,
     _phantom: PhantomData<fn() -> T>,
 }
 
@@ -33,28 +36,22 @@ where
     T: DeserializeOwned,
 {
     pub(crate) fn new(request_meta: &'m mut ToWidgetRequestMeta) -> Self {
-        Self { request_meta: Some(request_meta), _phantom: PhantomData }
+        Self { request_meta, _phantom: PhantomData }
     }
 
-    pub(crate) fn null() -> Self {
-        Self { request_meta: None, _phantom: PhantomData }
-    }
-
-    pub(crate) fn then(
+    pub(crate) fn add_response_handler(
         self,
         response_handler: impl FnOnce(T, &mut WidgetMachine) -> Vec<Action> + Send + 'static,
     ) {
-        if let Some(request_meta) = self.request_meta {
-            request_meta.response_fn = Some(Box::new(move |raw_response_data, machine| {
-                match serde_json::from_str(raw_response_data.get()) {
-                    Ok(response_data) => response_handler(response_data, machine),
-                    Err(e) => {
-                        error!("Failed to deserialize toWidget response: {e}");
-                        Vec::new()
-                    }
+        self.request_meta.response_fn = Some(Box::new(move |raw_response_data, machine| {
+            match serde_json::from_str(raw_response_data.get()) {
+                Ok(response_data) => response_handler(response_data, machine),
+                Err(e) => {
+                    error!("Failed to deserialize toWidget response: {e}");
+                    Vec::new()
                 }
-            }));
-        }
+            }
+        }));
     }
 }
 
@@ -117,7 +114,7 @@ impl ToWidgetRequest for NotifyOpenIdChanged {
     type ResponseData = OpenIdResponse;
 }
 
-/// Notify the widget that we received a new matrix event.
+/// Notify the widget that we received a new Matrix event.
 /// This is a "response" to the widget subscribing to the events in the room.
 #[derive(Serialize)]
 #[serde(transparent)]
@@ -128,5 +125,28 @@ impl ToWidgetRequest for NotifyNewMatrixEvent {
     type ResponseData = Empty;
 }
 
+/// Notify the widget that room state has changed.
+/// This is a "response" to the widget subscribing to the events in the room.
+#[derive(Serialize)]
+pub(crate) struct NotifyStateUpdate {
+    pub(super) state: Vec<Raw<AnyStateEvent>>,
+}
+
+impl ToWidgetRequest for NotifyStateUpdate {
+    const ACTION: &'static str = "update_state";
+    type ResponseData = Empty;
+}
+
 #[derive(Deserialize)]
 pub(crate) struct Empty {}
+
+/// Notify the widget that we received a new Matrix to-device message.
+/// This is a "response" to the widget subscribing to the to-device messages.
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(crate) struct NotifyNewToDeviceMessage(pub(crate) Raw<AnyToDeviceEvent>);
+
+impl ToWidgetRequest for NotifyNewToDeviceMessage {
+    const ACTION: &'static str = "send_to_device";
+    type ResponseData = Empty;
+}

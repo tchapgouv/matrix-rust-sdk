@@ -4,11 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    types:
-      - opened
-      - reopened
-      - synchronize
-      - ready_for_review
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -36,7 +31,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-02-20
+          toolchain: nightly-2025-06-27
 
       - name: Install Node.js
         uses: actions/setup-node@v4

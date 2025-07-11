@@ -16,10 +16,8 @@ use std::{collections::HashMap, fmt::Write as _, fs, panic, sync::Arc};
 
 use anyhow::{Context, Result};
 use as_variant::as_variant;
-use async_compat::get_runtime_handle;
-use content::{InReplyToDetails, RepliedToEventDetails};
 use eyeball_im::VectorDiff;
-use futures_util::{pin_mut, StreamExt as _};
+use futures_util::pin_mut;
 use matrix_sdk::{
     attachment::{
         AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
@@ -27,14 +25,21 @@ use matrix_sdk::{
     },
     deserialized_responses::{ShieldState as SdkShieldState, ShieldStateCode},
     event_cache::RoomPaginationStatus,
-    room::edit::EditedContent as SdkEditedContent,
-    Error,
+    room::{
+        edit::EditedContent as SdkEditedContent,
+        reply::{EnforceThread, Reply},
+    },
+};
+use matrix_sdk_common::{
+    executor::{AbortHandle, JoinHandle},
+    stream::StreamExt,
 };
 use matrix_sdk_ui::timeline::{
-    self, EventItemOrigin, Profile, RepliedToEvent, TimelineDetails,
+    self, AttachmentSource, EventItemOrigin, Profile, TimelineDetails,
     TimelineUniqueId as SdkTimelineUniqueId,
 };
 use mime::Mime;
+use reply::{EmbeddedEventDetails, InReplyToDetails};
 use ruma::{
     events::{
         location::{AssetType as RumaAssetType, LocationContent, ZoomLevel},
@@ -48,21 +53,19 @@ use ruma::{
         },
         receipt::ReceiptThread,
         room::message::{
-            ForwardThread, LocationMessageEventContent, MessageType,
+            LocationMessageEventContent, MessageType, ReplyWithinThread,
             RoomMessageEventContentWithoutRelation,
         },
         AnyMessageLikeEventContent,
     },
     EventId, UInt,
 };
-use tokio::{
-    sync::Mutex,
-    task::{AbortHandle, JoinHandle},
-};
+use tokio::sync::Mutex;
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use self::content::{Reaction, ReactionSenderData, TimelineItemContent};
+use self::content::TimelineItemContent;
+pub use self::msg_like::MessageContent;
 use crate::{
     client::ProgressWatcher,
     error::{ClientError, RoomError},
@@ -72,15 +75,18 @@ use crate::{
         AssetType, AudioInfo, FileInfo, FormattedBody, ImageInfo, Mentions, PollKind,
         ThumbnailInfo, VideoInfo,
     },
+    runtime::get_runtime_handle,
     task_handle::TaskHandle,
     utils::Timestamp,
 };
 
 pub mod configuration;
 mod content;
+mod msg_like;
+mod reply;
 
-pub use content::MessageContent;
 use matrix_sdk::utils::formatted_body_from;
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 
 use crate::error::QueueWedgeError;
 
@@ -93,11 +99,6 @@ pub struct Timeline {
 impl Timeline {
     pub(crate) fn new(inner: matrix_sdk_ui::timeline::Timeline) -> Arc<Self> {
         Arc::new(Self { inner })
-    }
-
-    pub(crate) fn from_arc(inner: Arc<matrix_sdk_ui::timeline::Timeline>) -> Arc<Self> {
-        // SAFETY: repr(transparent) means transmuting the arc this way is allowed
-        unsafe { Arc::from_raw(Arc::into_raw(inner) as _) }
     }
 
     fn send_attachment(
@@ -122,11 +123,12 @@ impl Timeline {
             .info(attachment_info)
             .caption(params.caption)
             .formatted_caption(formatted_caption)
-            .mentions(params.mentions.map(Into::into));
+            .mentions(params.mentions.map(Into::into))
+            .reply(params.reply_params.map(|p| p.try_into()).transpose()?);
 
         let handle = SendAttachmentJoinHandle::new(get_runtime_handle().spawn(async move {
             let mut request =
-                self.inner.send_attachment(params.filename, mime_type, attachment_config);
+                self.inner.send_attachment(params.source, mime_type, attachment_config);
 
             if params.use_send_queue {
                 request = request.use_send_queue();
@@ -196,18 +198,77 @@ fn build_thumbnail_info(
 
 #[derive(uniffi::Record)]
 pub struct UploadParameters {
-    /// Filename (previously called "url") for the media to be sent.
-    filename: String,
+    /// Source from which to upload data
+    source: UploadSource,
     /// Optional non-formatted caption, for clients that support it.
     caption: Option<String>,
     /// Optional HTML-formatted caption, for clients that support it.
     formatted_caption: Option<FormattedBody>,
-    // Optional intentional mentions to be sent with the media.
+    /// Optional intentional mentions to be sent with the media.
     mentions: Option<Mentions>,
+    /// Optional parameters for sending the media as (threaded) reply.
+    reply_params: Option<ReplyParameters>,
     /// Should the media be sent with the send queue, or synchronously?
     ///
     /// Watching progress only works with the synchronous method, at the moment.
     use_send_queue: bool,
+}
+
+/// A source for uploading a file
+#[derive(uniffi::Enum)]
+pub enum UploadSource {
+    /// Upload source is a file on disk
+    File {
+        /// Path to file
+        filename: String,
+    },
+    /// Upload source is data in memory
+    Data {
+        /// Bytes being uploaded
+        bytes: Vec<u8>,
+        /// Filename to associate with bytes
+        filename: String,
+    },
+}
+
+impl From<UploadSource> for AttachmentSource {
+    fn from(value: UploadSource) -> Self {
+        match value {
+            UploadSource::File { filename } => Self::File(filename.into()),
+            UploadSource::Data { bytes, filename } => Self::Data { bytes, filename },
+        }
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct ReplyParameters {
+    /// The ID of the event to reply to.
+    event_id: String,
+    /// Whether to enforce a thread relation.
+    enforce_thread: bool,
+    /// If enforcing a threaded relation, whether the message is a reply on a
+    /// thread.
+    reply_within_thread: bool,
+}
+
+impl TryInto<Reply> for ReplyParameters {
+    type Error = RoomError;
+
+    fn try_into(self) -> Result<Reply, Self::Error> {
+        let event_id =
+            EventId::parse(&self.event_id).map_err(|_| RoomError::InvalidRepliedToEventId)?;
+        let enforce_thread = if self.enforce_thread {
+            EnforceThread::Threaded(if self.reply_within_thread {
+                ReplyWithinThread::Yes
+            } else {
+                ReplyWithinThread::No
+            })
+        } else {
+            EnforceThread::MaybeThreaded
+        };
+
+        Ok(Reply { event_id, enforce_thread })
+    }
 }
 
 #[matrix_sdk_ffi_macros::export]
@@ -215,18 +276,18 @@ impl Timeline {
     pub async fn add_listener(&self, listener: Box<dyn TimelineListener>) -> Arc<TaskHandle> {
         let (timeline_items, timeline_stream) = self.inner.subscribe().await;
 
+        // It's important that the initial items are passed *before* we forward the
+        // stream updates, with a guaranteed ordering. Otherwise, it could
+        // be that the listener be called before the initial items have been
+        // handled by the caller. See #3535 for details.
+
+        // First, pass all the items as a reset update.
+        listener.on_update(vec![Arc::new(TimelineDiff::new(VectorDiff::Reset {
+            values: timeline_items,
+        }))]);
+
         Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             pin_mut!(timeline_stream);
-
-            // It's important that the initial items are passed *before* we forward the
-            // stream updates, with a guaranteed ordering. Otherwise, it could
-            // be that the listener be called before the initial items have been
-            // handled by the caller. See #3535 for details.
-
-            // First, pass all the items as a reset update.
-            listener.on_update(vec![Arc::new(TimelineDiff::new(VectorDiff::Reset {
-                values: timeline_items,
-            }))]);
 
             // Then forward new items.
             while let Some(diffs) = timeline_stream.next().await {
@@ -320,7 +381,7 @@ impl Timeline {
             Ok(handle) => Ok(Arc::new(SendHandle::new(handle))),
             Err(err) => {
                 error!("error when sending a message: {err}");
-                Err(anyhow::anyhow!(err).into())
+                Err(err.into())
             }
         }
     }
@@ -446,7 +507,7 @@ impl Timeline {
         Ok(())
     }
 
-    pub fn end_poll(
+    pub async fn end_poll(
         self: Arc<Self>,
         poll_start_event_id: String,
         text: String,
@@ -456,31 +517,24 @@ impl Timeline {
         let poll_end_event_content = UnstablePollEndEventContent::new(text, poll_start_event_id);
         let event_content = AnyMessageLikeEventContent::UnstablePollEnd(poll_end_event_content);
 
-        get_runtime_handle().spawn(async move {
-            if let Err(err) = self.inner.send(event_content).await {
-                error!("unable to end poll: {err}");
-            }
-        });
+        if let Err(err) = self.inner.send(event_content).await {
+            error!("unable to end poll: {err}");
+        }
 
         Ok(())
     }
 
+    /// Send a reply.
+    ///
+    /// If the replied to event has a thread relation, it is forwarded on the
+    /// reply so that clients that support threads can render the reply
+    /// inside the thread.
     pub async fn send_reply(
         &self,
         msg: Arc<RoomMessageEventContentWithoutRelation>,
-        event_id: String,
+        reply_params: ReplyParameters,
     ) -> Result<(), ClientError> {
-        let event_id = EventId::parse(event_id)?;
-        let replied_to_info = self
-            .inner
-            .replied_to_info_from_event_id(&event_id)
-            .await
-            .map_err(|err| anyhow::anyhow!(err))?;
-
-        self.inner
-            .send_reply((*msg).clone(), replied_to_info, ForwardThread::Yes)
-            .await
-            .map_err(|err| anyhow::anyhow!(err))?;
+        self.inner.send_reply((*msg).clone(), reply_params.try_into()?).await?;
         Ok(())
     }
 
@@ -510,7 +564,10 @@ impl Timeline {
                 let event_id = match event_or_transaction_id {
                     EventOrTransactionId::EventId { event_id } => EventId::parse(event_id)?,
                     EventOrTransactionId::TransactionId { .. } => {
-                        warn!("trying to apply an edit to a local echo that doesn't exist in this timeline, aborting");
+                        warn!(
+                            "trying to apply an edit to a local echo that doesn't exist \
+                             in this timeline, aborting"
+                        );
                         return Ok(());
                     }
                 };
@@ -531,7 +588,8 @@ impl Timeline {
         description: Option<String>,
         zoom_level: Option<u8>,
         asset_type: Option<AssetType>,
-    ) {
+        reply_params: Option<ReplyParameters>,
+    ) -> Result<(), ClientError> {
         let mut location_event_message_content =
             LocationMessageEventContent::new(body, geo_uri.clone());
 
@@ -548,8 +606,13 @@ impl Timeline {
         let room_message_event_content = RoomMessageEventContentWithoutRelation::new(
             MessageType::Location(location_event_message_content),
         );
-        // Errors are logged in `Self::send` already.
-        let _ = self.send(Arc::new(room_message_event_content)).await;
+
+        if let Some(reply_params) = reply_params {
+            self.send_reply(Arc::new(room_message_event_content), reply_params).await
+        } else {
+            self.send(Arc::new(room_message_event_content)).await?;
+            Ok(())
+        }
     }
 
     /// Toggle a reaction on an event.
@@ -574,7 +637,10 @@ impl Timeline {
 
     pub async fn fetch_details_for_event(&self, event_id: String) -> Result<(), ClientError> {
         let event_id = <&EventId>::try_from(event_id.as_str())?;
-        self.inner.fetch_details_for_event(event_id).await.context("Fetching event details")?;
+        self.inner
+            .fetch_details_for_event(event_id)
+            .await
+            .map_err(|e| ClientError::from_str(e, Some("Fetching event details".to_owned())))?;
         Ok(())
     }
 
@@ -626,33 +692,31 @@ impl Timeline {
     ) -> Result<Arc<InReplyToDetails>, ClientError> {
         let event_id = EventId::parse(&event_id_str)?;
 
-        let replied_to: Result<RepliedToEvent, Error> =
-            if let Some(event) = self.inner.item_by_event_id(&event_id).await {
-                Ok(RepliedToEvent::from_timeline_item(&event))
-            } else {
-                match self.inner.room().event(&event_id, None).await {
-                    Ok(timeline_event) => Ok(RepliedToEvent::try_from_timeline_event_for_room(
-                        timeline_event,
-                        self.inner.room(),
-                    )
-                    .await?),
-                    Err(e) => Err(e),
-                }
-            };
+        let replied_to = match self.inner.room().load_or_fetch_event(&event_id, None).await {
+            Ok(event) => self.inner.make_replied_to(event).await.map_err(ClientError::from),
+            Err(e) => Err(ClientError::from(e)),
+        };
 
         match replied_to {
-            Ok(replied_to) => Ok(Arc::new(InReplyToDetails::new(
+            Ok(Some(replied_to)) => Ok(Arc::new(InReplyToDetails::new(
                 event_id_str,
-                RepliedToEventDetails::Ready {
-                    content: replied_to.content().clone().into(),
-                    sender: replied_to.sender().to_string(),
-                    sender_profile: replied_to.sender_profile().into(),
+                EmbeddedEventDetails::Ready {
+                    content: replied_to.content.clone().into(),
+                    sender: replied_to.sender.to_string(),
+                    sender_profile: replied_to.sender_profile.into(),
+                    timestamp: replied_to.timestamp.into(),
+                    event_or_transaction_id: replied_to.identifier.into(),
                 },
+            ))),
+
+            Ok(None) => Ok(Arc::new(InReplyToDetails::new(
+                event_id_str,
+                EmbeddedEventDetails::Error { message: "unsupported event".to_owned() },
             ))),
 
             Err(e) => Ok(Arc::new(InReplyToDetails::new(
                 event_id_str,
-                RepliedToEventDetails::Error { message: e.to_string() },
+                EmbeddedEventDetails::Error { message: e.to_string() },
             ))),
         }
     }
@@ -756,12 +820,12 @@ pub enum FocusEventError {
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait TimelineListener: Sync + Send {
+pub trait TimelineListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_update(&self, diff: Vec<Arc<TimelineDiff>>);
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait PaginationStatusListener: Sync + Send {
+pub trait PaginationStatusListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_update(&self, status: RoomPaginationStatus);
 }
 
@@ -939,6 +1003,7 @@ impl TimelineItem {
         match self.0.as_virtual()? {
             VItem::DateDivider(ts) => Some(VirtualTimelineItem::DateDivider { ts: (*ts).into() }),
             VItem::ReadMarker => Some(VirtualTimelineItem::ReadMarker),
+            VItem::TimelineStart => Some(VirtualTimelineItem::TimelineStart),
         }
     }
 
@@ -1033,7 +1098,6 @@ pub struct EventTimelineItem {
     is_editable: bool,
     content: TimelineItemContent,
     timestamp: Timestamp,
-    reactions: Vec<Reaction>,
     local_send_state: Option<EventSendState>,
     local_created_at: Option<u64>,
     read_receipts: HashMap<String, Receipt>,
@@ -1044,21 +1108,6 @@ pub struct EventTimelineItem {
 
 impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
     fn from(item: matrix_sdk_ui::timeline::EventTimelineItem) -> Self {
-        let reactions = item
-            .content()
-            .reactions()
-            .iter()
-            .map(|(k, v)| Reaction {
-                key: k.to_owned(),
-                senders: v
-                    .into_iter()
-                    .map(|(sender_id, info)| ReactionSenderData {
-                        sender_id: sender_id.to_string(),
-                        timestamp: info.timestamp.into(),
-                    })
-                    .collect(),
-            })
-            .collect();
         let item = Arc::new(item);
         let lazy_provider = Arc::new(LazyTimelineItemProvider(item.clone()));
         let read_receipts =
@@ -1067,12 +1116,11 @@ impl From<matrix_sdk_ui::timeline::EventTimelineItem> for EventTimelineItem {
             is_remote: !item.is_local_echo(),
             event_or_transaction_id: item.identifier().into(),
             sender: item.sender().to_string(),
-            sender_profile: item.sender_profile().into(),
+            sender_profile: item.sender_profile().clone().into(),
             is_own: item.is_own(),
             is_editable: item.is_editable(),
             content: item.content().clone().into(),
             timestamp: item.timestamp().into(),
-            reactions,
             local_send_state: item.send_state().map(|s| s.into()),
             local_created_at: item.local_created_at().map(|t| t.0.into()),
             read_receipts,
@@ -1109,13 +1157,13 @@ pub enum ProfileDetails {
     Error { message: String },
 }
 
-impl From<&TimelineDetails<Profile>> for ProfileDetails {
-    fn from(details: &TimelineDetails<Profile>) -> Self {
+impl From<TimelineDetails<Profile>> for ProfileDetails {
+    fn from(details: TimelineDetails<Profile>) -> Self {
         match details {
             TimelineDetails::Unavailable => Self::Unavailable,
             TimelineDetails::Pending => Self::Pending,
             TimelineDetails::Ready(profile) => Self::Ready {
-                display_name: profile.display_name.clone(),
+                display_name: profile.display_name,
                 display_name_ambiguous: profile.display_name_ambiguous,
                 avatar_url: profile.avatar_url.as_ref().map(ToString::to_string),
             },
@@ -1165,15 +1213,15 @@ impl TryFrom<PollData> for UnstablePollStartContentBlock {
 
 #[derive(uniffi::Object)]
 pub struct SendAttachmentJoinHandle {
-    join_hdl: Arc<Mutex<JoinHandle<Result<(), RoomError>>>>,
-    abort_hdl: AbortHandle,
+    join_handle: Arc<Mutex<JoinHandle<Result<(), RoomError>>>>,
+    abort_handle: AbortHandle,
 }
 
 impl SendAttachmentJoinHandle {
-    fn new(join_hdl: JoinHandle<Result<(), RoomError>>) -> Arc<Self> {
-        let abort_hdl = join_hdl.abort_handle();
-        let join_hdl = Arc::new(Mutex::new(join_hdl));
-        Arc::new(Self { join_hdl, abort_hdl })
+    fn new(join_handle: JoinHandle<Result<(), RoomError>>) -> Arc<Self> {
+        let abort_handle = join_handle.abort_handle();
+        let join_handle = Arc::new(Mutex::new(join_handle));
+        Arc::new(Self { join_handle, abort_handle })
     }
 }
 
@@ -1183,7 +1231,7 @@ impl SendAttachmentJoinHandle {
     ///
     /// If the sending had been cancelled, will return immediately.
     pub async fn join(&self) -> Result<(), RoomError> {
-        let handle = self.join_hdl.clone();
+        let handle = self.join_handle.clone();
         let mut locked_handle = handle.lock().await;
         let join_result = (&mut *locked_handle).await;
         match join_result {
@@ -1193,7 +1241,10 @@ impl SendAttachmentJoinHandle {
                     return Ok(());
                 }
                 error!("task panicked! resuming panic from here.");
+                #[cfg(not(target_family = "wasm"))]
                 panic::resume_unwind(err.into_panic());
+                #[cfg(target_family = "wasm")]
+                panic!("task panicked! {err}");
             }
         }
     }
@@ -1202,7 +1253,7 @@ impl SendAttachmentJoinHandle {
     ///
     /// A subsequent call to [`Self::join`] will return immediately.
     pub fn cancel(&self) {
-        self.abort_hdl.abort();
+        self.abort_handle.abort();
     }
 }
 
@@ -1219,6 +1270,9 @@ pub enum VirtualTimelineItem {
 
     /// The user's own read marker.
     ReadMarker,
+
+    /// The timeline start, that is, the *oldest* event in time for that room.
+    TimelineStart,
 }
 
 /// A [`TimelineItem`](super::TimelineItem) that doesn't correspond to an event.
@@ -1327,5 +1381,243 @@ impl LazyTimelineItemProvider {
 
     fn contains_only_emojis(&self) -> bool {
         self.0.contains_only_emojis()
+    }
+}
+
+#[cfg(feature = "unstable-msc4274")]
+mod galleries {
+    use std::{panic, sync::Arc};
+
+    use matrix_sdk::{
+        attachment::{
+            AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo, Thumbnail,
+        },
+        utils::formatted_body_from,
+    };
+    use matrix_sdk_common::executor::{AbortHandle, JoinHandle};
+    use matrix_sdk_ui::timeline::GalleryConfig;
+    use mime::Mime;
+    use tokio::sync::Mutex;
+    use tracing::error;
+
+    use crate::{
+        error::RoomError,
+        ruma::{AudioInfo, FileInfo, FormattedBody, ImageInfo, Mentions, VideoInfo},
+        runtime::get_runtime_handle,
+        timeline::{build_thumbnail_info, ReplyParameters, Timeline},
+    };
+
+    #[derive(uniffi::Record)]
+    pub struct GalleryUploadParameters {
+        /// Optional non-formatted caption, for clients that support it.
+        caption: Option<String>,
+        /// Optional HTML-formatted caption, for clients that support it.
+        formatted_caption: Option<FormattedBody>,
+        /// Optional intentional mentions to be sent with the gallery.
+        mentions: Option<Mentions>,
+        /// Optional parameters for sending the media as (threaded) reply.
+        reply_params: Option<ReplyParameters>,
+    }
+
+    #[derive(uniffi::Enum)]
+    pub enum GalleryItemInfo {
+        Audio {
+            audio_info: AudioInfo,
+            filename: String,
+            caption: Option<String>,
+            formatted_caption: Option<FormattedBody>,
+        },
+        File {
+            file_info: FileInfo,
+            filename: String,
+            caption: Option<String>,
+            formatted_caption: Option<FormattedBody>,
+        },
+        Image {
+            image_info: ImageInfo,
+            filename: String,
+            caption: Option<String>,
+            formatted_caption: Option<FormattedBody>,
+            thumbnail_path: Option<String>,
+        },
+        Video {
+            video_info: VideoInfo,
+            filename: String,
+            caption: Option<String>,
+            formatted_caption: Option<FormattedBody>,
+            thumbnail_path: Option<String>,
+        },
+    }
+
+    impl GalleryItemInfo {
+        fn mimetype(&self) -> &Option<String> {
+            match self {
+                GalleryItemInfo::Audio { audio_info, .. } => &audio_info.mimetype,
+                GalleryItemInfo::File { file_info, .. } => &file_info.mimetype,
+                GalleryItemInfo::Image { image_info, .. } => &image_info.mimetype,
+                GalleryItemInfo::Video { video_info, .. } => &video_info.mimetype,
+            }
+        }
+
+        fn filename(&self) -> &String {
+            match self {
+                GalleryItemInfo::Audio { filename, .. } => filename,
+                GalleryItemInfo::File { filename, .. } => filename,
+                GalleryItemInfo::Image { filename, .. } => filename,
+                GalleryItemInfo::Video { filename, .. } => filename,
+            }
+        }
+
+        fn caption(&self) -> &Option<String> {
+            match self {
+                GalleryItemInfo::Audio { caption, .. } => caption,
+                GalleryItemInfo::File { caption, .. } => caption,
+                GalleryItemInfo::Image { caption, .. } => caption,
+                GalleryItemInfo::Video { caption, .. } => caption,
+            }
+        }
+
+        fn formatted_caption(&self) -> &Option<FormattedBody> {
+            match self {
+                GalleryItemInfo::Audio { formatted_caption, .. } => formatted_caption,
+                GalleryItemInfo::File { formatted_caption, .. } => formatted_caption,
+                GalleryItemInfo::Image { formatted_caption, .. } => formatted_caption,
+                GalleryItemInfo::Video { formatted_caption, .. } => formatted_caption,
+            }
+        }
+
+        fn attachment_info(&self) -> Result<AttachmentInfo, RoomError> {
+            match self {
+                GalleryItemInfo::Audio { audio_info, .. } => Ok(AttachmentInfo::Audio(
+                    BaseAudioInfo::try_from(audio_info)
+                        .map_err(|_| RoomError::InvalidAttachmentData)?,
+                )),
+                GalleryItemInfo::File { file_info, .. } => Ok(AttachmentInfo::File(
+                    BaseFileInfo::try_from(file_info)
+                        .map_err(|_| RoomError::InvalidAttachmentData)?,
+                )),
+                GalleryItemInfo::Image { image_info, .. } => Ok(AttachmentInfo::Image(
+                    BaseImageInfo::try_from(image_info)
+                        .map_err(|_| RoomError::InvalidAttachmentData)?,
+                )),
+                GalleryItemInfo::Video { video_info, .. } => Ok(AttachmentInfo::Video(
+                    BaseVideoInfo::try_from(video_info)
+                        .map_err(|_| RoomError::InvalidAttachmentData)?,
+                )),
+            }
+        }
+
+        fn thumbnail(&self) -> Result<Option<Thumbnail>, RoomError> {
+            match self {
+                GalleryItemInfo::Audio { .. } | GalleryItemInfo::File { .. } => Ok(None),
+                GalleryItemInfo::Image { image_info, thumbnail_path, .. } => {
+                    build_thumbnail_info(thumbnail_path.clone(), image_info.thumbnail_info.clone())
+                }
+                GalleryItemInfo::Video { video_info, thumbnail_path, .. } => {
+                    build_thumbnail_info(thumbnail_path.clone(), video_info.thumbnail_info.clone())
+                }
+            }
+        }
+    }
+
+    impl TryInto<matrix_sdk_ui::timeline::GalleryItemInfo> for GalleryItemInfo {
+        type Error = RoomError;
+
+        fn try_into(
+            self,
+        ) -> std::result::Result<matrix_sdk_ui::timeline::GalleryItemInfo, Self::Error> {
+            let mime_str = self.mimetype().as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
+            let mime_type =
+                mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
+            Ok(matrix_sdk_ui::timeline::GalleryItemInfo {
+                source: self.filename().into(),
+                content_type: mime_type,
+                attachment_info: self.attachment_info()?,
+                caption: self.caption().clone(),
+                formatted_caption: self
+                    .formatted_caption()
+                    .clone()
+                    .map(ruma::events::room::message::FormattedBody::from),
+                thumbnail: self.thumbnail()?,
+            })
+        }
+    }
+
+    #[derive(uniffi::Object)]
+    pub struct SendGalleryJoinHandle {
+        join_handle: Arc<Mutex<JoinHandle<Result<(), RoomError>>>>,
+        abort_handle: AbortHandle,
+    }
+
+    impl SendGalleryJoinHandle {
+        fn new(join_handle: JoinHandle<Result<(), RoomError>>) -> Arc<Self> {
+            let abort_handle = join_handle.abort_handle();
+            let join_handle = Arc::new(Mutex::new(join_handle));
+            Arc::new(Self { join_handle, abort_handle })
+        }
+    }
+
+    #[matrix_sdk_ffi_macros::export]
+    impl SendGalleryJoinHandle {
+        /// Wait until the gallery has been sent.
+        ///
+        /// If the sending had been cancelled, will return immediately.
+        pub async fn join(&self) -> Result<(), RoomError> {
+            let handle = self.join_handle.clone();
+            let mut locked_handle = handle.lock().await;
+            let join_result = (&mut *locked_handle).await;
+            match join_result {
+                Ok(res) => res,
+                Err(err) => {
+                    if err.is_cancelled() {
+                        return Ok(());
+                    }
+                    error!("task panicked! resuming panic from here.");
+                    #[cfg(not(target_family = "wasm"))]
+                    panic::resume_unwind(err.into_panic());
+                    #[cfg(target_family = "wasm")]
+                    panic!("task panicked! {err}");
+                }
+            }
+        }
+
+        /// Cancel the current sending task.
+        ///
+        /// A subsequent call to [`Self::join`] will return immediately.
+        pub fn cancel(&self) {
+            self.abort_handle.abort();
+        }
+    }
+
+    #[matrix_sdk_ffi_macros::export]
+    impl Timeline {
+        pub fn send_gallery(
+            self: Arc<Self>,
+            params: GalleryUploadParameters,
+            item_infos: Vec<GalleryItemInfo>,
+        ) -> Result<Arc<SendGalleryJoinHandle>, RoomError> {
+            let formatted_caption = formatted_body_from(
+                params.caption.as_deref(),
+                params.formatted_caption.map(Into::into),
+            );
+
+            let mut gallery_config = GalleryConfig::new()
+                .caption(params.caption)
+                .formatted_caption(formatted_caption)
+                .mentions(params.mentions.map(Into::into))
+                .reply(params.reply_params.map(|p| p.try_into()).transpose()?);
+
+            for item_info in item_infos {
+                gallery_config = gallery_config.add_item(item_info.try_into()?);
+            }
+
+            let handle = SendGalleryJoinHandle::new(get_runtime_handle().spawn(async move {
+                let request = self.inner.send_gallery(gallery_config);
+                request.await.map_err(|_| RoomError::FailedSendingAttachment)?;
+                Ok(())
+            }));
+
+            Ok(handle)
+        }
     }
 }

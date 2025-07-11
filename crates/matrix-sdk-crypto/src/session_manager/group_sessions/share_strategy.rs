@@ -15,7 +15,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     default::Default,
-    ops::Deref,
 };
 
 use itertools::{Either, Itertools};
@@ -27,6 +26,7 @@ use tracing::{debug, instrument, trace};
 use super::OutboundGroupSession;
 use crate::{
     error::{OlmResult, SessionRecipientCollectionError},
+    olm::ShareInfo,
     store::Store,
     DeviceData, EncryptionSettings, LocalTrust, OlmError, OwnUserIdentityData, UserIdentityData,
 };
@@ -156,23 +156,13 @@ pub(crate) async fn collect_session_recipients(
     settings: &EncryptionSettings,
     outbound: &OutboundGroupSession,
 ) -> OlmResult<CollectRecipientsResult> {
-    let users: BTreeSet<&UserId> = users.collect();
-    let mut result = CollectRecipientsResult::default();
-    let mut verified_users_with_new_identities: Vec<OwnedUserId> = Default::default();
-
-    trace!(?users, ?settings, "Calculating group session recipients");
-
-    let users_shared_with: BTreeSet<OwnedUserId> =
-        outbound.shared_with_set.read().keys().cloned().collect();
-
-    let users_shared_with: BTreeSet<&UserId> = users_shared_with.iter().map(Deref::deref).collect();
-
-    // A user left if a user is missing from the set of users that should
-    // get the session but is in the set of users that received the session.
-    let user_left = !users_shared_with.difference(&users).collect::<BTreeSet<_>>().is_empty();
-
-    let visibility_changed = outbound.settings().history_visibility != settings.history_visibility;
-    let algorithm_changed = outbound.settings().algorithm != settings.algorithm;
+    let mut result = collect_recipients_for_share_strategy(
+        store,
+        users,
+        &settings.sharing_strategy,
+        Some(outbound),
+    )
+    .await?;
 
     // To protect the room history we need to rotate the session if either:
     //
@@ -181,19 +171,66 @@ pub(crate) async fn collect_session_recipients(
     // 3. The history visibility changed.
     // 4. The encryption algorithm changed.
     //
-    // This is calculated in the following code and stored in this variable.
-    result.should_rotate = user_left || visibility_changed || algorithm_changed;
+    // `result.should_rotate` is true if the first or second in that list is true;
+    // we now need to check for the other two.
+    let device_removed = result.should_rotate;
+
+    let visibility_changed = outbound.settings().history_visibility != settings.history_visibility;
+    let algorithm_changed = outbound.settings().algorithm != settings.algorithm;
+
+    result.should_rotate = device_removed || visibility_changed || algorithm_changed;
+
+    if result.should_rotate {
+        debug!(
+            device_removed,
+            visibility_changed, algorithm_changed, "Rotating room key to protect room history",
+        );
+    }
+
+    Ok(result)
+}
+
+/// Given a list of users and a [`CollectStrategy`], return the list of devices
+/// that cryptographic keys should be shared with, or that withheld notices
+/// should be sent to.
+///
+/// If an existing [`OutboundGroupSession`] is provided, will also check the
+/// list of devices that the session has been *previously* shared with, and
+/// if that list is too broad, returns a flag indicating that the session should
+/// be rotated (e.g., because a device has been deleted or a user has left the
+/// chat).
+pub(crate) async fn collect_recipients_for_share_strategy(
+    store: &Store,
+    users: impl Iterator<Item = &UserId>,
+    share_strategy: &CollectStrategy,
+    outbound: Option<&OutboundGroupSession>,
+) -> OlmResult<CollectRecipientsResult> {
+    let users: BTreeSet<&UserId> = users.collect();
+    trace!(?users, ?share_strategy, "Calculating group session recipients");
+
+    let mut result = CollectRecipientsResult::default();
+    let mut verified_users_with_new_identities: Vec<OwnedUserId> = Default::default();
+
+    // If we have an outbound session, check if a user is missing from the set of
+    // users that should get the session but is in the set of users that
+    // received the session.
+    if let Some(outbound) = outbound {
+        let view = outbound.sharing_view();
+        let users_shared_with = view.shared_with_users().collect::<BTreeSet<_>>();
+        let left_users = users_shared_with.difference(&users).collect::<BTreeSet<_>>();
+        if !left_users.is_empty() {
+            trace!(?left_users, "Some users have left the chat: session must be rotated");
+            result.should_rotate = true;
+        }
+    }
 
     let own_identity = store.get_user_identity(store.user_id()).await?.and_then(|i| i.into_own());
 
     // Get the recipient and withheld devices, based on the collection strategy.
-    match settings.sharing_strategy {
+    match share_strategy {
         CollectStrategy::AllDevices => {
             for user_id in users {
-                trace!(
-                    "CollectStrategy::AllDevices: Considering recipient devices for user {}",
-                    user_id
-                );
+                trace!(?user_id, "CollectStrategy::AllDevices: Considering recipient devices",);
                 let user_devices = store.get_device_data_for_user_filtered(user_id).await?;
                 let device_owner_identity = store.get_user_identity(user_id).await?;
 
@@ -210,7 +247,10 @@ pub(crate) async fn collect_session_recipients(
                 Default::default();
 
             for user_id in users {
-                trace!("CollectStrategy::ErrorOnVerifiedUserProblem: Considering recipient devices for user {}", user_id);
+                trace!(
+                    ?user_id,
+                    "CollectStrategy::ErrorOnVerifiedUserProblem: Considering recipient devices"
+                );
                 let user_devices = store.get_device_data_for_user_filtered(user_id).await?;
 
                 let device_owner_identity = store.get_user_identity(user_id).await?;
@@ -264,18 +304,21 @@ pub(crate) async fn collect_session_recipients(
                 None => {
                     return Err(OlmError::SessionRecipientCollectionError(
                         SessionRecipientCollectionError::CrossSigningNotSetup,
-                    ))
+                    ));
                 }
                 Some(identity) if !identity.is_verified() => {
                     return Err(OlmError::SessionRecipientCollectionError(
                         SessionRecipientCollectionError::SendingFromUnverifiedDevice,
-                    ))
+                    ));
                 }
                 Some(_) => (),
             }
 
             for user_id in users {
-                trace!("CollectStrategy::IdentityBasedStrategy: Considering recipient devices for user {}", user_id);
+                trace!(
+                    ?user_id,
+                    "CollectStrategy::IdentityBasedStrategy: Considering recipient devices"
+                );
                 let user_devices = store.get_device_data_for_user_filtered(user_id).await?;
 
                 let device_owner_identity = store.get_user_identity(user_id).await?;
@@ -300,7 +343,10 @@ pub(crate) async fn collect_session_recipients(
 
         CollectStrategy::OnlyTrustedDevices => {
             for user_id in users {
-                trace!("CollectStrategy::OnlyTrustedDevices: Considering recipient devices for user {}", user_id);
+                trace!(
+                    ?user_id,
+                    "CollectStrategy::OnlyTrustedDevices: Considering recipient devices"
+                );
                 let user_devices = store.get_device_data_for_user_filtered(user_id).await?;
                 let device_owner_identity = store.get_user_identity(user_id).await?;
 
@@ -325,15 +371,6 @@ pub(crate) async fn collect_session_recipients(
         ));
     }
 
-    if result.should_rotate {
-        debug!(
-            result.should_rotate,
-            user_left,
-            visibility_changed,
-            algorithm_changed,
-            "Rotating room key to protect room history",
-        );
-    }
     trace!(result.should_rotate, "Done calculating group session recipients");
 
     Ok(result)
@@ -343,7 +380,7 @@ pub(crate) async fn collect_session_recipients(
 /// user.
 fn update_recipients_for_user(
     recipients: &mut CollectRecipientsResult,
-    outbound: &OutboundGroupSession,
+    outbound: Option<&OutboundGroupSession>,
     user_id: &UserId,
     recipient_devices: RecipientDevicesForUser,
 ) {
@@ -351,9 +388,14 @@ fn update_recipients_for_user(
     // rotated for other reasons, we also need to check whether any
     // of the devices in the session got deleted or blacklisted in the
     // meantime. If so, we should also rotate the session.
-    if !recipients.should_rotate {
-        recipients.should_rotate =
-            is_session_overshared_for_user(outbound, user_id, &recipient_devices.allowed_devices)
+    if let Some(outbound) = outbound {
+        if !recipients.should_rotate {
+            recipients.should_rotate = is_session_overshared_for_user(
+                outbound,
+                user_id,
+                &recipient_devices.allowed_devices,
+            )
+        }
     }
 
     recipients
@@ -388,24 +430,20 @@ fn is_session_overshared_for_user(
     let recipient_device_ids: BTreeSet<&DeviceId> =
         recipient_devices.iter().map(|d| d.device_id()).collect();
 
-    let guard = outbound_session.shared_with_set.read();
-
-    let Some(shared) = guard.get(user_id) else {
-        return false;
-    };
-
-    // Devices that received this session
-    let shared: BTreeSet<&DeviceId> = shared.keys().map(|d| d.as_ref()).collect();
-
-    // The set difference between
-    //
-    // 1. Devices that had previously received the session, and
-    // 2. Devices that would now receive the session
-    //
-    // Represents newly deleted or blacklisted devices. If this
-    // set is non-empty, we must rotate.
-    let newly_deleted_or_blacklisted =
-        shared.difference(&recipient_device_ids).collect::<BTreeSet<_>>();
+    let view = outbound_session.sharing_view();
+    let newly_deleted_or_blacklisted: BTreeSet<&DeviceId> = view
+        .iter_shares(Some(user_id), None)
+        .filter_map(|(_user_id, device_id, info)| {
+            // If a devices who we've shared the session with before is not in the
+            // list of devices that should receive the session, we need to rotate.
+            // We also collect all of those device IDs to log them out.
+            if matches!(info, ShareInfo::Shared(_)) && !recipient_device_ids.contains(device_id) {
+                Some(device_id)
+            } else {
+                None
+            }
+        })
+        .collect();
 
     let should_rotate = !newly_deleted_or_blacklisted.is_empty();
     if should_rotate {
@@ -686,17 +724,21 @@ mod tests {
         },
     };
     use ruma::{
-        device_id, events::room::history_visibility::HistoryVisibility, room_id, TransactionId,
+        device_id,
+        events::{dummy::ToDeviceDummyEventContent, room::history_visibility::HistoryVisibility},
+        room_id, TransactionId,
     };
     use serde_json::json;
 
     use crate::{
         error::SessionRecipientCollectionError,
-        olm::OutboundGroupSession,
+        olm::{OutboundGroupSession, ShareInfo},
         session_manager::{
             group_sessions::share_strategy::collect_session_recipients, CollectStrategy,
         },
+        store::caches::SequenceNumber,
         testing::simulate_key_query_response_for_verification,
+        types::requests::ToDeviceRequest,
         CrossSigningKeyExport, EncryptionSettings, LocalTrust, OlmError, OlmMachine,
     };
 
@@ -1652,7 +1694,7 @@ mod tests {
         ) {
             // The share list should be empty
             for (user, device_list) in recips.devices {
-                assert_eq!(device_list.len(), 0, "session unexpectedly shared with {}", user);
+                assert_eq!(device_list.len(), 0, "session unexpectedly shared with {user}");
             }
 
             // ... and there should be one withheld message
@@ -2057,9 +2099,110 @@ mod tests {
         let machine = test_machine().await;
         import_known_users_to_test_machine(&machine).await;
 
-        let fake_room_id = room_id!("!roomid:localhost");
         let encryption_settings = all_devices_strategy_settings();
+        let group_session = create_test_outbound_group_session(&machine, &encryption_settings);
+        let sender_key = machine.identity_keys().curve25519;
 
+        group_session
+            .mark_shared_with(
+                KeyDistributionTestData::dan_id(),
+                KeyDistributionTestData::dan_signed_device_id(),
+                sender_key,
+            )
+            .await;
+        group_session
+            .mark_shared_with(
+                KeyDistributionTestData::dan_id(),
+                KeyDistributionTestData::dan_unsigned_device_id(),
+                sender_key,
+            )
+            .await;
+
+        // Try to share again after dan has removed one of his devices
+        let keys_query = KeyDistributionTestData::dan_keys_query_response_device_loggedout();
+        machine.mark_request_as_sent(&TransactionId::new(), &keys_query).await.unwrap();
+
+        // share again
+        let share_result = collect_session_recipients(
+            machine.store(),
+            vec![KeyDistributionTestData::dan_id()].into_iter(),
+            &encryption_settings,
+            &group_session,
+        )
+        .await
+        .unwrap();
+
+        assert!(share_result.should_rotate);
+    }
+
+    /// Test that the session is rotated if a devices has a pending
+    /// to-device request that would share the keys with it.
+    #[async_test]
+    async fn test_should_rotate_based_on_device_with_pending_request_excluded() {
+        let machine = test_machine().await;
+        import_known_users_to_test_machine(&machine).await;
+
+        let encryption_settings = all_devices_strategy_settings();
+        let group_session = create_test_outbound_group_session(&machine, &encryption_settings);
+        let sender_key = machine.identity_keys().curve25519;
+
+        let dan_user = KeyDistributionTestData::dan_id();
+        let dan_dev1 = KeyDistributionTestData::dan_signed_device_id();
+        let dan_dev2 = KeyDistributionTestData::dan_unsigned_device_id();
+
+        // Share the session with device 1
+        group_session.mark_shared_with(dan_user, dan_dev1, sender_key).await;
+
+        {
+            // Add a pending request to share with device 2
+            let share_infos = BTreeMap::from([(
+                dan_user.to_owned(),
+                BTreeMap::from([(
+                    dan_dev2.to_owned(),
+                    ShareInfo::new_shared(sender_key, 0, SequenceNumber::default()),
+                )]),
+            )]);
+
+            let txid = TransactionId::new();
+            let req = Arc::new(ToDeviceRequest::for_recipients(
+                dan_user,
+                vec![dan_dev2.to_owned()],
+                &ruma::events::AnyToDeviceEventContent::Dummy(ToDeviceDummyEventContent),
+                txid.clone(),
+            ));
+            group_session.add_request(txid, req, share_infos);
+        }
+
+        // Remove device 2
+        let keys_query = KeyDistributionTestData::dan_keys_query_response_device_loggedout();
+        machine.mark_request_as_sent(&TransactionId::new(), &keys_query).await.unwrap();
+
+        // Share again
+        let share_result = collect_session_recipients(
+            machine.store(),
+            vec![KeyDistributionTestData::dan_id()].into_iter(),
+            &encryption_settings,
+            &group_session,
+        )
+        .await
+        .unwrap();
+
+        assert!(share_result.should_rotate);
+    }
+
+    /// Test that the session is not rotated if a devices is removed
+    /// but was already withheld from receiving the session.
+    #[async_test]
+    async fn test_should_not_rotate_if_keys_were_withheld() {
+        let machine = test_machine().await;
+        import_known_users_to_test_machine(&machine).await;
+
+        let encryption_settings = all_devices_strategy_settings();
+        let group_session = create_test_outbound_group_session(&machine, &encryption_settings);
+        let fake_room_id = group_session.room_id();
+
+        // Because we don't have Olm sessions initialized, this will contain
+        // withheld requests for both of Dan's devices
         let requests = machine
             .share_room_key(
                 fake_room_id,
@@ -2077,13 +2220,11 @@ mod tests {
                 .await
                 .unwrap();
         }
+
         // Try to share again after dan has removed one of his devices
         let keys_query = KeyDistributionTestData::dan_keys_query_response_device_loggedout();
-        let txn_id = TransactionId::new();
-        machine.mark_request_as_sent(&txn_id, &keys_query).await.unwrap();
+        machine.mark_request_as_sent(&TransactionId::new(), &keys_query).await.unwrap();
 
-        let group_session =
-            machine.store().get_outbound_group_session(fake_room_id).await.unwrap().unwrap();
         // share again
         let share_result = collect_session_recipients(
             machine.store(),
@@ -2094,7 +2235,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(share_result.should_rotate);
+        assert!(!share_result.should_rotate);
     }
 
     /// Common setup for tests which require a verified user to have unsigned

@@ -14,23 +14,47 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    num::NonZeroUsize,
     sync::Arc,
 };
 
-use matrix_sdk::ring_buffer::RingBuffer;
-use ruma::{EventId, OwnedEventId, OwnedUserId, RoomVersionId};
+use imbl::Vector;
+use matrix_sdk::deserialized_responses::EncryptionInfo;
+use ruma::{
+    events::{
+        poll::unstable_start::UnstablePollStartEventContent, relation::Replacement,
+        room::message::RelationWithoutReplacement, AnyMessageLikeEventContent,
+        AnySyncMessageLikeEvent, AnySyncTimelineEvent, BundledMessageLikeRelations,
+    },
+    serde::Raw,
+    EventId, OwnedEventId, OwnedUserId, RoomVersionId,
+};
 use tracing::trace;
 
 use super::{
-    super::{
-        rfind_event_by_id, subscriber::skip::SkipCount, TimelineItem, TimelineItemKind,
-        TimelineUniqueId,
-    },
+    super::{subscriber::skip::SkipCount, TimelineItem, TimelineItemKind, TimelineUniqueId},
     read_receipts::ReadReceipts,
-    Aggregations, AllRemoteEvents, ObservableItemsTransaction, PendingEdit,
+    Aggregation, AggregationKind, Aggregations, AllRemoteEvents, ObservableItemsTransaction,
+    PendingEdit, PendingEditKind,
 };
-use crate::unable_to_decrypt_hook::UtdHookManager;
+use crate::{
+    timeline::{
+        event_item::{
+            extract_bundled_edit_event_json, extract_poll_edit_content,
+            extract_room_msg_edit_content,
+        },
+        InReplyToDetails, TimelineEventItemId,
+    },
+    unable_to_decrypt_hook::UtdHookManager,
+};
+
+/// All parameters to [`TimelineAction::from_content`] that only apply if an
+/// event is a remote echo.
+pub(crate) struct RemoteEventContext<'a> {
+    pub event_id: &'a EventId,
+    pub raw_event: &'a Raw<AnySyncTimelineEvent>,
+    pub relations: BundledMessageLikeRelations<AnySyncMessageLikeEvent>,
+    pub bundled_edit_encryption_info: Option<Arc<EncryptionInfo>>,
+}
 
 #[derive(Clone, Debug)]
 pub(in crate::timeline) struct TimelineMetadata {
@@ -41,7 +65,7 @@ pub(in crate::timeline) struct TimelineMetadata {
     /// This value is constant over the lifetime of the metadata.
     internal_id_prefix: Option<String>,
 
-    /// The `count` value for the `Skip higher-order stream used by the
+    /// The `count` value for the `Skip` higher-order stream used by the
     /// `TimelineSubscriber`. See its documentation to learn more.
     pub(super) subscriber_skip_count: SkipCount,
 
@@ -62,7 +86,7 @@ pub(in crate::timeline) struct TimelineMetadata {
     pub room_version: RoomVersionId,
 
     /// The own [`OwnedUserId`] of the client who opened the timeline.
-    own_user_id: OwnedUserId,
+    pub(crate) own_user_id: OwnedUserId,
 
     // **** DYNAMIC FIELDS ****
     /// The next internal identifier for timeline items, used for both local and
@@ -80,10 +104,9 @@ pub(in crate::timeline) struct TimelineMetadata {
     pub aggregations: Aggregations,
 
     /// Given an event, what are all the events that are replies to it?
+    ///
+    /// Only works for remote events *and* replies which are remote-echoed.
     pub replies: HashMap<OwnedEventId, BTreeSet<OwnedEventId>>,
-
-    /// Edit events received before the related event they're editing.
-    pub pending_edits: RingBuffer<PendingEdit>,
 
     /// Identifier of the fully-read event, helping knowing where to introduce
     /// the read marker.
@@ -103,10 +126,6 @@ pub(in crate::timeline) struct TimelineMetadata {
     pub(super) read_receipts: ReadReceipts,
 }
 
-/// Maximum number of stash pending edits.
-/// SAFETY: 32 is not 0.
-const MAX_NUM_STASHED_PENDING_EDITS: NonZeroUsize = NonZeroUsize::new(32).unwrap();
-
 impl TimelineMetadata {
     pub(in crate::timeline) fn new(
         own_user_id: OwnedUserId,
@@ -120,7 +139,6 @@ impl TimelineMetadata {
             own_user_id,
             next_internal_id: Default::default(),
             aggregations: Default::default(),
-            pending_edits: RingBuffer::new(MAX_NUM_STASHED_PENDING_EDITS),
             replies: Default::default(),
             fully_read_event: Default::default(),
             // It doesn't make sense to set this to false until we fill the `fully_read_event`
@@ -139,7 +157,6 @@ impl TimelineMetadata {
         // ids across timeline clears.
         self.aggregations.clear();
         self.replies.clear();
-        self.pending_edits.clear();
         self.fully_read_event = None;
         // We forgot about the fully read marker right above, so wait for a new one
         // before attempting to update it for each new timeline item.
@@ -196,12 +213,16 @@ impl TimelineMetadata {
         let Some(fully_read_event) = &self.fully_read_event else { return };
         trace!(?fully_read_event, "Updating read marker");
 
-        let read_marker_idx = items.iter().rposition(|item| item.is_read_marker());
+        let read_marker_idx = items
+            .iter_remotes_region()
+            .rev()
+            .find_map(|(idx, item)| item.is_read_marker().then_some(idx));
 
-        let mut fully_read_event_idx =
-            rfind_event_by_id(items, fully_read_event).map(|(idx, _)| idx);
+        let mut fully_read_event_idx = items.iter_remotes_region().rev().find_map(|(idx, item)| {
+            (item.as_event()?.event_id() == Some(fully_read_event)).then_some(idx)
+        });
 
-        if let Some(i) = &mut fully_read_event_idx {
+        if let Some(fully_read_event_idx) = &mut fully_read_event_idx {
             // The item at position `i` is the first item that's fully read, we're about to
             // insert a read marker just after it.
             //
@@ -209,24 +230,26 @@ impl TimelineMetadata {
 
             // Find the position of the first element…
             let next = items
-                .iter()
-                .enumerate()
+                .iter_remotes_region()
                 // …strictly *after* the fully read event…
-                .skip(*i + 1)
+                .skip_while(|(idx, _)| idx <= fully_read_event_idx)
                 // …that's not virtual and not sent by us…
-                .find(|(_, item)| {
-                    item.as_event().is_some_and(|event| event.sender() != self.own_user_id)
-                })
-                .map(|(i, _)| i);
+                .find_map(|(idx, item)| {
+                    (item.as_event()?.sender() != self.own_user_id).then_some(idx)
+                });
 
             if let Some(next) = next {
                 // `next` point to the first item that's not sent by us, so the *previous* of
                 // next is the right place where to insert the fully read marker.
-                *i = next.wrapping_sub(1);
+                *fully_read_event_idx = next.wrapping_sub(1);
             } else {
                 // There's no event after the read marker that's not sent by us, i.e. the full
-                // timeline has been read: the fully read marker goes to the end.
-                *i = items.len().wrapping_sub(1);
+                // timeline has been read: the fully read marker goes to the end, even after the
+                // local timeline items.
+                //
+                // TODO (@hywan): Should we introduce a `items.position_of_last_remote()` to
+                // insert before the local timeline items?
+                *fully_read_event_idx = items.len().wrapping_sub(1);
             }
         }
 
@@ -282,6 +305,196 @@ impl TimelineMetadata {
                     self.has_up_to_date_read_marker_item = false;
                 }
             }
+        }
+    }
+
+    /// Extract the content from a remote message-like event and process its
+    /// relations.
+    pub(crate) fn process_event_relations(
+        &mut self,
+        event: &AnySyncTimelineEvent,
+        raw_event: &Raw<AnySyncTimelineEvent>,
+        bundled_edit_encryption_info: Option<Arc<EncryptionInfo>>,
+        timeline_items: &Vector<Arc<TimelineItem>>,
+        is_thread_focus: bool,
+    ) -> (Option<InReplyToDetails>, Option<OwnedEventId>) {
+        if let AnySyncTimelineEvent::MessageLike(ev) = event {
+            if let Some(content) = ev.original_content() {
+                let remote_ctx = Some(RemoteEventContext {
+                    event_id: ev.event_id(),
+                    raw_event,
+                    relations: ev.relations(),
+                    bundled_edit_encryption_info,
+                });
+                return self.process_content_relations(
+                    &content,
+                    remote_ctx,
+                    timeline_items,
+                    is_thread_focus,
+                );
+            }
+        }
+        (None, None)
+    }
+
+    /// Extracts the in-reply-to details and thread root from the content of a
+    /// message-like event, and take care of internal bookkeeping as well
+    /// (like marking responses).
+    ///
+    /// Returns the in-reply-to details and the thread root event ID, if any.
+    pub(crate) fn process_content_relations(
+        &mut self,
+        content: &AnyMessageLikeEventContent,
+        remote_ctx: Option<RemoteEventContext<'_>>,
+        timeline_items: &Vector<Arc<TimelineItem>>,
+        is_thread_focus: bool,
+    ) -> (Option<InReplyToDetails>, Option<OwnedEventId>) {
+        match content {
+            AnyMessageLikeEventContent::Sticker(content) => {
+                let (in_reply_to, thread_root) = Self::extract_reply_and_thread_root(
+                    content.relates_to.clone().and_then(|rel| rel.try_into().ok()),
+                    timeline_items,
+                    is_thread_focus,
+                );
+
+                if let Some(event_id) = remote_ctx.map(|ctx| ctx.event_id) {
+                    self.mark_response(event_id, in_reply_to.as_ref());
+                }
+
+                (in_reply_to, thread_root)
+            }
+
+            AnyMessageLikeEventContent::UnstablePollStart(UnstablePollStartEventContent::New(
+                c,
+            )) => {
+                let (in_reply_to, thread_root) = Self::extract_reply_and_thread_root(
+                    c.relates_to.clone(),
+                    timeline_items,
+                    is_thread_focus,
+                );
+
+                // Record the bundled edit in the aggregations set, if any.
+                if let Some(ctx) = remote_ctx {
+                    // Extract a potentially bundled edit.
+                    if let Some((edit_event_id, new_content)) =
+                        extract_poll_edit_content(ctx.relations)
+                    {
+                        let edit_json = extract_bundled_edit_event_json(ctx.raw_event);
+                        let aggregation = Aggregation::new(
+                            TimelineEventItemId::EventId(edit_event_id),
+                            AggregationKind::Edit(PendingEdit {
+                                kind: PendingEditKind::Poll(Replacement::new(
+                                    ctx.event_id.to_owned(),
+                                    new_content,
+                                )),
+                                edit_json,
+                                encryption_info: ctx.bundled_edit_encryption_info,
+                                bundled_item_owner: Some(ctx.event_id.to_owned()),
+                            }),
+                        );
+                        self.aggregations.add(
+                            TimelineEventItemId::EventId(ctx.event_id.to_owned()),
+                            aggregation,
+                        );
+                    }
+
+                    self.mark_response(ctx.event_id, in_reply_to.as_ref());
+                }
+
+                (in_reply_to, thread_root)
+            }
+
+            AnyMessageLikeEventContent::RoomMessage(msg) => {
+                let (in_reply_to, thread_root) = Self::extract_reply_and_thread_root(
+                    msg.relates_to.clone().and_then(|rel| rel.try_into().ok()),
+                    timeline_items,
+                    is_thread_focus,
+                );
+
+                // Record the bundled edit in the aggregations set, if any.
+                if let Some(ctx) = remote_ctx {
+                    // Extract a potentially bundled edit.
+                    if let Some((edit_event_id, new_content)) =
+                        extract_room_msg_edit_content(ctx.relations)
+                    {
+                        let edit_json = extract_bundled_edit_event_json(ctx.raw_event);
+                        let aggregation = Aggregation::new(
+                            TimelineEventItemId::EventId(edit_event_id),
+                            AggregationKind::Edit(PendingEdit {
+                                kind: PendingEditKind::RoomMessage(Replacement::new(
+                                    ctx.event_id.to_owned(),
+                                    new_content,
+                                )),
+                                edit_json,
+                                encryption_info: ctx.bundled_edit_encryption_info,
+                                bundled_item_owner: Some(ctx.event_id.to_owned()),
+                            }),
+                        );
+                        self.aggregations.add(
+                            TimelineEventItemId::EventId(ctx.event_id.to_owned()),
+                            aggregation,
+                        );
+                    }
+
+                    self.mark_response(ctx.event_id, in_reply_to.as_ref());
+                }
+
+                (in_reply_to, thread_root)
+            }
+
+            _ => (None, None),
+        }
+    }
+
+    /// Extracts the in-reply-to details and thread root from a relation, if
+    /// available.
+    fn extract_reply_and_thread_root(
+        relates_to: Option<RelationWithoutReplacement>,
+        timeline_items: &Vector<Arc<TimelineItem>>,
+        is_thread_focus: bool,
+    ) -> (Option<InReplyToDetails>, Option<OwnedEventId>) {
+        let mut thread_root = None;
+
+        let in_reply_to = relates_to.and_then(|relation| match relation {
+            RelationWithoutReplacement::Reply { in_reply_to } => {
+                Some(InReplyToDetails::new(in_reply_to.event_id, timeline_items))
+            }
+            RelationWithoutReplacement::Thread(thread) => {
+                thread_root = Some(thread.event_id);
+
+                if is_thread_focus && thread.is_falling_back {
+                    // In general, a threaded event is marked as a response to the previous message
+                    // in the thread, to maintain backwards compatibility with clients not
+                    // supporting threads.
+                    //
+                    // But we can have actual replies to other in-thread events. The
+                    // `is_falling_back` bool helps distinguishing both use cases.
+                    //
+                    // If this timeline is thread-focused, we only mark non-falling-back replies as
+                    // actual in-thread replies.
+                    None
+                } else {
+                    thread.in_reply_to.map(|in_reply_to| {
+                        InReplyToDetails::new(in_reply_to.event_id, timeline_items)
+                    })
+                }
+            }
+            _ => None,
+        });
+
+        (in_reply_to, thread_root)
+    }
+
+    /// Mark a message as a response to another message, if it is a reply.
+    fn mark_response(&mut self, event_id: &EventId, in_reply_to: Option<&InReplyToDetails>) {
+        // If this message is a reply to another message, add an entry in the
+        // inverted mapping.
+        if let Some(replied_to_event_id) = in_reply_to.as_ref().map(|details| &details.event_id) {
+            // This is a reply! Add an entry.
+            self.replies
+                .entry(replied_to_event_id.to_owned())
+                .or_default()
+                .insert(event_id.to_owned());
         }
     }
 }
@@ -368,4 +581,10 @@ pub(in crate::timeline) struct EventMeta {
     /// Note that the #2 timeline item (the day divider) doesn't map to any
     /// remote event, but if it moves, it has an impact on this mapping.
     pub timeline_item_index: Option<usize>,
+}
+
+impl EventMeta {
+    pub fn new(event_id: OwnedEventId, visible: bool) -> Self {
+        Self { event_id, visible, timeline_item_index: None }
+    }
 }

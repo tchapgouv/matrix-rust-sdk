@@ -1,15 +1,12 @@
 use std::sync::{Arc, Mutex};
 
-use async_compat::get_runtime_handle;
 use language_tags::LanguageTag;
-use matrix_sdk::{
-    async_trait,
-    widget::{MessageLikeEventFilter, StateEventFilter},
-};
+use matrix_sdk::widget::{MessageLikeEventFilter, StateEventFilter, ToDeviceEventFilter};
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use ruma::events::MessageLikeEventType;
 use tracing::error;
 
-use crate::room::Room;
+use crate::{room::Room, runtime::get_runtime_handle};
 
 #[derive(uniffi::Record)]
 pub struct WidgetDriverAndHandle {
@@ -95,7 +92,7 @@ impl From<matrix_sdk::widget::WidgetSettings> for WidgetSettings {
 ///
 /// # Arguments
 /// * `widget_settings` - The widget settings to generate the url for.
-/// * `room` - A matrix room which is used to query the logged in username
+/// * `room` - A Matrix room which is used to query the logged in username
 /// * `props` - Properties from the client that can be used by a widget to adapt
 ///   to the client. e.g. language, font-scale...
 #[matrix_sdk_ffi_macros::export]
@@ -113,168 +110,6 @@ pub async fn generate_webview_url(
     .map(|url| url.to_string())?)
 }
 
-/// Defines if a call is encrypted and which encryption system should be used.
-///
-/// This controls the url parameters: `perParticipantE2EE`, `password`.
-#[derive(uniffi::Enum, Clone)]
-pub enum EncryptionSystem {
-    /// Equivalent to the element call url parameter: `enableE2EE=false`
-    Unencrypted,
-    /// Equivalent to the element call url parameter:
-    /// `perParticipantE2EE=true`
-    PerParticipantKeys,
-    /// Equivalent to the element call url parameter:
-    /// `password={secret}`
-    SharedSecret {
-        /// The secret/password which is used in the url.
-        secret: String,
-    },
-}
-
-impl From<EncryptionSystem> for matrix_sdk::widget::EncryptionSystem {
-    fn from(value: EncryptionSystem) -> Self {
-        match value {
-            EncryptionSystem::Unencrypted => Self::Unencrypted,
-            EncryptionSystem::PerParticipantKeys => Self::PerParticipantKeys,
-            EncryptionSystem::SharedSecret { secret } => Self::SharedSecret { secret },
-        }
-    }
-}
-
-/// Defines the intent of showing the call.
-///
-/// This controls whether to show or skip the lobby.
-#[derive(uniffi::Enum, Clone)]
-pub enum Intent {
-    /// The user wants to start a call.
-    StartCall,
-    /// The user wants to join an existing call.
-    JoinExisting,
-}
-impl From<Intent> for matrix_sdk::widget::Intent {
-    fn from(value: Intent) -> Self {
-        match value {
-            Intent::StartCall => Self::StartCall,
-            Intent::JoinExisting => Self::JoinExisting,
-        }
-    }
-}
-
-/// Properties to create a new virtual Element Call widget.
-#[derive(uniffi::Record, Clone)]
-pub struct VirtualElementCallWidgetOptions {
-    /// The url to the Element Call app including any `/room` path if required.
-    ///
-    /// E.g. <https://call.element.io>, <https://call.element.dev>, <https://call.element.dev/room>
-    pub element_call_url: String,
-
-    /// The widget id.
-    pub widget_id: String,
-
-    /// The url that is used as the target for the PostMessages sent
-    /// by the widget (to the client).
-    ///
-    /// For a web app client this is the client url. In case of using other
-    /// platforms the client most likely is setup up to listen to
-    /// postmessages in the same webview the widget is hosted. In this case
-    /// the `parent_url` is set to the url of the webview with the widget. Be
-    /// aware that this means that the widget will receive its own postmessage
-    /// messages. The `matrix-widget-api` (js) ignores those so this works but
-    /// it might break custom implementations.
-    ///
-    /// Defaults to `element_call_url` for the non-iframe (dedicated webview)
-    /// usecase.
-    pub parent_url: Option<String>,
-
-    /// Whether the branding header of Element call should be hidden.
-    ///
-    /// Default: `true`
-    pub hide_header: Option<bool>,
-
-    /// If set, the lobby will be skipped and the widget will join the
-    /// call on the `io.element.join` action.
-    ///
-    /// Default: `false`
-    pub preload: Option<bool>,
-
-    /// The font scale which will be used inside element call.
-    ///
-    /// Default: `1`
-    pub font_scale: Option<f64>,
-
-    /// Whether element call should prompt the user to open in the browser or
-    /// the app.
-    ///
-    /// Default: `false`
-    pub app_prompt: Option<bool>,
-
-    /// Make it not possible to get to the calls list in the webview.
-    ///
-    /// Default: `true`
-    pub confine_to_room: Option<bool>,
-
-    /// The font to use, to adapt to the system font.
-    pub font: Option<String>,
-
-    /// The encryption system to use.
-    ///
-    /// Use `EncryptionSystem::Unencrypted` to disable encryption.
-    pub encryption: EncryptionSystem,
-
-    /// The intent of showing the call.
-    /// If the user wants to start a call or join an existing one.
-    /// Controls if the lobby is skipped or not.
-    pub intent: Option<Intent>,
-
-    /// Do not show the screenshare button.
-    pub hide_screensharing: bool,
-
-    /// Can be used to pass a PostHog id to element call.
-    pub posthog_user_id: Option<String>,
-    /// The host of the posthog api.
-    /// Supported since Element Call v0.9.0. Only used by the embedded package.
-    pub posthog_api_host: Option<String>,
-    /// The key for the posthog api.
-    /// Supported since Element Call v0.9.0. Only used by the embedded package.
-    pub posthog_api_key: Option<String>,
-
-    /// The url to use for submitting rageshakes.
-    /// Supported since Element Call v0.9.0. Only used by the embedded package.
-    pub rageshake_submit_url: Option<String>,
-
-    /// Sentry [DSN](https://docs.sentry.io/concepts/key-terms/dsn-explainer/)
-    /// Supported since Element Call v0.9.0. Only used by the embedded package.
-    pub sentry_dsn: Option<String>,
-    /// Sentry [environment](https://docs.sentry.io/concepts/key-terms/key-terms/)
-    /// Supported since Element Call v0.9.0. Only used by the embedded package.
-    pub sentry_environment: Option<String>,
-}
-
-impl From<VirtualElementCallWidgetOptions> for matrix_sdk::widget::VirtualElementCallWidgetOptions {
-    fn from(value: VirtualElementCallWidgetOptions) -> Self {
-        Self {
-            element_call_url: value.element_call_url,
-            widget_id: value.widget_id,
-            parent_url: value.parent_url,
-            hide_header: value.hide_header,
-            preload: value.preload,
-            font_scale: value.font_scale,
-            app_prompt: value.app_prompt,
-            confine_to_room: value.confine_to_room,
-            font: value.font,
-            posthog_user_id: value.posthog_user_id,
-            encryption: value.encryption.into(),
-            intent: value.intent.map(Into::into),
-            hide_screensharing: value.hide_screensharing,
-            posthog_api_host: value.posthog_api_host,
-            posthog_api_key: value.posthog_api_key,
-            rageshake_submit_url: value.rageshake_submit_url,
-            sentry_dsn: value.sentry_dsn,
-            sentry_environment: value.sentry_environment,
-        }
-    }
-}
-
 /// `WidgetSettings` are usually created from a state event.
 /// (currently unimplemented)
 ///
@@ -290,9 +125,9 @@ impl From<VirtualElementCallWidgetOptions> for matrix_sdk::widget::VirtualElemen
 ///   call widget.
 #[matrix_sdk_ffi_macros::export]
 pub fn new_virtual_element_call_widget(
-    props: VirtualElementCallWidgetOptions,
+    props: matrix_sdk::widget::VirtualElementCallWidgetOptions,
 ) -> Result<WidgetSettings, ParseError> {
-    Ok(matrix_sdk::widget::WidgetSettings::new_virtual_element_call_widget(props.into())
+    Ok(matrix_sdk::widget::WidgetSettings::new_virtual_element_call_widget(props)
         .map(|w| w.into())?)
 }
 
@@ -321,7 +156,9 @@ pub fn get_element_call_required_permissions(
             event_type: "org.matrix.rageshake_request".to_owned(),
         },
         // To read and send encryption keys
+        WidgetEventFilter::ToDevice { event_type: "io.element.call.encryption_keys".to_owned() },
         // TODO change this to the appropriate to-device version once ready
+        // remove this once all matrixRTC call apps supports to-device encryption.
         WidgetEventFilter::MessageLikeWithType {
             event_type: "io.element.call.encryption_keys".to_owned(),
         },
@@ -344,6 +181,8 @@ pub fn get_element_call_required_permissions(
         read: vec![
             // To compute the current state of the matrixRTC session.
             WidgetEventFilter::StateWithType { event_type: StateEventType::CallMember.to_string() },
+            // To display the name of the room.
+            WidgetEventFilter::StateWithType { event_type: StateEventType::RoomName.to_string() },
             // To detect leaving/kicked room members during a call.
             WidgetEventFilter::StateWithType { event_type: StateEventType::RoomMember.to_string() },
             // To decide whether to encrypt the call streams based on the room encryption setting.
@@ -373,7 +212,7 @@ pub fn get_element_call_required_permissions(
                 state_key: format!("{own_user_id}_{own_device_id}"),
             },
             // The same as above but with an underscore.
-            // To work around the issue that state events starting with `@` have to be matrix id's
+            // To work around the issue that state events starting with `@` have to be Matrix id's
             // but we use mxId+deviceId.
             WidgetEventFilter::StateWithTypeAndStateKey {
                 event_type: StateEventType::CallMember.to_string(),
@@ -442,7 +281,7 @@ pub struct WidgetCapabilities {
     /// Types of the messages that a widget wants to be able to send.
     pub send: Vec<WidgetEventFilter>,
     /// If this capability is requested by the widget, it can not operate
-    /// separately from the matrix client.
+    /// separately from the Matrix client.
     ///
     /// This means clients should not offer to open the widget in a separate
     /// browser/tab/webview that is not connected to the postmessage widget-api.
@@ -488,9 +327,11 @@ pub enum WidgetEventFilter {
     StateWithType { event_type: String },
     /// Matches state events with the given `type` and `state_key`.
     StateWithTypeAndStateKey { event_type: String, state_key: String },
+    /// Matches to-device events with the given `event_type`.
+    ToDevice { event_type: String },
 }
 
-impl From<WidgetEventFilter> for matrix_sdk::widget::EventFilter {
+impl From<WidgetEventFilter> for matrix_sdk::widget::Filter {
     fn from(value: WidgetEventFilter) -> Self {
         match value {
             WidgetEventFilter::MessageLikeWithType { event_type } => {
@@ -505,13 +346,16 @@ impl From<WidgetEventFilter> for matrix_sdk::widget::EventFilter {
             WidgetEventFilter::StateWithTypeAndStateKey { event_type, state_key } => {
                 Self::State(StateEventFilter::WithTypeAndStateKey(event_type.into(), state_key))
             }
+            WidgetEventFilter::ToDevice { event_type } => {
+                Self::ToDevice(ToDeviceEventFilter { event_type: event_type.into() })
+            }
         }
     }
 }
 
-impl From<matrix_sdk::widget::EventFilter> for WidgetEventFilter {
-    fn from(value: matrix_sdk::widget::EventFilter) -> Self {
-        use matrix_sdk::widget::EventFilter as F;
+impl From<matrix_sdk::widget::Filter> for WidgetEventFilter {
+    fn from(value: matrix_sdk::widget::Filter) -> Self {
+        use matrix_sdk::widget::Filter as F;
 
         match value {
             F::MessageLike(MessageLikeEventFilter::WithType(event_type)) => {
@@ -526,18 +370,20 @@ impl From<matrix_sdk::widget::EventFilter> for WidgetEventFilter {
             F::State(StateEventFilter::WithTypeAndStateKey(event_type, state_key)) => {
                 Self::StateWithTypeAndStateKey { event_type: event_type.to_string(), state_key }
             }
+            F::ToDevice(ToDeviceEventFilter { event_type }) => {
+                Self::ToDevice { event_type: event_type.to_string() }
+            }
         }
     }
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait WidgetCapabilitiesProvider: Send + Sync {
+pub trait WidgetCapabilitiesProvider: SendOutsideWasm + SyncOutsideWasm {
     fn acquire_capabilities(&self, capabilities: WidgetCapabilities) -> WidgetCapabilities;
 }
 
 struct CapabilitiesProviderWrap(Arc<dyn WidgetCapabilitiesProvider>);
 
-#[async_trait]
 impl matrix_sdk::widget::CapabilitiesProvider for CapabilitiesProviderWrap {
     async fn acquire_capabilities(
         &self,
@@ -631,8 +477,7 @@ mod tests {
         let cap_assert = |capability: &str| {
             assert!(
                 permission_array.contains(&capability.to_owned()),
-                "The \"{}\" capability was missing from the element call capability list.",
-                capability
+                "The \"{capability}\" capability was missing from the element call capability list."
             );
         };
 
@@ -640,14 +485,21 @@ mod tests {
         cap_assert("org.matrix.msc4157.update_delayed_event");
         cap_assert("org.matrix.msc4157.send.delayed_event");
         cap_assert("org.matrix.msc2762.receive.state_event:org.matrix.msc3401.call.member");
+        cap_assert("org.matrix.msc2762.receive.state_event:m.room.name");
         cap_assert("org.matrix.msc2762.receive.state_event:m.room.member");
         cap_assert("org.matrix.msc2762.receive.state_event:m.room.encryption");
         cap_assert("org.matrix.msc2762.receive.event:org.matrix.rageshake_request");
         cap_assert("org.matrix.msc2762.receive.event:io.element.call.encryption_keys");
         cap_assert("org.matrix.msc2762.receive.state_event:m.room.create");
-        cap_assert("org.matrix.msc2762.send.state_event:org.matrix.msc3401.call.member#@my_user:my_domain.org");
-        cap_assert("org.matrix.msc2762.send.state_event:org.matrix.msc3401.call.member#@my_user:my_domain.org_ABCDEFGHI");
-        cap_assert("org.matrix.msc2762.send.state_event:org.matrix.msc3401.call.member#_@my_user:my_domain.org_ABCDEFGHI");
+        cap_assert(
+            "org.matrix.msc2762.send.state_event:org.matrix.msc3401.call.member#@my_user:my_domain.org",
+        );
+        cap_assert(
+            "org.matrix.msc2762.send.state_event:org.matrix.msc3401.call.member#@my_user:my_domain.org_ABCDEFGHI",
+        );
+        cap_assert(
+            "org.matrix.msc2762.send.state_event:org.matrix.msc3401.call.member#_@my_user:my_domain.org_ABCDEFGHI",
+        );
         cap_assert("org.matrix.msc2762.send.event:org.matrix.rageshake_request");
         cap_assert("org.matrix.msc2762.send.event:io.element.call.encryption_keys");
     }

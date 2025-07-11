@@ -22,10 +22,10 @@ use web_sys::{DomException, IdbTransactionMode};
 
 use crate::{
     crypto_store::{
-        indexeddb_serializer::IndexeddbSerializer,
         migrations::{do_schema_upgrade, old_keys, v7, MigrationDb},
         Result,
     },
+    serializer::IndexeddbSerializer,
     IndexeddbCryptoStoreError,
 };
 
@@ -101,7 +101,10 @@ pub(crate) async fn data_migrate(name: &str, serializer: &IndexeddbSerializer) -
             }
 
             if !cursor.continue_cursor()?.await? {
-                debug!("Migrated {row_count} sessions: {updated} keys updated and {deleted} obsolete entries deleted.");
+                debug!(
+                    "Migrated {row_count} sessions: {updated} keys updated \
+                     and {deleted} obsolete entries deleted."
+                );
                 break;
             }
         }

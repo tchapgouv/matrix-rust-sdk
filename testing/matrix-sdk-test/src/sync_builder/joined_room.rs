@@ -1,15 +1,16 @@
 use ruma::{
     api::client::sync::sync_events::v3::JoinedRoom,
     events::{
-        AnyRoomAccountDataEvent, AnySyncEphemeralRoomEvent, AnySyncStateEvent, AnySyncTimelineEvent,
+        receipt::ReceiptEventContent, typing::TypingEventContent, AnyRoomAccountDataEvent,
+        AnySyncStateEvent, AnySyncTimelineEvent,
     },
     serde::Raw,
     OwnedRoomId, RoomId,
 };
 use serde_json::{from_value as from_json_value, Value as JsonValue};
 
-use super::{EphemeralTestEvent, RoomAccountDataTestEvent, StateTestEvent};
-use crate::DEFAULT_TEST_ROOM_ID;
+use super::RoomAccountDataTestEvent;
+use crate::{event_factory::EventBuilder, DEFAULT_TEST_ROOM_ID};
 
 pub struct JoinedRoomBuilder {
     pub(super) room_id: OwnedRoomId,
@@ -73,8 +74,8 @@ impl JoinedRoomBuilder {
     }
 
     /// Add an event to the state.
-    pub fn add_state_event(mut self, event: StateTestEvent) -> Self {
-        self.inner.state.events.push(event.into_raw_event());
+    pub fn add_state_event(mut self, event: impl Into<Raw<AnySyncStateEvent>>) -> Self {
+        self.inner.state.events.push(event.into());
         self
     }
 
@@ -87,24 +88,21 @@ impl JoinedRoomBuilder {
         self
     }
 
-    /// Add an ephemeral event.
-    pub fn add_ephemeral_event(mut self, event: EphemeralTestEvent) -> Self {
-        self.inner.ephemeral.events.push(event.into_raw_event());
+    /// Add a single read receipt to the joined room's ephemeral events.
+    pub fn add_receipt(mut self, f: EventBuilder<ReceiptEventContent>) -> Self {
+        self.inner.ephemeral.events.push(f.into_raw());
         self
     }
 
-    /// Add ephemeral events in bulk.
-    pub fn add_ephemeral_bulk<I>(mut self, events: I) -> Self
-    where
-        I: IntoIterator<Item = Raw<AnySyncEphemeralRoomEvent>>,
-    {
-        self.inner.ephemeral.events.extend(events);
+    /// Add a typing notification event for this sync.
+    pub fn add_typing(mut self, f: EventBuilder<TypingEventContent>) -> Self {
+        self.inner.ephemeral.events.push(f.into_raw());
         self
     }
 
     /// Add room account data.
     pub fn add_account_data(mut self, event: RoomAccountDataTestEvent) -> Self {
-        self.inner.account_data.events.push(event.into_raw_event());
+        self.inner.account_data.events.push(event.into());
         self
     }
 

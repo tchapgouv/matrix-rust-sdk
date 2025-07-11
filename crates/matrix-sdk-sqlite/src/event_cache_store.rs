@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A sqlite-based backend for the [`EventCacheStore`].
+//! An SQLite-based backend for the [`EventCacheStore`].
 
 use std::{borrow::Cow, fmt, iter::once, path::Path, sync::Arc};
 
@@ -22,6 +22,7 @@ use matrix_sdk_base::{
     deserialized_responses::TimelineEvent,
     event_cache::{
         store::{
+            compute_filters_string, extract_event_relation,
             media::{
                 EventCacheStoreMedia, IgnoreMediaRetentionPolicy, MediaRetentionPolicy,
                 MediaService,
@@ -31,12 +32,16 @@ use matrix_sdk_base::{
         Event, Gap,
     },
     linked_chunk::{
-        ChunkContent, ChunkIdentifier, ChunkIdentifierGenerator, Position, RawChunk, Update,
+        ChunkContent, ChunkIdentifier, ChunkIdentifierGenerator, ChunkMetadata, LinkedChunkId,
+        Position, RawChunk, Update,
     },
     media::{MediaRequestParameters, UniqueKey},
 };
 use matrix_sdk_store_encryption::StoreCipher;
-use ruma::{time::SystemTime, EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, RoomId};
+use ruma::{
+    events::relation::RelationType, time::SystemTime, EventId, MilliSecondsSinceUnixEpoch, MxcUri,
+    OwnedEventId, RoomId,
+};
 use rusqlite::{params_from_iter, OptionalExtension, ToSql, Transaction, TransactionBehavior};
 use tokio::fs;
 use tracing::{debug, error, trace};
@@ -47,7 +52,7 @@ use crate::{
         repeat_vars, time_to_timestamp, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
         SqliteKeyValueStoreConnExt, SqliteTransactionExt,
     },
-    OpenStoreError,
+    OpenStoreError, SqliteStoreConfig,
 };
 
 mod keys {
@@ -60,12 +65,15 @@ mod keys {
     pub const MEDIA: &str = "media";
 }
 
+/// The database name.
+const DATABASE_NAME: &str = "matrix-sdk-event-cache.sqlite3";
+
 /// Identifier of the latest database version.
 ///
 /// This is used to figure whether the SQLite database requires a migration.
 /// Every new SQL migration should imply a bump of this number, and changes in
 /// the [`run_migrations`] function.
-const DATABASE_VERSION: u8 = 6;
+const DATABASE_VERSION: u8 = 8;
 
 /// The string used to identify a chunk of type events, in the `type` field in
 /// the database.
@@ -74,7 +82,7 @@ const CHUNK_TYPE_EVENT_TYPE_STRING: &str = "E";
 /// database.
 const CHUNK_TYPE_GAP_TYPE_STRING: &str = "G";
 
-/// A SQLite-based event cache store.
+/// An SQLite-based event cache store.
 #[derive(Clone)]
 pub struct SqliteEventCacheStore {
     store_cipher: Option<Arc<StoreCipher>>,
@@ -96,23 +104,36 @@ impl SqliteEventCacheStore {
         path: impl AsRef<Path>,
         passphrase: Option<&str>,
     ) -> Result<Self, OpenStoreError> {
-        let pool = create_pool(path.as_ref()).await?;
+        Self::open_with_config(SqliteStoreConfig::new(path).passphrase(passphrase)).await
+    }
 
-        Self::open_with_pool(pool, passphrase).await
+    /// Open the SQLite-based event cache store with the config open config.
+    pub async fn open_with_config(config: SqliteStoreConfig) -> Result<Self, OpenStoreError> {
+        let SqliteStoreConfig { path, passphrase, pool_config, runtime_config } = config;
+
+        fs::create_dir_all(&path).await.map_err(OpenStoreError::CreateDir)?;
+
+        let mut config = deadpool_sqlite::Config::new(path.join(DATABASE_NAME));
+        config.pool = Some(pool_config);
+
+        let pool = config.create_pool(Runtime::Tokio1)?;
+
+        let this = Self::open_with_pool(pool, passphrase.as_deref()).await?;
+        this.pool.get().await?.apply_runtime_config(runtime_config).await?;
+
+        Ok(this)
     }
 
     /// Open an SQLite-based event cache store using the given SQLite database
     /// pool. The given passphrase will be used to encrypt private data.
-    pub async fn open_with_pool(
+    async fn open_with_pool(
         pool: SqlitePool,
         passphrase: Option<&str>,
     ) -> Result<Self, OpenStoreError> {
         let conn = pool.get().await?;
-        conn.set_journal_size_limit().await?;
 
         let version = conn.db_version().await?;
         run_migrations(&conn, version).await?;
-        conn.optimize().await?;
 
         let store_cipher = match passphrase {
             Some(p) => Some(Arc::new(conn.get_or_create_store_cipher(p).await?)),
@@ -158,10 +179,10 @@ impl SqliteEventCacheStore {
     async fn acquire(&self) -> Result<SqliteAsyncConn> {
         let connection = self.pool.get().await?;
 
-        // Per https://www.sqlite.org/foreignkeys.html#fk_enable, foreign key support must be
-        // enabled on a per-connection basis. Execute it every time we try to get a
-        // connection, since we can't guarantee a previous connection did enable
-        // it before.
+        // Per https://www.sqlite.org/foreignkeys.html#fk_enable, foreign key
+        // support must be enabled on a per-connection basis. Execute it every
+        // time we try to get a connection, since we can't guarantee a previous
+        // connection did enable it before.
         connection.execute_batch("PRAGMA foreign_keys = ON;").await?;
 
         Ok(connection)
@@ -177,13 +198,36 @@ impl SqliteEventCacheStore {
             row.get::<_, String>(3)?,
         ))
     }
+
+    fn encode_event(&self, event: &TimelineEvent) -> Result<EncodedEvent> {
+        let serialized = serde_json::to_vec(event)?;
+
+        // Extract the relationship info here.
+        let raw_event = event.raw();
+        let (relates_to, rel_type) = extract_event_relation(raw_event).unzip();
+
+        // The content may be encrypted.
+        let content = self.encode_value(serialized)?;
+
+        Ok(EncodedEvent {
+            content,
+            rel_type,
+            relates_to: relates_to.map(|relates_to| relates_to.to_string()),
+        })
+    }
+}
+
+struct EncodedEvent {
+    content: Vec<u8>,
+    rel_type: Option<String>,
+    relates_to: Option<String>,
 }
 
 trait TransactionExtForLinkedChunks {
     fn rebuild_chunk(
         &self,
         store: &SqliteEventCacheStore,
-        room_id: &Key,
+        linked_chunk_id: &Key,
         previous: Option<u64>,
         index: u64,
         next: Option<u64>,
@@ -193,14 +237,14 @@ trait TransactionExtForLinkedChunks {
     fn load_gap_content(
         &self,
         store: &SqliteEventCacheStore,
-        room_id: &Key,
+        linked_chunk_id: &Key,
         chunk_id: ChunkIdentifier,
     ) -> Result<Gap>;
 
     fn load_events_content(
         &self,
         store: &SqliteEventCacheStore,
-        room_id: &Key,
+        linked_chunk_id: &Key,
         chunk_id: ChunkIdentifier,
     ) -> Result<Vec<Event>>;
 }
@@ -209,7 +253,7 @@ impl TransactionExtForLinkedChunks for Transaction<'_> {
     fn rebuild_chunk(
         &self,
         store: &SqliteEventCacheStore,
-        room_id: &Key,
+        linked_chunk_id: &Key,
         previous: Option<u64>,
         id: u64,
         next: Option<u64>,
@@ -222,13 +266,13 @@ impl TransactionExtForLinkedChunks for Transaction<'_> {
         match chunk_type {
             CHUNK_TYPE_GAP_TYPE_STRING => {
                 // It's a gap!
-                let gap = self.load_gap_content(store, room_id, id)?;
+                let gap = self.load_gap_content(store, linked_chunk_id, id)?;
                 Ok(RawChunk { content: ChunkContent::Gap(gap), previous, identifier: id, next })
             }
 
             CHUNK_TYPE_EVENT_TYPE_STRING => {
                 // It's events!
-                let events = self.load_events_content(store, room_id, id)?;
+                let events = self.load_events_content(store, linked_chunk_id, id)?;
                 Ok(RawChunk {
                     content: ChunkContent::Items(events),
                     previous,
@@ -249,14 +293,14 @@ impl TransactionExtForLinkedChunks for Transaction<'_> {
     fn load_gap_content(
         &self,
         store: &SqliteEventCacheStore,
-        room_id: &Key,
+        linked_chunk_id: &Key,
         chunk_id: ChunkIdentifier,
     ) -> Result<Gap> {
         // There's at most one row for it in the database, so a call to `query_row` is
         // sufficient.
         let encoded_prev_token: Vec<u8> = self.query_row(
-            "SELECT prev_token FROM gaps WHERE chunk_id = ? AND room_id = ?",
-            (chunk_id.index(), &room_id),
+            "SELECT prev_token FROM gap_chunks WHERE chunk_id = ? AND linked_chunk_id = ?",
+            (chunk_id.index(), &linked_chunk_id),
             |row| row.get(0),
         )?;
         let prev_token_bytes = store.decode_value(&encoded_prev_token)?;
@@ -267,7 +311,7 @@ impl TransactionExtForLinkedChunks for Transaction<'_> {
     fn load_events_content(
         &self,
         store: &SqliteEventCacheStore,
-        room_id: &Key,
+        linked_chunk_id: &Key,
         chunk_id: ChunkIdentifier,
     ) -> Result<Vec<Event>> {
         // Retrieve all the events from the database.
@@ -276,12 +320,13 @@ impl TransactionExtForLinkedChunks for Transaction<'_> {
         for event_data in self
             .prepare(
                 r#"
-                    SELECT content FROM events
-                    WHERE chunk_id = ? AND room_id = ?
-                    ORDER BY position ASC
+                    SELECT events.content
+                    FROM event_chunks ec, events
+                    WHERE events.event_id = ec.event_id AND ec.chunk_id = ? AND ec.linked_chunk_id = ?
+                    ORDER BY ec.position ASC
                 "#,
             )?
-            .query_map((chunk_id.index(), &room_id), |row| row.get::<_, Vec<u8>>(0))?
+            .query_map((chunk_id.index(), &linked_chunk_id), |row| row.get::<_, Vec<u8>>(0))?
         {
             let encoded_content = event_data?;
             let serialized_content = store.decode_value(&encoded_content)?;
@@ -292,12 +337,6 @@ impl TransactionExtForLinkedChunks for Transaction<'_> {
 
         Ok(events)
     }
-}
-
-async fn create_pool(path: &Path) -> Result<SqlitePool, OpenStoreError> {
-    fs::create_dir_all(path).await.map_err(OpenStoreError::CreateDir)?;
-    let cfg = deadpool_sqlite::Config::new(path.join("matrix-sdk-event-cache.sqlite3"));
-    Ok(cfg.create_pool(Runtime::Tokio1)?)
 }
 
 /// Run migrations for the given version of the database.
@@ -368,6 +407,26 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
         .await?;
     }
 
+    if version < 7 {
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!(
+                "../migrations/event_cache_store/007_event_chunks.sql"
+            ))?;
+            txn.set_db_version(7)
+        })
+        .await?;
+    }
+
+    if version < 8 {
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!(
+                "../migrations/event_cache_store/008_linked_chunk_id.sql"
+            ))?;
+            txn.set_db_version(8)
+        })
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -410,13 +469,14 @@ impl EventCacheStore for SqliteEventCacheStore {
 
     async fn handle_linked_chunk_updates(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
         updates: Vec<Update<Event, Gap>>,
     ) -> Result<(), Self::Error> {
         // Use a single transaction throughout this function, so that either all updates
         // work, or none is taken into account.
-        let hashed_room_id = self.encode_key(keys::LINKED_CHUNKS, room_id);
-        let room_id = room_id.to_owned();
+        let hashed_linked_chunk_id =
+            self.encode_key(keys::LINKED_CHUNKS, linked_chunk_id.storage_key());
+        let linked_chunk_id = linked_chunk_id.to_owned();
         let this = self.clone();
 
         with_immediate_transaction(self.acquire().await?, move |txn| {
@@ -428,13 +488,13 @@ impl EventCacheStore for SqliteEventCacheStore {
                         let next = next.as_ref().map(ChunkIdentifier::index);
 
                         trace!(
-                            %room_id,
+                            %linked_chunk_id,
                             "new events chunk (prev={previous:?}, i={new}, next={next:?})",
                         );
 
                         insert_chunk(
                             txn,
-                            &hashed_room_id,
+                            &hashed_linked_chunk_id,
                             previous,
                             new,
                             next,
@@ -451,14 +511,14 @@ impl EventCacheStore for SqliteEventCacheStore {
                         let next = next.as_ref().map(ChunkIdentifier::index);
 
                         trace!(
-                            %room_id,
+                            %linked_chunk_id,
                             "new gap chunk (prev={previous:?}, i={new}, next={next:?})",
                         );
 
                         // Insert the chunk as a gap.
                         insert_chunk(
                             txn,
-                            &hashed_room_id,
+                            &hashed_linked_chunk_id,
                             previous,
                             new,
                             next,
@@ -468,38 +528,38 @@ impl EventCacheStore for SqliteEventCacheStore {
                         // Insert the gap's value.
                         txn.execute(
                             r#"
-                            INSERT INTO gaps(chunk_id, room_id, prev_token)
+                            INSERT INTO gap_chunks(chunk_id, linked_chunk_id, prev_token)
                             VALUES (?, ?, ?)
                         "#,
-                            (new, &hashed_room_id, prev_token),
+                            (new, &hashed_linked_chunk_id, prev_token),
                         )?;
                     }
 
                     Update::RemoveChunk(chunk_identifier) => {
                         let chunk_id = chunk_identifier.index();
 
-                        trace!(%room_id, "removing chunk @ {chunk_id}");
+                        trace!(%linked_chunk_id, "removing chunk @ {chunk_id}");
 
                         // Find chunk to delete.
                         let (previous, next): (Option<usize>, Option<usize>) = txn.query_row(
-                            "SELECT previous, next FROM linked_chunks WHERE id = ? AND room_id = ?",
-                            (chunk_id, &hashed_room_id),
+                            "SELECT previous, next FROM linked_chunks WHERE id = ? AND linked_chunk_id = ?",
+                            (chunk_id, &hashed_linked_chunk_id),
                             |row| Ok((row.get(0)?, row.get(1)?))
                         )?;
 
                         // Replace its previous' next to its own next.
                         if let Some(previous) = previous {
-                            txn.execute("UPDATE linked_chunks SET next = ? WHERE id = ? AND room_id = ?", (next, previous, &hashed_room_id))?;
+                            txn.execute("UPDATE linked_chunks SET next = ? WHERE id = ? AND linked_chunk_id = ?", (next, previous, &hashed_linked_chunk_id))?;
                         }
 
                         // Replace its next' previous to its own previous.
                         if let Some(next) = next {
-                            txn.execute("UPDATE linked_chunks SET previous = ? WHERE id = ? AND room_id = ?", (previous, next, &hashed_room_id))?;
+                            txn.execute("UPDATE linked_chunks SET previous = ? WHERE id = ? AND linked_chunk_id = ?", (previous, next, &hashed_linked_chunk_id))?;
                         }
 
                         // Now delete it, and let cascading delete corresponding entries in the
                         // other data tables.
-                        txn.execute("DELETE FROM linked_chunks WHERE id = ? AND room_id = ?", (chunk_id, &hashed_room_id))?;
+                        txn.execute("DELETE FROM linked_chunks WHERE id = ? AND linked_chunk_id = ?", (chunk_id, &hashed_linked_chunk_id))?;
                     }
 
                     Update::PushItems { at, items } => {
@@ -510,53 +570,70 @@ impl EventCacheStore for SqliteEventCacheStore {
 
                         let chunk_id = at.chunk_identifier().index();
 
-                        trace!(%room_id, "pushing {} items @ {chunk_id}", items.len());
+                        trace!(%linked_chunk_id, "pushing {} items @ {chunk_id}", items.len());
 
-                        let mut statement = txn.prepare(
-                            "INSERT INTO events(chunk_id, room_id, event_id, content, position) VALUES (?, ?, ?, ?, ?)"
+                        let mut chunk_statement = txn.prepare(
+                            "INSERT INTO event_chunks(chunk_id, linked_chunk_id, event_id, position) VALUES (?, ?, ?, ?)"
+                        )?;
+
+                        // Note: we use `OR REPLACE` here, because the event might have been
+                        // already inserted in the database. This is the case when an event is
+                        // deduplicated and moved to another position; or because it was inserted
+                        // outside the context of a linked chunk (e.g. pinned event).
+                        let mut content_statement = txn.prepare(
+                            "INSERT OR REPLACE INTO events(room_id, event_id, content, relates_to, rel_type) VALUES (?, ?, ?, ?, ?)"
                         )?;
 
                         let invalid_event = |event: TimelineEvent| {
                             let Some(event_id) = event.event_id() else {
-                                error!(%room_id, "Trying to push an event with no ID");
+                                error!(%linked_chunk_id, "Trying to push an event with no ID");
                                 return None;
                             };
 
                             Some((event_id.to_string(), event))
                         };
 
+                        let room_id = linked_chunk_id.room_id();
+                        let hashed_room_id = this.encode_key(keys::LINKED_CHUNKS, room_id);
+
                         for (i, (event_id, event)) in items.into_iter().filter_map(invalid_event).enumerate() {
-                            let serialized = serde_json::to_vec(&event)?;
-                            let content = this.encode_value(serialized)?;
-
+                            // Insert the location information into the database.
                             let index = at.index() + i;
+                            chunk_statement.execute((chunk_id, &hashed_linked_chunk_id, &event_id, index))?;
 
-                            statement.execute((chunk_id, &hashed_room_id, event_id, content, index))?;
+                            // Now, insert the event content into the database.
+                            let encoded_event = this.encode_event(&event)?;
+                            content_statement.execute((&hashed_room_id, event_id, encoded_event.content, encoded_event.relates_to, encoded_event.rel_type))?;
                         }
                     }
 
                     Update::ReplaceItem { at, item: event } => {
                         let chunk_id = at.chunk_identifier().index();
+
                         let index = at.index();
 
-                        trace!(%room_id, "replacing item @ {chunk_id}:{index}");
-
-                        let serialized = serde_json::to_vec(&event)?;
-                        let content = this.encode_value(serialized)?;
+                        trace!(%linked_chunk_id, "replacing item @ {chunk_id}:{index}");
 
                         // The event id should be the same, but just in case it changed…
                         let Some(event_id) = event.event_id().map(|event_id| event_id.to_string()) else {
-                            error!(%room_id, "Trying to replace an event with a new one that has no ID");
+                            error!(%linked_chunk_id, "Trying to replace an event with a new one that has no ID");
                             continue;
                         };
 
+                        // Replace the event's content. Really we'd like to update, but in case the
+                        // event id changed, we are a bit lenient here and will allow an insertion
+                        // of the new event.
+                        let encoded_event = this.encode_event(&event)?;
+                        let room_id = linked_chunk_id.room_id();
+                        let hashed_room_id = this.encode_key(keys::LINKED_CHUNKS, room_id);
                         txn.execute(
-                            r#"
-                            UPDATE events
-                            SET content = ?, event_id = ?
-                            WHERE room_id = ? AND chunk_id = ? AND position = ?
-                        "#,
-                            (content, event_id, &hashed_room_id, chunk_id, index,)
+                            "INSERT OR REPLACE INTO events(room_id, event_id, content, relates_to, rel_type) VALUES (?, ?, ?, ?, ?)"
+                        , (&hashed_room_id, &event_id, encoded_event.content, encoded_event.relates_to, encoded_event.rel_type))?;
+
+                        // Replace the event id in the linked chunk, in case it changed.
+                        txn.execute(
+                            r#"UPDATE event_chunks SET event_id = ? WHERE linked_chunk_id = ? AND chunk_id = ? AND position = ?"#,
+                            (event_id, &hashed_linked_chunk_id, chunk_id, index)
                         )?;
                     }
 
@@ -564,40 +641,144 @@ impl EventCacheStore for SqliteEventCacheStore {
                         let chunk_id = at.chunk_identifier().index();
                         let index = at.index();
 
-                        trace!(%room_id, "removing item @ {chunk_id}:{index}");
+                        trace!(%linked_chunk_id, "removing item @ {chunk_id}:{index}");
 
-                        // Remove the entry.
-                        txn.execute("DELETE FROM events WHERE room_id = ? AND chunk_id = ? AND position = ?", (&hashed_room_id, chunk_id, index))?;
+                        // Remove the entry in the chunk table.
+                        txn.execute("DELETE FROM event_chunks WHERE linked_chunk_id = ? AND chunk_id = ? AND position = ?", (&hashed_linked_chunk_id, chunk_id, index))?;
 
-                        // Decrement the index of each item after the one we're going to remove.
+                        // Decrement the index of each item after the one we are
+                        // going to remove.
+                        //
+                        // Imagine we have the following events:
+                        //
+                        // | event_id | linked_chunk_id | chunk_id | position |
+                        // |----------|-----------------|----------|----------|
+                        // | $ev0     | !r0             | 42       | 0        |
+                        // | $ev1     | !r0             | 42       | 1        |
+                        // | $ev2     | !r0             | 42       | 2        |
+                        // | $ev3     | !r0             | 42       | 3        |
+                        // | $ev4     | !r0             | 42       | 4        |
+                        // 
+                        // `$ev2` has been removed, then we end up in this
+                        // state:
+                        //
+                        // | event_id | linked_chunk_id    | chunk_id | position |
+                        // |----------|--------------------|----------|----------|
+                        // | $ev0     | !r0                | 42       | 0        |
+                        // | $ev1     | !r0                | 42       | 1        |
+                        // |          |                    |          |          | <- no more `$ev2`
+                        // | $ev3     | !r0                | 42       | 3        |
+                        // | $ev4     | !r0                | 42       | 4        |
+                        //
+                        // We need to shift the `position` of `$ev3` and `$ev4`
+                        // to `position - 1`, like so:
+                        // 
+                        // | event_id | linked_chunk_id | chunk_id | position |
+                        // |----------|-----------------|----------|----------|
+                        // | $ev0     | !r0             | 42       | 0        |
+                        // | $ev1     | !r0             | 42       | 1        |
+                        // | $ev3     | !r0             | 42       | 2        |
+                        // | $ev4     | !r0             | 42       | 3        |
+                        //
+                        // Usually, it boils down to run the following query:
+                        //
+                        // ```sql
+                        // UPDATE event_chunks
+                        // SET position = position - 1
+                        // WHERE position > 2 AND …
+                        // ```
+                        //
+                        // Okay. But `UPDATE` runs on rows in no particular
+                        // order. It means that it can update `$ev4` before
+                        // `$ev3` for example. What happens in this particular
+                        // case? The `position` of `$ev4` becomes `3`, however
+                        // `$ev3` already has `position = 3`. Because there
+                        // is a `UNIQUE` constraint on `(linked_chunk_id, chunk_id,
+                        // position)`, it will result in a constraint violation.
+                        //
+                        // There is **no way** to control the execution order of
+                        // `UPDATE` in SQLite. To persuade yourself, try:
+                        //
+                        // ```sql
+                        // UPDATE event_chunks
+                        // SET position = position - 1
+                        // FROM (
+                        //     SELECT event_id
+                        //     FROM event_chunks
+                        //     WHERE position > 2 AND …
+                        //     ORDER BY position ASC
+                        // ) as ordered
+                        // WHERE event_chunks.event_id = ordered.event_id
+                        // ```
+                        //
+                        // It will fail the same way.
+                        //
+                        // Thus, we have 2 solutions:
+                        //
+                        // 1. Remove the `UNIQUE` constraint,
+                        // 2. Be creative.
+                        //
+                        // The `UNIQUE` constraint is a safe belt. Normally, we
+                        // have `event_cache::Deduplicator` that is responsible
+                        // to ensure there is no duplicated event. However,
+                        // relying on this is “fragile” in the sense it can
+                        // contain bugs. Relying on the `UNIQUE` constraint from
+                        // SQLite is more robust. It's “braces and belt” as we
+                        // say here.
+                        //
+                        // So. We need to be creative.
+                        //
+                        // Many solutions exist. Amongst the most popular, we
+                        // see _dropping and re-creating the index_, which is
+                        // no-go for us, it's too expensive. I (@hywan) have
+                        // adopted the following one:
+                        // 
+                        // - Do `position = position - 1` but in the negative
+                        //   space, so `position = -(position - 1)`. A position
+                        //   cannot be negative; we are sure it is unique!
+                        // - Once all candidate rows are updated, do `position =
+                        //   -position` to move back to the positive space.
+                        //
+                        // 'told you it's gonna be creative.
+                        //
+                        // This solution is a hack, **but** it is a small
+                        // number of operations, and we can keep the `UNIQUE`
+                        // constraint in place.
                         txn.execute(
                             r#"
-                                UPDATE events
-                                SET position = position - 1
-                                WHERE room_id = ? AND chunk_id = ? AND position > ?
+                                UPDATE event_chunks
+                                SET position = -(position - 1)
+                                WHERE linked_chunk_id = ? AND chunk_id = ? AND position > ?
                             "#,
-                            (&hashed_room_id, chunk_id, index)
+                            (&hashed_linked_chunk_id, chunk_id, index)
                         )?;
-
+                        txn.execute(
+                            r#"
+                                UPDATE event_chunks
+                                SET position = -position
+                                WHERE position < 0 AND linked_chunk_id = ? AND chunk_id = ?
+                            "#,
+                            (&hashed_linked_chunk_id, chunk_id)
+                        )?;
                     }
 
                     Update::DetachLastItems { at } => {
                         let chunk_id = at.chunk_identifier().index();
                         let index = at.index();
 
-                        trace!(%room_id, "truncating items >= {chunk_id}:{index}");
+                        trace!(%linked_chunk_id, "truncating items >= {chunk_id}:{index}");
 
                         // Remove these entries.
-                        txn.execute("DELETE FROM events WHERE room_id = ? AND chunk_id = ? AND position >= ?", (&hashed_room_id, chunk_id, index))?;
+                        txn.execute("DELETE FROM event_chunks WHERE linked_chunk_id = ? AND chunk_id = ? AND position >= ?", (&hashed_linked_chunk_id, chunk_id, index))?;
                     }
 
                     Update::Clear => {
-                        trace!(%room_id, "clearing items");
+                        trace!(%linked_chunk_id, "clearing items");
 
                         // Remove chunks, and let cascading do its job.
                         txn.execute(
-                            "DELETE FROM linked_chunks WHERE room_id = ?",
-                            (&hashed_room_id,),
+                            "DELETE FROM linked_chunks WHERE linked_chunk_id = ?",
+                            (&hashed_linked_chunk_id,),
                         )?;
                     }
 
@@ -616,10 +797,10 @@ impl EventCacheStore for SqliteEventCacheStore {
 
     async fn load_all_chunks(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
     ) -> Result<Vec<RawChunk<Event, Gap>>, Self::Error> {
-        let room_id = room_id.to_owned();
-        let hashed_room_id = self.encode_key(keys::LINKED_CHUNKS, &room_id);
+        let hashed_linked_chunk_id =
+            self.encode_key(keys::LINKED_CHUNKS, linked_chunk_id.storage_key());
 
         let this = self.clone();
 
@@ -632,14 +813,14 @@ impl EventCacheStore for SqliteEventCacheStore {
                 // Use `ORDER BY id` to get a deterministic ordering for testing purposes.
                 for data in txn
                     .prepare(
-                        "SELECT id, previous, next, type FROM linked_chunks WHERE room_id = ? ORDER BY id",
+                        "SELECT id, previous, next, type FROM linked_chunks WHERE linked_chunk_id = ? ORDER BY id",
                     )?
-                    .query_map((&hashed_room_id,), Self::map_row_to_chunk)?
+                    .query_map((&hashed_linked_chunk_id,), Self::map_row_to_chunk)?
                 {
                     let (id, previous, next, chunk_type) = data?;
                     let new = txn.rebuild_chunk(
                         &this,
-                        &hashed_room_id,
+                        &hashed_linked_chunk_id,
                         previous,
                         id,
                         next,
@@ -655,12 +836,72 @@ impl EventCacheStore for SqliteEventCacheStore {
         Ok(result)
     }
 
+    async fn load_all_chunks_metadata(
+        &self,
+        linked_chunk_id: LinkedChunkId<'_>,
+    ) -> Result<Vec<ChunkMetadata>, Self::Error> {
+        let hashed_linked_chunk_id =
+            self.encode_key(keys::LINKED_CHUNKS, linked_chunk_id.storage_key());
+
+        self.acquire()
+            .await?
+            .with_transaction(move |txn| -> Result<_> {
+                // I'm not a DB analyst, so for my own future sanity: this query joins the
+                // linked_chunks and events_chunks tables together, with a few specificities:
+                //
+                // - the `GROUP BY` clause will regroup the joined item lines by chunk.
+                // - the `COUNT(ec.event_id)` counts the number of unique non-NULL lines from
+                //   the events_chunks table, aka the number of events in the chunk.
+                // - using a `LEFT JOIN` makes it so that if there's a chunk that has no events
+                //   (because it's a gap, or an empty events chunk), there will still be a
+                //   result for that chunk, and the count will be `0` (because the joined lines
+                //   would be `NULL`).
+                //
+                // Overall, this query will return what we want:
+                // - for a gap or an empty item chunk: a count of 0,
+                // - otherwise, the number of related lines in `event_chunks` for that chunk,
+                //   i.e. the number of events in that chunk.
+                //
+                // Also, use `ORDER BY id` to get a deterministic ordering for testing purposes.
+
+                txn.prepare(
+                    r#"
+                        SELECT lc.id, lc.previous, lc.next, COUNT(ec.event_id)
+                        FROM linked_chunks as lc
+                        LEFT JOIN event_chunks as ec ON ec.chunk_id = lc.id
+                        WHERE lc.linked_chunk_id = ?
+                        GROUP BY lc.id
+                        ORDER BY lc.id"#,
+                )?
+                .query_map((&hashed_linked_chunk_id,), |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, Option<u64>>(1)?,
+                        row.get::<_, Option<u64>>(2)?,
+                        row.get::<_, usize>(3)?,
+                    ))
+                })?
+                .map(|data| -> Result<_> {
+                    let (id, previous, next, num_items) = data?;
+
+                    Ok(ChunkMetadata {
+                        identifier: ChunkIdentifier::new(id),
+                        previous: previous.map(ChunkIdentifier::new),
+                        next: next.map(ChunkIdentifier::new),
+                        num_items,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+    }
+
     async fn load_last_chunk(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
     ) -> Result<(Option<RawChunk<Event, Gap>>, ChunkIdentifierGenerator), Self::Error> {
-        let room_id = room_id.to_owned();
-        let hashed_room_id = self.encode_key(keys::LINKED_CHUNKS, &room_id);
+        let hashed_linked_chunk_id =
+            self.encode_key(keys::LINKED_CHUNKS, linked_chunk_id.storage_key());
 
         let this = self.clone();
 
@@ -671,10 +912,10 @@ impl EventCacheStore for SqliteEventCacheStore {
                 // Find the latest chunk identifier to generate a `ChunkIdentifierGenerator`, and count the number of chunks.
                 let (chunk_identifier_generator, number_of_chunks) = txn
                     .prepare(
-                        "SELECT MAX(id), COUNT(*) FROM linked_chunks WHERE room_id = ?"
+                        "SELECT MAX(id), COUNT(*) FROM linked_chunks WHERE linked_chunk_id = ?"
                     )?
                     .query_row(
-                        (&hashed_room_id,),
+                        (&hashed_linked_chunk_id,),
                         |row| {
                             Ok((
                                 // Read the `MAX(id)` as an `Option<u64>` instead
@@ -699,10 +940,10 @@ impl EventCacheStore for SqliteEventCacheStore {
                 // Find the last chunk.
                 let Some((chunk_identifier, previous_chunk, chunk_type)) = txn
                     .prepare(
-                        "SELECT id, previous, type FROM linked_chunks WHERE room_id = ? AND next IS NULL"
+                        "SELECT id, previous, type FROM linked_chunks WHERE linked_chunk_id = ? AND next IS NULL"
                     )?
                     .query_row(
-                        (&hashed_room_id,),
+                        (&hashed_linked_chunk_id,),
                         |row| {
                             Ok((
                                 row.get::<_, u64>(0)?,
@@ -735,7 +976,7 @@ impl EventCacheStore for SqliteEventCacheStore {
                 // Build the chunk.
                 let last_chunk = txn.rebuild_chunk(
                     &this,
-                    &hashed_room_id,
+                    &hashed_linked_chunk_id,
                     previous_chunk,
                     chunk_identifier,
                     None,
@@ -749,11 +990,11 @@ impl EventCacheStore for SqliteEventCacheStore {
 
     async fn load_previous_chunk(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
         before_chunk_identifier: ChunkIdentifier,
     ) -> Result<Option<RawChunk<Event, Gap>>, Self::Error> {
-        let room_id = room_id.to_owned();
-        let hashed_room_id = self.encode_key(keys::LINKED_CHUNKS, &room_id);
+        let hashed_linked_chunk_id =
+            self.encode_key(keys::LINKED_CHUNKS, linked_chunk_id.storage_key());
 
         let this = self.clone();
 
@@ -764,10 +1005,10 @@ impl EventCacheStore for SqliteEventCacheStore {
                 // Find the chunk before the chunk identified by `before_chunk_identifier`.
                 let Some((chunk_identifier, previous_chunk, next_chunk, chunk_type)) = txn
                     .prepare(
-                        "SELECT id, previous, next, type FROM linked_chunks WHERE room_id = ? AND next = ?"
+                        "SELECT id, previous, next, type FROM linked_chunks WHERE linked_chunk_id = ? AND next = ?"
                     )?
                     .query_row(
-                        (&hashed_room_id, before_chunk_identifier.index()),
+                        (&hashed_linked_chunk_id, before_chunk_identifier.index()),
                         |row| {
                             Ok((
                                 row.get::<_, u64>(0)?,
@@ -786,7 +1027,7 @@ impl EventCacheStore for SqliteEventCacheStore {
                 // Build the chunk.
                 let last_chunk = txn.rebuild_chunk(
                     &this,
-                    &hashed_room_id,
+                    &hashed_linked_chunk_id,
                     previous_chunk,
                     chunk_identifier,
                     next_chunk,
@@ -798,12 +1039,14 @@ impl EventCacheStore for SqliteEventCacheStore {
             .await
     }
 
-    async fn clear_all_rooms_chunks(&self) -> Result<(), Self::Error> {
+    async fn clear_all_linked_chunks(&self) -> Result<(), Self::Error> {
         self.acquire()
             .await?
             .with_transaction(move |txn| {
                 // Remove all the chunks, and let cascading do its job.
-                txn.execute("DELETE FROM linked_chunks", ())
+                txn.execute("DELETE FROM linked_chunks", ())?;
+                // Also clear all the events' contents.
+                txn.execute("DELETE FROM events", ())
             })
             .await?;
         Ok(())
@@ -811,7 +1054,7 @@ impl EventCacheStore for SqliteEventCacheStore {
 
     async fn filter_duplicated_events(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
         events: Vec<OwnedEventId>,
     ) -> Result<Vec<(OwnedEventId, Position)>, Self::Error> {
         // If there's no events for which we want to check duplicates, we can return
@@ -822,21 +1065,28 @@ impl EventCacheStore for SqliteEventCacheStore {
         }
 
         // Select all events that exist in the store, i.e. the duplicates.
-        let room_id = room_id.to_owned();
-        let hashed_room_id = self.encode_key(keys::LINKED_CHUNKS, &room_id);
+        let hashed_linked_chunk_id =
+            self.encode_key(keys::LINKED_CHUNKS, linked_chunk_id.storage_key());
+        let linked_chunk_id = linked_chunk_id.to_owned();
 
         self.acquire()
             .await?
             .with_transaction(move |txn| -> Result<_> {
                 txn.chunk_large_query_over(events, None, move |txn, events| {
                     let query = format!(
-                        "SELECT event_id, chunk_id, position FROM events WHERE room_id = ? AND event_id IN ({}) ORDER BY chunk_id ASC, position ASC",
+                        r#"
+                            SELECT event_id, chunk_id, position
+                            FROM event_chunks
+                            WHERE linked_chunk_id = ? AND event_id IN ({})
+                            ORDER BY chunk_id ASC, position ASC
+                        "#,
                         repeat_vars(events.len()),
                     );
+
                     let parameters = params_from_iter(
-                        // parameter for `room_id = ?`
+                        // parameter for `linked_chunk_id = ?`
                         once(
-                            hashed_room_id
+                            hashed_linked_chunk_id
                                 .to_sql()
                                 // SAFETY: it cannot fail since `Key::to_sql` never fails
                                 .unwrap(),
@@ -853,26 +1103,26 @@ impl EventCacheStore for SqliteEventCacheStore {
 
                     let mut duplicated_events = Vec::new();
 
-                    for duplicated_event in txn
-                        .prepare(&query)?
-                        .query_map(parameters, |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, u64>(1)?,
-                                row.get::<_, usize>(2)?
-                            ))
-                        })?
-                    {
+                    for duplicated_event in txn.prepare(&query)?.query_map(parameters, |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, usize>(2)?,
+                        ))
+                    })? {
                         let (duplicated_event, chunk_identifier, index) = duplicated_event?;
 
                         let Ok(duplicated_event) = EventId::parse(duplicated_event.clone()) else {
                             // Normally unreachable, but the event ID has been stored even if it is
                             // malformed, let's skip it.
-                            error!(%duplicated_event, %room_id, "Reading an malformed event ID");
+                            error!(%duplicated_event, %linked_chunk_id, "Reading an malformed event ID");
                             continue;
                         };
 
-                        duplicated_events.push((duplicated_event, Position::new(ChunkIdentifier::new(chunk_identifier), index)));
+                        duplicated_events.push((
+                            duplicated_event,
+                            Position::new(ChunkIdentifier::new(chunk_identifier), index),
+                        ));
                     }
 
                     Ok(duplicated_events)
@@ -885,25 +1135,18 @@ impl EventCacheStore for SqliteEventCacheStore {
         &self,
         room_id: &RoomId,
         event_id: &EventId,
-    ) -> Result<Option<(Position, Event)>, Self::Error> {
-        let hashed_room_id = self.encode_key(keys::LINKED_CHUNKS, room_id);
+    ) -> Result<Option<Event>, Self::Error> {
         let event_id = event_id.to_owned();
         let this = self.clone();
+
+        let hashed_room_id = self.encode_key(keys::LINKED_CHUNKS, room_id);
 
         self.acquire()
             .await?
             .with_transaction(move |txn| -> Result<_> {
-                let Some((chunk_identifier, index, event)) = txn
-                    .prepare(
-                        "SELECT chunk_id, position, content FROM events WHERE room_id = ? AND event_id = ?",
-                    )?
-                    .query_row((hashed_room_id, event_id.as_str(),), |row| {
-                        Ok((
-                            row.get::<_, u64>(0)?,
-                            row.get::<_, usize>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                        ))
-                    })
+                let Some(event) = txn
+                    .prepare("SELECT content FROM events WHERE event_id = ? AND room_id = ?")?
+                    .query_row((event_id.as_str(), hashed_room_id), |row| row.get::<_, Vec<u8>>(0))
                     .optional()?
                 else {
                     // Event is not found.
@@ -912,7 +1155,97 @@ impl EventCacheStore for SqliteEventCacheStore {
 
                 let event = serde_json::from_slice(&this.decode_value(&event)?)?;
 
-                Ok(Some((Position::new(ChunkIdentifier::new(chunk_identifier), index), event)))
+                Ok(Some(event))
+            })
+            .await
+    }
+
+    async fn find_event_relations(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+        filters: Option<&[RelationType]>,
+    ) -> Result<Vec<(Event, Option<Position>)>, Self::Error> {
+        let hashed_room_id = self.encode_key(keys::LINKED_CHUNKS, room_id);
+
+        let hashed_linked_chunk_id =
+            self.encode_key(keys::LINKED_CHUNKS, LinkedChunkId::Room(room_id).storage_key());
+
+        let event_id = event_id.to_owned();
+        let filters = filters.map(ToOwned::to_owned);
+        let this = self.clone();
+
+        self.acquire()
+            .await?
+            .with_transaction(move |txn| -> Result<_> {
+                let filter_query = if let Some(filters) = compute_filters_string(filters.as_deref())
+                {
+                    format!(
+                        " AND rel_type IN ({})",
+                        filters
+                            .into_iter()
+                            .map(|f| format!(r#""{f}""#))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                } else {
+                    "".to_owned()
+                };
+
+                let query = format!(
+                    "SELECT events.content, event_chunks.chunk_id, event_chunks.position
+                    FROM events
+                    LEFT JOIN event_chunks ON events.event_id = event_chunks.event_id AND event_chunks.linked_chunk_id = ?
+                    WHERE relates_to = ? AND room_id = ? {filter_query}"
+                );
+
+                // Collect related events.
+                let mut related = Vec::new();
+                for result in
+                    txn.prepare(&query)?.query_map((hashed_linked_chunk_id, event_id.as_str(), hashed_room_id), |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Option<u64>>(1)?,
+                            row.get::<_, Option<usize>>(2)?,
+                        ))
+                    })?
+                {
+                    let (event_blob, chunk_id, index) = result?;
+
+                    let event: Event = serde_json::from_slice(&this.decode_value(&event_blob)?)?;
+
+                    // Only build the position if both the chunk_id and position were present; in
+                    // theory, they should either be present at the same time, or not at all.
+                    let pos = chunk_id.zip(index).map(|(chunk_id, index)| {
+                        Position::new(ChunkIdentifier::new(chunk_id), index)
+                    });
+
+                    related.push((event, pos));
+                }
+
+                Ok(related)
+            })
+            .await
+    }
+
+    async fn save_event(&self, room_id: &RoomId, event: Event) -> Result<(), Self::Error> {
+        let Some(event_id) = event.event_id() else {
+            error!(%room_id, "Trying to save an event with no ID");
+            return Ok(());
+        };
+
+        let hashed_room_id = self.encode_key(keys::LINKED_CHUNKS, room_id);
+        let event_id = event_id.to_string();
+        let encoded_event = self.encode_event(&event)?;
+
+        self.acquire()
+            .await?
+            .with_transaction(move |txn| -> Result<_> {
+                txn.execute(
+                    "INSERT OR REPLACE INTO events(room_id, event_id, content, relates_to, rel_type) VALUES (?, ?, ?, ?, ?)"
+                    , (&hashed_room_id, &event_id, encoded_event.content, encoded_event.relates_to, encoded_event.rel_type))?;
+
+                Ok(())
             })
             .await
     }
@@ -1001,8 +1334,8 @@ impl EventCacheStore for SqliteEventCacheStore {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl EventCacheStoreMedia for SqliteEventCacheStore {
     type Error = Error;
 
@@ -1303,7 +1636,7 @@ async fn with_immediate_transaction<
 
 fn insert_chunk(
     txn: &Transaction<'_>,
-    room_id: &Key,
+    linked_chunk_id: &Key,
     previous: Option<u64>,
     new: u64,
     next: Option<u64>,
@@ -1312,10 +1645,10 @@ fn insert_chunk(
     // First, insert the new chunk.
     txn.execute(
         r#"
-            INSERT INTO linked_chunks(id, room_id, previous, next, type)
+            INSERT INTO linked_chunks(id, linked_chunk_id, previous, next, type)
             VALUES (?, ?, ?, ?, ?)
         "#,
-        (new, room_id, previous, next, type_str),
+        (new, linked_chunk_id, previous, next, type_str),
     )?;
 
     // If this chunk has a previous one, update its `next` field.
@@ -1324,9 +1657,9 @@ fn insert_chunk(
             r#"
                 UPDATE linked_chunks
                 SET next = ?
-                WHERE id = ? AND room_id = ?
+                WHERE id = ? AND linked_chunk_id = ?
             "#,
-            (new, previous, room_id),
+            (new, previous, linked_chunk_id),
         )?;
     }
 
@@ -1336,9 +1669,9 @@ fn insert_chunk(
             r#"
                 UPDATE linked_chunks
                 SET previous = ?
-                WHERE id = ? AND room_id = ?
+                WHERE id = ? AND linked_chunk_id = ?
             "#,
-            (new, next, room_id),
+            (new, next, linked_chunk_id),
         )?;
     }
 
@@ -1348,6 +1681,7 @@ fn insert_chunk(
 #[cfg(test)]
 mod tests {
     use std::{
+        path::PathBuf,
         sync::atomic::{AtomicU32, Ordering::SeqCst},
         time::Duration,
     };
@@ -1356,7 +1690,9 @@ mod tests {
     use matrix_sdk_base::{
         event_cache::{
             store::{
-                integration_tests::{check_test_event, make_test_event},
+                integration_tests::{
+                    check_test_event, make_test_event, make_test_event_with_event_id,
+                },
                 media::IgnoreMediaRetentionPolicy,
                 EventCacheStore, EventCacheStoreError,
             },
@@ -1364,23 +1700,27 @@ mod tests {
         },
         event_cache_store_integration_tests, event_cache_store_integration_tests_time,
         event_cache_store_media_integration_tests,
-        linked_chunk::{ChunkContent, ChunkIdentifier, Position, Update},
+        linked_chunk::{ChunkContent, ChunkIdentifier, LinkedChunkId, Position, Update},
         media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
     };
     use matrix_sdk_test::{async_test, DEFAULT_TEST_ROOM_ID};
     use once_cell::sync::Lazy;
-    use ruma::{events::room::MediaSource, media::Method, mxc_uri, room_id, uint};
+    use ruma::{event_id, events::room::MediaSource, media::Method, mxc_uri, room_id, uint};
     use tempfile::{tempdir, TempDir};
 
     use super::SqliteEventCacheStore;
-    use crate::utils::SqliteAsyncConnExt;
+    use crate::{event_cache_store::keys, utils::SqliteAsyncConnExt, SqliteStoreConfig};
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
     static NUM: AtomicU32 = AtomicU32::new(0);
 
-    async fn get_event_cache_store() -> Result<SqliteEventCacheStore, EventCacheStoreError> {
+    fn new_event_cache_store_workspace() -> PathBuf {
         let name = NUM.fetch_add(1, SeqCst).to_string();
-        let tmpdir_path = TMP_DIR.path().join(name);
+        TMP_DIR.path().join(name)
+    }
+
+    async fn get_event_cache_store() -> Result<SqliteEventCacheStore, EventCacheStoreError> {
+        let tmpdir_path = new_event_cache_store_workspace();
 
         tracing::info!("using event cache store @ {}", tmpdir_path.to_str().unwrap());
 
@@ -1401,6 +1741,16 @@ mod tests {
             })
             .await
             .expect("querying media cache content by last access failed")
+    }
+
+    #[async_test]
+    async fn test_pool_size() {
+        let tmpdir_path = new_event_cache_store_workspace();
+        let store_open_config = SqliteStoreConfig::new(tmpdir_path).pool_max_size(42);
+
+        let store = SqliteEventCacheStore::open_with_config(store_open_config).await.unwrap();
+
+        assert_eq!(store.pool.status().max_size, 42);
     }
 
     #[async_test]
@@ -1475,10 +1825,11 @@ mod tests {
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         let room_id = &DEFAULT_TEST_ROOM_ID;
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
 
         store
             .handle_linked_chunk_updates(
-                room_id,
+                linked_chunk_id,
                 vec![
                     Update::NewItemsChunk {
                         previous: None,
@@ -1501,7 +1852,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut chunks = store.load_all_chunks(room_id).await.unwrap();
+        let mut chunks = store.load_all_chunks(linked_chunk_id).await.unwrap();
 
         assert_eq!(chunks.len(), 3);
 
@@ -1538,10 +1889,11 @@ mod tests {
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         let room_id = &DEFAULT_TEST_ROOM_ID;
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
 
         store
             .handle_linked_chunk_updates(
-                room_id,
+                linked_chunk_id,
                 vec![Update::NewGapChunk {
                     previous: None,
                     new: ChunkIdentifier::new(42),
@@ -1552,7 +1904,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut chunks = store.load_all_chunks(room_id).await.unwrap();
+        let mut chunks = store.load_all_chunks(linked_chunk_id).await.unwrap();
 
         assert_eq!(chunks.len(), 1);
 
@@ -1571,10 +1923,12 @@ mod tests {
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         let room_id = &DEFAULT_TEST_ROOM_ID;
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        let event_id = event_id!("$world");
 
         store
             .handle_linked_chunk_updates(
-                room_id,
+                linked_chunk_id,
                 vec![
                     Update::NewItemsChunk {
                         previous: None,
@@ -1585,19 +1939,19 @@ mod tests {
                         at: Position::new(ChunkIdentifier::new(42), 0),
                         items: vec![
                             make_test_event(room_id, "hello"),
-                            make_test_event(room_id, "world"),
+                            make_test_event_with_event_id(room_id, "world", Some(event_id)),
                         ],
                     },
                     Update::ReplaceItem {
                         at: Position::new(ChunkIdentifier::new(42), 1),
-                        item: make_test_event(room_id, "yolo"),
+                        item: make_test_event_with_event_id(room_id, "yolo", Some(event_id)),
                     },
                 ],
             )
             .await
             .unwrap();
 
-        let mut chunks = store.load_all_chunks(room_id).await.unwrap();
+        let mut chunks = store.load_all_chunks(linked_chunk_id).await.unwrap();
 
         assert_eq!(chunks.len(), 1);
 
@@ -1617,10 +1971,11 @@ mod tests {
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         let room_id = &DEFAULT_TEST_ROOM_ID;
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
 
         store
             .handle_linked_chunk_updates(
-                room_id,
+                linked_chunk_id,
                 vec![
                     Update::NewGapChunk {
                         previous: None,
@@ -1646,7 +2001,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut chunks = store.load_all_chunks(room_id).await.unwrap();
+        let mut chunks = store.load_all_chunks(linked_chunk_id).await.unwrap();
 
         assert_eq!(chunks.len(), 2);
 
@@ -1667,7 +2022,7 @@ mod tests {
             assert_eq!(gap.prev_token, "tartiflette");
         });
 
-        // Check that cascading worked. Yes, sqlite, I doubt you.
+        // Check that cascading worked. Yes, SQLite, I doubt you.
         let gaps = store
             .acquire()
             .await
@@ -1675,7 +2030,7 @@ mod tests {
             .with_transaction(|txn| -> rusqlite::Result<_> {
                 let mut gaps = Vec::new();
                 for data in txn
-                    .prepare("SELECT chunk_id FROM gaps ORDER BY chunk_id")?
+                    .prepare("SELECT chunk_id FROM gap_chunks ORDER BY chunk_id")?
                     .query_map((), |row| row.get::<_, u64>(0))?
                 {
                     gaps.push(data?);
@@ -1693,10 +2048,11 @@ mod tests {
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         let room_id = &DEFAULT_TEST_ROOM_ID;
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
 
         store
             .handle_linked_chunk_updates(
-                room_id,
+                linked_chunk_id,
                 vec![
                     Update::NewItemsChunk {
                         previous: None,
@@ -1719,7 +2075,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut chunks = store.load_all_chunks(room_id).await.unwrap();
+        let mut chunks = store.load_all_chunks(linked_chunk_id).await.unwrap();
 
         assert_eq!(chunks.len(), 1);
 
@@ -1741,10 +2097,11 @@ mod tests {
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         let room_id = *DEFAULT_TEST_ROOM_ID;
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
 
         store
             .handle_linked_chunk_updates(
-                room_id,
+                linked_chunk_id,
                 vec![
                     Update::NewItemsChunk {
                         previous: None,
@@ -1754,17 +2111,23 @@ mod tests {
                     Update::PushItems {
                         at: Position::new(ChunkIdentifier::new(42), 0),
                         items: vec![
-                            make_test_event(room_id, "hello"),
-                            make_test_event(room_id, "world"),
+                            make_test_event(room_id, "one"),
+                            make_test_event(room_id, "two"),
+                            make_test_event(room_id, "three"),
+                            make_test_event(room_id, "four"),
+                            make_test_event(room_id, "five"),
+                            make_test_event(room_id, "six"),
                         ],
                     },
-                    Update::RemoveItem { at: Position::new(ChunkIdentifier::new(42), 0) },
+                    Update::RemoveItem {
+                        at: Position::new(ChunkIdentifier::new(42), 2), /* "three" */
+                    },
                 ],
             )
             .await
             .unwrap();
 
-        let mut chunks = store.load_all_chunks(room_id).await.unwrap();
+        let mut chunks = store.load_all_chunks(linked_chunk_id).await.unwrap();
 
         assert_eq!(chunks.len(), 1);
 
@@ -1773,25 +2136,29 @@ mod tests {
         assert_eq!(c.previous, None);
         assert_eq!(c.next, None);
         assert_matches!(c.content, ChunkContent::Items(events) => {
-            assert_eq!(events.len(), 1);
-            check_test_event(&events[0], "world");
+            assert_eq!(events.len(), 5);
+            check_test_event(&events[0], "one");
+            check_test_event(&events[1], "two");
+            check_test_event(&events[2], "four");
+            check_test_event(&events[3], "five");
+            check_test_event(&events[4], "six");
         });
 
-        // Make sure the position has been updated for the remaining event.
+        // Make sure the position have been updated for the remaining events.
         let num_rows: u64 = store
             .acquire()
             .await
             .unwrap()
             .with_transaction(move |txn| {
                 txn.query_row(
-                    "SELECT COUNT(*) FROM events WHERE chunk_id = 42 AND room_id = ? AND position = 0",
-                    (room_id.as_bytes(),),
+                    "SELECT COUNT(*) FROM event_chunks WHERE chunk_id = 42 AND linked_chunk_id = ? AND position IN (2, 3, 4)",
+                    (store.encode_key(keys::LINKED_CHUNKS, linked_chunk_id.storage_key()),),
                     |row| row.get(0),
                 )
             })
             .await
             .unwrap();
-        assert_eq!(num_rows, 1);
+        assert_eq!(num_rows, 3);
     }
 
     #[async_test]
@@ -1799,10 +2166,11 @@ mod tests {
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         let room_id = *DEFAULT_TEST_ROOM_ID;
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
 
         store
             .handle_linked_chunk_updates(
-                room_id,
+                linked_chunk_id,
                 vec![
                     Update::NewItemsChunk {
                         previous: None,
@@ -1823,7 +2191,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut chunks = store.load_all_chunks(room_id).await.unwrap();
+        let mut chunks = store.load_all_chunks(linked_chunk_id).await.unwrap();
 
         assert_eq!(chunks.len(), 1);
 
@@ -1842,13 +2210,14 @@ mod tests {
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         let room_id = *DEFAULT_TEST_ROOM_ID;
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
 
         // Same updates and checks as test_linked_chunk_push_items, but with extra
         // `StartReattachItems` and `EndReattachItems` updates, which must have no
         // effects.
         store
             .handle_linked_chunk_updates(
-                room_id,
+                linked_chunk_id,
                 vec![
                     Update::NewItemsChunk {
                         previous: None,
@@ -1870,7 +2239,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut chunks = store.load_all_chunks(room_id).await.unwrap();
+        let mut chunks = store.load_all_chunks(linked_chunk_id).await.unwrap();
 
         assert_eq!(chunks.len(), 1);
 
@@ -1891,13 +2260,14 @@ mod tests {
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         let room_id = *DEFAULT_TEST_ROOM_ID;
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
         let event_0 = make_test_event(room_id, "hello");
         let event_1 = make_test_event(room_id, "world");
         let event_2 = make_test_event(room_id, "howdy");
 
         store
             .handle_linked_chunk_updates(
-                room_id,
+                linked_chunk_id,
                 vec![
                     Update::NewItemsChunk {
                         previous: None,
@@ -1920,22 +2290,22 @@ mod tests {
             .await
             .unwrap();
 
-        let chunks = store.load_all_chunks(room_id).await.unwrap();
+        let chunks = store.load_all_chunks(linked_chunk_id).await.unwrap();
         assert!(chunks.is_empty());
 
-        // Check that cascading worked. Yes, sqlite, I doubt you.
+        // Check that cascading worked. Yes, SQLite, I doubt you.
         store
             .acquire()
             .await
             .unwrap()
             .with_transaction(|txn| -> rusqlite::Result<_> {
                 let num_gaps = txn
-                    .prepare("SELECT COUNT(chunk_id) FROM gaps ORDER BY chunk_id")?
+                    .prepare("SELECT COUNT(chunk_id) FROM gap_chunks ORDER BY chunk_id")?
                     .query_row((), |row| row.get::<_, u64>(0))?;
                 assert_eq!(num_gaps, 0);
 
                 let num_events = txn
-                    .prepare("SELECT COUNT(event_id) FROM events ORDER BY chunk_id")?
+                    .prepare("SELECT COUNT(event_id) FROM event_chunks ORDER BY chunk_id")?
                     .query_row((), |row| row.get::<_, u64>(0))?;
                 assert_eq!(num_events, 0);
 
@@ -1947,7 +2317,7 @@ mod tests {
         // It's okay to re-insert a past event.
         store
             .handle_linked_chunk_updates(
-                room_id,
+                linked_chunk_id,
                 vec![
                     Update::NewItemsChunk {
                         previous: None,
@@ -1969,14 +2339,16 @@ mod tests {
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         let room1 = room_id!("!realcheeselovers:raclette.fr");
+        let linked_chunk_id1 = LinkedChunkId::Room(room1);
         let room2 = room_id!("!realcheeselovers:fondue.ch");
+        let linked_chunk_id2 = LinkedChunkId::Room(room2);
 
         // Check that applying updates to one room doesn't affect the others.
         // Use the same chunk identifier in both rooms to battle-test search.
 
         store
             .handle_linked_chunk_updates(
-                room1,
+                linked_chunk_id1,
                 vec![
                     Update::NewItemsChunk {
                         previous: None,
@@ -1997,7 +2369,7 @@ mod tests {
 
         store
             .handle_linked_chunk_updates(
-                room2,
+                linked_chunk_id2,
                 vec![
                     Update::NewItemsChunk {
                         previous: None,
@@ -2014,7 +2386,7 @@ mod tests {
             .unwrap();
 
         // Check chunks from room 1.
-        let mut chunks_room1 = store.load_all_chunks(room1).await.unwrap();
+        let mut chunks_room1 = store.load_all_chunks(linked_chunk_id1).await.unwrap();
         assert_eq!(chunks_room1.len(), 1);
 
         let c = chunks_room1.remove(0);
@@ -2025,7 +2397,7 @@ mod tests {
         });
 
         // Check chunks from room 2.
-        let mut chunks_room2 = store.load_all_chunks(room2).await.unwrap();
+        let mut chunks_room2 = store.load_all_chunks(linked_chunk_id2).await.unwrap();
         assert_eq!(chunks_room2.len(), 1);
 
         let c = chunks_room2.remove(0);
@@ -2040,12 +2412,13 @@ mod tests {
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         let room_id = *DEFAULT_TEST_ROOM_ID;
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
 
         // Trigger a violation of the unique constraint on the (room id, chunk id)
         // couple.
         let err = store
             .handle_linked_chunk_updates(
-                room_id,
+                linked_chunk_id,
                 vec![
                     Update::NewItemsChunk {
                         previous: None,
@@ -2070,7 +2443,7 @@ mod tests {
         // If the updates have been handled transactionally, then no new chunks should
         // have been added; failure of the second update leads to the first one being
         // rolled back.
-        let chunks = store.load_all_chunks(room_id).await.unwrap();
+        let chunks = store.load_all_chunks(linked_chunk_id).await.unwrap();
         assert!(chunks.is_empty());
     }
 
@@ -2079,20 +2452,22 @@ mod tests {
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         let room_id = *DEFAULT_TEST_ROOM_ID;
-        let duplicates = store.filter_duplicated_events(room_id, Vec::new()).await.unwrap();
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
+        let duplicates = store.filter_duplicated_events(linked_chunk_id, Vec::new()).await.unwrap();
         assert!(duplicates.is_empty());
     }
 
     #[async_test]
     async fn test_load_last_chunk() {
         let room_id = room_id!("!r0:matrix.org");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
         let event = |msg: &str| make_test_event(room_id, msg);
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         // Case #1: no last chunk.
         {
             let (last_chunk, chunk_identifier_generator) =
-                store.load_last_chunk(room_id).await.unwrap();
+                store.load_last_chunk(linked_chunk_id).await.unwrap();
 
             assert!(last_chunk.is_none());
             assert_eq!(chunk_identifier_generator.current(), 0);
@@ -2102,7 +2477,7 @@ mod tests {
         {
             store
                 .handle_linked_chunk_updates(
-                    room_id,
+                    linked_chunk_id,
                     vec![
                         Update::NewItemsChunk {
                             previous: None,
@@ -2119,7 +2494,7 @@ mod tests {
                 .unwrap();
 
             let (last_chunk, chunk_identifier_generator) =
-                store.load_last_chunk(room_id).await.unwrap();
+                store.load_last_chunk(linked_chunk_id).await.unwrap();
 
             assert_matches!(last_chunk, Some(last_chunk) => {
                 assert_eq!(last_chunk.identifier, 42);
@@ -2138,7 +2513,7 @@ mod tests {
         {
             store
                 .handle_linked_chunk_updates(
-                    room_id,
+                    linked_chunk_id,
                     vec![
                         Update::NewItemsChunk {
                             previous: Some(ChunkIdentifier::new(42)),
@@ -2155,7 +2530,7 @@ mod tests {
                 .unwrap();
 
             let (last_chunk, chunk_identifier_generator) =
-                store.load_last_chunk(room_id).await.unwrap();
+                store.load_last_chunk(linked_chunk_id).await.unwrap();
 
             assert_matches!(last_chunk, Some(last_chunk) => {
                 assert_eq!(last_chunk.identifier, 7);
@@ -2177,11 +2552,12 @@ mod tests {
     #[async_test]
     async fn test_load_last_chunk_with_a_cycle() {
         let room_id = room_id!("!r0:matrix.org");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         store
             .handle_linked_chunk_updates(
-                room_id,
+                linked_chunk_id,
                 vec![
                     Update::NewItemsChunk {
                         previous: None,
@@ -2201,20 +2577,23 @@ mod tests {
             .await
             .unwrap();
 
-        store.load_last_chunk(room_id).await.unwrap_err();
+        store.load_last_chunk(linked_chunk_id).await.unwrap_err();
     }
 
     #[async_test]
     async fn test_load_previous_chunk() {
         let room_id = room_id!("!r0:matrix.org");
+        let linked_chunk_id = LinkedChunkId::Room(room_id);
         let event = |msg: &str| make_test_event(room_id, msg);
         let store = get_event_cache_store().await.expect("creating cache store failed");
 
         // Case #1: no chunk at all, equivalent to having an nonexistent
         // `before_chunk_identifier`.
         {
-            let previous_chunk =
-                store.load_previous_chunk(room_id, ChunkIdentifier::new(153)).await.unwrap();
+            let previous_chunk = store
+                .load_previous_chunk(linked_chunk_id, ChunkIdentifier::new(153))
+                .await
+                .unwrap();
 
             assert!(previous_chunk.is_none());
         }
@@ -2224,7 +2603,7 @@ mod tests {
         {
             store
                 .handle_linked_chunk_updates(
-                    room_id,
+                    linked_chunk_id,
                     vec![Update::NewItemsChunk {
                         previous: None,
                         new: ChunkIdentifier::new(42),
@@ -2235,7 +2614,7 @@ mod tests {
                 .unwrap();
 
             let previous_chunk =
-                store.load_previous_chunk(room_id, ChunkIdentifier::new(42)).await.unwrap();
+                store.load_previous_chunk(linked_chunk_id, ChunkIdentifier::new(42)).await.unwrap();
 
             assert!(previous_chunk.is_none());
         }
@@ -2244,7 +2623,7 @@ mod tests {
         {
             store
                 .handle_linked_chunk_updates(
-                    room_id,
+                    linked_chunk_id,
                     vec![
                         // new chunk before the one that exists.
                         Update::NewItemsChunk {
@@ -2262,7 +2641,7 @@ mod tests {
                 .unwrap();
 
             let previous_chunk =
-                store.load_previous_chunk(room_id, ChunkIdentifier::new(42)).await.unwrap();
+                store.load_previous_chunk(linked_chunk_id, ChunkIdentifier::new(42)).await.unwrap();
 
             assert_matches!(previous_chunk, Some(previous_chunk) => {
                 assert_eq!(previous_chunk.identifier, 7);

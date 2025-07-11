@@ -28,8 +28,11 @@ use matrix_sdk_crypto::{
         PrivateCrossSigningIdentity, SenderDataType, Session, StaticAccountData,
     },
     store::{
-        BackupKeys, Changes, CryptoStore, DehydratedDeviceKey, PendingChanges, RoomKeyCounts,
-        RoomSettings,
+        types::{
+            BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts, RoomSettings,
+            StoredRoomKeyBundleData,
+        },
+        CryptoStore,
     },
     types::events::room_key_withheld::RoomKeyWithheldEvent,
     Account, DeviceData, GossipRequest, GossippedSecret, SecretInfo, TrackedUser, UserIdentityData,
@@ -51,10 +54,13 @@ use crate::{
         repeat_vars, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
         SqliteKeyValueStoreConnExt,
     },
-    OpenStoreError,
+    OpenStoreError, SqliteStoreConfig,
 };
 
-/// A sqlite based cryptostore.
+/// The database name.
+const DATABASE_NAME: &str = "matrix-sdk-crypto.sqlite3";
+
+/// An SQLite-based crypto store.
 #[derive(Clone)]
 pub struct SqliteCryptoStore {
     store_cipher: Option<Arc<StoreCipher>>,
@@ -73,32 +79,43 @@ impl fmt::Debug for SqliteCryptoStore {
 }
 
 impl SqliteCryptoStore {
-    /// Open the sqlite-based crypto store at the given path using the given
+    /// Open the SQLite-based crypto store at the given path using the given
     /// passphrase to encrypt private data.
     pub async fn open(
         path: impl AsRef<Path>,
         passphrase: Option<&str>,
     ) -> Result<Self, OpenStoreError> {
-        let path = path.as_ref();
-        fs::create_dir_all(path).await.map_err(OpenStoreError::CreateDir)?;
-        let cfg = deadpool_sqlite::Config::new(path.join("matrix-sdk-crypto.sqlite3"));
-        let pool = cfg.create_pool(Runtime::Tokio1)?;
-
-        Self::open_with_pool(pool, passphrase).await
+        Self::open_with_config(SqliteStoreConfig::new(path).passphrase(passphrase)).await
     }
 
-    /// Create a sqlite-based crypto store using the given sqlite database pool.
-    /// The given passphrase will be used to encrypt private data.
-    pub async fn open_with_pool(
+    /// Open the SQLite-based crypto store with the config open config.
+    pub async fn open_with_config(config: SqliteStoreConfig) -> Result<Self, OpenStoreError> {
+        let SqliteStoreConfig { path, passphrase, pool_config, runtime_config } = config;
+
+        fs::create_dir_all(&path).await.map_err(OpenStoreError::CreateDir)?;
+
+        let mut config = deadpool_sqlite::Config::new(path.join(DATABASE_NAME));
+        config.pool = Some(pool_config);
+
+        let pool = config.create_pool(Runtime::Tokio1)?;
+
+        let this = Self::open_with_pool(pool, passphrase.as_deref()).await?;
+        this.pool.get().await?.apply_runtime_config(runtime_config).await?;
+
+        Ok(this)
+    }
+
+    /// Create an SQLite-based crypto store using the given SQLite database
+    /// pool. The given passphrase will be used to encrypt private data.
+    async fn open_with_pool(
         pool: SqlitePool,
         passphrase: Option<&str>,
     ) -> Result<Self, OpenStoreError> {
         let conn = pool.get().await?;
-        conn.set_journal_size_limit().await?;
 
         let version = conn.db_version().await?;
+        debug!("Opened sqlite store with version {}", version);
         run_migrations(&conn, version).await?;
-        conn.optimize().await?;
 
         let store_cipher = match passphrase {
             Some(p) => Some(Arc::new(conn.get_or_create_store_cipher(p).await?)),
@@ -194,7 +211,7 @@ impl SqliteCryptoStore {
     }
 }
 
-const DATABASE_VERSION: u8 = 9;
+const DATABASE_VERSION: u8 = 10;
 
 /// key for the dehydrated device pickle key in the key/value table.
 const DEHYDRATED_DEVICE_PICKLE_KEY: &str = "dehydrated_device_pickle_key";
@@ -290,6 +307,16 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
         .await?;
     }
 
+    if version < 10 {
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!(
+                "../migrations/crypto_store/010_received_room_key_bundles.sql"
+            ))?;
+            txn.set_db_version(10)
+        })
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -337,6 +364,13 @@ trait SqliteConnectionExt {
     fn set_room_settings(&self, room_id: &[u8], data: &[u8]) -> rusqlite::Result<()>;
 
     fn set_secret(&self, request_id: &[u8], data: &[u8]) -> rusqlite::Result<()>;
+
+    fn set_received_room_key_bundle(
+        &self,
+        room_id: &[u8],
+        user_id: &[u8],
+        data: &[u8],
+    ) -> rusqlite::Result<()>;
 }
 
 impl SqliteConnectionExt for rusqlite::Connection {
@@ -463,6 +497,21 @@ impl SqliteConnectionExt for rusqlite::Connection {
             (secret_name, data),
         )?;
 
+        Ok(())
+    }
+
+    fn set_received_room_key_bundle(
+        &self,
+        room_id: &[u8],
+        sender_user_id: &[u8],
+        data: &[u8],
+    ) -> rusqlite::Result<()> {
+        self.execute(
+            "INSERT INTO received_room_key_bundle(room_id, sender_user_id, bundle_data)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT (room_id, sender_user_id) DO UPDATE SET bundle_data = ?3",
+            (room_id, sender_user_id, data),
+        )?;
         Ok(())
     }
 }
@@ -731,6 +780,21 @@ trait SqliteObjectCryptoStoreExt: SqliteAsyncConnExt {
             .await
             .optional()?)
     }
+
+    async fn get_received_room_key_bundle(
+        &self,
+        room_id: Key,
+        sender_user: Key,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .query_row(
+                "SELECT bundle_data FROM received_room_key_bundle WHERE room_id = ? AND sender_user_id = ?",
+                (room_id, sender_user),
+                |row| { row.get(0) },
+            )
+            .await
+            .optional()?)
+    }
 }
 
 #[async_trait]
@@ -932,6 +996,14 @@ impl CryptoStore for SqliteCryptoStore {
                     let secret_name = this.encode_key("secrets", secret.secret_name.to_string());
                     let value = this.serialize_json(&secret)?;
                     txn.set_secret(&secret_name, &value)?;
+                }
+
+                for bundle in changes.received_room_key_bundles {
+                    let room_id =
+                        this.encode_key("received_room_key_bundle", &bundle.bundle_data.room_id);
+                    let user_id = this.encode_key("received_room_key_bundle", &bundle.sender_user);
+                    let value = this.serialize_value(&bundle)?;
+                    txn.set_received_room_key_bundle(&room_id, &user_id, &value)?;
                 }
 
                 Ok::<_, Error>(())
@@ -1324,6 +1396,21 @@ impl CryptoStore for SqliteCryptoStore {
         return Ok(Some(settings));
     }
 
+    async fn get_received_room_key_bundle_data(
+        &self,
+        room_id: &RoomId,
+        user_id: &UserId,
+    ) -> Result<Option<StoredRoomKeyBundleData>> {
+        let room_id = self.encode_key("received_room_key_bundle", room_id);
+        let user_id = self.encode_key("received_room_key_bundle", user_id);
+        self.acquire()
+            .await?
+            .get_received_room_key_bundle(room_id, user_id)
+            .await?
+            .map(|value| self.deserialize_value(&value))
+            .transpose()
+    }
+
     async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let Some(serialized) = self.acquire().await?.get_kv(key).await? else {
             return Ok(None);
@@ -1421,6 +1508,7 @@ mod tests {
     use tokio::fs;
 
     use super::SqliteCryptoStore;
+    use crate::SqliteStoreConfig;
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
 
@@ -1431,8 +1519,8 @@ mod tests {
         database: SqliteCryptoStore,
     }
 
-    async fn get_test_db(data_path: &str, passphrase: Option<&str>) -> TestDb {
-        let db_name = "matrix-sdk-crypto.sqlite3";
+    fn copy_db(data_path: &str) -> TempDir {
+        let db_name = super::DATABASE_NAME;
 
         let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let database_path = manifest_path.join(data_path).join(db_name);
@@ -1443,11 +1531,27 @@ mod tests {
         // Copy the test database to the tempdir so our test runs are idempotent.
         std::fs::copy(&database_path, destination).unwrap();
 
+        tmpdir
+    }
+
+    async fn get_test_db(data_path: &str, passphrase: Option<&str>) -> TestDb {
+        let tmpdir = copy_db(data_path);
+
         let database = SqliteCryptoStore::open(tmpdir.path(), passphrase)
             .await
             .expect("Can't open the test store");
 
         TestDb { _dir: tmpdir, database }
+    }
+
+    #[async_test]
+    async fn test_pool_size() {
+        let store_open_config =
+            SqliteStoreConfig::new(TMP_DIR.path().join("test_pool_size")).pool_max_size(42);
+
+        let store = SqliteCryptoStore::open_with_config(store_open_config).await.unwrap();
+
+        assert_eq!(store.pool.status().max_size, 42);
     }
 
     /// Test that we didn't regress in our storage layer by loading data from a
@@ -1638,7 +1742,7 @@ mod tests {
             let olm_sessions =
                 database.get_sessions(id).await.expect("Should have some olm sessions");
 
-            println!("### Session id: {:?}", id);
+            println!("### Session id: {id:?}");
             assert_eq!(olm_sessions.map_or(0, |v| v.len()), count);
         }
 
@@ -1787,6 +1891,7 @@ mod tests {
         assert_eq!(backup_keys.backup_version.unwrap(), "6");
         assert!(backup_keys.decryption_key.is_some());
     }
+
     async fn get_store(
         name: &str,
         passphrase: Option<&str>,

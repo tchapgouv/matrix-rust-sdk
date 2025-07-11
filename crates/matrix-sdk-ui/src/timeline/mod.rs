@@ -19,18 +19,22 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
 use algorithms::rfind_event_by_item_id;
-use event_item::{extract_room_msg_edit_content, TimelineItemHandle};
+use event_item::TimelineItemHandle;
 use eyeball_im::VectorDiff;
+#[cfg(feature = "unstable-msc4274")]
+use futures::SendGallery;
 use futures_core::Stream;
 use imbl::Vector;
+#[cfg(feature = "unstable-msc4274")]
+use matrix_sdk::attachment::{AttachmentInfo, Thumbnail};
 use matrix_sdk::{
     attachment::AttachmentConfig,
+    deserialized_responses::TimelineEvent,
     event_cache::{EventCacheDropHandles, RoomEventCache},
-    event_handler::EventHandlerHandle,
     executor::JoinHandle,
-    room::{edit::EditedContent, Receipts, Room},
+    room::{edit::EditedContent, reply::Reply, Receipts, Room},
     send_queue::{RoomSendQueueError, SendHandle},
-    Client, Result,
+    Result,
 };
 use mime::Mime;
 use pinned_events_loader::PinnedEventsRoom;
@@ -40,25 +44,26 @@ use ruma::{
         poll::unstable_start::{NewUnstablePollStartEventContent, UnstablePollStartEventContent},
         receipt::{Receipt, ReceiptThread},
         room::{
-            message::{
-                AddMentions, ForwardThread, OriginalRoomMessageEvent,
-                RoomMessageEventContentWithoutRelation,
-            },
+            message::RoomMessageEventContentWithoutRelation,
             pinned_events::RoomPinnedEventsEventContent,
         },
-        AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
-        SyncMessageLikeEvent,
+        AnyMessageLikeEventContent, AnySyncTimelineEvent,
     },
-    serde::Raw,
-    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId, RoomVersionId, UserId,
+    EventId, OwnedEventId, RoomVersionId, UserId,
+};
+#[cfg(feature = "unstable-msc4274")]
+use ruma::{
+    events::{room::message::FormattedBody, Mentions},
+    OwnedTransactionId,
 };
 use subscriber::TimelineWithDropHandle;
 use thiserror::Error;
-use tracing::{error, instrument, trace, warn};
+use tracing::{instrument, trace, warn};
 
 use self::{
     algorithms::rfind_event_by_id, controller::TimelineController, futures::SendAttachment,
 };
+use crate::timeline::controller::CryptoDropHandles;
 
 mod algorithms;
 mod builder;
@@ -73,6 +78,7 @@ mod item;
 mod pagination;
 mod pinned_events_loader;
 mod subscriber;
+mod tasks;
 #[cfg(test)]
 mod tests;
 mod to_device;
@@ -84,56 +90,18 @@ pub use self::{
     controller::default_event_filter,
     error::*,
     event_item::{
-        AnyOtherFullStateEventContent, EncryptedMessage, EventItemOrigin, EventSendState,
-        EventTimelineItem, InReplyToDetails, MemberProfileChange, MembershipChange, Message,
-        OtherState, PollResult, PollState, Profile, ReactionInfo, ReactionStatus,
-        ReactionsByKeyBySender, RepliedToEvent, RoomMembershipChange, RoomPinnedEventsChange,
-        Sticker, TimelineDetails, TimelineEventItemId, TimelineItemContent,
+        AnyOtherFullStateEventContent, EmbeddedEvent, EncryptedMessage, EventItemOrigin,
+        EventSendState, EventTimelineItem, InReplyToDetails, MemberProfileChange, MembershipChange,
+        Message, MsgLikeContent, MsgLikeKind, OtherState, PollResult, PollState, Profile,
+        ReactionInfo, ReactionStatus, ReactionsByKeyBySender, RoomMembershipChange,
+        RoomPinnedEventsChange, Sticker, ThreadSummary, TimelineDetails, TimelineEventItemId,
+        TimelineItemContent,
     },
     event_type_filter::TimelineEventTypeFilter,
     item::{TimelineItem, TimelineItemKind, TimelineUniqueId},
     traits::RoomExt,
     virtual_item::VirtualTimelineItem,
 };
-
-/// Information needed to reply to an event.
-#[derive(Debug, Clone)]
-pub struct RepliedToInfo {
-    /// The event ID of the event to reply to.
-    event_id: OwnedEventId,
-    /// The sender of the event to reply to.
-    sender: OwnedUserId,
-    /// The timestamp of the event to reply to.
-    timestamp: MilliSecondsSinceUnixEpoch,
-    /// The content of the event to reply to.
-    content: ReplyContent,
-}
-
-impl RepliedToInfo {
-    /// The event ID of the event to reply to.
-    pub fn event_id(&self) -> &EventId {
-        &self.event_id
-    }
-
-    /// The sender of the event to reply to.
-    pub fn sender(&self) -> &UserId {
-        &self.sender
-    }
-
-    /// The content of the event to reply to.
-    pub fn content(&self) -> &ReplyContent {
-        &self.content
-    }
-}
-
-/// The content of a reply.
-#[derive(Debug, Clone)]
-pub enum ReplyContent {
-    /// Content of a message event.
-    Message(Message),
-    /// Content of any other kind of event stored as raw JSON.
-    Raw(Raw<AnySyncTimelineEvent>),
-}
 
 /// A high-level view into a regular¹ room's contents.
 ///
@@ -158,10 +126,31 @@ pub struct Timeline {
 pub enum TimelineFocus {
     /// Focus on live events, i.e. receive events from sync and append them in
     /// real-time.
-    Live,
+    Live {
+        /// Whether to hide in-thread replies from the live timeline.
+        ///
+        /// This should be set to true when the client can create
+        /// [`Self::Thread`]-focused timelines from the thread roots themselves.
+        hide_threaded_events: bool,
+    },
 
     /// Focus on a specific event, e.g. after clicking a permalink.
-    Event { target: OwnedEventId, num_context_events: u16 },
+    Event {
+        target: OwnedEventId,
+        num_context_events: u16,
+        /// Whether to hide in-thread replies from the live timeline.
+        ///
+        /// This should be set to true when the client can create
+        /// [`Self::Thread`]-focused timelines from the thread roots themselves.
+        hide_threaded_events: bool,
+    },
+
+    /// Focus on a specific thread
+    Thread {
+        root_event_id: OwnedEventId,
+        /// Number of initial events to load on the first /relations request.
+        num_events: u16,
+    },
 
     /// Only show pinned events.
     PinnedEvents { max_events_to_load: u16, max_concurrent_requests: u16 },
@@ -170,8 +159,9 @@ pub enum TimelineFocus {
 impl TimelineFocus {
     pub(super) fn debug_string(&self) -> String {
         match self {
-            TimelineFocus::Live => "live".to_owned(),
+            TimelineFocus::Live { .. } => "live".to_owned(),
             TimelineFocus::Event { target, .. } => format!("permalink:{target}"),
+            TimelineFocus::Thread { root_event_id, .. } => format!("thread:{root_event_id}"),
             TimelineFocus::PinnedEvents { .. } => "pinned-events".to_owned(),
         }
     }
@@ -186,11 +176,6 @@ pub enum DateDividerMode {
 }
 
 impl Timeline {
-    /// Create a new [`TimelineBuilder`] for the given room.
-    pub fn builder(room: &Room) -> TimelineBuilder {
-        TimelineBuilder::new(room)
-    }
-
     /// Returns the room for this timeline.
     pub fn room(&self) -> &Room {
         self.controller.room()
@@ -255,7 +240,7 @@ impl Timeline {
 
     /// Get the latest of the timeline's event items.
     pub async fn latest_event(&self) -> Option<EventTimelineItem> {
-        if self.controller.is_live().await {
+        if self.controller.is_live() {
             self.controller.items().await.last()?.as_event().cloned()
         } else {
             None
@@ -315,107 +300,18 @@ impl Timeline {
     ///
     /// * `content` - The content of the reply
     ///
-    /// * `replied_to_info` - A wrapper that contains the event ID, sender,
-    ///   content and timestamp of the event to reply to
+    /// * `event_id` - The ID of the event to reply to
     ///
-    /// * `forward_thread` - Usually `Yes`, unless you explicitly want to the
-    ///   reply to show up in the main timeline even though the `reply_item` is
-    ///   part of a thread
-    #[instrument(skip(self, content, replied_to_info))]
+    /// * `enforce_thread` - Whether to enforce a thread relation on the reply
+    #[instrument(skip(self, content))]
     pub async fn send_reply(
         &self,
         content: RoomMessageEventContentWithoutRelation,
-        replied_to_info: RepliedToInfo,
-        forward_thread: ForwardThread,
-    ) -> Result<(), RoomSendQueueError> {
-        let event_id = replied_to_info.event_id;
-
-        // [The specification](https://spec.matrix.org/v1.10/client-server-api/#user-and-room-mentions) says:
-        //
-        // > Users should not add their own Matrix ID to the `m.mentions` property as
-        // > outgoing messages cannot self-notify.
-        //
-        // If the replied to event has been written by the current user, let's toggle to
-        // `AddMentions::No`.
-        let mention_the_sender = if self.room().own_user_id() == replied_to_info.sender {
-            AddMentions::No
-        } else {
-            AddMentions::Yes
-        };
-
-        let content = match replied_to_info.content {
-            ReplyContent::Message(msg) => {
-                let event = OriginalRoomMessageEvent {
-                    event_id: event_id.to_owned(),
-                    sender: replied_to_info.sender,
-                    origin_server_ts: replied_to_info.timestamp,
-                    room_id: self.room().room_id().to_owned(),
-                    content: msg.to_content(),
-                    unsigned: Default::default(),
-                };
-                content.make_reply_to(&event, forward_thread, mention_the_sender)
-            }
-            ReplyContent::Raw(raw_event) => content.make_reply_to_raw(
-                &raw_event,
-                event_id.to_owned(),
-                self.room().room_id(),
-                forward_thread,
-                mention_the_sender,
-            ),
-        };
-
+        reply: Reply,
+    ) -> Result<(), Error> {
+        let content = self.room().make_reply_event(content, reply).await?;
         self.send(content.into()).await?;
-
         Ok(())
-    }
-
-    /// Get the information needed to reply to the event with the given ID.
-    pub async fn replied_to_info_from_event_id(
-        &self,
-        event_id: &EventId,
-    ) -> Result<RepliedToInfo, UnsupportedReplyItem> {
-        if let Some(timeline_item) = self.item_by_event_id(event_id).await {
-            return timeline_item.replied_to_info();
-        }
-
-        let event = self.room().event(event_id, None).await.map_err(|error| {
-            error!("Failed to fetch event with ID {event_id} with error: {error}");
-            UnsupportedReplyItem::MissingEvent
-        })?;
-
-        let raw_sync_event = event.into_raw();
-        let sync_event = raw_sync_event.deserialize().map_err(|error| {
-            error!("Failed to deserialize event with ID {event_id} with error: {error}");
-            UnsupportedReplyItem::FailedToDeserializeEvent
-        })?;
-
-        let reply_content = match &sync_event {
-            AnySyncTimelineEvent::MessageLike(message_like_event) => {
-                if let AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(
-                    original_message,
-                )) = message_like_event
-                {
-                    // We don't have access to reactions here.
-                    let reactions = Default::default();
-                    ReplyContent::Message(Message::from_event(
-                        original_message.content.clone(),
-                        extract_room_msg_edit_content(message_like_event.relations()),
-                        &self.items().await,
-                        reactions,
-                    ))
-                } else {
-                    ReplyContent::Raw(raw_sync_event)
-                }
-            }
-            AnySyncTimelineEvent::State(_) => return Err(UnsupportedReplyItem::StateEvent),
-        };
-
-        Ok(RepliedToInfo {
-            event_id: event_id.to_owned(),
-            sender: sync_event.sender().to_owned(),
-            timestamp: sync_event.origin_server_ts(),
-            content: reply_content,
-        })
     }
 
     /// Edit an event given its [`TimelineEventItemId`] and some new content.
@@ -448,7 +344,7 @@ impl Timeline {
                 // Relations are filled by the editing code itself.
                 let new_content: AnyMessageLikeEventContent = match new_content {
                     EditedContent::RoomMessage(message) => {
-                        if matches!(item.content, TimelineItemContent::Message(_)) {
+                        if item.content.is_message() {
                             AnyMessageLikeEventContent::RoomMessage(message.into())
                         } else {
                             return Err(EditError::ContentMismatch {
@@ -460,7 +356,7 @@ impl Timeline {
                     }
 
                     EditedContent::PollStart { new_content, .. } => {
-                        if matches!(item.content, TimelineItemContent::Poll(_)) {
+                        if item.content.is_poll() {
                             AnyMessageLikeEventContent::UnstablePollStart(
                                 UnstablePollStartEventContent::New(
                                     NewUnstablePollStartEventContent::new(new_content),
@@ -545,6 +441,28 @@ impl Timeline {
         config: AttachmentConfig,
     ) -> SendAttachment<'_> {
         SendAttachment::new(self, source.into(), mime_type, config)
+    }
+
+    /// Sends a media gallery to the room.
+    ///
+    /// If the encryption feature is enabled, this method will transparently
+    /// encrypt the room message if the room is encrypted.
+    ///
+    /// The attachments and their optional thumbnails are stored in the media
+    /// cache and can be retrieved at any time, by calling
+    /// [`Media::get_media_content()`] with the `MediaSource` that can be found
+    /// in the corresponding `TimelineEventItem`, and using a
+    /// `MediaFormat::File`.
+    ///
+    /// # Arguments
+    /// * `gallery` - A configuration object containing details about the
+    ///   gallery like files, thumbnails, etc.
+    ///
+    /// [`Media::get_media_content()`]: matrix_sdk::Media::get_media_content
+    #[cfg(feature = "unstable-msc4274")]
+    #[instrument(skip_all)]
+    pub fn send_gallery(&self, gallery: GalleryConfig) -> SendGallery<'_> {
+        SendGallery::new(self, gallery)
     }
 
     /// Redact an event given its [`TimelineEventItemId`] and an optional
@@ -656,7 +574,10 @@ impl Timeline {
     /// first if the receipt points to an event in this timeline that is more
     /// recent than the current ones, to avoid unnecessary requests.
     ///
-    /// Returns a boolean indicating if it sent the request or not.
+    /// If an unthreaded receipt is sent, this will also unset the unread flag
+    /// of the room if necessary.
+    ///
+    /// Returns a boolean indicating if it sent the receipt or not.
     #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
     pub async fn send_single_receipt(
         &self,
@@ -668,6 +589,12 @@ impl Timeline {
             trace!(
                 "not sending receipt, because we already cover the event with a previous receipt"
             );
+
+            if thread == ReceiptThread::Unthreaded {
+                // Unset the read marker.
+                self.room().set_unread_flag(false).await?;
+            }
+
             return Ok(false);
         }
 
@@ -682,6 +609,8 @@ impl Timeline {
     /// checks first if the receipts point to events in this timeline that
     /// are more recent than the current ones, to avoid unnecessary
     /// requests.
+    ///
+    /// This also unsets the unread marker of the room if necessary.
     #[instrument(skip(self))]
     pub async fn send_multiple_receipts(&self, mut receipts: Receipts) -> Result<()> {
         if let Some(fully_read) = &receipts.fully_read {
@@ -722,7 +651,15 @@ impl Timeline {
             }
         }
 
-        self.room().send_multiple_receipts(receipts).await
+        let room = self.room();
+
+        if !receipts.is_empty() {
+            room.send_multiple_receipts(receipts).await?;
+        } else {
+            room.set_unread_flag(false).await?;
+        }
+
+        Ok(())
     }
 
     /// Mark the room as read by sending an unthreaded read receipt on the
@@ -732,13 +669,19 @@ impl Timeline {
     /// reply also belongs to the unthreaded timeline. No threaded receipt
     /// will be sent here (see also #3123).
     ///
-    /// Returns a boolean indicating if we sent the request or not.
+    /// This also unsets the unread marker of the room if necessary.
+    ///
+    /// Returns a boolean indicating if it sent the receipt or not.
     #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
     pub async fn mark_as_read(&self, receipt_type: ReceiptType) -> Result<bool> {
         if let Some(event_id) = self.controller.latest_event_id().await {
             self.send_single_receipt(receipt_type, ReceiptThread::Unthreaded, event_id).await
         } else {
             trace!("can't mark room as read because there's no latest event id");
+
+            // Unset the read marker.
+            self.room().set_unread_flag(false).await?;
+
             Ok(false)
         }
     }
@@ -794,6 +737,18 @@ impl Timeline {
             Ok(false)
         }
     }
+
+    /// Create a [`EmbeddedEvent`] from an arbitrary event, be it in the
+    /// timeline or not.
+    ///
+    /// Can be `None` if the event cannot be represented as a standalone item,
+    /// because it's an aggregation.
+    pub async fn make_replied_to(
+        &self,
+        event: TimelineEvent,
+    ) -> Result<Option<EmbeddedEvent>, Error> {
+        self.controller.make_replied_to(event).await
+    }
 }
 
 /// Test helpers, likely not very useful in production.
@@ -816,39 +771,29 @@ impl Timeline {
 
 #[derive(Debug)]
 struct TimelineDropHandle {
-    client: Client,
-    event_handler_handles: Vec<EventHandlerHandle>,
     room_update_join_handle: JoinHandle<()>,
     pinned_events_join_handle: Option<JoinHandle<()>>,
-    room_key_from_backups_join_handle: JoinHandle<()>,
-    room_keys_received_join_handle: JoinHandle<()>,
-    room_key_backup_enabled_join_handle: JoinHandle<()>,
     local_echo_listener_handle: JoinHandle<()>,
     _event_cache_drop_handle: Arc<EventCacheDropHandles>,
-    encryption_changes_handle: JoinHandle<()>,
+    _crypto_drop_handles: CryptoDropHandles,
 }
 
 impl Drop for TimelineDropHandle {
     fn drop(&mut self) {
-        for handle in self.event_handler_handles.drain(..) {
-            self.client.remove_event_handler(handle);
-        }
-
         if let Some(handle) = self.pinned_events_join_handle.take() {
             handle.abort()
         };
 
         self.local_echo_listener_handle.abort();
         self.room_update_join_handle.abort();
-        self.room_key_from_backups_join_handle.abort();
-        self.room_key_backup_enabled_join_handle.abort();
-        self.room_keys_received_join_handle.abort();
-        self.encryption_changes_handle.abort();
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub type TimelineEventFilterFn =
     dyn Fn(&AnySyncTimelineEvent, &RoomVersionId) -> bool + Send + Sync;
+#[cfg(target_family = "wasm")]
+pub type TimelineEventFilterFn = dyn Fn(&AnySyncTimelineEvent, &RoomVersionId) -> bool;
 
 /// A source for sending an attachment.
 ///
@@ -896,5 +841,164 @@ where
 {
     fn from(value: P) -> Self {
         Self::File(value.into())
+    }
+}
+
+/// Configuration for sending a gallery.
+///
+/// This duplicates [`matrix_sdk::attachment::GalleryConfig`] but uses an
+/// `AttachmentSource` so that we can delay loading the actual data until we're
+/// inside the SendGallery future. This allows [`Timeline::send_gallery`] to
+/// return early without blocking the caller.
+#[cfg(feature = "unstable-msc4274")]
+#[derive(Debug, Default)]
+pub struct GalleryConfig {
+    pub(crate) txn_id: Option<OwnedTransactionId>,
+    pub(crate) items: Vec<GalleryItemInfo>,
+    pub(crate) caption: Option<String>,
+    pub(crate) formatted_caption: Option<FormattedBody>,
+    pub(crate) mentions: Option<Mentions>,
+    pub(crate) reply: Option<Reply>,
+}
+
+#[cfg(feature = "unstable-msc4274")]
+impl GalleryConfig {
+    /// Create a new empty `GalleryConfig`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the transaction ID to send.
+    ///
+    /// # Arguments
+    ///
+    /// * `txn_id` - A unique ID that can be attached to a `MessageEvent` held
+    ///   in its unsigned field as `transaction_id`. If not given, one is
+    ///   created for the message.
+    #[must_use]
+    pub fn txn_id(mut self, txn_id: OwnedTransactionId) -> Self {
+        self.txn_id = Some(txn_id);
+        self
+    }
+
+    /// Adds a media item to the gallery.
+    ///
+    /// # Arguments
+    ///
+    /// * `item` - Information about the item to be added.
+    #[must_use]
+    pub fn add_item(mut self, item: GalleryItemInfo) -> Self {
+        self.items.push(item);
+        self
+    }
+
+    /// Set the optional caption.
+    ///
+    /// # Arguments
+    ///
+    /// * `caption` - The optional caption.
+    pub fn caption(mut self, caption: Option<String>) -> Self {
+        self.caption = caption;
+        self
+    }
+
+    /// Set the optional formatted caption.
+    ///
+    /// # Arguments
+    ///
+    /// * `formatted_caption` - The optional formatted caption.
+    pub fn formatted_caption(mut self, formatted_caption: Option<FormattedBody>) -> Self {
+        self.formatted_caption = formatted_caption;
+        self
+    }
+
+    /// Set the mentions of the message.
+    ///
+    /// # Arguments
+    ///
+    /// * `mentions` - The mentions of the message.
+    pub fn mentions(mut self, mentions: Option<Mentions>) -> Self {
+        self.mentions = mentions;
+        self
+    }
+
+    /// Set the reply information of the message.
+    ///
+    /// # Arguments
+    ///
+    /// * `reply` - The reply information of the message.
+    pub fn reply(mut self, reply: Option<Reply>) -> Self {
+        self.reply = reply;
+        self
+    }
+
+    /// Returns the number of media items in the gallery.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Checks whether the gallery contains any media items or not.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+#[cfg(feature = "unstable-msc4274")]
+impl TryFrom<GalleryConfig> for matrix_sdk::attachment::GalleryConfig {
+    type Error = Error;
+
+    fn try_from(value: GalleryConfig) -> Result<Self, Self::Error> {
+        let mut config = matrix_sdk::attachment::GalleryConfig::new();
+
+        if let Some(txn_id) = value.txn_id {
+            config = config.txn_id(txn_id);
+        }
+
+        for item in value.items {
+            config = config.add_item(item.try_into()?);
+        }
+
+        config = config.caption(value.caption);
+        config = config.formatted_caption(value.formatted_caption);
+        config = config.mentions(value.mentions);
+        config = config.reply(value.reply);
+
+        Ok(config)
+    }
+}
+
+#[cfg(feature = "unstable-msc4274")]
+#[derive(Debug)]
+/// Metadata for a gallery item
+pub struct GalleryItemInfo {
+    /// The attachment source.
+    pub source: AttachmentSource,
+    /// The mime type.
+    pub content_type: Mime,
+    /// The attachment info.
+    pub attachment_info: AttachmentInfo,
+    /// The caption.
+    pub caption: Option<String>,
+    /// The formatted caption.
+    pub formatted_caption: Option<FormattedBody>,
+    /// The thumbnail.
+    pub thumbnail: Option<Thumbnail>,
+}
+
+#[cfg(feature = "unstable-msc4274")]
+impl TryFrom<GalleryItemInfo> for matrix_sdk::attachment::GalleryItemInfo {
+    type Error = Error;
+
+    fn try_from(value: GalleryItemInfo) -> Result<Self, Self::Error> {
+        let (data, filename) = value.source.try_into_bytes_and_filename()?;
+        Ok(matrix_sdk::attachment::GalleryItemInfo {
+            filename,
+            content_type: value.content_type,
+            data,
+            attachment_info: value.attachment_info,
+            caption: value.caption,
+            formatted_caption: value.formatted_caption,
+            thumbnail: value.thumbnail,
+        })
     }
 }

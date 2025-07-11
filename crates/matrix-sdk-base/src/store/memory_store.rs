@@ -19,6 +19,7 @@ use std::{
 
 use async_trait::async_trait;
 use growable_bloom_filter::GrowableBloom;
+use matrix_sdk_common::ROOM_VERSION_FALLBACK;
 use ruma::{
     canonical_json::{redact, RedactedBecause},
     events::{
@@ -31,15 +32,15 @@ use ruma::{
     serde::Raw,
     time::Instant,
     CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri,
-    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
+    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
 };
 use tracing::{debug, instrument, warn};
 
 use super::{
     send_queue::{ChildTransactionId, QueuedRequest, SentRequestKey},
-    traits::{ComposerDraft, ServerCapabilities},
+    traits::{ComposerDraft, ServerInfo},
     DependentQueuedRequest, DependentQueuedRequestKind, QueuedRequestKind, Result, RoomInfo,
-    StateChanges, StateStore, StoreError,
+    RoomLoadSettings, StateChanges, StateStore, StoreError,
 };
 use crate::{
     deserialized_responses::{DisplayName, RawAnySyncOrStrippedState},
@@ -51,10 +52,10 @@ use crate::{
 #[allow(clippy::type_complexity)]
 struct MemoryStoreInner {
     recently_visited_rooms: HashMap<OwnedUserId, Vec<OwnedRoomId>>,
-    composer_drafts: HashMap<OwnedRoomId, ComposerDraft>,
+    composer_drafts: HashMap<(OwnedRoomId, Option<OwnedEventId>), ComposerDraft>,
     user_avatar_url: HashMap<OwnedUserId, OwnedMxcUri>,
     sync_token: Option<String>,
-    server_capabilities: Option<ServerCapabilities>,
+    server_info: Option<ServerInfo>,
     filters: HashMap<String, String>,
     utd_hook_manager_data: Option<GrowableBloom>,
     account_data: HashMap<GlobalAccountDataEventType, Raw<AnyGlobalAccountDataEvent>>,
@@ -138,8 +139,8 @@ impl MemoryStore {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl StateStore for MemoryStore {
     type Error = StoreError;
 
@@ -149,8 +150,8 @@ impl StateStore for MemoryStore {
             StateStoreDataKey::SyncToken => {
                 inner.sync_token.clone().map(StateStoreDataValue::SyncToken)
             }
-            StateStoreDataKey::ServerCapabilities => {
-                inner.server_capabilities.clone().map(StateStoreDataValue::ServerCapabilities)
+            StateStoreDataKey::ServerInfo => {
+                inner.server_info.clone().map(StateStoreDataValue::ServerInfo)
             }
             StateStoreDataKey::Filter(filter_name) => {
                 inner.filters.get(filter_name).cloned().map(StateStoreDataValue::Filter)
@@ -166,8 +167,9 @@ impl StateStore for MemoryStore {
             StateStoreDataKey::UtdHookManagerData => {
                 inner.utd_hook_manager_data.clone().map(StateStoreDataValue::UtdHookManagerData)
             }
-            StateStoreDataKey::ComposerDraft(room_id) => {
-                inner.composer_drafts.get(room_id).cloned().map(StateStoreDataValue::ComposerDraft)
+            StateStoreDataKey::ComposerDraft(room_id, thread_root) => {
+                let key = (room_id.to_owned(), thread_root.map(ToOwned::to_owned));
+                inner.composer_drafts.get(&key).cloned().map(StateStoreDataValue::ComposerDraft)
             }
             StateStoreDataKey::SeenKnockRequests(room_id) => inner
                 .seen_knock_requests
@@ -215,17 +217,15 @@ impl StateStore for MemoryStore {
                         .expect("Session data not the hook manager data"),
                 );
             }
-            StateStoreDataKey::ComposerDraft(room_id) => {
+            StateStoreDataKey::ComposerDraft(room_id, thread_root) => {
                 inner.composer_drafts.insert(
-                    room_id.to_owned(),
+                    (room_id.to_owned(), thread_root.map(ToOwned::to_owned)),
                     value.into_composer_draft().expect("Session data not a composer draft"),
                 );
             }
-            StateStoreDataKey::ServerCapabilities => {
-                inner.server_capabilities = Some(
-                    value
-                        .into_server_capabilities()
-                        .expect("Session data not containing server capabilities"),
+            StateStoreDataKey::ServerInfo => {
+                inner.server_info = Some(
+                    value.into_server_info().expect("Session data not containing server info"),
                 );
             }
             StateStoreDataKey::SeenKnockRequests(room_id) => {
@@ -245,7 +245,7 @@ impl StateStore for MemoryStore {
         let mut inner = self.inner.write().unwrap();
         match key {
             StateStoreDataKey::SyncToken => inner.sync_token = None,
-            StateStoreDataKey::ServerCapabilities => inner.server_capabilities = None,
+            StateStoreDataKey::ServerInfo => inner.server_info = None,
             StateStoreDataKey::Filter(filter_name) => {
                 inner.filters.remove(filter_name);
             }
@@ -256,8 +256,9 @@ impl StateStore for MemoryStore {
                 inner.recently_visited_rooms.remove(user_id);
             }
             StateStoreDataKey::UtdHookManagerData => inner.utd_hook_manager_data = None,
-            StateStoreDataKey::ComposerDraft(room_id) => {
-                inner.composer_drafts.remove(room_id);
+            StateStoreDataKey::ComposerDraft(room_id, thread_root) => {
+                let key = (room_id.to_owned(), thread_root.map(ToOwned::to_owned));
+                inner.composer_drafts.remove(&key);
             }
             StateStoreDataKey::SeenKnockRequests(room_id) => {
                 inner.seen_knock_requests.remove(room_id);
@@ -439,12 +440,13 @@ impl StateStore for MemoryStore {
         }
 
         let make_room_version = |room_info: &HashMap<OwnedRoomId, RoomInfo>, room_id| {
-            room_info.get(room_id).and_then(|info| info.room_version().cloned()).unwrap_or_else(
-                || {
-                    warn!(?room_id, "Unable to find the room version, assuming version 9");
-                    RoomVersionId::V9
-                },
-            )
+            room_info.get(room_id).map(|info| info.room_version_or_default()).unwrap_or_else(|| {
+                warn!(
+                    ?room_id,
+                    "Unable to find the room version, assuming {ROOM_VERSION_FALLBACK}"
+                );
+                ROOM_VERSION_FALLBACK
+            })
         };
 
         let inner = &mut *inner;
@@ -635,8 +637,18 @@ impl StateStore for MemoryStore {
         Ok(get_user_ids_inner(&inner.members, room_id, memberships))
     }
 
-    async fn get_room_infos(&self) -> Result<Vec<RoomInfo>> {
-        Ok(self.inner.read().unwrap().room_info.values().cloned().collect())
+    async fn get_room_infos(&self, room_load_settings: &RoomLoadSettings) -> Result<Vec<RoomInfo>> {
+        let memory_store_inner = self.inner.read().unwrap();
+        let room_infos = &memory_store_inner.room_info;
+
+        Ok(match room_load_settings {
+            RoomLoadSettings::All => room_infos.values().cloned().collect(),
+
+            RoomLoadSettings::One(room_id) => match room_infos.get(room_id) {
+                Some(room_info) => vec![room_info.clone()],
+                None => vec![],
+            },
+        })
     }
 
     async fn get_users_with_display_name(

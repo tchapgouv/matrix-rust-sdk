@@ -54,6 +54,7 @@
 mod all;
 mod any;
 mod category;
+mod deduplicate_versions;
 mod favourite;
 mod fuzzy_match_room_name;
 mod invite;
@@ -64,18 +65,17 @@ mod normalized_match_room_name;
 mod not;
 mod unread;
 
-#[cfg(test)]
-use std::sync::Arc;
-
 pub use all::new_filter as new_filter_all;
 pub use any::new_filter as new_filter_any;
 pub use category::{new_filter as new_filter_category, RoomCategory};
+pub use deduplicate_versions::new_filter as new_filter_deduplicate_versions;
 pub use favourite::new_filter as new_filter_favourite;
 pub use fuzzy_match_room_name::new_filter as new_filter_fuzzy_match_room_name;
 pub use invite::new_filter as new_filter_invite;
 pub use joined::new_filter as new_filter_joined;
 #[cfg(test)]
-use matrix_sdk::{test_utils::logged_in_client_with_server, Client, SlidingSync};
+use matrix_sdk::Client;
+use matrix_sdk::Room;
 #[cfg(test)]
 use matrix_sdk_test::{JoinedRoomBuilder, SyncResponseBuilder};
 pub use non_left::new_filter as new_filter_non_left;
@@ -92,8 +92,6 @@ use wiremock::{
     Mock, MockServer, ResponseTemplate,
 };
 
-use super::Room;
-
 /// A trait “alias” that represents a _filter_.
 ///
 /// A filter is simply a function that receives a `&Room` and returns a `bool`.
@@ -102,7 +100,10 @@ pub trait Filter: Fn(&Room) -> bool {}
 impl<F> Filter for F where F: Fn(&Room) -> bool {}
 
 /// Type alias for a boxed filter function.
+#[cfg(not(target_family = "wasm"))]
 pub type BoxedFilterFn = Box<dyn Filter + Send + Sync>;
+#[cfg(target_family = "wasm")]
+pub type BoxedFilterFn = Box<dyn Filter>;
 
 /// Normalize a string, i.e. decompose it into NFD (Normalization Form D, i.e. a
 /// canonical decomposition, see http://www.unicode.org/reports/tr15/) and
@@ -116,7 +117,6 @@ pub(super) async fn new_rooms<const N: usize>(
     room_ids: [&RoomId; N],
     client: &Client,
     server: &MockServer,
-    sliding_sync: &Arc<SlidingSync>,
 ) -> [Room; N] {
     let mut response_builder = SyncResponseBuilder::default();
 
@@ -135,15 +135,7 @@ pub(super) async fn new_rooms<const N: usize>(
 
     let _response = client.sync_once(Default::default()).await.unwrap();
 
-    room_ids.map(|room_id| Room::new(client.get_room(room_id).unwrap(), sliding_sync))
-}
-
-#[cfg(test)]
-pub(super) async fn client_and_server_prelude() -> (Client, MockServer, Arc<SlidingSync>) {
-    let (client, server) = logged_in_client_with_server().await;
-    let sliding_sync = Arc::new(client.sliding_sync("foo").unwrap().build().await.unwrap());
-
-    (client, server, sliding_sync)
+    room_ids.map(|room_id| client.get_room(room_id).unwrap())
 }
 
 #[cfg(test)]

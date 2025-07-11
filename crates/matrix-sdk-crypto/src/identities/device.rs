@@ -21,7 +21,7 @@ use std::{
     },
 };
 
-use matrix_sdk_common::{deserialized_responses::WithheldCode, locks::RwLock};
+use matrix_sdk_common::locks::RwLock;
 use ruma::{
     api::client::keys::upload_signatures::v3::Request as SignatureUploadRequest,
     events::{key::verification::VerificationMethod, AnyToDeviceEventContent},
@@ -31,20 +31,22 @@ use ruma::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{instrument, trace, warn};
+use tracing::{instrument, trace};
 use vodozemac::{olm::SessionConfig, Curve25519PublicKey, Ed25519PublicKey};
 
 use super::{atomic_bool_deserializer, atomic_bool_serializer};
 #[cfg(any(test, feature = "testing", doc))]
 use crate::OlmMachine;
 use crate::{
-    error::{EventError, MismatchedIdentityKeysError, OlmError, OlmResult, SignatureError},
+    error::{MismatchedIdentityKeysError, OlmError, OlmResult, SignatureError},
     identities::{OwnUserIdentityData, UserIdentityData},
     olm::{
         InboundGroupSession, OutboundGroupSession, Session, ShareInfo, SignedJsonObject, VerifyJson,
     },
     store::{
-        caches::SequenceNumber, Changes, CryptoStoreWrapper, DeviceChanges, Result as StoreResult,
+        caches::SequenceNumber,
+        types::{Changes, DeviceChanges},
+        CryptoStoreWrapper, Result as StoreResult,
     },
     types::{
         events::{
@@ -60,13 +62,15 @@ use crate::{
 
 pub enum MaybeEncryptedRoomKey {
     Encrypted {
-        used_session: Session,
-        share_info: ShareInfo,
+        // `Box` the session to reduce the size of `Encrypted`.
+        used_session: Box<Session>,
+        // `Box` the session to reduce the size of `Encrypted`.
+        share_info: Box<ShareInfo>,
         message: Raw<AnyToDeviceEventContent>,
     },
-    Withheld {
-        code: WithheldCode,
-    },
+    /// We could not encrypt a message to this device because there is no active
+    /// Olm session.
+    MissingSession,
 }
 
 /// A read-only version of a `Device`.
@@ -695,12 +699,7 @@ impl DeviceData {
                 Ok(None)
             }
         } else {
-            warn!(
-                "Trying to find an Olm session of a device, but the device doesn't have a \
-                Curve25519 key",
-            );
-
-            Err(EventError::MissingSenderKey.into())
+            Ok(None)
         }
     }
 
@@ -808,9 +807,9 @@ impl DeviceData {
         event_type: &str,
         content: impl Serialize,
     ) -> OlmResult<(Session, Raw<ToDeviceEncryptedEventContent>)> {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         let message_id = ulid::Ulid::new().to_string();
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         let message_id = ruma::TransactionId::new().to_string();
 
         tracing::Span::current().record("message_id", &message_id);
@@ -837,18 +836,16 @@ impl DeviceData {
 
         match self.encrypt(store, &event_type, content).await {
             Ok((session, encrypted)) => Ok(MaybeEncryptedRoomKey::Encrypted {
-                share_info: ShareInfo::new_shared(
+                share_info: Box::new(ShareInfo::new_shared(
                     session.sender_key().to_owned(),
                     message_index,
                     self.olm_wedging_index,
-                ),
-                used_session: session,
+                )),
+                used_session: Box::new(session),
                 message: encrypted.cast(),
             }),
 
-            Err(OlmError::MissingSession | OlmError::EventError(EventError::MissingSenderKey)) => {
-                Ok(MaybeEncryptedRoomKey::Withheld { code: WithheldCode::NoOlm })
-            }
+            Err(OlmError::MissingSession) => Ok(MaybeEncryptedRoomKey::MissingSession),
             Err(e) => Err(e),
         }
     }

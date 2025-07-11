@@ -16,9 +16,13 @@ use std::{cmp::Ordering, fmt};
 
 use ruma::{DeviceId, OwnedDeviceId, OwnedUserId, UserId};
 use serde::{de, de::Visitor, Deserialize, Deserializer, Serialize};
+use tracing::error;
 use vodozemac::Ed25519PublicKey;
 
-use crate::types::{serialize_ed25519_key, DeviceKeys};
+use crate::{
+    types::{serialize_ed25519_key, DeviceKeys},
+    Device,
+};
 
 /// Information about the sender of a megolm session where we know the
 /// cross-signing identity of the sender.
@@ -216,6 +220,58 @@ impl SenderData {
         Self::UnknownDevice { legacy_session: true, owner_check_failed: false }
     }
 
+    /// Create a [`SenderData`] representing the current verification state of
+    /// the given device.
+    ///
+    /// Depending on whether the device is correctly cross-signed or not, and
+    /// whether the user has been verified or not, this can return
+    /// [`SenderData::DeviceInfo`], [`SenderData::VerificationViolation`],
+    /// [`SenderData::SenderUnverified`] or [`SenderData::SenderVerified`]
+    pub fn from_device(sender_device: &Device) -> Self {
+        // Is the device cross-signed?
+        // Does the cross-signing key match that used to sign the device?
+        // And is the signature in the device valid?
+        let cross_signed = sender_device.is_cross_signed_by_owner();
+
+        if cross_signed {
+            Self::from_cross_signed_device(sender_device)
+        } else {
+            // We have device keys, but they are not signed by the sender
+            SenderData::device_info(sender_device.as_device_keys().clone())
+        }
+    }
+
+    fn from_cross_signed_device(sender_device: &Device) -> Self {
+        let user_id = sender_device.user_id().to_owned();
+        let device_id = Some(sender_device.device_id().to_owned());
+
+        let device_owner = sender_device.device_owner_identity.as_ref();
+        let master_key = device_owner.and_then(|i| i.master_key().get_first_key());
+
+        match (device_owner, master_key) {
+            (Some(device_owner), Some(master_key)) => {
+                // We have user_id and master_key for the user sending the to-device message.
+                let master_key = Box::new(master_key);
+                let known_sender_data = KnownSenderData { user_id, device_id, master_key };
+                if sender_device.is_cross_signing_trusted() {
+                    Self::SenderVerified(known_sender_data)
+                } else if device_owner.was_previously_verified() {
+                    Self::VerificationViolation(known_sender_data)
+                } else {
+                    Self::SenderUnverified(known_sender_data)
+                }
+            }
+
+            (_, _) => {
+                // Surprisingly, there was no key in the MasterPubkey. We did not expect this:
+                // treat it as if the device was not signed by this master key.
+                //
+                error!("MasterPubkey for user {user_id} does not contain any keys!");
+                Self::device_info(sender_device.as_device_keys().clone())
+            }
+        }
+    }
+
     /// Returns `Greater` if this `SenderData` represents a greater level of
     /// trust than the supplied one, `Equal` if they have the same level, and
     /// `Less` if the supplied one has a greater level of trust.
@@ -250,6 +306,26 @@ impl SenderData {
             Self::VerificationViolation { .. } => SenderDataType::VerificationViolation,
             Self::SenderUnverified { .. } => SenderDataType::SenderUnverified,
             Self::SenderVerified { .. } => SenderDataType::SenderVerified,
+        }
+    }
+
+    /// Return our best guess of the owner of the associated megolm session.
+    ///
+    /// For `SenderData::UnknownDevice`, we don't record any information about
+    /// the owner of the sender, so returns `None`.
+    pub(crate) fn user_id(&self) -> Option<OwnedUserId> {
+        match &self {
+            SenderData::UnknownDevice { .. } => None,
+            SenderData::DeviceInfo { device_keys, .. } => Some(device_keys.user_id.clone()),
+            SenderData::VerificationViolation(known_sender_data) => {
+                Some(known_sender_data.user_id.clone())
+            }
+            SenderData::SenderUnverified(known_sender_data) => {
+                Some(known_sender_data.user_id.clone())
+            }
+            SenderData::SenderVerified(known_sender_data) => {
+                Some(known_sender_data.user_id.clone())
+            }
         }
     }
 }
@@ -344,10 +420,11 @@ pub enum SenderDataType {
 
 #[cfg(test)]
 mod tests {
-    use std::{cmp::Ordering, collections::BTreeMap};
+    use std::{cmp::Ordering, collections::BTreeMap, ops::Deref};
 
     use assert_matches2::assert_let;
     use insta::assert_json_snapshot;
+    use matrix_sdk_test::async_test;
     use ruma::{
         device_id, owned_device_id, owned_user_id, user_id, DeviceKeyAlgorithm, DeviceKeyId,
     };
@@ -356,8 +433,13 @@ mod tests {
 
     use super::SenderData;
     use crate::{
-        olm::{KnownSenderData, PickledInboundGroupSession},
+        machine::test_helpers::{
+            create_signed_device_of_unverified_user, create_signed_device_of_verified_user,
+            create_unsigned_device,
+        },
+        olm::{KnownSenderData, PickledInboundGroupSession, PrivateCrossSigningIdentity},
         types::{DeviceKey, DeviceKeys, EventEncryptionAlgorithm, Signatures},
+        Account,
     };
 
     #[test]
@@ -624,18 +706,18 @@ mod tests {
         // This export usse a more efficient serialization format for bytes. This was
         // exported when the `KnownSenderData` master_key was serialized as an byte
         // array instead of a base64 encoded string.
-        const SERIALIZED_B64: &str =
-            "iaZwaWNrbGWEr2luaXRpYWxfcmF0Y2hldIKlaW5uZXLcAIABYMzfSnBRzMlPKF1uKjYbzLtkzNJ4RcylzN0HzP\
-             9DzON1Tm05zO7M2MzFQsy9Acz9zPnMqDvM4syQzNrMzxF5KzbM4sy9zPUbBWfM7m4/zJzM18zDzMESKgfMkE7M\
-             yszIHszqWjYyQURbzKTMkx7M58zANsy+AGPM2A8tbcyFYczge8ykzMFdbVxJMMyAzN8azJEXGsy8zPJazMMaP8\
-             ziDszmWwfM+My2ajLMr8y+eczTRm9TFadjb3VudGVyAKtzaWduaW5nX2tlecQgefpCr6Duu7QUWzKIeMOFmxv/\
-             NjfcsYwZz8IN2ZOhdaS0c2lnbmluZ19rZXlfdmVyaWZpZWTDpmNvbmZpZ4GndmVyc2lvbqJWMapzZW5kZXJfa2\
-             V52StoMkIySDg2ajFpYmk2SW13ak9UUkhzbTVMamtyT2kyUGtiSXVUb0w0TWtFq3NpZ25pbmdfa2V5gadlZDI1\
-             NTE52StUWHJqNS9UYXpia3Yram1CZDl4UlB4NWNVaFFzNUNnblc1Q1pNRjgvNjZzq3NlbmRlcl9kYXRhgbBTZW\
-             5kZXJVbnZlcmlmaWVkg6d1c2VyX2lks0B2YWxvdTM1Om1hdHJpeC5vcmepZGV2aWNlX2lkqkZJQlNaRlJLUE2q\
-             bWFzdGVyX2tlecQgkOp9s4ClyQujYD7rRZA8xgE6kvYlqKSNnMrQNmSrcuGncm9vbV9pZL4hRWt5VEtGdkViYl\
-             B6SmxhaUhFOm1hdHJpeC5vcmeoaW1wb3J0ZWTCqWJhY2tlZF91cMKyaGlzdG9yeV92aXNpYmlsaXR5wKlhbGdv\
-             cml0aG20bS5tZWdvbG0udjEuYWVzLXNoYTI";
+        const SERIALIZED_B64: &str = "\
+            iaZwaWNrbGWEr2luaXRpYWxfcmF0Y2hldIKlaW5uZXLcAIABYMzfSnBRzMlPKF1uKjYbzLtkzNJ4RcylzN0HzP\
+            9DzON1Tm05zO7M2MzFQsy9Acz9zPnMqDvM4syQzNrMzxF5KzbM4sy9zPUbBWfM7m4/zJzM18zDzMESKgfMkE7M\
+            yszIHszqWjYyQURbzKTMkx7M58zANsy+AGPM2A8tbcyFYczge8ykzMFdbVxJMMyAzN8azJEXGsy8zPJazMMaP8\
+            ziDszmWwfM+My2ajLMr8y+eczTRm9TFadjb3VudGVyAKtzaWduaW5nX2tlecQgefpCr6Duu7QUWzKIeMOFmxv/\
+            NjfcsYwZz8IN2ZOhdaS0c2lnbmluZ19rZXlfdmVyaWZpZWTDpmNvbmZpZ4GndmVyc2lvbqJWMapzZW5kZXJfa2\
+            V52StoMkIySDg2ajFpYmk2SW13ak9UUkhzbTVMamtyT2kyUGtiSXVUb0w0TWtFq3NpZ25pbmdfa2V5gadlZDI1\
+            NTE52StUWHJqNS9UYXpia3Yram1CZDl4UlB4NWNVaFFzNUNnblc1Q1pNRjgvNjZzq3NlbmRlcl9kYXRhgbBTZW\
+            5kZXJVbnZlcmlmaWVkg6d1c2VyX2lks0B2YWxvdTM1Om1hdHJpeC5vcmepZGV2aWNlX2lkqkZJQlNaRlJLUE2q\
+            bWFzdGVyX2tlecQgkOp9s4ClyQujYD7rRZA8xgE6kvYlqKSNnMrQNmSrcuGncm9vbV9pZL4hRWt5VEtGdkViYl\
+            B6SmxhaUhFOm1hdHJpeC5vcmeoaW1wb3J0ZWTCqWJhY2tlZF91cMKyaGlzdG9yeV92aXNpYmlsaXR5wKlhbGdv\
+            cml0aG20bS5tZWdvbG0udjEuYWVzLXNoYTI";
 
         let input = base64_decode(SERIALIZED_B64).unwrap();
         let sender_data: PickledInboundGroupSession = rmp_serde::from_slice(&input)
@@ -647,5 +729,109 @@ mod tests {
         );
 
         assert_eq!(master_key.to_base64(), "kOp9s4ClyQujYD7rRZA8xgE6kvYlqKSNnMrQNmSrcuE");
+    }
+
+    #[async_test]
+    async fn test_from_device_for_unsigned_device() {
+        let bob_account =
+            Account::with_device_id(user_id!("@bob:example.com"), device_id!("BOB_DEVICE"));
+        let bob_device = create_unsigned_device(bob_account.device_keys());
+
+        let sender_data = SenderData::from_device(&bob_device);
+
+        assert_eq!(
+            sender_data,
+            SenderData::DeviceInfo {
+                device_keys: bob_device.device_keys.deref().clone(),
+                legacy_session: false
+            }
+        );
+    }
+
+    #[async_test]
+    async fn test_from_device_for_unverified_user() {
+        let bob_identity =
+            PrivateCrossSigningIdentity::new(user_id!("@bob:example.com").to_owned());
+        let bob_account =
+            Account::with_device_id(user_id!("@bob:example.com"), device_id!("BOB_DEVICE"));
+        let bob_device = create_signed_device_of_unverified_user(
+            bob_account.device_keys().clone(),
+            &bob_identity,
+        )
+        .await;
+
+        let sender_data = SenderData::from_device(&bob_device);
+
+        assert_eq!(
+            sender_data,
+            SenderData::SenderUnverified(KnownSenderData {
+                user_id: bob_account.user_id().to_owned(),
+                device_id: Some(bob_account.device_id().to_owned()),
+                master_key: Box::new(
+                    bob_identity.master_public_key().await.unwrap().get_first_key().unwrap()
+                ),
+            })
+        );
+    }
+
+    #[async_test]
+    async fn test_from_device_for_verified_user() {
+        let alice_account =
+            Account::with_device_id(user_id!("@alice:example.com"), device_id!("ALICE_DEVICE"));
+        let alice_identity = PrivateCrossSigningIdentity::with_account(&alice_account).await.0;
+
+        let bob_identity =
+            PrivateCrossSigningIdentity::new(user_id!("@bob:example.com").to_owned());
+        let bob_account =
+            Account::with_device_id(user_id!("@bob:example.com"), device_id!("BOB_DEVICE"));
+        let bob_device = create_signed_device_of_verified_user(
+            bob_account.device_keys().clone(),
+            &bob_identity,
+            &alice_identity,
+        )
+        .await;
+
+        let sender_data = SenderData::from_device(&bob_device);
+
+        assert_eq!(
+            sender_data,
+            SenderData::SenderVerified(KnownSenderData {
+                user_id: bob_account.user_id().to_owned(),
+                device_id: Some(bob_account.device_id().to_owned()),
+                master_key: Box::new(
+                    bob_identity.master_public_key().await.unwrap().get_first_key().unwrap()
+                ),
+            })
+        );
+    }
+
+    #[async_test]
+    async fn test_from_device_for_verification_violation_user() {
+        let bob_identity =
+            PrivateCrossSigningIdentity::new(user_id!("@bob:example.com").to_owned());
+        let bob_account =
+            Account::with_device_id(user_id!("@bob:example.com"), device_id!("BOB_DEVICE"));
+        let bob_device =
+            create_signed_device_of_unverified_user(bob_account.device_keys(), &bob_identity).await;
+        bob_device
+            .device_owner_identity
+            .as_ref()
+            .unwrap()
+            .other()
+            .unwrap()
+            .mark_as_previously_verified();
+
+        let sender_data = SenderData::from_device(&bob_device);
+
+        assert_eq!(
+            sender_data,
+            SenderData::VerificationViolation(KnownSenderData {
+                user_id: bob_account.user_id().to_owned(),
+                device_id: Some(bob_account.device_id().to_owned()),
+                master_key: Box::new(
+                    bob_identity.master_public_key().await.unwrap().get_first_key().unwrap()
+                ),
+            })
+        );
     }
 }

@@ -1,13 +1,21 @@
-use std::{collections::HashMap, fmt, fmt::Display, time::SystemTime};
+use std::{collections::HashMap, error::Error, fmt, fmt::Display};
 
 use matrix_sdk::{
-    authentication::oauth::OAuthError, encryption::CryptoStoreError, event_cache::EventCacheError,
-    reqwest, room::edit::EditError, send_queue::RoomSendQueueError, HttpError, IdParseError,
-    NotificationSettingsError as SdkNotificationSettingsError,
+    authentication::oauth::OAuthError,
+    encryption::{identities::RequestVerificationError, CryptoStoreError},
+    event_cache::EventCacheError,
+    reqwest,
+    room::edit::EditError,
+    send_queue::RoomSendQueueError,
+    HttpError, IdParseError, NotificationSettingsError as SdkNotificationSettingsError,
     QueueWedgeError as SdkQueueWedgeError, StoreError,
 };
 use matrix_sdk_ui::{encryption_sync_service, notification_client, sync_service, timeline};
-use ruma::api::client::error::{ErrorBody, ErrorKind as RumaApiErrorKind, RetryAfter};
+use ruma::{
+    api::client::error::{ErrorBody, ErrorKind as RumaApiErrorKind, RetryAfter},
+    MilliSecondsSinceUnixEpoch,
+};
+use tracing::warn;
 use uniffi::UnexpectedUniFFICallbackError;
 
 use crate::{room_list::RoomListError, timeline::FocusEventError};
@@ -15,32 +23,39 @@ use crate::{room_list::RoomListError, timeline::FocusEventError};
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum ClientError {
     #[error("client error: {msg}")]
-    Generic { msg: String },
+    Generic { msg: String, details: Option<String> },
     #[error("api error {code}: {msg}")]
-    MatrixApi { kind: ErrorKind, code: String, msg: String },
+    MatrixApi { kind: ErrorKind, code: String, msg: String, details: Option<String> },
 }
 
 impl ClientError {
-    pub(crate) fn new<E: Display>(error: E) -> Self {
-        Self::Generic { msg: error.to_string() }
+    pub(crate) fn from_str<E: Display>(error: E, details: Option<String>) -> Self {
+        warn!("Error: {error}");
+        Self::Generic { msg: error.to_string(), details }
+    }
+
+    pub(crate) fn from_err<E: Error>(e: E) -> Self {
+        let details = Some(format!("{e:?}"));
+        Self::from_str(e, details)
     }
 }
 
 impl From<anyhow::Error> for ClientError {
     fn from(e: anyhow::Error) -> ClientError {
-        ClientError::Generic { msg: format!("{e:#}") }
+        let details = format!("{e:?}");
+        ClientError::Generic { msg: format!("{e:#}"), details: Some(details) }
     }
 }
 
 impl From<reqwest::Error> for ClientError {
     fn from(e: reqwest::Error) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<UnexpectedUniFFICallbackError> for ClientError {
     fn from(e: UnexpectedUniFFICallbackError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
@@ -53,135 +68,146 @@ impl From<matrix_sdk::Error> for ClientError {
                         let code = kind.errcode().to_string();
                         let Ok(kind) = kind.to_owned().try_into() else {
                             // We couldn't parse the API error, so we return a generic one instead
-                            return Self::Generic { msg: message.to_string() };
+                            return (*http_error).into();
                         };
-                        return Self::MatrixApi { kind, code, msg: message.to_owned() };
+                        return Self::MatrixApi {
+                            kind,
+                            code,
+                            msg: message.to_owned(),
+                            details: Some(format!("{api_error:?}")),
+                        };
                     }
                 }
-                Self::Generic { msg: http_error.to_string() }
+                (*http_error).into()
             }
-            _ => Self::Generic { msg: e.to_string() },
+            _ => Self::from_err(e),
         }
     }
 }
 
 impl From<StoreError> for ClientError {
     fn from(e: StoreError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<CryptoStoreError> for ClientError {
     fn from(e: CryptoStoreError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<HttpError> for ClientError {
     fn from(e: HttpError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<IdParseError> for ClientError {
     fn from(e: IdParseError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<serde_json::Error> for ClientError {
     fn from(e: serde_json::Error) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<url::ParseError> for ClientError {
     fn from(e: url::ParseError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<mime::FromStrError> for ClientError {
     fn from(e: mime::FromStrError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<encryption_sync_service::Error> for ClientError {
     fn from(e: encryption_sync_service::Error) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<timeline::Error> for ClientError {
     fn from(e: timeline::Error) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<timeline::UnsupportedEditItem> for ClientError {
     fn from(e: timeline::UnsupportedEditItem) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<notification_client::Error> for ClientError {
     fn from(e: notification_client::Error) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<sync_service::Error> for ClientError {
     fn from(e: sync_service::Error) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<OAuthError> for ClientError {
     fn from(e: OAuthError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<RoomError> for ClientError {
     fn from(e: RoomError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<RoomListError> for ClientError {
     fn from(e: RoomListError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<EventCacheError> for ClientError {
     fn from(e: EventCacheError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<EditError> for ClientError {
     fn from(e: EditError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<RoomSendQueueError> for ClientError {
     fn from(e: RoomSendQueueError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
     }
 }
 
 impl From<NotYetImplemented> for ClientError {
     fn from(_: NotYetImplemented) -> Self {
-        Self::new("This functionality is not implemented yet.")
+        Self::from_str("This functionality is not implemented yet.", None)
     }
 }
 
 impl From<FocusEventError> for ClientError {
     fn from(e: FocusEventError) -> Self {
-        Self::new(e)
+        Self::from_err(e)
+    }
+}
+
+impl From<RequestVerificationError> for ClientError {
+    fn from(e: RequestVerificationError) -> Self {
+        Self::from_err(e)
     }
 }
 
@@ -288,6 +314,8 @@ pub enum RoomError {
     TimelineUnavailable,
     #[error("Invalid thumbnail data")]
     InvalidThumbnailData,
+    #[error("Invalid replied to event ID")]
+    InvalidRepliedToEventId,
     #[error("Failed sending attachment")]
     FailedSendingAttachment,
 }
@@ -734,7 +762,9 @@ impl TryFrom<RumaApiErrorKind> for ErrorKind {
                 let retry_after_ms = match retry_after {
                     Some(RetryAfter::Delay(duration)) => Some(duration.as_millis() as u64),
                     Some(RetryAfter::DateTime(system_time)) => {
-                        let duration = system_time.duration_since(SystemTime::now()).ok();
+                        let duration = MilliSecondsSinceUnixEpoch::now()
+                            .to_system_time()
+                            .and_then(|now| system_time.duration_since(now).ok());
                         duration.map(|duration| duration.as_millis() as u64)
                     }
                     None => None,

@@ -1,3 +1,9 @@
+use std::sync::OnceLock;
+#[cfg(feature = "sentry")]
+use std::sync::{atomic::AtomicBool, Arc};
+
+#[cfg(feature = "sentry")]
+use tracing::warn;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_core::Subscriber;
 use tracing_subscriber::{
@@ -8,19 +14,13 @@ use tracing_subscriber::{
         time::FormatTime,
         FormatEvent, FormatFields, FormattedFields,
     },
-    layer::SubscriberExt,
+    layer::SubscriberExt as _,
     registry::LookupSpan,
-    util::SubscriberInitExt,
-    EnvFilter, Layer,
+    util::SubscriberInitExt as _,
+    Layer,
 };
 
-use crate::tracing::LogLevel;
-
-pub fn log_panics() {
-    std::env::set_var("RUST_BACKTRACE", "1");
-
-    log_panics::init();
-}
+use crate::{error::ClientError, tracing::LogLevel};
 
 fn text_layers<S>(config: TracingConfiguration) -> impl Layer<S>
 where
@@ -261,6 +261,7 @@ enum LogTarget {
 
     // SDK UI modules.
     MatrixSdkUiTimeline,
+    MatrixSdkUiNotificationClient,
 }
 
 impl LogTarget {
@@ -283,6 +284,7 @@ impl LogTarget {
             LogTarget::MatrixSdkSendQueue => "matrix_sdk::send_queue",
             LogTarget::MatrixSdkEventCacheStore => "matrix_sdk_sqlite::event_cache_store",
             LogTarget::MatrixSdkUiTimeline => "matrix_sdk_ui::timeline",
+            LogTarget::MatrixSdkUiNotificationClient => "matrix_sdk_ui::notification_client",
         }
     }
 }
@@ -305,6 +307,7 @@ const DEFAULT_TARGET_LOG_LEVELS: &[(LogTarget, LogLevel)] = &[
     (LogTarget::MatrixSdkEventCacheStore, LogLevel::Info),
     (LogTarget::MatrixSdkCommonStoreLocks, LogLevel::Warn),
     (LogTarget::MatrixSdkBaseStoreAmbiguityMap, LogLevel::Warn),
+    (LogTarget::MatrixSdkUiNotificationClient, LogLevel::Info),
 ];
 
 const IMMUTABLE_LOG_TARGETS: &[LogTarget] = &[
@@ -325,6 +328,8 @@ pub enum TraceLogPacks {
     SendQueue,
     /// Enables all the logs relevant to the timeline.
     Timeline,
+    /// Enables all the logs relevant to the notification client.
+    NotificationClient,
 }
 
 impl TraceLogPacks {
@@ -339,9 +344,26 @@ impl TraceLogPacks {
             ],
             TraceLogPacks::SendQueue => &[LogTarget::MatrixSdkSendQueue],
             TraceLogPacks::Timeline => &[LogTarget::MatrixSdkUiTimeline],
+            TraceLogPacks::NotificationClient => &[LogTarget::MatrixSdkUiNotificationClient],
         }
     }
 }
+
+#[cfg(feature = "sentry")]
+struct SentryLoggingCtx {
+    /// The Sentry client guard, which keeps the Sentry context alive.
+    _guard: sentry::ClientInitGuard,
+
+    /// Whether the Sentry layer is enabled or not, at a global level.
+    enabled: Arc<AtomicBool>,
+}
+
+struct LoggingCtx {
+    #[cfg(feature = "sentry")]
+    sentry: Option<SentryLoggingCtx>,
+}
+
+static LOGGING: OnceLock<LoggingCtx> = OnceLock::new();
 
 #[derive(uniffi::Record)]
 pub struct TracingConfiguration {
@@ -363,6 +385,105 @@ pub struct TracingConfiguration {
 
     /// If set, configures rotated log files where to write additional logs.
     write_to_files: Option<TracingFileConfiguration>,
+
+    /// If set, the Sentry DSN to use for error reporting.
+    #[cfg(feature = "sentry")]
+    sentry_dsn: Option<String>,
+}
+
+impl TracingConfiguration {
+    /// Sets up the tracing configuration and return a [`Logger`] instance
+    /// holding onto it.
+    #[cfg_attr(not(feature = "sentry"), allow(unused_mut))]
+    fn build(mut self) -> LoggingCtx {
+        // Show full backtraces, if we run into panics.
+        std::env::set_var("RUST_BACKTRACE", "1");
+
+        // Log panics.
+        log_panics::init();
+
+        let env_filter = build_tracing_filter(&self);
+
+        let logging_ctx;
+        #[cfg(feature = "sentry")]
+        {
+            // Prepare the Sentry layer, if a DSN is provided.
+            let (sentry_layer, sentry_logging_ctx) =
+                if let Some(sentry_dsn) = self.sentry_dsn.take() {
+                    // Initialize the Sentry client with the given options.
+                    let sentry_guard = sentry::init((
+                        sentry_dsn,
+                        sentry::ClientOptions {
+                            traces_sample_rate: 0.0,
+                            attach_stacktrace: true,
+                            release: Some(env!("VERGEN_GIT_SHA").into()),
+                            ..sentry::ClientOptions::default()
+                        },
+                    ));
+
+                    let sentry_enabled = Arc::new(AtomicBool::new(true));
+
+                    // Add a Sentry layer to the tracing subscriber.
+                    //
+                    // Pass custom event and span filters, which will ignore anything, if the Sentry
+                    // support has been globally disabled, or if the statement doesn't include a
+                    // `sentry` field set to `true`.
+                    let sentry_layer = sentry_tracing::layer()
+                        .event_filter({
+                            let enabled = sentry_enabled.clone();
+
+                            move |metadata| {
+                                if enabled.load(std::sync::atomic::Ordering::SeqCst)
+                                    && metadata.fields().field("sentry").is_some()
+                                {
+                                    sentry_tracing::default_event_filter(metadata)
+                                } else {
+                                    // Ignore the event.
+                                    sentry_tracing::EventFilter::Ignore
+                                }
+                            }
+                        })
+                        .span_filter({
+                            let enabled = sentry_enabled.clone();
+
+                            move |metadata| {
+                                if enabled.load(std::sync::atomic::Ordering::SeqCst) {
+                                    sentry_tracing::default_span_filter(metadata)
+                                } else {
+                                    // Ignore, if sentry is globally disabled.
+                                    false
+                                }
+                            }
+                        });
+
+                    (
+                        Some(sentry_layer),
+                        Some(SentryLoggingCtx { _guard: sentry_guard, enabled: sentry_enabled }),
+                    )
+                } else {
+                    (None, None)
+                };
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::new(&env_filter))
+                .with(crate::platform::text_layers(self))
+                .with(sentry_layer)
+                .init();
+            logging_ctx = LoggingCtx { sentry: sentry_logging_ctx };
+        }
+        #[cfg(not(feature = "sentry"))]
+        {
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::new(&env_filter))
+                .with(crate::platform::text_layers(self))
+                .init();
+            logging_ctx = LoggingCtx {};
+        }
+
+        // Log the log levels 🧠.
+        tracing::info!(env_filter, "Logging has been set up");
+
+        logging_ctx
+    }
 }
 
 fn build_tracing_filter(config: &TracingConfiguration) -> String {
@@ -407,26 +528,49 @@ fn build_tracing_filter(config: &TracingConfiguration) -> String {
 /// the NSE process on iOS). Otherwise, this can remain false, in which case a
 /// multithreaded tokio runtime will be set up.
 #[matrix_sdk_ffi_macros::export]
-pub fn init_platform(config: TracingConfiguration, use_lightweight_tokio_runtime: bool) {
-    log_panics();
-
-    let env_filter = build_tracing_filter(&config);
-
-    tracing_subscriber::registry()
-        .with(EnvFilter::new(&env_filter))
-        .with(text_layers(config))
-        .init();
-
-    // Log the log levels 🧠.
-    tracing::info!(env_filter, "Logging has been set up");
-
-    if use_lightweight_tokio_runtime {
-        setup_lightweight_tokio_runtime();
-    } else {
-        setup_multithreaded_tokio_runtime();
+pub fn init_platform(
+    config: TracingConfiguration,
+    use_lightweight_tokio_runtime: bool,
+) -> Result<(), ClientError> {
+    #[cfg(all(feature = "js", target_family = "wasm"))]
+    {
+        console_error_panic_hook::set_once();
     }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        LOGGING.set(config.build()).map_err(|_| ClientError::Generic {
+            msg: "logger already initialized".to_owned(),
+            details: None,
+        })?;
+
+        if use_lightweight_tokio_runtime {
+            setup_lightweight_tokio_runtime();
+        } else {
+            setup_multithreaded_tokio_runtime();
+        }
+    }
+
+    Ok(())
 }
 
+/// Set the global enablement level for the Sentry layer (after the logs have
+/// been set up).
+#[matrix_sdk_ffi_macros::export]
+#[cfg(feature = "sentry")]
+pub fn enable_sentry_logging(enabled: bool) {
+    if let Some(ctx) = LOGGING.get() {
+        if let Some(sentry_ctx) = &ctx.sentry {
+            sentry_ctx.enabled.store(enabled, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            warn!("Sentry logging is not enabled");
+        }
+    } else {
+        // Can't use log statements here, since logging hasn't been enabled yet 🧠
+        eprintln!("Logging hasn't been enabled yet");
+    };
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn setup_multithreaded_tokio_runtime() {
     async_compat::set_runtime_builder(Box::new(|| {
         eprintln!("spawning a multithreaded tokio runtime");
@@ -437,6 +581,7 @@ fn setup_multithreaded_tokio_runtime() {
     }));
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn setup_lightweight_tokio_runtime() {
     async_compat::set_runtime_builder(Box::new(|| {
         eprintln!("spawning a lightweight tokio runtime");
@@ -479,31 +624,38 @@ mod tests {
             extra_targets: vec!["super_duper_app".to_owned()],
             write_to_stdout_or_system: true,
             write_to_files: None,
+            #[cfg(feature = "sentry")]
+            sentry_dsn: None,
         };
 
         let filter = build_tracing_filter(&config);
 
         assert_eq!(
             filter,
-            "panic=error,\
-            hyper=warn,\
-            matrix_sdk_ffi=info,\
-            matrix_sdk=info,\
-            matrix_sdk::client=trace,\
-            matrix_sdk_crypto=debug,\
-            matrix_sdk_crypto::olm::account=trace,\
-            matrix_sdk::oidc=trace,\
-            matrix_sdk::http_client=debug,\
-            matrix_sdk::sliding_sync=info,\
-            matrix_sdk_base::sliding_sync=info,\
-            matrix_sdk_ui::timeline=info,\
-            matrix_sdk::send_queue=info,\
-            matrix_sdk::event_cache=info,\
-            matrix_sdk_base::event_cache=info,\
-            matrix_sdk_sqlite::event_cache_store=info,\
-            matrix_sdk_common::store_locks=warn,\
-            matrix_sdk_base::store::ambiguity_map=warn,\
-            super_duper_app=error"
+            r#"panic=error,
+            hyper=warn,
+            matrix_sdk_ffi=info,
+            matrix_sdk=info,
+            matrix_sdk::client=trace,
+            matrix_sdk_crypto=debug,
+            matrix_sdk_crypto::olm::account=trace,
+            matrix_sdk::oidc=trace,
+            matrix_sdk::http_client=debug,
+            matrix_sdk::sliding_sync=info,
+            matrix_sdk_base::sliding_sync=info,
+            matrix_sdk_ui::timeline=info,
+            matrix_sdk::send_queue=info,
+            matrix_sdk::event_cache=info,
+            matrix_sdk_base::event_cache=info,
+            matrix_sdk_sqlite::event_cache_store=info,
+            matrix_sdk_common::store_locks=warn,
+            matrix_sdk_base::store::ambiguity_map=warn,
+            matrix_sdk_ui::notification_client=info,
+            super_duper_app=error"#
+                .split('\n')
+                .map(|s| s.trim())
+                .collect::<Vec<_>>()
+                .join("")
         );
     }
 
@@ -515,32 +667,39 @@ mod tests {
             extra_targets: vec!["super_duper_app".to_owned(), "some_other_span".to_owned()],
             write_to_stdout_or_system: true,
             write_to_files: None,
+            #[cfg(feature = "sentry")]
+            sentry_dsn: None,
         };
 
         let filter = build_tracing_filter(&config);
 
         assert_eq!(
             filter,
-            "panic=error,\
-            hyper=warn,\
-            matrix_sdk_ffi=info,\
-            matrix_sdk=info,\
-            matrix_sdk::client=trace,\
-            matrix_sdk_crypto=trace,\
-            matrix_sdk_crypto::olm::account=trace,\
-            matrix_sdk::oidc=trace,\
-            matrix_sdk::http_client=trace,\
-            matrix_sdk::sliding_sync=trace,\
-            matrix_sdk_base::sliding_sync=trace,\
-            matrix_sdk_ui::timeline=trace,\
-            matrix_sdk::send_queue=trace,\
-            matrix_sdk::event_cache=trace,\
-            matrix_sdk_base::event_cache=trace,\
-            matrix_sdk_sqlite::event_cache_store=trace,\
-            matrix_sdk_common::store_locks=warn,\
-            matrix_sdk_base::store::ambiguity_map=warn,\
-            super_duper_app=trace,\
-            some_other_span=trace"
+            r#"panic=error,
+            hyper=warn,
+            matrix_sdk_ffi=info,
+            matrix_sdk=info,
+            matrix_sdk::client=trace,
+            matrix_sdk_crypto=trace,
+            matrix_sdk_crypto::olm::account=trace,
+            matrix_sdk::oidc=trace,
+            matrix_sdk::http_client=trace,
+            matrix_sdk::sliding_sync=trace,
+            matrix_sdk_base::sliding_sync=trace,
+            matrix_sdk_ui::timeline=trace,
+            matrix_sdk::send_queue=trace,
+            matrix_sdk::event_cache=trace,
+            matrix_sdk_base::event_cache=trace,
+            matrix_sdk_sqlite::event_cache_store=trace,
+            matrix_sdk_common::store_locks=warn,
+            matrix_sdk_base::store::ambiguity_map=warn,
+            matrix_sdk_ui::notification_client=trace,
+            super_duper_app=trace,
+            some_other_span=trace"#
+                .split('\n')
+                .map(|s| s.trim())
+                .collect::<Vec<_>>()
+                .join("")
         );
     }
 
@@ -552,6 +711,8 @@ mod tests {
             extra_targets: vec!["super_duper_app".to_owned()],
             write_to_stdout_or_system: true,
             write_to_files: None,
+            #[cfg(feature = "sentry")]
+            sentry_dsn: None,
         };
 
         let filter = build_tracing_filter(&config);
@@ -576,6 +737,7 @@ mod tests {
             matrix_sdk_sqlite::event_cache_store=trace,
             matrix_sdk_common::store_locks=warn,
             matrix_sdk_base::store::ambiguity_map=warn,
+            matrix_sdk_ui::notification_client=info,
             super_duper_app=info"#
                 .split('\n')
                 .map(|s| s.trim())

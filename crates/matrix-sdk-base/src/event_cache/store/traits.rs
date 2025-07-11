@@ -16,10 +16,13 @@ use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use matrix_sdk_common::{
-    linked_chunk::{ChunkIdentifier, ChunkIdentifierGenerator, Position, RawChunk, Update},
+    linked_chunk::{
+        ChunkIdentifier, ChunkIdentifierGenerator, ChunkMetadata, LinkedChunkId, Position,
+        RawChunk, Update,
+    },
     AsyncTraitDeps,
 };
-use ruma::{EventId, MxcUri, OwnedEventId, RoomId};
+use ruma::{events::relation::RelationType, EventId, MxcUri, OwnedEventId, RoomId};
 
 use super::{
     media::{IgnoreMediaRetentionPolicy, MediaRetentionPolicy},
@@ -37,8 +40,8 @@ pub const DEFAULT_CHUNK_CAPACITY: usize = 128;
 
 /// An abstract trait that can be used to implement different store backends
 /// for the event cache of the SDK.
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 pub trait EventCacheStore: AsyncTraitDeps {
     /// The error type used by this event cache store.
     type Error: fmt::Debug + Into<EventCacheStoreError>;
@@ -56,7 +59,7 @@ pub trait EventCacheStore: AsyncTraitDeps {
     /// in-memory. This method aims at forwarding this update inside this store.
     async fn handle_linked_chunk_updates(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
         updates: Vec<Update<Event, Gap>>,
     ) -> Result<(), Self::Error>;
 
@@ -64,7 +67,7 @@ pub trait EventCacheStore: AsyncTraitDeps {
     async fn remove_room(&self, room_id: &RoomId) -> Result<(), Self::Error> {
         // Right now, this means removing all the linked chunk. If implementations
         // override this behavior, they should *also* include this code.
-        self.handle_linked_chunk_updates(room_id, vec![Update::Clear]).await
+        self.handle_linked_chunk_updates(LinkedChunkId::Room(room_id), vec![Update::Clear]).await
     }
 
     /// Return all the raw components of a linked chunk, so the caller may
@@ -72,8 +75,17 @@ pub trait EventCacheStore: AsyncTraitDeps {
     #[doc(hidden)]
     async fn load_all_chunks(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
     ) -> Result<Vec<RawChunk<Event, Gap>>, Self::Error>;
+
+    /// Load all of the chunks' metadata for the given [`LinkedChunkId`].
+    ///
+    /// Chunks are unordered, and there's no guarantee that the chunks would
+    /// form a valid linked chunk after reconstruction.
+    async fn load_all_chunks_metadata(
+        &self,
+        linked_chunk_id: LinkedChunkId<'_>,
+    ) -> Result<Vec<ChunkMetadata>, Self::Error>;
 
     /// Load the last chunk of the `LinkedChunk` holding all events of the room
     /// identified by `room_id`.
@@ -81,7 +93,7 @@ pub trait EventCacheStore: AsyncTraitDeps {
     /// This is used to iteratively load events for the `EventCache`.
     async fn load_last_chunk(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
     ) -> Result<(Option<RawChunk<Event, Gap>>, ChunkIdentifierGenerator), Self::Error>;
 
     /// Load the chunk before the chunk identified by `before_chunk_identifier`
@@ -91,30 +103,66 @@ pub trait EventCacheStore: AsyncTraitDeps {
     /// This is used to iteratively load events for the `EventCache`.
     async fn load_previous_chunk(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
         before_chunk_identifier: ChunkIdentifier,
     ) -> Result<Option<RawChunk<Event, Gap>>, Self::Error>;
 
     /// Clear persisted events for all the rooms.
     ///
     /// This will empty and remove all the linked chunks stored previously,
-    /// using the above [`Self::handle_linked_chunk_updates`] methods.
-    async fn clear_all_rooms_chunks(&self) -> Result<(), Self::Error>;
+    /// using the above [`Self::handle_linked_chunk_updates`] methods. It
+    /// must *also* delete all the events' content, if they were stored in a
+    /// separate table.
+    ///
+    /// ⚠ This is meant only for super specific use cases, where there shouldn't
+    /// be any live in-memory linked chunks. In general, prefer using
+    /// `EventCache::clear_all_rooms()` from the common SDK crate.
+    async fn clear_all_linked_chunks(&self) -> Result<(), Self::Error>;
 
     /// Given a set of event IDs, return the duplicated events along with their
     /// position if there are any.
     async fn filter_duplicated_events(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
         events: Vec<OwnedEventId>,
     ) -> Result<Vec<(OwnedEventId, Position)>, Self::Error>;
 
-    /// Find an event by its ID.
+    /// Find an event by its ID in a room.
     async fn find_event(
         &self,
         room_id: &RoomId,
         event_id: &EventId,
-    ) -> Result<Option<(Position, Event)>, Self::Error>;
+    ) -> Result<Option<Event>, Self::Error>;
+
+    /// Find all the events (alongside their position in the room's linked
+    /// chunk, if available) that relate to a given event.
+    ///
+    /// The only events which don't have a position are those which have been
+    /// saved out-of-band using [`Self::save_event`].
+    ///
+    /// Note: it doesn't process relations recursively: for instance, if
+    /// requesting only thread events, it will NOT return the aggregated
+    /// events affecting the returned events. It is the responsibility of
+    /// the caller to do so, if needed.
+    ///
+    /// An additional filter can be provided to only retrieve related events for
+    /// a certain relationship.
+    async fn find_event_relations(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+        filter: Option<&[RelationType]>,
+    ) -> Result<Vec<(Event, Option<Position>)>, Self::Error>;
+
+    /// Save an event, that might or might not be part of an existing linked
+    /// chunk.
+    ///
+    /// If the event has no event id, it will not be saved, and the function
+    /// must return an Ok result early.
+    ///
+    /// If the event was already stored with the same id, it must be replaced,
+    /// without causing an error.
+    async fn save_event(&self, room_id: &RoomId, event: Event) -> Result<(), Self::Error>;
 
     /// Add a media file's content in the media store.
     ///
@@ -250,8 +298,8 @@ impl<T: fmt::Debug> fmt::Debug for EraseEventCacheStoreError<T> {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl<T: EventCacheStore> EventCacheStore for EraseEventCacheStoreError<T> {
     type Error = EventCacheStoreError;
 
@@ -266,52 +314,75 @@ impl<T: EventCacheStore> EventCacheStore for EraseEventCacheStoreError<T> {
 
     async fn handle_linked_chunk_updates(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
         updates: Vec<Update<Event, Gap>>,
     ) -> Result<(), Self::Error> {
-        self.0.handle_linked_chunk_updates(room_id, updates).await.map_err(Into::into)
+        self.0.handle_linked_chunk_updates(linked_chunk_id, updates).await.map_err(Into::into)
     }
 
     async fn load_all_chunks(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
     ) -> Result<Vec<RawChunk<Event, Gap>>, Self::Error> {
-        self.0.load_all_chunks(room_id).await.map_err(Into::into)
+        self.0.load_all_chunks(linked_chunk_id).await.map_err(Into::into)
+    }
+
+    async fn load_all_chunks_metadata(
+        &self,
+        linked_chunk_id: LinkedChunkId<'_>,
+    ) -> Result<Vec<ChunkMetadata>, Self::Error> {
+        self.0.load_all_chunks_metadata(linked_chunk_id).await.map_err(Into::into)
     }
 
     async fn load_last_chunk(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
     ) -> Result<(Option<RawChunk<Event, Gap>>, ChunkIdentifierGenerator), Self::Error> {
-        self.0.load_last_chunk(room_id).await.map_err(Into::into)
+        self.0.load_last_chunk(linked_chunk_id).await.map_err(Into::into)
     }
 
     async fn load_previous_chunk(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
         before_chunk_identifier: ChunkIdentifier,
     ) -> Result<Option<RawChunk<Event, Gap>>, Self::Error> {
-        self.0.load_previous_chunk(room_id, before_chunk_identifier).await.map_err(Into::into)
+        self.0
+            .load_previous_chunk(linked_chunk_id, before_chunk_identifier)
+            .await
+            .map_err(Into::into)
     }
 
-    async fn clear_all_rooms_chunks(&self) -> Result<(), Self::Error> {
-        self.0.clear_all_rooms_chunks().await.map_err(Into::into)
+    async fn clear_all_linked_chunks(&self) -> Result<(), Self::Error> {
+        self.0.clear_all_linked_chunks().await.map_err(Into::into)
     }
 
     async fn filter_duplicated_events(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
         events: Vec<OwnedEventId>,
     ) -> Result<Vec<(OwnedEventId, Position)>, Self::Error> {
-        self.0.filter_duplicated_events(room_id, events).await.map_err(Into::into)
+        self.0.filter_duplicated_events(linked_chunk_id, events).await.map_err(Into::into)
     }
 
     async fn find_event(
         &self,
         room_id: &RoomId,
         event_id: &EventId,
-    ) -> Result<Option<(Position, Event)>, Self::Error> {
+    ) -> Result<Option<Event>, Self::Error> {
         self.0.find_event(room_id, event_id).await.map_err(Into::into)
+    }
+
+    async fn find_event_relations(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+        filter: Option<&[RelationType]>,
+    ) -> Result<Vec<(Event, Option<Position>)>, Self::Error> {
+        self.0.find_event_relations(room_id, event_id, filter).await.map_err(Into::into)
+    }
+
+    async fn save_event(&self, room_id: &RoomId, event: Event) -> Result<(), Self::Error> {
+        self.0.save_event(room_id, event).await.map_err(Into::into)
     }
 
     async fn add_media_content(

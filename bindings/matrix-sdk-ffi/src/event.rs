@@ -1,3 +1,5 @@
+use std::ops::Deref;
+
 use anyhow::{bail, Context};
 use matrix_sdk::IdParseError;
 use matrix_sdk_ui::timeline::TimelineEventItemId;
@@ -22,7 +24,7 @@ use crate::{
 };
 
 #[derive(uniffi::Object)]
-pub struct TimelineEvent(pub(crate) AnySyncTimelineEvent);
+pub struct TimelineEvent(pub(crate) Box<AnySyncTimelineEvent>);
 
 #[matrix_sdk_ffi_macros::export]
 impl TimelineEvent {
@@ -39,7 +41,7 @@ impl TimelineEvent {
     }
 
     pub fn event_type(&self) -> Result<TimelineEventType, ClientError> {
-        let event_type = match &self.0 {
+        let event_type = match self.0.deref() {
             AnySyncTimelineEvent::MessageLike(event) => {
                 TimelineEventType::MessageLike { content: event.clone().try_into()? }
             }
@@ -53,11 +55,19 @@ impl TimelineEvent {
 
 impl From<AnyTimelineEvent> for TimelineEvent {
     fn from(event: AnyTimelineEvent) -> Self {
-        Self(event.into())
+        Self(Box::new(event.into()))
     }
 }
 
 #[derive(uniffi::Enum)]
+// A note about this `allow(clippy::large_enum_variant)`.
+// In order to reduce the size of `TimelineEventType`, we would need to
+// put some parts in a `Box`, or an `Arc`. Sadly, it doesn't play well with
+// UniFFI. We would need to change the `uniffi::Record` of the subtypes into
+// `uniffi::Object`, which is a radical change. It would simplify the memory
+// usage, but it would slow down the performance around the FFI border. Thus,
+// let's consider this is a false-positive lint in this particular case.
+#[allow(clippy::large_enum_variant)]
 pub enum TimelineEventType {
     MessageLike { content: MessageLikeEventContent },
     State { content: StateEventContent },
@@ -83,7 +93,7 @@ pub enum StateEventContent {
     RoomServerAcl,
     RoomThirdPartyInvite,
     RoomTombstone,
-    RoomTopic,
+    RoomTopic { topic: String },
     SpaceChild,
     SpaceParent,
     RoomAccessRule { rule: String },
@@ -119,16 +129,28 @@ impl TryFrom<AnySyncStateEvent> for StateEventContent {
             AnySyncStateEvent::RoomServerAcl(_) => StateEventContent::RoomServerAcl,
             AnySyncStateEvent::RoomThirdPartyInvite(_) => StateEventContent::RoomThirdPartyInvite,
             AnySyncStateEvent::RoomTombstone(_) => StateEventContent::RoomTombstone,
-            AnySyncStateEvent::RoomTopic(_) => StateEventContent::RoomTopic,
+            AnySyncStateEvent::RoomTopic(content) => {
+                let content = get_state_event_original_content(content)?;
+
+                StateEventContent::RoomTopic { topic: content.topic }
+            }
             AnySyncStateEvent::SpaceChild(_) => StateEventContent::SpaceChild,
             AnySyncStateEvent::SpaceParent(_) => StateEventContent::SpaceParent,
-            _ => bail!("Unsupported state event"),
+            _ => bail!("Unsupported state event: {:?}", value.event_type()),
         };
         Ok(event)
     }
 }
 
 #[derive(uniffi::Enum)]
+// A note about this `allow(clippy::large_enum_variant)`.
+// In order to reduce the size of `MessageLineEventContent`, we would need to
+// put some parts in a `Box`, or an `Arc`. Sadly, it doesn't play well with
+// UniFFI. We would need to change the `uniffi::Record` of the subtypes into
+// `uniffi::Object`, which is a radical change. It would simplify the memory
+// usage, but it would slow down the performance around the FFI border. Thus,
+// let's consider this is a false-positive lint in this particular case.
+#[allow(clippy::large_enum_variant)]
 pub enum MessageLikeEventContent {
     CallAnswer,
     CallInvite,
@@ -223,7 +245,7 @@ impl TryFrom<AnySyncMessageLikeEvent> for MessageLikeEventContent {
                 MessageLikeEventContent::RoomRedaction { redacted_event_id, reason }
             }
             AnySyncMessageLikeEvent::Sticker(_) => MessageLikeEventContent::Sticker,
-            _ => bail!("Unsupported Event Type"),
+            _ => bail!("Unsupported Event Type: {:?}", value.event_type()),
         };
         Ok(content)
     }
@@ -366,6 +388,8 @@ pub enum RoomMessageEventMessageType {
     Audio,
     Emote,
     File,
+    #[cfg(feature = "unstable-msc4274")]
+    Gallery,
     Image,
     Location,
     Notice,
@@ -382,6 +406,8 @@ impl From<RumaMessageType> for RoomMessageEventMessageType {
             RumaMessageType::Audio { .. } => Self::Audio,
             RumaMessageType::Emote { .. } => Self::Emote,
             RumaMessageType::File { .. } => Self::File,
+            #[cfg(feature = "unstable-msc4274")]
+            RumaMessageType::Gallery { .. } => Self::Gallery,
             RumaMessageType::Image { .. } => Self::Image,
             RumaMessageType::Location { .. } => Self::Location,
             RumaMessageType::Notice { .. } => Self::Notice,

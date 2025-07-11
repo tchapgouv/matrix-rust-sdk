@@ -19,11 +19,13 @@ use std::{
 };
 
 use itertools::Itertools;
+#[cfg(feature = "experimental-send-custom-to-device")]
+use matrix_sdk_common::deserialized_responses::WithheldCode;
 use matrix_sdk_common::{
     deserialized_responses::{
-        AlgorithmInfo, DecryptedRoomEvent, DeviceLinkProblem, EncryptionInfo, UnableToDecryptInfo,
-        UnableToDecryptReason, UnsignedDecryptionResult, UnsignedEventLocation, VerificationLevel,
-        VerificationState,
+        AlgorithmInfo, DecryptedRoomEvent, DeviceLinkProblem, EncryptionInfo,
+        ProcessedToDeviceEvent, UnableToDecryptInfo, UnableToDecryptReason,
+        UnsignedDecryptionResult, UnsignedEventLocation, VerificationLevel, VerificationState,
     },
     locks::RwLock as StdRwLock,
     BoxFuture,
@@ -53,7 +55,7 @@ use tokio::sync::Mutex;
 use tracing::{
     debug, error,
     field::{debug, display},
-    info, instrument, warn, Span,
+    info, instrument, trace, warn, Span,
 };
 use vodozemac::{
     megolm::{DecryptionError, SessionOrdering},
@@ -73,22 +75,28 @@ use crate::{
     },
     session_manager::{GroupSessionManager, SessionManager},
     store::{
-        Changes, CryptoStoreWrapper, DeviceChanges, IdentityChanges, IntoCryptoStore, MemoryStore,
-        PendingChanges, Result as StoreResult, RoomKeyInfo, RoomSettings, SecretImportError, Store,
-        StoreCache, StoreTransaction,
+        caches::StoreCache,
+        types::{
+            Changes, CrossSigningKeyExport, DeviceChanges, IdentityChanges, PendingChanges,
+            RoomKeyInfo, RoomSettings, StoredRoomKeyBundleData,
+        },
+        CryptoStoreWrapper, IntoCryptoStore, MemoryStore, Result as StoreResult, SecretImportError,
+        Store, StoreTransaction,
     },
     types::{
         events::{
-            olm_v1::{AnyDecryptedOlmEvent, DecryptedRoomKeyEvent},
+            olm_v1::{AnyDecryptedOlmEvent, DecryptedRoomKeyBundleEvent, DecryptedRoomKeyEvent},
             room::encrypted::{
                 EncryptedEvent, EncryptedToDeviceEvent, RoomEncryptedEventContent,
                 RoomEventEncryptionScheme, SupportedEventEncryptionSchemes,
+                ToDeviceEncryptedEventContent,
             },
             room_key::{MegolmV1AesSha2Content, RoomKeyContent},
+            room_key_bundle::RoomKeyBundleContent,
             room_key_withheld::{
                 MegolmV1AesSha2WithheldContent, RoomKeyWithheldContent, RoomKeyWithheldEvent,
             },
-            ToDeviceEvents,
+            ToDeviceEvent, ToDeviceEvents,
         },
         requests::{
             AnyIncomingResponse, KeysQueryRequest, OutgoingRequest, ToDeviceRequest,
@@ -98,7 +106,7 @@ use crate::{
     },
     utilities::timestamp_to_iso8601,
     verification::{Verification, VerificationMachine, VerificationRequest},
-    CrossSigningKeyExport, CryptoStoreError, DecryptionSettings, DeviceData, LocalTrust,
+    CollectStrategy, CryptoStoreError, DecryptionSettings, DeviceData, LocalTrust,
     RoomEventDecryptionResult, SignatureError, TrustRequirement,
 };
 
@@ -835,10 +843,16 @@ impl OlmMachine {
         }
     }
 
-    /// Decrypt a to-device event.
+    /// Decrypt and handle a to-device event.
     ///
-    /// Returns a decrypted `ToDeviceEvent` if the decryption was successful,
-    /// an error indicating why decryption failed otherwise.
+    /// If decryption (or checking the sender device) fails, returns
+    /// `Err(DecryptToDeviceError::OlmError)`.
+    ///
+    /// If the sender device is dehydrated, does no handling and immediately
+    /// returns `Err(DecryptToDeviceError::FromDehydratedDevice)`.
+    ///
+    /// Otherwise, handles the decrypted event and returns it (decrypted) as
+    /// `Ok(OlmDecryptionInfo)`.
     ///
     /// # Arguments
     ///
@@ -848,20 +862,32 @@ impl OlmMachine {
         transaction: &mut StoreTransaction,
         event: &EncryptedToDeviceEvent,
         changes: &mut Changes,
-    ) -> OlmResult<OlmDecryptionInfo> {
+    ) -> Result<OlmDecryptionInfo, DecryptToDeviceError> {
+        // Decrypt the event
         let mut decrypted =
             transaction.account().await?.decrypt_to_device_event(&self.inner.store, event).await?;
 
-        // We ignore all to-device events from dehydrated devices - we should not
-        // receive any
-        if !self.to_device_event_is_from_dehydrated_device(&decrypted, &event.sender).await? {
-            // Handle the decrypted event, e.g. fetch out Megolm sessions out of
-            // the event.
+        let from_dehydrated_device =
+            self.to_device_event_is_from_dehydrated_device(&decrypted, &event.sender).await?;
+
+        // Check whether this event is from a dehydrated device - if so, return Ok(None)
+        // to skip it because we don't expect ever to receive an event from a
+        // dehydrated device.
+        if from_dehydrated_device {
+            // Device is dehydrated: ignore this event
+            warn!(
+                sender = ?event.sender,
+                session = ?decrypted.session,
+                "Received a to-device event from a dehydrated device. This is unexpected: ignoring event"
+            );
+            Err(DecryptToDeviceError::FromDehydratedDevice)
+        } else {
+            // Device is not dehydrated: handle it as normal e.g. create a Megolm session
             self.handle_decrypted_to_device_event(transaction.cache(), &mut decrypted, changes)
                 .await?;
-        }
 
-        Ok(decrypted)
+            Ok(decrypted)
+        }
     }
 
     #[instrument(
@@ -936,6 +962,35 @@ impl OlmMachine {
                 Ok(None)
             }
         }
+    }
+
+    /// Handle a received, decrypted, `io.element.msc4268.room_key_bundle`
+    /// to-device event.
+    #[instrument()]
+    async fn receive_room_key_bundle_data(
+        &self,
+        event: &DecryptedRoomKeyBundleEvent,
+        changes: &mut Changes,
+    ) -> OlmResult<()> {
+        let Some(sender_device_keys) = &event.sender_device_keys else {
+            warn!("Received a room key bundle with no sender device keys: ignoring");
+            return Ok(());
+        };
+
+        // We already checked that `sender_device_keys` matches the actual sender of the
+        // message when we decrypted the message, which included doing
+        // `DeviceData::try_from` on it, so it can't fail.
+
+        let sender_device_data =
+            DeviceData::try_from(sender_device_keys).expect("failed to verify sender device keys");
+        let sender_device = self.store().wrap_device_data(sender_device_data).await?;
+
+        changes.received_room_key_bundles.push(StoredRoomKeyBundleData {
+            sender_user: event.sender.clone(),
+            sender_data: SenderData::from_device(&sender_device),
+            bundle_data: event.content.clone(),
+        });
+        Ok(())
     }
 
     fn add_withheld_info(&self, changes: &mut Changes, event: &RoomKeyWithheldEvent) {
@@ -1089,6 +1144,66 @@ impl OlmMachine {
         self.inner.group_session_manager.share_room_key(room_id, users, encryption_settings).await
     }
 
+    /// Encrypts the given content using Olm for each of the given devices.
+    ///
+    /// The 1-to-1 session must be established prior to this
+    /// call by using the [`OlmMachine::get_missing_sessions`] method or the
+    /// encryption will fail.
+    ///
+    /// The caller is responsible for sending the encrypted
+    /// event to the target device, and should do it ASAP to avoid out-of-order
+    /// messages.
+    ///
+    /// # Returns
+    /// A list of `ToDeviceRequest` to send out the event, and the list of
+    /// devices where encryption did not succeed (device excluded or no olm)
+    #[cfg(feature = "experimental-send-custom-to-device")]
+    pub async fn encrypt_content_for_devices(
+        &self,
+        devices: Vec<DeviceData>,
+        event_type: &str,
+        content: &Value,
+    ) -> OlmResult<(Vec<ToDeviceRequest>, Vec<(DeviceData, WithheldCode)>)> {
+        // TODO: Use a `CollectStrategy` arguments to filter our devices depending on
+        // safety settings (like not sending to insecure devices).
+        let mut changes = Changes::default();
+
+        let result = self
+            .inner
+            .group_session_manager
+            .encrypt_content_for_devices(devices, event_type, content.clone(), &mut changes)
+            .await;
+
+        // Persist any changes we might have collected.
+        if !changes.is_empty() {
+            let session_count = changes.sessions.len();
+
+            self.inner.store.save_changes(changes).await?;
+
+            trace!(
+                session_count = session_count,
+                "Stored the changed sessions after encrypting a custom to-device event"
+            );
+        }
+
+        result
+    }
+    /// Collect the devices belonging to the given user, and send the details of
+    /// a room key bundle to those devices.
+    ///
+    /// Returns a list of to-device requests which must be sent.
+    pub async fn share_room_key_bundle_data(
+        &self,
+        user_id: &UserId,
+        collect_strategy: &CollectStrategy,
+        bundle_data: RoomKeyBundleContent,
+    ) -> OlmResult<Vec<ToDeviceRequest>> {
+        self.inner
+            .group_session_manager
+            .share_room_key_bundle_data(user_id, collect_strategy, bundle_data)
+            .await
+    }
+
     /// Receive an unencrypted verification event.
     ///
     /// This method can be used to pass verification events that are happening
@@ -1106,8 +1221,7 @@ impl OlmMachine {
 
     /// Receive a verification event.
     ///
-    /// in rooms to the `OlmMachine`. The event should be in the decrypted form.
-    /// in rooms to the `OlmMachine`.
+    /// The event should be in the decrypted form.
     pub async fn receive_verification_event(&self, event: &AnyMessageLikeEvent) -> StoreResult<()> {
         self.inner.verification_machine.receive_any_event(event).await
     }
@@ -1168,6 +1282,10 @@ impl OlmMachine {
             AnyDecryptedOlmEvent::Dummy(_) => {
                 debug!("Received an `m.dummy` event");
             }
+            AnyDecryptedOlmEvent::RoomKeyBundle(e) => {
+                debug!("Received a room key bundle event {:?}", e);
+                self.receive_room_key_bundle_data(e, changes).await?;
+            }
             AnyDecryptedOlmEvent::Custom(_) => {
                 warn!("Received an unexpected encrypted to-device event");
             }
@@ -1210,10 +1328,16 @@ impl OlmMachine {
         self.inner.verification_machine.get_requests(user_id)
     }
 
+    /// Given a to-device event that has either been decrypted or arrived in
+    /// plaintext, handle it.
+    ///
+    /// Here, we only process events that are allowed to arrive in plaintext.
     async fn handle_to_device_event(&self, changes: &mut Changes, event: &ToDeviceEvents) {
         use crate::types::events::ToDeviceEvents::*;
 
         match event {
+            // These are handled here because we accept them either plaintext or
+            // encrypted
             RoomKeyRequest(e) => self.inner.key_request_machine.receive_incoming_key_request(e),
             SecretRequest(e) => self.inner.key_request_machine.receive_incoming_secret_request(e),
             RoomKeyWithheld(e) => self.add_withheld_info(changes, e),
@@ -1227,8 +1351,16 @@ impl OlmMachine {
             | KeyVerificationStart(..) => {
                 self.handle_verification_event(event).await;
             }
-            Dummy(_) | RoomKey(_) | ForwardedRoomKey(_) | RoomEncrypted(_) => {}
-            _ => {}
+
+            // We don't process custom or dummy events at all
+            Custom(_) | Dummy(_) => {}
+
+            // Encrypted events are handled elsewhere
+            RoomEncrypted(_) => {}
+
+            // These are handled in `handle_decrypted_to_device_event` because we
+            // only accept them if they arrive encrypted.
+            SecretSend(_) | RoomKey(_) | ForwardedRoomKey(_) => {}
         }
     }
 
@@ -1240,7 +1372,6 @@ impl OlmMachine {
             #[serde(borrow, rename = "org.matrix.msgid")]
             message_id: Option<&'a str>,
         }
-
         #[derive(Deserialize)]
         struct ToDeviceStub<'a> {
             sender: &'a str,
@@ -1269,8 +1400,8 @@ impl OlmMachine {
         &self,
         transaction: &mut StoreTransaction,
         changes: &mut Changes,
-        mut raw_event: Raw<AnyToDeviceEvent>,
-    ) -> Option<Raw<AnyToDeviceEvent>> {
+        raw_event: Raw<AnyToDeviceEvent>,
+    ) -> Option<ProcessedToDeviceEvent> {
         Self::record_message_id(&raw_event);
 
         let event: ToDeviceEvents = match raw_event.deserialize_as() {
@@ -1278,8 +1409,7 @@ impl OlmMachine {
             Err(e) => {
                 // Skip invalid events.
                 warn!("Received an invalid to-device event: {e}");
-
-                return Some(raw_event);
+                return Some(ProcessedToDeviceEvent::Invalid(raw_event));
             }
         };
 
@@ -1287,81 +1417,81 @@ impl OlmMachine {
 
         match event {
             ToDeviceEvents::RoomEncrypted(e) => {
-                let decrypted = match self.decrypt_to_device_event(transaction, &e, changes).await {
-                    Ok(e) => e,
-                    Err(err) => {
-                        if let OlmError::SessionWedged(sender, curve_key) = err {
-                            if let Err(e) = self
-                                .inner
-                                .session_manager
-                                .mark_device_as_wedged(&sender, curve_key)
-                                .await
-                            {
-                                error!(
-                                    error = ?e,
-                                    "Couldn't mark device from to be unwedged",
-                                );
-                            }
-                        }
-
-                        return Some(raw_event);
-                    }
-                };
-
-                // We ignore all to-device events from dehydrated devices - we should not
-                // receive any
-                match self.to_device_event_is_from_dehydrated_device(&decrypted, &e.sender).await {
-                    Ok(true) => {
-                        warn!(
-                            sender = ?e.sender,
-                            session = ?decrypted.session,
-                            "Received a to-device event from a dehydrated device. This is unexpected: ignoring event"
-                        );
-                        return None;
-                    }
-                    Ok(false) => {}
-                    Err(err) => {
-                        error!(
-                            error = ?err,
-                            "Couldn't check whether event is from dehydrated device",
-                        );
-                    }
-                }
-
-                // New sessions modify the account so we need to save that
-                // one as well.
-                match decrypted.session {
-                    SessionType::New(s) | SessionType::Existing(s) => {
-                        changes.sessions.push(s);
-                    }
-                }
-
-                changes.message_hashes.push(decrypted.message_hash);
-
-                if let Some(group_session) = decrypted.inbound_group_session {
-                    changes.inbound_group_sessions.push(group_session);
-                }
-
-                match decrypted.result.raw_event.deserialize_as() {
-                    Ok(event) => {
-                        self.handle_to_device_event(changes, &event).await;
-
-                        raw_event = event
-                            .serialize_zeroized()
-                            .expect("Zeroizing and reserializing our events should always work")
-                            .cast();
-                    }
-                    Err(e) => {
-                        warn!("Received an invalid encrypted to-device event: {e}");
-                        raw_event = decrypted.result.raw_event;
-                    }
-                }
+                self.receive_encrypted_to_device_event(transaction, changes, raw_event, e).await
             }
+            e => {
+                self.handle_to_device_event(changes, &e).await;
+                Some(ProcessedToDeviceEvent::PlainText(raw_event))
+            }
+        }
+    }
 
-            e => self.handle_to_device_event(changes, &e).await,
+    /// Decrypt the supplied encrypted to-device event (if we can) and handle
+    /// it.
+    ///
+    /// Return the same event, decrypted if possible.
+    ///
+    /// If we can identify that this to-device event came from a dehydrated
+    /// device, this method does not process it, and returns `None`.
+    async fn receive_encrypted_to_device_event(
+        &self,
+        transaction: &mut StoreTransaction,
+        changes: &mut Changes,
+        mut raw_event: Raw<AnyToDeviceEvent>,
+        e: ToDeviceEvent<ToDeviceEncryptedEventContent>,
+    ) -> Option<ProcessedToDeviceEvent> {
+        let decrypted = match self.decrypt_to_device_event(transaction, &e, changes).await {
+            Ok(decrypted) => decrypted,
+            Err(DecryptToDeviceError::OlmError(err)) => {
+                if let OlmError::SessionWedged(sender, curve_key) = err {
+                    if let Err(e) =
+                        self.inner.session_manager.mark_device_as_wedged(&sender, curve_key).await
+                    {
+                        error!(
+                            error = ?e,
+                            "Couldn't mark device to be unwedged",
+                        );
+                    }
+                }
+
+                return Some(ProcessedToDeviceEvent::UnableToDecrypt(raw_event));
+            }
+            Err(DecryptToDeviceError::FromDehydratedDevice) => return None,
+        };
+
+        // New sessions modify the account so we need to save that
+        // one as well.
+        match decrypted.session {
+            SessionType::New(s) | SessionType::Existing(s) => {
+                changes.sessions.push(s);
+            }
         }
 
-        Some(raw_event)
+        changes.message_hashes.push(decrypted.message_hash);
+
+        if let Some(group_session) = decrypted.inbound_group_session {
+            changes.inbound_group_sessions.push(group_session);
+        }
+
+        match decrypted.result.raw_event.deserialize_as() {
+            Ok(event) => {
+                self.handle_to_device_event(changes, &event).await;
+
+                raw_event = event
+                    .serialize_zeroized()
+                    .expect("Zeroizing and reserializing our events should always work")
+                    .cast();
+            }
+            Err(e) => {
+                warn!("Received an invalid encrypted to-device event: {e}");
+                raw_event = decrypted.result.raw_event;
+            }
+        }
+
+        Some(ProcessedToDeviceEvent::Decrypted {
+            raw: raw_event,
+            encryption_info: decrypted.result.encryption_info,
+        })
     }
 
     /// Decide whether a decrypted to-device event was sent from a dehydrated
@@ -1419,7 +1549,7 @@ impl OlmMachine {
     pub async fn receive_sync_changes(
         &self,
         sync_changes: EncryptionSyncChanges<'_>,
-    ) -> OlmResult<(Vec<Raw<AnyToDeviceEvent>>, Vec<RoomKeyInfo>)> {
+    ) -> OlmResult<(Vec<ProcessedToDeviceEvent>, Vec<RoomKeyInfo>)> {
         let mut store_transaction = self.inner.store.transaction().await;
 
         let (events, changes) =
@@ -1448,10 +1578,18 @@ impl OlmMachine {
         &self,
         transaction: &mut StoreTransaction,
         sync_changes: EncryptionSyncChanges<'_>,
-    ) -> OlmResult<(Vec<Raw<AnyToDeviceEvent>>, Changes)> {
+    ) -> OlmResult<(Vec<ProcessedToDeviceEvent>, Changes)> {
         // Remove verification objects that have expired or are done.
-        let mut events = self.inner.verification_machine.garbage_collect();
-
+        let mut events: Vec<ProcessedToDeviceEvent> = self
+            .inner
+            .verification_machine
+            .garbage_collect()
+            .iter()
+            // These are `fake` to device events just serving as local echo
+            // in order that our own client can react quickly to cancelled transaction.
+            // Just use PlainText for that.
+            .map(|e| ProcessedToDeviceEvent::PlainText(e.clone()))
+            .collect();
         // The account is automatically saved by the store transaction created by the
         // caller.
         let mut changes = Default::default();
@@ -1477,11 +1615,11 @@ impl OlmMachine {
         }
 
         for raw_event in sync_changes.to_device_events {
-            let raw_event =
+            let processed_event =
                 Box::pin(self.receive_to_device_event(transaction, &mut changes, raw_event)).await;
 
-            if let Some(raw_event) = raw_event {
-                events.push(raw_event);
+            if let Some(processed_event) = processed_event {
+                events.push(processed_event);
             }
         }
 
@@ -1522,20 +1660,65 @@ impl OlmMachine {
         self.inner.key_request_machine.request_key(room_id, &event).await
     }
 
-    /// Find whether the supplied session is verified, and provide
-    /// explanation of what is missing/wrong if not.
+    /// Find whether an event decrypted via the supplied session is verified,
+    /// and provide explanation of what is missing/wrong if not.
+    ///
+    /// Stores the updated [`SenderData`] for the session in the store
+    /// if we find an updated value for it.
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - The inbound Megolm session that was used to decrypt the
+    ///   event.
+    /// * `sender` - The `sender` of that event (as claimed by the envelope of
+    ///   the event).
+    async fn get_room_event_verification_state(
+        &self,
+        session: &InboundGroupSession,
+        sender: &UserId,
+    ) -> MegolmResult<(VerificationState, Option<OwnedDeviceId>)> {
+        let sender_data = self.get_or_update_sender_data(session, sender).await?;
+
+        // If the user ID in the sender data doesn't match that in the event envelope,
+        // this event is not from who it appears to be from.
+        //
+        // If `sender_data.user_id()` returns `None`, that means we don't have any
+        // information about the owner of the session (i.e. we have
+        // `SenderData::UnknownDevice`); in that case we fall through to the
+        // logic in `sender_data_to_verification_state` which will pick an appropriate
+        // `DeviceLinkProblem` for `VerificationLevel::None`.
+        let (verification_state, device_id) = match sender_data.user_id() {
+            Some(i) if i != sender => {
+                (VerificationState::Unverified(VerificationLevel::MismatchedSender), None)
+            }
+
+            Some(_) | None => {
+                sender_data_to_verification_state(sender_data, session.has_been_imported())
+            }
+        };
+
+        Ok((verification_state, device_id))
+    }
+
+    /// Get an up-to-date [`SenderData`] for the given session, suitable for
+    /// determining if messages decrypted using that session are verified.
     ///
     /// Checks both the stored verification state of the session and a
     /// recalculated verification state based on our current knowledge, and
     /// returns the more trusted of the two.
     ///
-    /// Store the updated [`SenderData`] for this session in the store
+    /// Stores the updated [`SenderData`] for the session in the store
     /// if we find an updated value for it.
-    async fn get_or_update_verification_state(
+    ///
+    /// # Arguments
+    ///
+    /// * `session` - The Megolm session that was used to decrypt the event.
+    /// * `sender` - The claimed sender of that event.
+    async fn get_or_update_sender_data(
         &self,
         session: &InboundGroupSession,
         sender: &UserId,
-    ) -> MegolmResult<(VerificationState, Option<OwnedDeviceId>)> {
+    ) -> MegolmResult<SenderData> {
         /// Whether we should recalculate the Megolm sender's data, given the
         /// current sender data. We only want to recalculate if it might
         /// increase trust and allow us to decrypt messages that we
@@ -1556,7 +1739,24 @@ impl OlmMachine {
         }
 
         let sender_data = if should_recalculate_sender_data(&session.sender_data) {
-            // The session is not sure of the sender yet. Calculate it.
+            // The session is not sure of the sender yet. Try to find a matching device
+            // belonging to the claimed sender of the recently-received event.
+            //
+            // It's worth noting that this could in theory result in unintuitive changes,
+            // like a session which initially appears to belong to Alice turning into a
+            // session which belongs to Bob [1]. This could mean that a session initially
+            // successfully decrypts events from Alice, but then stops decrypting those same
+            // events once we get an update.
+            //
+            // That's ok though: if we get good evidence that the session belongs to Bob,
+            // it's correct to update the session even if we previously had weak
+            // evidence it belonged to Alice.
+            //
+            // [1] For example: maybe Alice and Bob both publish devices with the *same*
+            // keys (presumably because they are colluding). Initially we think
+            // the session belongs to Alice, but then we do a device lookup for
+            // Bob, we find a matching device with a cross-signature, so prefer
+            // that.
             let calculated_sender_data = SenderDataFinder::find_using_curve_key(
                 self.store(),
                 session.sender_key(),
@@ -1582,7 +1782,7 @@ impl OlmMachine {
             session.sender_data.clone()
         };
 
-        Ok(sender_data_to_verification_state(sender_data, session.has_been_imported()))
+        Ok(sender_data)
     }
 
     /// Request missing local secrets from our devices (cross signing private
@@ -1653,13 +1853,13 @@ impl OlmMachine {
         &self,
         session: &InboundGroupSession,
         sender: &UserId,
-    ) -> MegolmResult<EncryptionInfo> {
+    ) -> MegolmResult<Arc<EncryptionInfo>> {
         let (verification_state, device_id) =
-            self.get_or_update_verification_state(session, sender).await?;
+            self.get_room_event_verification_state(session, sender).await?;
 
         let sender = sender.to_owned();
 
-        Ok(EncryptionInfo {
+        Ok(Arc::new(EncryptionInfo {
             sender,
             sender_device: device_id,
             algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
@@ -1669,10 +1869,10 @@ impl OlmMachine {
                     .iter()
                     .map(|(k, v)| (k.to_owned(), v.to_base64()))
                     .collect(),
+                session_id: Some(session.session_id().to_owned()),
             },
             verification_state,
-            session_id: Some(session.session_id().to_owned()),
-        })
+        }))
     }
 
     async fn decrypt_megolm_events(
@@ -1681,7 +1881,7 @@ impl OlmMachine {
         event: &EncryptedEvent,
         content: &SupportedEventEncryptionSchemes<'_>,
         decryption_settings: &DecryptionSettings,
-    ) -> MegolmResult<(JsonObject, EncryptionInfo)> {
+    ) -> MegolmResult<(JsonObject, Arc<EncryptionInfo>)> {
         let session =
             self.get_inbound_group_session_or_error(room_id, content.session_id()).await?;
 
@@ -1727,52 +1927,87 @@ impl OlmMachine {
         }
     }
 
-    /// Check that the sender of a Megolm session satisfies the trust
+    /// Check that a Megolm event satisfies the sender trust
     /// requirement from the decryption settings.
+    ///
+    /// If the requirement is not satisfied, returns
+    /// [`MegolmError::SenderIdentityNotTrusted`].
     fn check_sender_trust_requirement(
         &self,
         session: &InboundGroupSession,
         encryption_info: &EncryptionInfo,
         trust_requirement: &TrustRequirement,
     ) -> MegolmResult<()> {
-        /// Get the error from the encryption information.
-        fn encryption_info_to_error(encryption_info: &EncryptionInfo) -> MegolmResult<()> {
-            // When this is called, the verification state *must* be unverified,
-            // otherwise the sender_data would have been SenderVerified
-            let VerificationState::Unverified(verification_level) =
-                &encryption_info.verification_state
-            else {
-                unreachable!("inconsistent verification state");
-            };
+        trace!(
+            verification_state = ?encryption_info.verification_state,
+            ?trust_requirement, "check_sender_trust_requirement",
+        );
+
+        // VerificationState::Verified is acceptable for all TrustRequirement levels, so
+        // let's get that out of the way
+        let verification_level = match &encryption_info.verification_state {
+            VerificationState::Verified => return Ok(()),
+            VerificationState::Unverified(verification_level) => verification_level,
+        };
+
+        let ok = match trust_requirement {
+            TrustRequirement::Untrusted => true,
+
+            TrustRequirement::CrossSignedOrLegacy => {
+                // `VerificationLevel::UnsignedDevice` and `VerificationLevel::None` correspond
+                // to `SenderData::DeviceInfo` and `SenderData::UnknownDevice`
+                // respectively, and those cases may be acceptable if the reason
+                // for the lack of data is that the sessions were established
+                // before we started collecting SenderData.
+                let legacy_session = match session.sender_data {
+                    SenderData::DeviceInfo { legacy_session, .. } => legacy_session,
+                    SenderData::UnknownDevice { legacy_session, .. } => legacy_session,
+                    _ => false,
+                };
+
+                // In the CrossSignedOrLegacy case the following rules apply:
+                //
+                // 1. Identities we have not yet verified can be decrypted regardless of the
+                //    legacy state of the session.
+                // 2. Devices that aren't signed by the owning identity of the device can only
+                //    be decrypted if it's a legacy session.
+                // 3. If we have no information about the device, we should only decrypt if it's
+                //    a legacy session.
+                // 4. Anything else, should throw an error.
+                match (verification_level, legacy_session) {
+                    // Case 1
+                    (VerificationLevel::UnverifiedIdentity, _) => true,
+
+                    // Case 2
+                    (VerificationLevel::UnsignedDevice, true) => true,
+
+                    // Case 3
+                    (VerificationLevel::None(_), true) => true,
+
+                    // Case 4
+                    (VerificationLevel::VerificationViolation, _)
+                    | (VerificationLevel::MismatchedSender, _)
+                    | (VerificationLevel::UnsignedDevice, false)
+                    | (VerificationLevel::None(_), false) => false,
+                }
+            }
+
+            // If cross-signing of identities is required, the only acceptable unverified case
+            // is when the identity is signed but not yet verified by us.
+            TrustRequirement::CrossSigned => match verification_level {
+                VerificationLevel::UnverifiedIdentity => true,
+
+                VerificationLevel::VerificationViolation
+                | VerificationLevel::MismatchedSender
+                | VerificationLevel::UnsignedDevice
+                | VerificationLevel::None(_) => false,
+            },
+        };
+
+        if ok {
+            Ok(())
+        } else {
             Err(MegolmError::SenderIdentityNotTrusted(verification_level.clone()))
-        }
-
-        match trust_requirement {
-            TrustRequirement::Untrusted => Ok(()),
-
-            TrustRequirement::CrossSignedOrLegacy => match &session.sender_data {
-                // Reject if the sender was previously verified, but changed
-                // their identity and is not verified any more.
-                SenderData::VerificationViolation(..) => Err(
-                    MegolmError::SenderIdentityNotTrusted(VerificationLevel::VerificationViolation),
-                ),
-                SenderData::SenderUnverified(..) => Ok(()),
-                SenderData::SenderVerified(..) => Ok(()),
-                SenderData::DeviceInfo { legacy_session: true, .. } => Ok(()),
-                SenderData::UnknownDevice { legacy_session: true, .. } => Ok(()),
-                _ => encryption_info_to_error(encryption_info),
-            },
-
-            TrustRequirement::CrossSigned => match &session.sender_data {
-                // Reject if the sender was previously verified, but changed
-                // their identity and is not verified any more.
-                SenderData::VerificationViolation(..) => Err(
-                    MegolmError::SenderIdentityNotTrusted(VerificationLevel::VerificationViolation),
-                ),
-                SenderData::SenderUnverified(..) => Ok(()),
-                SenderData::SenderVerified(..) => Ok(()),
-                _ => encryption_info_to_error(encryption_info),
-            },
         }
     }
 
@@ -2056,11 +2291,12 @@ impl OlmMachine {
     ///
     /// * `event` - The event to get information for.
     /// * `room_id` - The ID of the room where the event was sent to.
+    #[instrument(skip(self, event), fields(event_id, sender, session_id))]
     pub async fn get_room_event_encryption_info(
         &self,
         event: &Raw<EncryptedEvent>,
         room_id: &RoomId,
-    ) -> MegolmResult<EncryptionInfo> {
+    ) -> MegolmResult<Arc<EncryptionInfo>> {
         let event = event.deserialize()?;
 
         let content: SupportedEventEncryptionSchemes<'_> = match &event.content.scheme {
@@ -2072,10 +2308,15 @@ impl OlmMachine {
             }
         };
 
+        Span::current()
+            .record("sender", debug(&event.sender))
+            .record("event_id", debug(&event.event_id))
+            .record("session_id", content.session_id());
+
         self.get_session_encryption_info(room_id, content.session_id(), &event.sender).await
     }
 
-    /// Get encryption info for a megolm session.
+    /// Get encryption info for an event decrypted with a megolm session.
     ///
     /// This recalculates the [`EncryptionInfo`] data that is returned by
     /// [`OlmMachine::decrypt_room_event`], based on the current
@@ -2087,13 +2328,14 @@ impl OlmMachine {
     ///
     /// * `room_id` - The ID of the room where the session is being used.
     /// * `session_id` - The ID of the session to get information for.
-    /// * `sender` - The user ID of the sender who created this session.
+    /// * `sender` - The (claimed) sender of the event where the session was
+    ///   used.
     pub async fn get_session_encryption_info(
         &self,
         room_id: &RoomId,
         session_id: &str,
         sender: &UserId,
-    ) -> MegolmResult<EncryptionInfo> {
+    ) -> MegolmResult<Arc<EncryptionInfo>> {
         let session = self.get_inbound_group_session_or_error(room_id, session_id).await?;
         self.get_encryption_info(&session, sender).await
     }
@@ -2690,6 +2932,38 @@ fn megolm_error_to_utd_info(
     });
 
     Ok(UnableToDecryptInfo { session_id, reason })
+}
+
+/// An error that can occur during [`OlmMachine::decrypt_to_device_event`] -
+/// either because decryption failed, or because the sender device was a
+/// dehydrated device, which should never send any to-device messages.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DecryptToDeviceError {
+    #[error("An Olm error occurred meaning we failed to decrypt the event")]
+    OlmError(#[from] OlmError),
+
+    #[error("The event was sent from a dehydrated device")]
+    FromDehydratedDevice,
+}
+
+impl From<CryptoStoreError> for DecryptToDeviceError {
+    fn from(value: CryptoStoreError) -> Self {
+        Self::OlmError(value.into())
+    }
+}
+
+#[cfg(test)]
+impl From<DecryptToDeviceError> for OlmError {
+    /// Unwrap the `OlmError` inside this error, or panic if this does not
+    /// contain an `OlmError`.
+    fn from(value: DecryptToDeviceError) -> Self {
+        match value {
+            DecryptToDeviceError::OlmError(olm_error) => olm_error,
+            DecryptToDeviceError::FromDehydratedDevice => {
+                panic!("Expected an OlmError but found FromDehydratedDevice")
+            }
+        }
+    }
 }
 
 #[cfg(test)]

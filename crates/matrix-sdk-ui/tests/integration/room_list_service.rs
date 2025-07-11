@@ -1,4 +1,4 @@
-use std::ops::Not;
+use std::{ops::Not, sync::Arc};
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
@@ -10,7 +10,7 @@ use matrix_sdk::{
         mocks::{MatrixMockServer, RoomMessagesResponseTemplate},
         set_client_session, test_client_builder,
     },
-    Client,
+    Client, RoomDisplayName,
 };
 use matrix_sdk_base::sync::UnreadNotificationsCount;
 use matrix_sdk_test::{
@@ -21,7 +21,7 @@ use matrix_sdk_ui::{
         filters::{new_filter_fuzzy_match_room_name, new_filter_non_left, new_filter_none},
         Error, RoomListLoadingState, State, SyncIndicator, ALL_ROOMS_LIST_NAME as ALL_ROOMS,
     },
-    timeline::{TimelineItemKind, VirtualTimelineItem},
+    timeline::{RoomExt as _, TimelineItemKind, VirtualTimelineItem},
     RoomListService,
 };
 use ruma::{
@@ -34,7 +34,7 @@ use ruma::{
 use serde_json::json;
 use stream_assert::{assert_next_matches, assert_pending};
 use tempfile::TempDir;
-use tokio::{spawn, sync::mpsc::channel, task::yield_now, time::sleep};
+use tokio::{spawn, sync::Barrier, task::yield_now, time::sleep};
 use wiremock::{
     matchers::{header, method, path},
     Mock, MockServer, ResponseTemplate,
@@ -360,15 +360,16 @@ async fn test_sync_all_states() -> Result<(), Error> {
                         ["m.room.member", "$LAZY"],
                         ["m.room.member", "$ME"],
                         ["m.room.topic", ""],
+                        ["m.room.avatar", ""],
                         ["m.room.canonical_alias", ""],
                         ["m.room.power_levels", ""],
                         ["org.matrix.msc3401.call.member", "*"],
                         ["m.room.join_rules", ""],
+                        ["m.room.tombstone", ""],
                         ["m.room.create", ""],
                         ["m.room.history_visibility", ""],
                         ["io.element.functional_members", ""],
                     ],
-                    "include_heroes": true,
                     "filters": {
                         "not_room_types": ["m.space"],
                     },
@@ -1292,19 +1293,21 @@ async fn test_loading_states() -> Result<(), Error> {
             RoomListLoadingState::Loaded { maximum_number_of_rooms: Some(12) }
         );
 
+        // The sync skips the `Init` state, and immediately starts in the `SettingUp`
+        // state, as the sync `pos`ition marker was set.
         sync_then_assert_request_and_fake_response! {
             [server, room_list, sync]
-            states = Init => SettingUp,
+            states = SettingUp => Running,
             assert request >= {
                 "lists": {
                     ALL_ROOMS: {
-                        "ranges": [[0, 19]],
+                        "ranges": [[0, 11]],
                         "timeline_limit": 1,
                     },
                 },
             },
             respond with = {
-                "pos": "0",
+                "pos": "3",
                 "lists": {
                     ALL_ROOMS: {
                         "count": 13, // 1 more room
@@ -1489,8 +1492,20 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
         push front [ "!r4:bar.org" ];
         end;
     };
-    // TODO (@hywan): Must be removed once we restore `RoomInfoNotableUpdate`
-    // filtering inside `RoomList`.
+    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
+    // removed.
+    assert_entries_batch! {
+        [dynamic_entries_stream]
+        set [ 1 ] [ "!r1:bar.org" ];
+        end;
+    };
+    assert_entries_batch! {
+        [dynamic_entries_stream]
+        set [ 0 ] [ "!r4:bar.org" ];
+        end;
+    };
+    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
+    // removed.
     assert_entries_batch! {
         [dynamic_entries_stream]
         set [ 1 ] [ "!r1:bar.org" ];
@@ -1582,13 +1597,28 @@ async fn test_dynamic_entries_stream() -> Result<(), Error> {
         push front [ "!r7:bar.org" ];
         end;
     };
-    // TODO (@hywan): Must be removed once we restore `RoomInfoNotableUpdate`
-    // filtering inside `RoomList`.
+    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
+    // removed.
     assert_entries_batch! {
         [dynamic_entries_stream]
         set [ 1 ] [ "!r5:bar.org" ];
         end;
     };
+    assert_entries_batch! {
+        [dynamic_entries_stream]
+        set [ 0 ] [ "!r7:bar.org" ];
+        end;
+    };
+
+    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
+    // removed.
+    assert_entries_batch! {
+        [dynamic_entries_stream]
+        set [ 1 ] [ "!r5:bar.org" ];
+        end;
+    };
+    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
+    // removed.
     assert_entries_batch! {
         [dynamic_entries_stream]
         set [ 0 ] [ "!r7:bar.org" ];
@@ -1991,8 +2021,16 @@ async fn test_room_sorting() -> Result<(), Error> {
     // | 4     | !r1     | 6       | Aaa  |
     // | 5     | !r4     | 5       |      |
 
-    // TODO (@hywan): Must be removed once we restore `RoomInfoNotableUpdate`
-    // filtering inside `RoomList`.
+    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
+    // removed.
+    assert_entries_batch! {
+        [stream]
+        set [ 2 ] [ "!r6:bar.org" ];
+        end;
+    };
+
+    // TODO (@hywan): Remove as soon as `RoomInfoNotableUpdateReasons::NONE` is
+    // removed.
     assert_entries_batch! {
         [stream]
         set [ 2 ] [ "!r6:bar.org" ];
@@ -2096,7 +2134,7 @@ async fn test_room() -> Result<(), Error> {
     let room0 = room_list.room(room_id_0)?;
 
     // Room has received a name from sliding sync.
-    assert_eq!(room0.cached_display_name(), Some("Room #0".to_owned()));
+    assert_eq!(room0.cached_display_name(), Some(RoomDisplayName::Named("Room #0".to_owned())));
 
     // Room has received an avatar from sliding sync.
     assert_eq!(room0.avatar_url(), Some(mxc_uri!("mxc://homeserver/media").to_owned()));
@@ -2104,7 +2142,7 @@ async fn test_room() -> Result<(), Error> {
     let room1 = room_list.room(room_id_1)?;
 
     // Room has not received a name from sliding sync, then it's calculated.
-    assert_eq!(room1.cached_display_name(), Some("Empty Room".to_owned()));
+    assert_eq!(room1.cached_display_name(), Some(RoomDisplayName::Empty));
 
     // Room has not received an avatar from sliding sync, then it's calculated, but
     // there is nothing to calculate from, so there is no URL.
@@ -2141,7 +2179,7 @@ async fn test_room() -> Result<(), Error> {
     };
 
     // Room has _now_ received a name from sliding sync!
-    assert_eq!(room1.cached_display_name(), Some("Room #1".to_owned()));
+    assert_eq!(room1.cached_display_name(), Some(RoomDisplayName::Named("Room #1".to_owned())));
 
     // Room has _now_ received an avatar URL from sliding sync!
     assert_eq!(room1.avatar_url(), Some(mxc_uri!("mxc://homeserver/other-media").to_owned()));
@@ -2228,10 +2266,12 @@ async fn test_room_subscription() -> Result<(), Error> {
                         ["m.room.member", "$LAZY"],
                         ["m.room.member", "$ME"],
                         ["m.room.topic", ""],
+                        ["m.room.avatar", ""],
                         ["m.room.canonical_alias", ""],
                         ["m.room.power_levels", ""],
                         ["org.matrix.msc3401.call.member", "*"],
                         ["m.room.join_rules", ""],
+                        ["m.room.tombstone", ""],
                         ["m.room.create", ""],
                         ["m.room.history_visibility", ""],
                         ["io.element.functional_members", ""],
@@ -2269,10 +2309,12 @@ async fn test_room_subscription() -> Result<(), Error> {
                         ["m.room.member", "$LAZY"],
                         ["m.room.member", "$ME"],
                         ["m.room.topic", ""],
+                        ["m.room.avatar", ""],
                         ["m.room.canonical_alias", ""],
                         ["m.room.power_levels", ""],
                         ["org.matrix.msc3401.call.member", "*"],
                         ["m.room.join_rules", ""],
+                        ["m.room.tombstone", ""],
                         ["m.room.create", ""],
                         ["m.room.history_visibility", ""],
                         ["io.element.functional_members", ""],
@@ -2427,8 +2469,7 @@ async fn test_room_timeline() -> Result<(), Error> {
     mock_encryption_state(&server, false).await;
 
     let room = room_list.room(room_id)?;
-    room.init_timeline_with_builder(room.default_room_timeline_builder().await.unwrap()).await?;
-    let timeline = room.timeline().unwrap();
+    let timeline = room.timeline_builder().build().await.unwrap();
 
     let (previous_timeline_items, mut timeline_items_stream) = timeline.subscribe().await;
 
@@ -2492,7 +2533,7 @@ async fn test_room_empty_timeline() {
 
     // The room wasn't synced, but it will be available
     let room = room_list.room(&room_id).unwrap();
-    let timeline = room.default_room_timeline_builder().await.unwrap().build().await.unwrap();
+    let timeline = room.timeline_builder().build().await.unwrap();
     let (prev_items, _) = timeline.subscribe().await;
 
     // However, since the room wasn't synced its timeline won't have any initial
@@ -2529,10 +2570,10 @@ async fn test_room_latest_event() -> Result<(), Error> {
     };
 
     let room = room_list.room(room_id)?;
-    room.init_timeline_with_builder(room.default_room_timeline_builder().await.unwrap()).await?;
+    let timeline = room.timeline_builder().build().await.unwrap();
 
     // The latest event does not exist.
-    assert!(room.latest_event().await.is_none());
+    assert!(room.latest_event_item().await.is_none());
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -2552,7 +2593,7 @@ async fn test_room_latest_event() -> Result<(), Error> {
 
     // The latest event exists.
     assert_matches!(
-        room.latest_event().await,
+        room.latest_event_item().await,
         Some(event) => {
             assert!(event.is_local_echo().not());
             assert_eq!(event.event_id(), Some(event_id!("$x0:bar.org")));
@@ -2576,12 +2617,9 @@ async fn test_room_latest_event() -> Result<(), Error> {
     };
 
     // The latest event has been updated.
-    let latest_event = room.latest_event().await.unwrap();
+    let latest_event = room.latest_event_item().await.unwrap();
     assert!(latest_event.is_local_echo().not());
     assert_eq!(latest_event.event_id(), Some(event_id!("$x1:bar.org")));
-
-    // Now let's compare with the result of the `Timeline`.
-    let timeline = room.timeline().unwrap();
 
     // The latest event matches the latest event of the `Timeline`.
     assert_matches!(
@@ -2606,24 +2644,14 @@ async fn test_room_latest_event() -> Result<(), Error> {
         }
     );
 
-    // The latest event is a local event.
-    assert_matches!(
-        room.latest_event().await,
-        Some(event) => {
-            assert!(event.is_local_echo());
-            assert_eq!(event.event_id(), None);
-        }
-    );
-
     Ok(())
 }
 
-// #[ignore = "Flaky"]
 #[async_test]
 async fn test_sync_indicator() -> Result<(), Error> {
     let (_, server, room_list) = new_room_list_service().await?;
 
-    const DELAY_BEFORE_SHOWING: Duration = Duration::from_millis(20);
+    const DELAY_BEFORE_SHOWING: Duration = Duration::from_millis(100);
     const DELAY_BEFORE_HIDING: Duration = Duration::from_millis(0);
 
     let sync = room_list.sync();
@@ -2632,13 +2660,10 @@ async fn test_sync_indicator() -> Result<(), Error> {
     let sync_indicator = room_list.sync_indicator(DELAY_BEFORE_SHOWING, DELAY_BEFORE_HIDING);
 
     let request_margin = Duration::from_millis(100);
-    let request_1_delay = DELAY_BEFORE_SHOWING * 2;
-    let request_2_delay = DELAY_BEFORE_SHOWING * 3;
-    let request_4_delay = DELAY_BEFORE_SHOWING * 2;
-    let request_5_delay = DELAY_BEFORE_SHOWING * 2;
+    let request_delay = DELAY_BEFORE_SHOWING * 2;
 
-    let (in_between_requests_synchronizer_sender, mut in_between_requests_synchronizer) =
-        channel(1);
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier_sync_indicator = barrier.clone();
 
     macro_rules! assert_next_sync_indicator {
         ($sync_indicator:ident, $pattern:pat, now $(,)?) => {
@@ -2655,81 +2680,75 @@ async fn test_sync_indicator() -> Result<(), Error> {
     let sync_indicator_task = spawn(async move {
         pin_mut!(sync_indicator);
 
+        let barrier = barrier_sync_indicator;
+
         // `SyncIndicator` is forced to be hidden to begin with.
         assert_next_sync_indicator!(sync_indicator, SyncIndicator::Hide, now);
 
+        barrier.wait().await;
+
         // Request 1.
         {
-            // Sync has started, the `SyncIndicator` must be shown… but not immediately!
+            // The state transitions into `Init`. The `SyncIndicator` must be `Show`.
             assert_next_sync_indicator!(
                 sync_indicator,
                 SyncIndicator::Show,
                 under DELAY_BEFORE_SHOWING + request_margin,
             );
-
-            // Then, once the sync is done, the `SyncIndicator` must be hidden.
-            assert_next_sync_indicator!(
-                sync_indicator,
-                SyncIndicator::Hide,
-                under request_1_delay - DELAY_BEFORE_SHOWING
-                    + DELAY_BEFORE_HIDING
-                    + request_margin,
-            );
         }
 
-        in_between_requests_synchronizer.recv().await.unwrap();
-        assert_pending!(sync_indicator);
+        barrier.wait().await;
 
         // Request 2.
         {
-            // Nothing happens, as the state transitions from `SettingUp` to
-            // `Running`, no `SyncIndicator` must be shown.
-        }
-
-        in_between_requests_synchronizer.recv().await.unwrap();
-        assert_pending!(sync_indicator);
-
-        // Request 3.
-        {
-            // Sync has errored, the `SyncIndicator` should be show. Fortunately
-            // for us (fictional situation), the sync is restarted
-            // immediately, and `SyncIndicator` doesn't have time to
-            // be shown for this particular state update.
-        }
-
-        in_between_requests_synchronizer.recv().await.unwrap();
-        assert_pending!(sync_indicator);
-
-        // Request 4.
-        {
-            // The system is recovering, It takes times (fictional situation)!
-            // `SyncIndicator` has time to show (off).
+            // The state transitions into `SettingUp`. The `SyncIndicator` stays in `Show`.
             assert_next_sync_indicator!(
                 sync_indicator,
                 SyncIndicator::Show,
                 under DELAY_BEFORE_SHOWING + request_margin,
             );
+        }
 
-            // Then, once the sync is done, the `SyncIndicator` must be hidden.
+        barrier.wait().await;
+
+        // Request 3.
+        {
+            // The state transitions into `Running`. The `SyncIndicator` must be `Hide`.
             assert_next_sync_indicator!(
                 sync_indicator,
                 SyncIndicator::Hide,
-                under request_4_delay - DELAY_BEFORE_SHOWING
-                    + DELAY_BEFORE_HIDING
-                    + request_margin,
+                under DELAY_BEFORE_HIDING + request_margin,
             );
         }
 
-        in_between_requests_synchronizer.recv().await.unwrap();
-        assert_pending!(sync_indicator);
+        barrier.wait().await;
+
+        // Request 4.
+        {
+            // The state transitions into `Error`. The `SyncIndicator` must be `Show`.
+            assert_next_sync_indicator!(
+                sync_indicator,
+                SyncIndicator::Show,
+                under DELAY_BEFORE_SHOWING + request_margin,
+            );
+        }
+
+        barrier.wait().await;
 
         // Request 5.
+        {
+            // The state transitions into `Recovering`. The `SyncIndicator` must be `Hide`.
+            assert_next_sync_indicator!(
+                sync_indicator,
+                SyncIndicator::Hide,
+                under DELAY_BEFORE_HIDING + request_margin,
+            );
+        }
 
-        in_between_requests_synchronizer.recv().await.unwrap();
-
-        // Even though request 5 took a while, the `SyncIndicator` shouldn't show.
         assert_pending!(sync_indicator);
     });
+
+    barrier.wait().await;
 
     // Request 1.
     sync_then_assert_request_and_fake_response! {
@@ -2739,10 +2758,10 @@ async fn test_sync_indicator() -> Result<(), Error> {
         respond with = {
             "pos": "0",
         },
-        after delay = request_1_delay, // Slow request!
+        after delay = request_delay,
     };
 
-    in_between_requests_synchronizer_sender.send(()).await.unwrap();
+    barrier.wait().await;
 
     // Request 2.
     sync_then_assert_request_and_fake_response! {
@@ -2752,10 +2771,10 @@ async fn test_sync_indicator() -> Result<(), Error> {
         respond with = {
             "pos": "1",
         },
-        after delay = request_2_delay, // Slow request!
+        after delay = request_delay,
     };
 
-    in_between_requests_synchronizer_sender.send(()).await.unwrap();
+    barrier.wait().await;
 
     // Request 3.
     sync_then_assert_request_and_fake_response! {
@@ -2767,12 +2786,13 @@ async fn test_sync_indicator() -> Result<(), Error> {
             "error": "foo",
             "errcode": "M_UNKNOWN",
         },
+        after delay = request_delay,
     };
 
     let sync = room_list.sync();
     pin_mut!(sync);
 
-    in_between_requests_synchronizer_sender.send(()).await.unwrap();
+    barrier.wait().await;
 
     // Request 4.
     sync_then_assert_request_and_fake_response! {
@@ -2782,10 +2802,10 @@ async fn test_sync_indicator() -> Result<(), Error> {
         respond with = {
             "pos": "2",
         },
-        after delay = request_4_delay, // Slow request!
+        after delay = request_delay,
     };
 
-    in_between_requests_synchronizer_sender.send(()).await.unwrap();
+    barrier.wait().await;
 
     // Request 5.
     sync_then_assert_request_and_fake_response! {
@@ -2795,10 +2815,8 @@ async fn test_sync_indicator() -> Result<(), Error> {
         respond with = {
             "pos": "3",
         },
-        after delay = request_5_delay, // Slow request!
+        after delay = request_delay,
     };
-
-    in_between_requests_synchronizer_sender.send(()).await.unwrap();
 
     sync_indicator_task.await.unwrap();
 
@@ -2856,10 +2874,7 @@ async fn test_multiple_timeline_init() {
         // Get a RoomListService::Room, initialize the timeline, start a pagination.
         let room = room_list.room(room_id).unwrap();
 
-        let builder = room.default_room_timeline_builder().await.unwrap();
-        room.init_timeline_with_builder(builder).await.unwrap();
-
-        let timeline = room.timeline().unwrap();
+        let timeline = room.timeline_builder().build().await.unwrap();
 
         spawn(async move { timeline.paginate_backwards(20).await })
     };
@@ -2872,6 +2887,5 @@ async fn test_multiple_timeline_init() {
     task.abort();
 
     // A new timeline for the same room can still be constructed.
-    let builder = room.default_room_timeline_builder().await.unwrap();
-    room.init_timeline_with_builder(builder).await.unwrap();
+    room.timeline_builder().build().await.unwrap();
 }

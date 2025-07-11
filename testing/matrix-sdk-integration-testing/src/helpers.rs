@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     ops::Deref,
     option_env,
     path::{Path, PathBuf},
@@ -13,9 +14,12 @@ use matrix_sdk::{
     encryption::EncryptionSettings,
     ruma::{
         api::client::{account::register::v3::Request as RegistrationRequest, uiaa},
+        time::Instant,
         RoomId,
     },
     sliding_sync::VersionBuilder,
+    sync::SyncResponse,
+    timeout::ElapsedError,
     Client, ClientBuilder, Room,
 };
 use once_cell::sync::Lazy;
@@ -36,6 +40,7 @@ pub struct TestClientBuilder {
     username: String,
     use_sqlite_dir: Option<SqlitePath>,
     encryption_settings: EncryptionSettings,
+    enable_share_history_on_invite: bool,
     http_proxy: Option<String>,
     cross_process_store_locks_holder_name: Option<String>,
 }
@@ -52,6 +57,7 @@ impl TestClientBuilder {
             username,
             use_sqlite_dir: None,
             encryption_settings: Default::default(),
+            enable_share_history_on_invite: false,
             http_proxy: None,
             cross_process_store_locks_holder_name: None,
         }
@@ -76,6 +82,11 @@ impl TestClientBuilder {
         self
     }
 
+    pub fn enable_share_history_on_invite(mut self, enable_share_history_on_invite: bool) -> Self {
+        self.enable_share_history_on_invite = enable_share_history_on_invite;
+        self
+    }
+
     pub fn http_proxy(mut self, url: String) -> Self {
         self.http_proxy = Some(url);
         self
@@ -95,6 +106,7 @@ impl TestClientBuilder {
             .homeserver_url(homeserver_url)
             .sliding_sync_version_builder(VersionBuilder::Native)
             .with_encryption_settings(self.encryption_settings)
+            .with_enable_share_history_on_invite(self.enable_share_history_on_invite)
             .request_config(RequestConfig::short_retry());
 
         if let Some(holder_name) = &self.cross_process_store_locks_holder_name {
@@ -185,7 +197,7 @@ impl SyncTokenAwareClient {
         Self { client, token: Arc::new(None.into()) }
     }
 
-    pub async fn sync_once(&self) -> Result<()> {
+    pub async fn sync_once(&self) -> Result<SyncResponse> {
         let mut settings = SyncSettings::default().timeout(Duration::from_secs(1));
 
         let token = { self.token.lock().unwrap().clone() };
@@ -197,9 +209,9 @@ impl SyncTokenAwareClient {
 
         let mut prev_token = self.token.lock().unwrap();
         if prev_token.as_ref() != Some(&response.next_batch) {
-            *prev_token = Some(response.next_batch);
+            *prev_token = Some(response.next_batch.clone());
         }
-        Ok(())
+        Ok(response)
     }
 }
 
@@ -211,19 +223,50 @@ impl Deref for SyncTokenAwareClient {
     }
 }
 
+/// Repeatedly run the given callback, at increasing intervals, until it returns
+/// `Some`, or the given timeout has elapsed.
+///
+/// The callback `cb` is called with the attempt number as an argument.
+///
+/// # Returns
+///
+/// The result of `cb` if it returned `Some`. If the timeout elapses, an error
+/// of type [`ElapsedError`].
+pub async fn wait_until_some<F, Fut, R>(
+    mut cb: F,
+    timeout_duration: Duration,
+) -> Result<R, ElapsedError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Option<R>>,
+{
+    let start = Instant::now();
+    let mut attempt_count = 1;
+    loop {
+        if let Some(r) = cb(attempt_count).await {
+            return Ok(r);
+        };
+        if start - Instant::now() > timeout_duration {
+            return Err(ElapsedError());
+        }
+        sleep(Duration::from_millis(125) * attempt_count).await;
+        attempt_count += 1;
+    }
+}
+
 /// Waits for a room to arrive from a sync, for ~2 seconds.
 ///
 /// Note: this doesn't run any sync, it assumes a sync has been running in the
 /// background.
 pub async fn wait_for_room(client: &Client, room_id: &RoomId) -> Room {
-    for i in 1..5 {
-        // Linear backoff: wait at most (1+2+3+4+5)*150ms > 2s for the response to come
-        // back from the server.
-        if let Some(room) = client.get_room(room_id) {
-            return room;
-        };
-        tracing::warn!("attempt #{i}, alice couldn't see the room, retrying in a few…");
-        sleep(Duration::from_millis(i * 150)).await;
-    }
-    panic!("room couldn't be fetched after all attempts");
+    let cb = async |i| {
+        client.get_room(room_id).or_else(|| {
+            tracing::warn!("attempt #{i}, alice couldn't see the room, retrying in a few…");
+            None
+        })
+    };
+
+    wait_until_some(cb, Duration::from_secs(2))
+        .await
+        .expect("room couldn't be fetched after all attempts")
 }

@@ -21,18 +21,21 @@ use std::{
 use async_trait::async_trait;
 use matrix_sdk_common::{
     linked_chunk::{
-        relational::RelationalLinkedChunk, ChunkIdentifier, ChunkIdentifierGenerator, Position,
-        RawChunk, Update,
+        relational::RelationalLinkedChunk, ChunkIdentifier, ChunkIdentifierGenerator,
+        ChunkMetadata, LinkedChunkId, OwnedLinkedChunkId, Position, RawChunk, Update,
     },
     ring_buffer::RingBuffer,
     store_locks::memory_store_helper::try_take_leased_lock,
 };
 use ruma::{
+    events::relation::RelationType,
     time::{Instant, SystemTime},
     EventId, MxcUri, OwnedEventId, OwnedMxcUri, RoomId,
 };
+use tracing::error;
 
 use super::{
+    compute_filters_string, extract_event_relation,
     media::{EventCacheStoreMedia, IgnoreMediaRetentionPolicy, MediaRetentionPolicy, MediaService},
     EventCacheStore, EventCacheStoreError, Result,
 };
@@ -54,7 +57,7 @@ pub struct MemoryStore {
 struct MemoryStoreInner {
     media: RingBuffer<MediaContent>,
     leases: HashMap<String, (String, Instant)>,
-    events: RelationalLinkedChunk<Event, Gap>,
+    events: RelationalLinkedChunk<OwnedEventId, Event, Gap>,
     media_retention_policy: Option<MediaRetentionPolicy>,
     last_media_cleanup_time: SystemTime,
 }
@@ -107,8 +110,8 @@ impl MemoryStore {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl EventCacheStore for MemoryStore {
     type Error = EventCacheStoreError;
 
@@ -125,70 +128,81 @@ impl EventCacheStore for MemoryStore {
 
     async fn handle_linked_chunk_updates(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
         updates: Vec<Update<Event, Gap>>,
     ) -> Result<(), Self::Error> {
         let mut inner = self.inner.write().unwrap();
-        inner.events.apply_updates(room_id, updates);
+        inner.events.apply_updates(linked_chunk_id, updates);
 
         Ok(())
     }
 
     async fn load_all_chunks(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
     ) -> Result<Vec<RawChunk<Event, Gap>>, Self::Error> {
         let inner = self.inner.read().unwrap();
         inner
             .events
-            .load_all_chunks(room_id)
+            .load_all_chunks(linked_chunk_id)
+            .map_err(|err| EventCacheStoreError::InvalidData { details: err })
+    }
+
+    async fn load_all_chunks_metadata(
+        &self,
+        linked_chunk_id: LinkedChunkId<'_>,
+    ) -> Result<Vec<ChunkMetadata>, Self::Error> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .events
+            .load_all_chunks_metadata(linked_chunk_id)
             .map_err(|err| EventCacheStoreError::InvalidData { details: err })
     }
 
     async fn load_last_chunk(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
     ) -> Result<(Option<RawChunk<Event, Gap>>, ChunkIdentifierGenerator), Self::Error> {
         let inner = self.inner.read().unwrap();
         inner
             .events
-            .load_last_chunk(room_id)
+            .load_last_chunk(linked_chunk_id)
             .map_err(|err| EventCacheStoreError::InvalidData { details: err })
     }
 
     async fn load_previous_chunk(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
         before_chunk_identifier: ChunkIdentifier,
     ) -> Result<Option<RawChunk<Event, Gap>>, Self::Error> {
         let inner = self.inner.read().unwrap();
         inner
             .events
-            .load_previous_chunk(room_id, before_chunk_identifier)
+            .load_previous_chunk(linked_chunk_id, before_chunk_identifier)
             .map_err(|err| EventCacheStoreError::InvalidData { details: err })
     }
 
-    async fn clear_all_rooms_chunks(&self) -> Result<(), Self::Error> {
+    async fn clear_all_linked_chunks(&self) -> Result<(), Self::Error> {
         self.inner.write().unwrap().events.clear();
         Ok(())
     }
 
     async fn filter_duplicated_events(
         &self,
-        room_id: &RoomId,
+        linked_chunk_id: LinkedChunkId<'_>,
         mut events: Vec<OwnedEventId>,
     ) -> Result<Vec<(OwnedEventId, Position)>, Self::Error> {
-        // Collect all duplicated events.
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let inner = self.inner.read().unwrap();
 
         let mut duplicated_events = Vec::new();
 
-        for (event, position) in inner.events.unordered_room_items(room_id) {
-            // If `events` is empty, we can short-circuit.
-            if events.is_empty() {
-                break;
-            }
-
+        for (event, position) in
+            inner.events.unordered_linked_chunk_items(&linked_chunk_id.to_owned())
+        {
             if let Some(known_event_id) = event.event_id() {
                 // This event is a duplicate!
                 if let Some(index) =
@@ -206,15 +220,62 @@ impl EventCacheStore for MemoryStore {
         &self,
         room_id: &RoomId,
         event_id: &EventId,
-    ) -> Result<Option<(Position, Event)>, Self::Error> {
+    ) -> Result<Option<Event>, Self::Error> {
         let inner = self.inner.read().unwrap();
 
-        let event_and_room = inner.events.items().find_map(|(position, event, this_room_id)| {
-            (room_id == this_room_id && event.event_id()? == event_id)
-                .then_some((position, event.clone()))
-        });
+        let target_linked_chunk_id = OwnedLinkedChunkId::Room(room_id.to_owned());
 
-        Ok(event_and_room)
+        let event = inner
+            .events
+            .items(&target_linked_chunk_id)
+            .find_map(|(event, _pos)| (event.event_id()? == event_id).then_some(event.clone()));
+
+        Ok(event)
+    }
+
+    async fn find_event_relations(
+        &self,
+        room_id: &RoomId,
+        event_id: &EventId,
+        filters: Option<&[RelationType]>,
+    ) -> Result<Vec<(Event, Option<Position>)>, Self::Error> {
+        let inner = self.inner.read().unwrap();
+
+        let target_linked_chunk_id = OwnedLinkedChunkId::Room(room_id.to_owned());
+
+        let filters = compute_filters_string(filters);
+
+        let related_events = inner
+            .events
+            .items(&target_linked_chunk_id)
+            .filter_map(|(event, pos)| {
+                // Must have a relation.
+                let (related_to, rel_type) = extract_event_relation(event.raw())?;
+
+                // Must relate to the target item.
+                if related_to != event_id {
+                    return None;
+                }
+
+                // Must not be filtered out.
+                if let Some(filters) = &filters {
+                    filters.contains(&rel_type).then_some((event.clone(), pos))
+                } else {
+                    Some((event.clone(), pos))
+                }
+            })
+            .collect();
+
+        Ok(related_events)
+    }
+
+    async fn save_event(&self, room_id: &RoomId, event: Event) -> Result<(), Self::Error> {
+        if event.event_id().is_none() {
+            error!(%room_id, "Trying to save an event with no ID");
+            return Ok(());
+        }
+        self.inner.write().unwrap().events.save_item(room_id.to_owned(), event);
+        Ok(())
     }
 
     async fn add_media_content(
@@ -314,8 +375,8 @@ impl EventCacheStore for MemoryStore {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
 impl EventCacheStoreMedia for MemoryStore {
     type Error = EventCacheStoreError;
 

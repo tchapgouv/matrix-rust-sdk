@@ -6,10 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Refactor
+
+- The cached `ServerCapabilities` has been renamed to `ServerInfo` and
+  additionally contains the well-known response alongside the existing server versions.
+  Despite the old name, it does not contain the server capabilities.
+  ([#5167](https://github.com/matrix-org/matrix-rust-sdk/pull/5167))
+- `Room::join_rule` and `Room::is_public` now return an `Option` to reflect that the join rule
+  state event might be missing, in which case they will return `None`.
+  ([#5278](https://github.com/matrix-org/matrix-rust-sdk/pull/5278))
+
+## [0.12.0] - 2025-06-10
+
+No notable changes in this release.
+
+## [0.11.0] - 2025-04-11
+
 ### Features
 
-- [**breaking**] The `Client::subscribe_to_ignore_user_list_changes()` method will now only trigger
-  whenever the ignored user list has changed from what was previously known, instead of triggering
+- [**breaking**] The `Client::subscribe_to_ignore_user_list_changes()`
+  method will now only trigger whenever the ignored user list has
+  changed from what was previously known, instead of triggering
   every time an ignore-user-list event has been received from sync.
   ([#4779](https://github.com/matrix-org/matrix-rust-sdk/pull/4779))
 - [**breaking**] The `MediaRetentionPolicy` can now trigger regular cleanups
@@ -27,6 +44,24 @@ All notable changes to this project will be documented in this file.
 - [**breaking**] `Room::is_encrypted` is replaced by `Room::encryption_state`
   which returns a value of the new `EncryptionState` enum
   ([#4777](https://github.com/matrix-org/matrix-rust-sdk/pull/4777))
+
+### Refactor
+
+- [**breaking**] `BaseClient::store` is renamed `state_store`
+  ([#4851](https://github.com/matrix-org/matrix-rust-sdk/pull/4851))
+- [**breaking**] `BaseClient::with_store_config` is renamed `new`
+  ([#4847](https://github.com/matrix-org/matrix-rust-sdk/pull/4847))
+- [**breaking**] `BaseClient::set_session_metadata` is renamed
+  `activate`, and `BaseClient::logged_in` is renamed `is_activated`
+  ([#4850](https://github.com/matrix-org/matrix-rust-sdk/pull/4850))
+- [**breaking] `DependentQueuedRequestKind::UploadFileWithThumbnail`
+  was renamed to `DependentQueuedRequestKind::UploadFileOrThumbnail`.
+  Under the `unstable-msc4274` feature, `DependentQueuedRequestKind::UploadFileOrThumbnail`
+  and `SentMediaInfo` were generalized to allow chaining multiple dependent
+  file / thumbnail uploads.
+  ([#4897](https://github.com/matrix-org/matrix-rust-sdk/pull/4897))
+- [**breaking**] `RoomInfo::prev_state` has been removed due to being useless.
+  ([#5054](https://github.com/matrix-org/matrix-rust-sdk/pull/5054))
 
 ## [0.10.0] - 2025-02-04
 

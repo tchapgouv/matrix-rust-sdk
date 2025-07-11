@@ -13,10 +13,10 @@ use matrix_sdk_base::{
     store::{
         migration_helpers::RoomInfoV1, ChildTransactionId, DependentQueuedRequest,
         DependentQueuedRequestKind, QueueWedgeError, QueuedRequest, QueuedRequestKind,
-        SentRequestKey,
+        RoomLoadSettings, SentRequestKey,
     },
     MinimalRoomMemberEvent, RoomInfo, RoomMemberships, RoomState, StateChanges, StateStore,
-    StateStoreDataKey, StateStoreDataValue,
+    StateStoreDataKey, StateStoreDataValue, ROOM_VERSION_FALLBACK,
 };
 use matrix_sdk_store_encryption::StoreCipher;
 use ruma::{
@@ -33,12 +33,12 @@ use ruma::{
     },
     serde::Raw,
     CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId,
-    OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UInt, UserId,
+    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::fs;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::{
     error::{Error, Result},
@@ -46,7 +46,7 @@ use crate::{
         repeat_vars, Key, SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt,
         SqliteKeyValueStoreConnExt,
     },
-    OpenStoreError,
+    OpenStoreError, SqliteStoreConfig,
 };
 
 mod keys {
@@ -64,14 +64,17 @@ mod keys {
     pub const DEPENDENTS_SEND_QUEUE: &str = "dependent_send_queue_events";
 }
 
+/// The filename used for the SQLITE database file used by the state store.
+pub const DATABASE_NAME: &str = "matrix-sdk-state.sqlite3";
+
 /// Identifier of the latest database version.
 ///
-/// This is used to figure whether the sqlite database requires a migration.
+/// This is used to figure whether the SQLite database requires a migration.
 /// Every new SQL migration should imply a bump of this number, and changes in
-/// the [`SqliteStateStore::run_migrations`] function..
+/// the [`SqliteStateStore::run_migrations`] function.
 const DATABASE_VERSION: u8 = 12;
 
-/// A sqlite based cryptostore.
+/// An SQLite-based state store.
 #[derive(Clone)]
 pub struct SqliteStateStore {
     store_cipher: Option<Arc<StoreCipher>>,
@@ -86,25 +89,39 @@ impl fmt::Debug for SqliteStateStore {
 }
 
 impl SqliteStateStore {
-    /// Open the sqlite-based state store at the given path using the given
+    /// Open the SQLite-based state store at the given path using the given
     /// passphrase to encrypt private data.
     pub async fn open(
         path: impl AsRef<Path>,
         passphrase: Option<&str>,
     ) -> Result<Self, OpenStoreError> {
-        let pool = create_pool(path.as_ref()).await?;
-
-        Self::open_with_pool(pool, passphrase).await
+        Self::open_with_config(SqliteStoreConfig::new(path).passphrase(passphrase)).await
     }
 
-    /// Create a sqlite-based state store using the given sqlite database pool.
+    /// Open the SQLite-based state store with the config open config.
+    pub async fn open_with_config(config: SqliteStoreConfig) -> Result<Self, OpenStoreError> {
+        let SqliteStoreConfig { path, passphrase, pool_config, runtime_config } = config;
+
+        fs::create_dir_all(&path).await.map_err(OpenStoreError::CreateDir)?;
+
+        let mut config = deadpool_sqlite::Config::new(path.join(DATABASE_NAME));
+        config.pool = Some(pool_config);
+
+        let pool = config.create_pool(Runtime::Tokio1)?;
+
+        let this = Self::open_with_pool(pool, passphrase.as_deref()).await?;
+        this.pool.get().await?.apply_runtime_config(runtime_config).await?;
+
+        Ok(this)
+    }
+
+    /// Create an SQLite-based state store using the given SQLite database pool.
     /// The given passphrase will be used to encrypt private data.
-    pub async fn open_with_pool(
+    async fn open_with_pool(
         pool: SqlitePool,
         passphrase: Option<&str>,
     ) -> Result<Self, OpenStoreError> {
         let conn = pool.get().await?;
-        conn.set_journal_size_limit().await?;
 
         let mut version = conn.db_version().await?;
 
@@ -119,7 +136,6 @@ impl SqliteStateStore {
         };
         let this = Self { store_cipher, pool };
         this.run_migrations(&conn, version, None).await?;
-        conn.optimize().await?;
 
         Ok(this)
     }
@@ -374,7 +390,32 @@ impl SqliteStateStore {
 
     fn deserialize_json<T: DeserializeOwned>(&self, data: &[u8]) -> Result<T> {
         let decoded = self.decode_value(data)?;
-        Ok(serde_json::from_slice(&decoded)?)
+
+        let json_deserializer = &mut serde_json::Deserializer::from_slice(&decoded);
+
+        serde_path_to_error::deserialize(json_deserializer).map_err(|err| {
+            let raw_json: Option<Raw<serde_json::Value>> = serde_json::from_slice(&decoded).ok();
+
+            let target_type = std::any::type_name::<T>();
+            let serde_path = err.path().to_string();
+
+            error!(
+                sentry = true,
+                %err,
+                "Failed to deserialize {target_type} in the state state: {serde_path}",
+            );
+
+            if let Some(raw) = raw_json {
+                if let Some(room_id) = raw.get_field::<OwnedRoomId>("room_id").ok().flatten() {
+                    warn!("Found a room id in the source data to deserialize: {room_id}");
+                }
+                if let Some(event_id) = raw.get_field::<OwnedEventId>("event_id").ok().flatten() {
+                    warn!("Found an event id in the source data to deserialize: {event_id}");
+                }
+            }
+
+            err.into_inner().into()
+        })
     }
 
     fn deserialize_value<T: DeserializeOwned>(&self, value: &[u8]) -> Result<T> {
@@ -394,9 +435,7 @@ impl SqliteStateStore {
     fn encode_state_store_data_key(&self, key: StateStoreDataKey<'_>) -> Key {
         let key_s = match key {
             StateStoreDataKey::SyncToken => Cow::Borrowed(StateStoreDataKey::SYNC_TOKEN),
-            StateStoreDataKey::ServerCapabilities => {
-                Cow::Borrowed(StateStoreDataKey::SERVER_CAPABILITIES)
-            }
+            StateStoreDataKey::ServerInfo => Cow::Borrowed(StateStoreDataKey::SERVER_INFO),
             StateStoreDataKey::Filter(f) => {
                 Cow::Owned(format!("{}:{f}", StateStoreDataKey::FILTER))
             }
@@ -409,8 +448,15 @@ impl SqliteStateStore {
             StateStoreDataKey::UtdHookManagerData => {
                 Cow::Borrowed(StateStoreDataKey::UTD_HOOK_MANAGER_DATA)
             }
-            StateStoreDataKey::ComposerDraft(room_id) => {
-                Cow::Owned(format!("{}:{room_id}", StateStoreDataKey::COMPOSER_DRAFT))
+            StateStoreDataKey::ComposerDraft(room_id, thread_root) => {
+                if let Some(thread_root) = thread_root {
+                    Cow::Owned(format!(
+                        "{}:{room_id}:{thread_root}",
+                        StateStoreDataKey::COMPOSER_DRAFT
+                    ))
+                } else {
+                    Cow::Owned(format!("{}:{room_id}", StateStoreDataKey::COMPOSER_DRAFT))
+                }
             }
             StateStoreDataKey::SeenKnockRequests(room_id) => {
                 Cow::Owned(format!("{}:{room_id}", StateStoreDataKey::SEEN_KNOCK_REQUESTS))
@@ -446,12 +492,6 @@ impl SqliteStateStore {
         let member_room_id = self.encode_key(keys::MEMBER, room_id);
         txn.remove_room_members(&member_room_id, Some(stripped))
     }
-}
-
-async fn create_pool(path: &Path) -> Result<SqlitePool, OpenStoreError> {
-    fs::create_dir_all(path).await.map_err(OpenStoreError::CreateDir)?;
-    let cfg = deadpool_sqlite::Config::new(path.join("matrix-sdk-state.sqlite3"));
-    Ok(cfg.create_pool(Runtime::Tokio1)?)
 }
 
 /// Initialize the database.
@@ -788,12 +828,22 @@ trait SqliteObjectStateStoreExt: SqliteAsyncConnExt {
         Ok(())
     }
 
-    async fn get_room_infos(&self) -> Result<Vec<Vec<u8>>> {
-        Ok(self
-            .prepare("SELECT data FROM room_info", move |mut stmt| {
-                stmt.query_map((), |row| row.get(0))?.collect()
-            })
-            .await?)
+    async fn get_room_infos(&self, room_id: Option<Key>) -> Result<Vec<Vec<u8>>> {
+        Ok(match room_id {
+            None => {
+                self.prepare("SELECT data FROM room_info", move |mut stmt| {
+                    stmt.query_map((), |row| row.get(0))?.collect()
+                })
+                .await?
+            }
+
+            Some(room_id) => {
+                self.prepare("SELECT data FROM room_info WHERE room_id = ?", move |mut stmt| {
+                    stmt.query((room_id,))?.mapped(|row| row.get(0)).collect()
+                })
+                .await?
+            }
+        })
     }
 
     async fn get_maybe_stripped_state_events_for_keys(
@@ -1002,8 +1052,8 @@ impl StateStore for SqliteStateStore {
                     StateStoreDataKey::SyncToken => {
                         StateStoreDataValue::SyncToken(self.deserialize_value(&data)?)
                     }
-                    StateStoreDataKey::ServerCapabilities => {
-                        StateStoreDataValue::ServerCapabilities(self.deserialize_value(&data)?)
+                    StateStoreDataKey::ServerInfo => {
+                        StateStoreDataValue::ServerInfo(self.deserialize_value(&data)?)
                     }
                     StateStoreDataKey::Filter(_) => {
                         StateStoreDataValue::Filter(self.deserialize_value(&data)?)
@@ -1017,7 +1067,7 @@ impl StateStore for SqliteStateStore {
                     StateStoreDataKey::UtdHookManagerData => {
                         StateStoreDataValue::UtdHookManagerData(self.deserialize_value(&data)?)
                     }
-                    StateStoreDataKey::ComposerDraft(_) => {
+                    StateStoreDataKey::ComposerDraft(_, _) => {
                         StateStoreDataValue::ComposerDraft(self.deserialize_value(&data)?)
                     }
                     StateStoreDataKey::SeenKnockRequests(_) => {
@@ -1037,10 +1087,8 @@ impl StateStore for SqliteStateStore {
             StateStoreDataKey::SyncToken => self.serialize_value(
                 &value.into_sync_token().expect("Session data not a sync token"),
             )?,
-            StateStoreDataKey::ServerCapabilities => self.serialize_value(
-                &value
-                    .into_server_capabilities()
-                    .expect("Session data not containing server capabilities"),
+            StateStoreDataKey::ServerInfo => self.serialize_value(
+                &value.into_server_info().expect("Session data not containing server info"),
             )?,
             StateStoreDataKey::Filter(_) => {
                 self.serialize_value(&value.into_filter().expect("Session data not a filter"))?
@@ -1054,7 +1102,7 @@ impl StateStore for SqliteStateStore {
             StateStoreDataKey::UtdHookManagerData => self.serialize_value(
                 &value.into_utd_hook_manager_data().expect("Session data not UtdHookManagerData"),
             )?,
-            StateStoreDataKey::ComposerDraft(_) => self.serialize_value(
+            StateStoreDataKey::ComposerDraft(_, _) => self.serialize_value(
                 &value.into_composer_draft().expect("Session data not a composer draft"),
             )?,
             StateStoreDataKey::SeenKnockRequests(_) => self.serialize_value(
@@ -1296,13 +1344,13 @@ impl StateStore for SqliteStateStore {
                             .ok()
                             .flatten()
                             .and_then(|v| this.deserialize_json::<RoomInfo>(&v).ok())
-                            .and_then(|info| info.room_version().cloned())
+                            .map(|info| info.room_version_or_default())
                             .unwrap_or_else(|| {
                                 warn!(
                                     ?room_id,
-                                    "Unable to find the room version, assume version 9"
+                                    "Unable to find the room version, assuming {ROOM_VERSION_FALLBACK}"
                                 );
-                                RoomVersionId::V9
+                                ROOM_VERSION_FALLBACK
                             })
                     };
 
@@ -1548,10 +1596,13 @@ impl StateStore for SqliteStateStore {
             .collect()
     }
 
-    async fn get_room_infos(&self) -> Result<Vec<RoomInfo>> {
+    async fn get_room_infos(&self, room_load_settings: &RoomLoadSettings) -> Result<Vec<RoomInfo>> {
         self.acquire()
             .await?
-            .get_room_infos()
+            .get_room_infos(match room_load_settings {
+                RoomLoadSettings::All => None,
+                RoomLoadSettings::One(room_id) => Some(self.encode_key(keys::ROOM_INFO, room_id)),
+            })
             .await?
             .into_iter()
             .map(|data| self.deserialize_json(&data))
@@ -2126,26 +2177,80 @@ mod tests {
 
 #[cfg(test)]
 mod encrypted_tests {
-    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU32, Ordering::SeqCst},
+    };
 
     use matrix_sdk_base::{statestore_integration_tests, StateStore, StoreError};
+    use matrix_sdk_test::async_test;
     use once_cell::sync::Lazy;
     use tempfile::{tempdir, TempDir};
 
     use super::SqliteStateStore;
+    use crate::{utils::SqliteAsyncConnExt, SqliteStoreConfig};
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
     static NUM: AtomicU32 = AtomicU32::new(0);
 
-    async fn get_store() -> Result<impl StateStore, StoreError> {
+    fn new_state_store_workspace() -> PathBuf {
         let name = NUM.fetch_add(1, SeqCst).to_string();
-        let tmpdir_path = TMP_DIR.path().join(name);
+        TMP_DIR.path().join(name)
+    }
+
+    async fn get_store() -> Result<impl StateStore, StoreError> {
+        let tmpdir_path = new_state_store_workspace();
 
         tracing::info!("using store @ {}", tmpdir_path.to_str().unwrap());
 
         Ok(SqliteStateStore::open(tmpdir_path.to_str().unwrap(), Some("default_test_password"))
             .await
             .unwrap())
+    }
+
+    #[async_test]
+    async fn test_pool_size() {
+        let tmpdir_path = new_state_store_workspace();
+        let store_open_config = SqliteStoreConfig::new(tmpdir_path).pool_max_size(42);
+
+        let store = SqliteStateStore::open_with_config(store_open_config).await.unwrap();
+
+        assert_eq!(store.pool.status().max_size, 42);
+    }
+
+    #[async_test]
+    async fn test_cache_size() {
+        let tmpdir_path = new_state_store_workspace();
+        let store_open_config = SqliteStoreConfig::new(tmpdir_path).cache_size(1500);
+
+        let store = SqliteStateStore::open_with_config(store_open_config).await.unwrap();
+
+        let conn = store.pool.get().await.unwrap();
+        let cache_size =
+            conn.query_row("PRAGMA cache_size", (), |row| row.get::<_, i32>(0)).await.unwrap();
+
+        // The value passed to `SqliteStoreConfig` is in bytes. Check it is
+        // converted to kibibytes. Also, it must be a negative value because it
+        // _is_ the size in kibibytes, not in page size.
+        assert_eq!(cache_size, -(1500 / 1024));
+    }
+
+    #[async_test]
+    async fn test_journal_size_limit() {
+        let tmpdir_path = new_state_store_workspace();
+        let store_open_config = SqliteStoreConfig::new(tmpdir_path).journal_size_limit(1500);
+
+        let store = SqliteStateStore::open_with_config(store_open_config).await.unwrap();
+
+        let conn = store.pool.get().await.unwrap();
+        let journal_size_limit = conn
+            .query_row("PRAGMA journal_size_limit", (), |row| row.get::<_, u32>(0))
+            .await
+            .unwrap();
+
+        // The value passed to `SqliteStoreConfig` is in bytes. It stays in
+        // bytes in SQLite.
+        assert_eq!(journal_size_limit, 1500);
     }
 
     statestore_integration_tests!();
@@ -2161,8 +2266,14 @@ mod migration_tests {
         },
     };
 
+    use as_variant::as_variant;
+    use deadpool_sqlite::Runtime;
     use matrix_sdk_base::{
-        store::{ChildTransactionId, DependentQueuedRequestKind, SerializableEventContent},
+        media::{MediaFormat, MediaRequestParameters},
+        store::{
+            ChildTransactionId, DependentQueuedRequestKind, RoomLoadSettings,
+            SerializableEventContent,
+        },
         sync::UnreadNotificationsCount,
         RoomState, StateStore,
     };
@@ -2170,20 +2281,23 @@ mod migration_tests {
     use once_cell::sync::Lazy;
     use ruma::{
         events::{
-            room::{create::RoomCreateEventContent, message::RoomMessageEventContent},
+            room::{create::RoomCreateEventContent, message::RoomMessageEventContent, MediaSource},
             StateEventType,
         },
-        room_id, server_name, user_id, EventId, MilliSecondsSinceUnixEpoch, RoomId, TransactionId,
-        UserId,
+        room_id, server_name, user_id, EventId, MilliSecondsSinceUnixEpoch, OwnedTransactionId,
+        RoomId, TransactionId, UserId,
     };
     use rusqlite::Transaction;
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
     use tempfile::{tempdir, TempDir};
+    use tokio::fs;
 
-    use super::{create_pool, init, keys, SqliteStateStore};
+    use super::{init, keys, SqliteStateStore, DATABASE_NAME};
     use crate::{
         error::{Error, Result},
         utils::{SqliteAsyncConnExt, SqliteKeyValueStoreAsyncConnExt},
+        OpenStoreError,
     };
 
     static TMP_DIR: Lazy<TempDir> = Lazy::new(|| tempdir().unwrap());
@@ -2196,7 +2310,12 @@ mod migration_tests {
     }
 
     async fn create_fake_db(path: &Path, version: u8) -> Result<SqliteStateStore> {
-        let pool = create_pool(path).await.unwrap();
+        fs::create_dir_all(&path).await.map_err(OpenStoreError::CreateDir).unwrap();
+
+        let config = deadpool_sqlite::Config::new(path.join(DATABASE_NAME));
+        // use default pool config
+
+        let pool = config.create_pool(Runtime::Tokio1).unwrap();
         let conn = pool.get().await?;
 
         init(&conn).await?;
@@ -2288,7 +2407,7 @@ mod migration_tests {
         let store = SqliteStateStore::open(path, Some(SECRET)).await.unwrap();
 
         // Check all room infos are there.
-        assert_eq!(store.get_room_infos().await.unwrap().len(), 5);
+        assert_eq!(store.get_room_infos(&RoomLoadSettings::default()).await.unwrap().len(), 5);
     }
 
     // Add a room in version 2 format of the state store.
@@ -2406,7 +2525,7 @@ mod migration_tests {
         let store = SqliteStateStore::open(path, Some(SECRET)).await.unwrap();
 
         // Check all room infos are there.
-        let room_infos = store.get_room_infos().await.unwrap();
+        let room_infos = store.get_room_infos(&RoomLoadSettings::default()).await.unwrap();
         assert_eq!(room_infos.len(), 3);
 
         let room_a = room_infos.iter().find(|r| r.room_id() == room_a_id).unwrap();
@@ -2509,5 +2628,42 @@ mod migration_tests {
         .execute((room_id_value, parent_txn_id, own_txn_id, content))?;
 
         Ok(())
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub enum LegacyDependentQueuedRequestKind {
+        UploadFileWithThumbnail {
+            content_type: String,
+            cache_key: MediaRequestParameters,
+            related_to: OwnedTransactionId,
+        },
+    }
+
+    #[async_test]
+    pub async fn test_dependent_queued_request_variant_renaming() {
+        let path = new_path();
+        let db = create_fake_db(&path, 7).await.unwrap();
+
+        let cache_key = MediaRequestParameters {
+            format: MediaFormat::File,
+            source: MediaSource::Plain("https://server.local/foobar".into()),
+        };
+        let related_to = TransactionId::new();
+        let request = LegacyDependentQueuedRequestKind::UploadFileWithThumbnail {
+            content_type: "image/png".to_owned(),
+            cache_key,
+            related_to: related_to.clone(),
+        };
+
+        let data = db
+            .serialize_json(&request)
+            .expect("should be able to serialize legacy dependent request");
+        let deserialized: DependentQueuedRequestKind = db.deserialize_json(&data).expect(
+            "should be able to deserialize dependent request from legacy dependent request",
+        );
+
+        as_variant!(deserialized, DependentQueuedRequestKind::UploadFileOrThumbnail { related_to: de_related_to, .. } => {
+            assert_eq!(de_related_to, related_to);
+        });
     }
 }

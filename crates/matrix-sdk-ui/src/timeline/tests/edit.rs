@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
@@ -23,16 +23,12 @@ use matrix_sdk_base::deserialized_responses::{DecryptedRoomEvent, TimelineEvent}
 use matrix_sdk_test::{async_test, ALICE, BOB};
 use ruma::{
     event_id,
-    events::{
-        room::message::{MessageType, RedactedRoomMessageEventContent},
-        BundledMessageLikeRelations,
-    },
+    events::room::message::{MessageType, RedactedRoomMessageEventContent},
     room_id,
 };
 use stream_assert::{assert_next_matches, assert_pending};
 
 use super::TestTimeline;
-use crate::timeline::TimelineItemContent;
 
 #[async_test]
 async fn test_live_redacted() {
@@ -74,7 +70,7 @@ async fn test_live_sanitized() {
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let first_event = item.as_event().unwrap();
-    assert_let!(TimelineItemContent::Message(message) = first_event.content());
+    assert_let!(Some(message) = first_event.content().as_message());
     assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(text.body, "**original** message");
     assert_eq!(text.formatted.as_ref().unwrap().body, "<strong>original</strong> message");
@@ -88,7 +84,7 @@ async fn test_live_sanitized() {
     let new_html_content = "<edited/> <strong>better</strong> message";
     timeline
         .handle_live_event(
-            f.text_html(format!("* {}", new_plain_content), format!("* {}", new_html_content))
+            f.text_html(format!("* {new_plain_content}"), format!("* {new_html_content}"))
                 .sender(&ALICE)
                 .edit(
                     first_event_id,
@@ -99,7 +95,7 @@ async fn test_live_sanitized() {
 
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
     let first_event = item.as_event().unwrap();
-    assert_let!(TimelineItemContent::Message(message) = first_event.content());
+    assert_let!(Some(message) = first_event.content().as_message());
     assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(text.body, new_plain_content);
     assert_eq!(text.formatted.as_ref().unwrap().body, " <strong>better</strong> message");
@@ -115,36 +111,32 @@ async fn test_aggregated_sanitized() {
 
     let f = &timeline.factory;
 
-    let mut relations = BundledMessageLikeRelations::new();
-    relations.replace = Some(Box::new(
-        f.text_html(
-            "* !!edited!! **better** message",
-            "* <edited/> <strong>better</strong> message",
-        )
-        .edit(
-            original_event_id,
-            MessageType::text_html(
-                "!!edited!! **better** message",
-                "<edited/> <strong>better</strong> message",
-            )
-            .into(),
-        )
-        .event_id(edit_event_id)
-        .sender(*ALICE)
-        .into_raw_sync(),
-    ));
-
     let ev = f
         .text_html("**original** message", "<strong>original</strong> message")
         .sender(*ALICE)
         .event_id(original_event_id)
-        .bundled_relations(relations);
+        .with_bundled_edit(
+            f.text_html(
+                "* !!edited!! **better** message",
+                "* <edited/> <strong>better</strong> message",
+            )
+            .edit(
+                original_event_id,
+                MessageType::text_html(
+                    "!!edited!! **better** message",
+                    "<edited/> <strong>better</strong> message",
+                )
+                .into(),
+            )
+            .event_id(edit_event_id)
+            .sender(*ALICE),
+        );
 
     timeline.handle_live_event(ev).await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let first_event = item.as_event().unwrap();
-    assert_let!(TimelineItemContent::Message(message) = first_event.content());
+    assert_let!(Some(message) = first_event.content().as_message());
     assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(text.body, "!!edited!! **better** message");
     assert_eq!(text.formatted.as_ref().unwrap().body, " <strong>better</strong> message");
@@ -168,23 +160,25 @@ async fn test_edit_updates_encryption_info() {
         .room(room_id)
         .into_raw_timeline();
 
-    let mut encryption_info = EncryptionInfo {
+    let mut encryption_info = Arc::new(EncryptionInfo {
         sender: (*ALICE).into(),
         sender_device: None,
         algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
             curve25519_key: "123".to_owned(),
             sender_claimed_keys: BTreeMap::new(),
+            session_id: Some("mysessionid6333".to_owned()),
         },
         verification_state: VerificationState::Verified,
-        session_id: Some("mysessionid6333".to_owned()),
-    };
+    });
 
-    let original_event: TimelineEvent = DecryptedRoomEvent {
-        event: original_event.cast(),
-        encryption_info: encryption_info.clone(),
-        unsigned_encryption_info: None,
-    }
-    .into();
+    let original_event = TimelineEvent::from_decrypted(
+        DecryptedRoomEvent {
+            event: original_event.cast(),
+            encryption_info: encryption_info.clone(),
+            unsigned_encryption_info: None,
+        },
+        None,
+    );
 
     timeline.handle_live_event(original_event).await;
 
@@ -196,7 +190,7 @@ async fn test_edit_updates_encryption_info() {
         VerificationState::Verified
     );
 
-    assert_let!(TimelineItemContent::Message(message) = first_event.content());
+    assert_let!(Some(message) = first_event.content().as_message());
     assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(text.body, "**original** message");
 
@@ -206,14 +200,16 @@ async fn test_edit_updates_encryption_info() {
         .room(room_id)
         .edit(original_event_id, MessageType::text_plain("!!edited!! **better** message").into())
         .into_raw_timeline();
-    encryption_info.verification_state =
+    Arc::make_mut(&mut encryption_info).verification_state =
         VerificationState::Unverified(VerificationLevel::UnverifiedIdentity);
-    let edit_event: TimelineEvent = DecryptedRoomEvent {
-        event: edit_event.cast(),
-        encryption_info: encryption_info.clone(),
-        unsigned_encryption_info: None,
-    }
-    .into();
+    let edit_event = TimelineEvent::from_decrypted(
+        DecryptedRoomEvent {
+            event: edit_event.cast(),
+            encryption_info: encryption_info.clone(),
+            unsigned_encryption_info: None,
+        },
+        None,
+    );
 
     timeline.handle_live_event(edit_event).await;
 
@@ -225,7 +221,7 @@ async fn test_edit_updates_encryption_info() {
         VerificationState::Unverified(VerificationLevel::UnverifiedIdentity)
     );
 
-    assert_let!(TimelineItemContent::Message(message) = first_event.content());
+    assert_let!(Some(message) = first_event.content().as_message());
     assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(text.body, "!!edited!! **better** message");
 }
@@ -253,20 +249,12 @@ async fn test_relations_edit_overrides_pending_edit_msg() {
     assert_pending!(stream);
 
     // Now we receive the original event, with a bundled relations group.
-    let mut relations = BundledMessageLikeRelations::new();
-    relations.replace = Some(Box::new(
+    let ev = f.text_msg("original").sender(*ALICE).event_id(original_event_id).with_bundled_edit(
         f.text_msg("* edit 2")
             .edit(original_event_id, MessageType::text_plain("edit 2").into())
             .event_id(edit2_event_id)
-            .sender(*ALICE)
-            .into_raw_sync(),
-    ));
-
-    let ev = f
-        .text_msg("original")
-        .sender(*ALICE)
-        .event_id(original_event_id)
-        .bundled_relations(relations);
+            .sender(*ALICE),
+    );
 
     timeline.handle_live_event(ev).await;
 
@@ -319,18 +307,6 @@ async fn test_relations_edit_overrides_pending_edit_poll() {
     assert_pending!(stream);
 
     // Now we receive the original event, with a bundled relations group.
-    let mut relations = BundledMessageLikeRelations::new();
-    relations.replace = Some(Box::new(
-        f.poll_edit(
-            original_event_id,
-            "Can the real slim shady please stand up?",
-            vec!["Excuse me?", "Please stand up 🎵", "Please stand up 🎶"],
-        )
-        .sender(*ALICE)
-        .event_id(edit2_event_id)
-        .into(),
-    ));
-
     let ev = f
         .poll_start(
             "Can the fake slim shady please stand down?\nExcuse me?",
@@ -339,7 +315,15 @@ async fn test_relations_edit_overrides_pending_edit_poll() {
         )
         .sender(*ALICE)
         .event_id(original_event_id)
-        .bundled_relations(relations);
+        .with_bundled_edit(
+            f.poll_edit(
+                original_event_id,
+                "Can the real slim shady please stand up?",
+                vec!["Excuse me?", "Please stand up 🎵", "Please stand up 🎶"],
+            )
+            .sender(*ALICE)
+            .event_id(edit2_event_id),
+        );
 
     timeline.handle_live_event(ev).await;
 
@@ -427,18 +411,16 @@ async fn test_updated_reply_doesnt_lose_latest_edit() {
         )
         .await;
 
-    {
-        // The reply is updated.
-        let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
-        // And still has the latest edit JSON.
-        assert!(item.latest_edit_json().is_some());
-        assert_eq!(item.content().as_message().unwrap().body(), "guten tag");
+    // The original is updated.
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
+    // And now has a latest edit JSON.
+    assert!(item.latest_edit_json().is_some());
 
-        // The original is updated.
-        let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
-        // And now has a latest edit JSON.
-        assert!(item.latest_edit_json().is_some());
+    // The reply is updated.
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 1, value } => value);
+    // And still has the latest edit JSON.
+    assert!(item.latest_edit_json().is_some());
+    assert_eq!(item.content().as_message().unwrap().body(), "guten tag");
 
-        assert_pending!(stream);
-    }
+    assert_pending!(stream);
 }

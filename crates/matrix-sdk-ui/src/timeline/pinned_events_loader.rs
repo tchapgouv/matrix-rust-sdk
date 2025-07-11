@@ -15,19 +15,23 @@
 use std::{fmt::Formatter, sync::Arc};
 
 use futures_util::{stream, StreamExt};
-use matrix_sdk::{
-    config::RequestConfig, event_cache::paginator::PaginatorError, BoxFuture, Room,
-    SendOutsideWasm, SyncOutsideWasm,
-};
+use matrix_sdk::{config::RequestConfig, BoxFuture, Room, SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_base::deserialized_responses::TimelineEvent;
 use ruma::{events::relation::RelationType, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId};
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 /// Utility to load the pinned events in a room.
 pub struct PinnedEventsLoader {
     /// Backend to load pinned events.
     room: Arc<dyn PinnedEventsRoom>,
+
+    /// A list of pinned event ids we've observed previously.
+    ///
+    /// Starts as an empty vector and is updated when the list of pinned events
+    /// is updated.
+    previous_pinned_event_ids: Mutex<Vec<OwnedEventId>>,
 
     /// Maximum number of pinned events to load (either from network or the
     /// cache).
@@ -46,7 +50,12 @@ impl PinnedEventsLoader {
         max_events_to_load: usize,
         max_concurrent_requests: usize,
     ) -> Self {
-        Self { room, max_events_to_load, max_concurrent_requests }
+        Self {
+            room,
+            max_events_to_load,
+            max_concurrent_requests,
+            previous_pinned_event_ids: Mutex::new(Vec::new()),
+        }
     }
 
     /// Loads the pinned events in this room, using the cache first and then
@@ -54,10 +63,10 @@ impl PinnedEventsLoader {
     /// This method will perform as many concurrent requests for events as
     /// `max_concurrent_requests` allows, to avoid overwhelming the server.
     ///
-    /// It returns a `Result` with either a
-    /// chronologically sorted list of retrieved [`TimelineEvent`]s
-    /// or a [`PinnedEventsLoaderError`].
-    pub async fn load_events(&self) -> Result<Vec<TimelineEvent>, PinnedEventsLoaderError> {
+    /// Returns `None` if the list of pinned events hasn't changed since the
+    /// previous time we loaded them. May return an error if there was an
+    /// issue fetching the full events.
+    pub async fn load_events(&self) -> Result<Option<Vec<TimelineEvent>>, PinnedEventsLoaderError> {
         let pinned_event_ids: Vec<OwnedEventId> = self
             .room
             .pinned_event_ids()
@@ -68,14 +77,20 @@ impl PinnedEventsLoader {
             .rev()
             .collect();
 
+        // Check if the list of pinned events has changed since the last time.
+        if pinned_event_ids == *self.previous_pinned_event_ids.lock().await {
+            return Ok(None);
+        }
+
         if pinned_event_ids.is_empty() {
-            return Ok(Vec::new());
+            *self.previous_pinned_event_ids.lock().await = Vec::new();
+            return Ok(Some(Vec::new()));
         }
 
         let request_config = Some(RequestConfig::default().retry_limit(3));
 
         let mut loaded_events: Vec<TimelineEvent> =
-            stream::iter(pinned_event_ids.into_iter().map(|event_id| {
+            stream::iter(pinned_event_ids.clone().into_iter().map(|event_id| {
                 let provider = self.room.clone();
                 let relations_filter =
                     Some(vec![RelationType::Annotation, RelationType::Replacement]);
@@ -116,7 +131,11 @@ impl PinnedEventsLoader {
                 .unwrap_or_else(|_| MilliSecondsSinceUnixEpoch::now())
         });
 
-        Ok(loaded_events)
+        // We've successfully loaded *some* pinned events, so we can update the list of
+        // previously seen pinned events.
+        *self.previous_pinned_event_ids.lock().await = pinned_event_ids;
+
+        Ok(Some(loaded_events))
     }
 }
 
@@ -132,7 +151,7 @@ pub trait PinnedEventsRoom: SendOutsideWasm + SyncOutsideWasm {
         event_id: &'a EventId,
         request_config: Option<RequestConfig>,
         related_event_filters: Option<Vec<RelationType>>,
-    ) -> BoxFuture<'a, Result<(TimelineEvent, Vec<TimelineEvent>), PaginatorError>>;
+    ) -> BoxFuture<'a, Result<(TimelineEvent, Vec<TimelineEvent>), matrix_sdk::Error>>;
 
     /// Get the pinned event ids for a room.
     fn pinned_event_ids(&self) -> Option<Vec<OwnedEventId>>;
@@ -150,10 +169,11 @@ impl PinnedEventsRoom for Room {
         event_id: &'a EventId,
         request_config: Option<RequestConfig>,
         related_event_filters: Option<Vec<RelationType>>,
-    ) -> BoxFuture<'a, Result<(TimelineEvent, Vec<TimelineEvent>), PaginatorError>> {
+    ) -> BoxFuture<'a, Result<(TimelineEvent, Vec<TimelineEvent>), matrix_sdk::Error>> {
         Box::pin(async move {
             if let Ok((cache, _handles)) = self.event_cache().await {
-                if let Some(ret) = cache.event_with_relations(event_id, related_event_filters).await
+                if let Some(ret) =
+                    cache.find_event_with_relations(event_id, related_event_filters).await
                 {
                     debug!("Loaded pinned event {event_id} and related events from cache");
                     return Ok(ret);
@@ -161,10 +181,7 @@ impl PinnedEventsRoom for Room {
             }
 
             debug!("Loading pinned event {event_id} from HS");
-            self.event(event_id, request_config)
-                .await
-                .map(|e| (e, Vec::new()))
-                .map_err(|err| PaginatorError::SdkError(Box::new(err)))
+            self.event(event_id, request_config).await.map(|e| (e, Vec::new()))
         })
     }
 

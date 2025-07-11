@@ -13,9 +13,8 @@
 // limitations under the License.
 
 use matrix_sdk::{
-    event_cache::{paginator::PaginatorError, EventCacheError},
-    send_queue::RoomSendQueueError,
-    HttpError,
+    event_cache::EventCacheError, paginators::PaginatorError, room::reply::ReplyError,
+    send_queue::RoomSendQueueError, HttpError,
 };
 use thiserror::Error;
 
@@ -73,6 +72,10 @@ pub enum Error {
     #[error(transparent)]
     EditError(#[from] EditError),
 
+    /// An error happened while attempting to reply to an event.
+    #[error(transparent)]
+    ReplyError(#[from] ReplyError),
+
     /// An error happened while attempting to redact an event.
     #[error(transparent)]
     RedactError(#[from] RedactError),
@@ -110,27 +113,12 @@ pub enum RedactError {
 
 #[derive(Error, Debug)]
 pub enum PaginationError {
-    /// The timeline isn't in the event focus mode.
-    #[error("The timeline isn't in the event focus mode")]
-    NotEventFocusMode,
-
     /// An error occurred while paginating.
     #[error("Error when paginating.")]
     Paginator(#[source] PaginatorError),
-}
 
-#[derive(Debug, Error)]
-pub enum UnsupportedReplyItem {
-    #[error("local messages whose event ID is not known can't be replied to currently")]
-    MissingEventId,
-    #[error("redacted events whose JSON form isn't available can't be replied")]
-    MissingJson,
-    #[error("event to reply to not found")]
-    MissingEvent,
-    #[error("failed to deserialize event to reply to")]
-    FailedToDeserializeEvent,
-    #[error("tried to reply to a state event")]
-    StateEvent,
+    #[error("Pagination type not supported in this focus mode")]
+    NotSupported,
 }
 
 #[derive(Debug, Error)]
