@@ -14,8 +14,10 @@
 // limitations under the License.
 
 #![doc = include_str!("../docs/encryption.md")]
-#![cfg_attr(target_arch = "wasm32", allow(unused_imports))]
+#![cfg_attr(target_family = "wasm", allow(unused_imports))]
 
+#[cfg(feature = "experimental-send-custom-to-device")]
+use std::ops::Deref;
 use std::{
     collections::{BTreeMap, HashSet},
     io::{Cursor, Read, Write},
@@ -31,7 +33,7 @@ use futures_util::{
     stream::{self, StreamExt},
 };
 use matrix_sdk_base::crypto::{
-    store::RoomKeyInfo,
+    store::types::{RoomKeyBundleInfo, RoomKeyInfo},
     types::requests::{
         OutgoingRequest, OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest,
     },
@@ -57,6 +59,8 @@ use ruma::{
     },
     DeviceId, MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedUserId, TransactionId, UserId,
 };
+#[cfg(feature = "experimental-send-custom-to-device")]
+use ruma::{events::AnyToDeviceEventContent, serde::Raw, to_device::DeviceIdOrAllDevices};
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLockReadGuard};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
@@ -99,6 +103,8 @@ pub use matrix_sdk_base::crypto::{
     SessionCreationError, SignatureError, VERSION,
 };
 
+#[cfg(feature = "experimental-send-custom-to-device")]
+use crate::config::RequestConfig;
 pub use crate::error::RoomKeyImportError;
 
 /// All the data related to the encryption state.
@@ -286,8 +292,13 @@ impl CrossSigningResetHandle {
                 return Ok(());
             }
 
-            if e.as_uiaa_response().is_none() {
-                return Err(e.into());
+            match e.as_uiaa_response() {
+                Some(uiaa_info) => {
+                    if uiaa_info.auth_error.is_some() {
+                        return Err(e.into());
+                    }
+                }
+                None => return Err(e.into()),
             }
         }
 
@@ -314,22 +325,13 @@ pub enum CrossSigningResetAuthType {
 }
 
 impl CrossSigningResetAuthType {
-    #[allow(clippy::unused_async)]
-    async fn new(
-        #[allow(unused_variables)] client: &Client,
-        error: &HttpError,
-    ) -> Result<Option<Self>> {
+    fn new(error: &HttpError) -> Result<Option<Self>> {
         if let Some(auth_info) = error.as_uiaa_response() {
-            #[cfg(feature = "experimental-oidc")]
-            if client.oauth().issuer().is_some() {
-                OAuthCrossSigningResetInfo::from_auth_info(client, auth_info)
-                    .map(|t| Some(CrossSigningResetAuthType::OAuth(t)))
+            if let Ok(auth_info) = OAuthCrossSigningResetInfo::from_auth_info(auth_info) {
+                Ok(Some(CrossSigningResetAuthType::OAuth(auth_info)))
             } else {
                 Ok(Some(CrossSigningResetAuthType::Uiaa(auth_info.clone())))
             }
-
-            #[cfg(not(feature = "experimental-oidc"))]
-            Ok(Some(CrossSigningResetAuthType::Uiaa(auth_info.clone())))
         } else {
             Ok(None)
         }
@@ -345,12 +347,7 @@ pub struct OAuthCrossSigningResetInfo {
 }
 
 impl OAuthCrossSigningResetInfo {
-    #[cfg(feature = "experimental-oidc")]
-    fn from_auth_info(
-        // This is used if the OAuth 2.0 feature is enabled.
-        #[allow(unused_variables)] client: &Client,
-        auth_info: &UiaaInfo,
-    ) -> Result<Self> {
+    fn from_auth_info(auth_info: &UiaaInfo) -> Result<Self> {
         let parameters =
             serde_json::from_str::<OAuthCrossSigningResetUiaaParameters>(auth_info.params.get())?;
 
@@ -360,7 +357,6 @@ impl OAuthCrossSigningResetInfo {
 
 /// The parsed `parameters` part of a [`ruma::api::client::uiaa::UiaaInfo`]
 /// response
-#[cfg(feature = "experimental-oidc")]
 #[derive(Debug, Deserialize)]
 struct OAuthCrossSigningResetUiaaParameters {
     /// The URL where the user can approve the reset of the cross-signing keys.
@@ -370,7 +366,6 @@ struct OAuthCrossSigningResetUiaaParameters {
 
 /// The `org.matrix.cross_signing_reset` part of the Uiaa response `parameters``
 /// dictionary.
-#[cfg(feature = "experimental-oidc")]
 #[derive(Debug, Deserialize)]
 struct OAuthCrossSigningResetUiaaResetParameter {
     /// The URL where the user can approve the reset of the cross-signing keys.
@@ -446,24 +441,22 @@ impl Client {
     /// # let client = Client::new(homeserver).await?;
     /// # let room = client.get_room(&room_id!("!test:example.com")).unwrap();
     /// let mut reader = std::io::Cursor::new(b"Hello, world!");
-    /// let encrypted_file = client.upload_encrypted_file(&mime::TEXT_PLAIN, &mut reader).await?;
+    /// let encrypted_file = client.upload_encrypted_file(&mut reader).await?;
     ///
     /// room.send(CustomEventContent { encrypted_file }).await?;
     /// # anyhow::Ok(()) };
     /// ```
     pub fn upload_encrypted_file<'a, R: Read + ?Sized + 'a>(
         &'a self,
-        content_type: &'a mime::Mime,
         reader: &'a mut R,
     ) -> UploadEncryptedFile<'a, R> {
-        UploadEncryptedFile::new(self, content_type, reader)
+        UploadEncryptedFile::new(self, reader)
     }
 
     /// Encrypt and upload the file and thumbnails, and return the source
     /// information.
     pub(crate) async fn upload_encrypted_media_and_thumbnail(
         &self,
-        content_type: &mime::Mime,
         data: &[u8],
         thumbnail: Option<Thumbnail>,
         send_progress: SharedObservable<TransmissionProgress>,
@@ -472,7 +465,7 @@ impl Client {
 
         let upload_attachment = async {
             let mut cursor = Cursor::new(data);
-            self.upload_encrypted_file(content_type, &mut cursor)
+            self.upload_encrypted_file(&mut cursor)
                 .with_send_progress_observable(send_progress)
                 .await
         };
@@ -493,11 +486,11 @@ impl Client {
             return Ok(None);
         };
 
-        let (data, content_type, thumbnail_info) = thumbnail.into_parts();
+        let (data, _, thumbnail_info) = thumbnail.into_parts();
         let mut cursor = Cursor::new(data);
 
         let file = self
-            .upload_encrypted_file(&content_type, &mut cursor)
+            .upload_encrypted_file(&mut cursor)
             .with_send_progress_observable(send_progress)
             .await?;
 
@@ -567,7 +560,7 @@ impl Client {
 
         self.get_room(room_id)
             .expect("Can't send a message to a room that isn't known to the store")
-            .send(content)
+            .send(*content)
             .with_transaction_id(txn_id)
             .await
     }
@@ -648,6 +641,7 @@ impl Client {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     pub(crate) async fn send_outgoing_requests(&self) -> Result<()> {
         const MAX_CONCURRENT_REQUESTS: usize = 20;
 
@@ -729,7 +723,6 @@ impl Encryption {
         }
     }
 
-    #[cfg(feature = "experimental-oidc")]
     pub(crate) async fn import_secrets_bundle(
         &self,
         bundle: &matrix_sdk_base::crypto::types::SecretsBundle,
@@ -795,8 +788,8 @@ impl Encryption {
         let olm = olm.as_ref()?;
         #[allow(clippy::bind_instead_of_map)]
         olm.get_verification(user_id, flow_id).and_then(|v| match v {
-            matrix_sdk_base::crypto::Verification::SasV1(s) => {
-                Some(SasVerification { inner: s, client: self.client.clone() }.into())
+            matrix_sdk_base::crypto::Verification::SasV1(sas) => {
+                Some(SasVerification { inner: sas, client: self.client.clone() }.into())
             }
             #[cfg(feature = "qrcode")]
             matrix_sdk_base::crypto::Verification::QrV1(qr) => {
@@ -1210,7 +1203,7 @@ impl Encryption {
         }
 
         if let Err(error) = self.client.send(upload_signing_keys_req.clone()).await {
-            if let Some(auth_type) = CrossSigningResetAuthType::new(&self.client, &error).await? {
+            if let Ok(Some(auth_type)) = CrossSigningResetAuthType::new(&error) {
                 let client = self.client.clone();
 
                 Ok(Some(CrossSigningResetHandle::new(
@@ -1359,7 +1352,7 @@ impl Encryption {
     ///     .await?;
     /// # anyhow::Ok(()) };
     /// ```
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub async fn export_room_keys(
         &self,
         path: PathBuf,
@@ -1421,7 +1414,7 @@ impl Encryption {
     /// );
     /// # anyhow::Ok(()) };
     /// ```
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub async fn import_room_keys(
         &self,
         path: PathBuf,
@@ -1485,6 +1478,43 @@ impl Encryption {
         Some(olm.store().room_keys_received_stream())
     }
 
+    /// Receive notifications of historic room key bundles as a [`Stream`].
+    ///
+    /// Historic room key bundles are defined in [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268).
+    ///
+    /// Each time a historic room key bundle was received, an update will be
+    /// sent to the stream. This stream is useful for informative purposes
+    /// exclusively, historic room key bundles are handled by the SDK
+    /// automatically.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::Client;
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// use futures_util::StreamExt;
+    ///
+    /// let Some(mut bundle_stream) =
+    ///     client.encryption().historic_room_key_stream().await
+    /// else {
+    ///     return Ok(());
+    /// };
+    ///
+    /// while let Some(bundle_info) = bundle_stream.next().await {
+    ///     println!("Received a historic room key bundle {bundle_info:?}");
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn historic_room_key_stream(&self) -> Option<impl Stream<Item = RoomKeyBundleInfo>> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref()?;
+
+        Some(olm.store().historic_room_key_stream())
+    }
+
     /// Get the secret storage manager of the client.
     pub fn secret_storage(&self) -> SecretStorage {
         SecretStorage { client: self.client.to_owned() }
@@ -1518,7 +1548,10 @@ impl Encryption {
             if prev_holder == lock_value {
                 return Ok(());
             }
-            warn!("Recreating cross-process store lock with a different holder value: prev was {prev_holder}, new is {lock_value}");
+            warn!(
+                "Recreating cross-process store lock with a different holder value: \
+                 prev was {prev_holder}, new is {lock_value}"
+            );
         }
 
         let olm_machine = self.client.base_client().olm_machine().await;
@@ -1688,7 +1721,7 @@ impl Encryption {
         }
     }
 
-    /// Upload the device keys and initial set of one-tim keys to the server.
+    /// Upload the device keys and initial set of one-time keys to the server.
     ///
     /// This should only be called when the user logs in for the first time,
     /// the method will ensure that other devices see our own device as an
@@ -1697,7 +1730,6 @@ impl Encryption {
     /// **Warning**: Do not use this method if we're already calling
     /// [`Client::send_outgoing_request()`]. This method is intended for
     /// explicitly uploading the device keys before starting a sync.
-    #[cfg(feature = "experimental-oidc")]
     pub(crate) async fn ensure_device_keys_upload(&self) -> Result<()> {
         let olm = self.client.olm_machine().await;
         let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
@@ -1747,9 +1779,85 @@ impl Encryption {
             }
         }
     }
+
+    /// Encrypts then send the given content via the `/sendToDevice` end-point
+    /// using Olm encryption.
+    ///
+    /// If there are a lot of recipient devices multiple `/sendToDevice`
+    /// requests might be sent out.
+    ///
+    /// # Returns
+    /// A list of failures. The list of devices that couldn't get the messages.
+    #[cfg(feature = "experimental-send-custom-to-device")]
+    pub async fn encrypt_and_send_raw_to_device(
+        &self,
+        recipient_devices: Vec<&Device>,
+        event_type: &str,
+        content: Raw<AnyToDeviceEventContent>,
+    ) -> Result<Vec<(OwnedUserId, OwnedDeviceId)>> {
+        let users = recipient_devices.iter().map(|device| device.user_id());
+
+        // Will claim one-time-key for users that needs it
+        // TODO: For later optimisation: This will establish missing olm sessions with
+        // all this users devices, but we just want for some devices.
+        self.client.claim_one_time_keys(users).await?;
+
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref().expect("Olm machine wasn't started");
+
+        let (requests, withhelds) = olm
+            .encrypt_content_for_devices(
+                recipient_devices.into_iter().map(|d| d.deref().clone()).collect(),
+                event_type,
+                &content
+                    .deserialize_as::<serde_json::Value>()
+                    .expect("Deserialize as Value will always work"),
+            )
+            .await?;
+
+        let mut failures: Vec<(OwnedUserId, OwnedDeviceId)> = Default::default();
+
+        // Push the withhelds in the failures
+        withhelds.iter().for_each(|(d, _)| {
+            failures.push((d.user_id().to_owned(), d.device_id().to_owned()));
+        });
+
+        // TODO: parallelize that? it's already grouping 250 devices per chunk.
+        for request in requests {
+            let ruma_request = RumaToDeviceRequest::new_raw(
+                request.event_type.clone(),
+                request.txn_id.clone(),
+                request.messages.clone(),
+            );
+
+            let send_result = self
+                .client
+                .send_inner(ruma_request, Some(RequestConfig::short_retry()), Default::default())
+                .await;
+
+            // If the sending failed we need to collect the failures to report them
+            if send_result.is_err() {
+                // Mark the sending as failed
+                for (user_id, device_map) in request.messages {
+                    for device_id in device_map.keys() {
+                        match device_id {
+                            DeviceIdOrAllDevices::DeviceId(device_id) => {
+                                failures.push((user_id.clone(), device_id.to_owned()));
+                            }
+                            DeviceIdOrAllDevices::AllDevices => {
+                                // Cannot happen in this case
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(failures)
+    }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use std::{
         ops::Not,
@@ -1778,7 +1886,7 @@ mod tests {
     use crate::{
         assert_next_matches_with_timeout,
         config::RequestConfig,
-        encryption::VerificationState,
+        encryption::{OAuthCrossSigningResetInfo, VerificationState},
         test_utils::{
             client::mock_matrix_session, logged_in_client, no_retry_test_client, set_client_session,
         },
@@ -1909,6 +2017,8 @@ mod tests {
     #[async_test]
     async fn test_generation_counter_invalidates_olm_machine() {
         // Create two clients using the same sqlite database.
+
+        use matrix_sdk_base::store::RoomLoadSettings;
         let sqlite_path = std::env::temp_dir().join("generation_counter_sqlite.db");
         let session = mock_matrix_session();
 
@@ -1919,7 +2029,11 @@ mod tests {
             .build()
             .await
             .unwrap();
-        client1.matrix_auth().restore_session(session.clone()).await.unwrap();
+        client1
+            .matrix_auth()
+            .restore_session(session.clone(), RoomLoadSettings::default())
+            .await
+            .unwrap();
 
         let client2 = Client::builder()
             .homeserver_url("http://localhost:1234")
@@ -1928,7 +2042,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        client2.matrix_auth().restore_session(session).await.unwrap();
+        client2.matrix_auth().restore_session(session, RoomLoadSettings::default()).await.unwrap();
 
         // When the lock isn't enabled, any attempt at locking won't return a guard.
         let guard = client1.encryption().try_lock_store_once().await.unwrap();
@@ -1946,7 +2060,7 @@ mod tests {
             client1.olm_machine().await.clone().expect("must have an olm machine");
 
         // Also enable backup to check that new machine has the same backup keys.
-        let decryption_key = matrix_sdk_base::crypto::store::BackupDecryptionKey::new()
+        let decryption_key = matrix_sdk_base::crypto::store::types::BackupDecryptionKey::new()
             .expect("Can't create new recovery key");
         let backup_key = decryption_key.megolm_v1_public_key();
         backup_key.set_version("1".to_owned());
@@ -2010,6 +2124,8 @@ mod tests {
     #[async_test]
     async fn test_generation_counter_no_spurious_invalidation() {
         // Create two clients using the same sqlite database.
+
+        use matrix_sdk_base::store::RoomLoadSettings;
         let sqlite_path =
             std::env::temp_dir().join("generation_counter_no_spurious_invalidations.db");
         let session = mock_matrix_session();
@@ -2021,7 +2137,11 @@ mod tests {
             .build()
             .await
             .unwrap();
-        client.matrix_auth().restore_session(session.clone()).await.unwrap();
+        client
+            .matrix_auth()
+            .restore_session(session.clone(), RoomLoadSettings::default())
+            .await
+            .unwrap();
 
         let initial_olm_machine = client.olm_machine().await.as_ref().unwrap().clone();
 
@@ -2040,7 +2160,11 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            client2.matrix_auth().restore_session(session).await.unwrap();
+            client2
+                .matrix_auth()
+                .restore_session(session, RoomLoadSettings::default())
+                .await
+                .unwrap();
 
             client2
                 .encryption()
@@ -2108,5 +2232,30 @@ mod tests {
         // Then we can get an updated value without waiting for any network requests
         assert!(keys_requested.load(Ordering::SeqCst).not());
         assert_next_matches_with_timeout!(verification_state, VerificationState::Unverified);
+    }
+
+    #[test]
+    fn test_oauth_reset_info_from_uiaa_info() {
+        let auth_info = json!({
+            "session": "dummy",
+            "flows": [
+                {
+                    "stages": [
+                        "org.matrix.cross_signing_reset"
+                    ]
+                }
+            ],
+            "params": {
+                "org.matrix.cross_signing_reset": {
+                    "url": "https://example.org/account/account?action=org.matrix.cross_signing_reset"
+                }
+            },
+            "msg": "To reset..."
+        });
+
+        let auth_info = serde_json::from_value(auth_info)
+            .expect("We should be able to deserialize the UiaaInfo");
+        OAuthCrossSigningResetInfo::from_auth_info(&auth_info)
+            .expect("We should be able to fetch the cross-signing reset info from the auth info");
     }
 }

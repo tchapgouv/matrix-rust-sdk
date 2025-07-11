@@ -18,7 +18,7 @@ use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
 use matrix_sdk::{
     assert_next_matches_with_timeout,
-    linked_chunk::{ChunkIdentifier, Position, Update},
+    linked_chunk::{ChunkIdentifier, LinkedChunkId, Position, Update},
     test_utils::mocks::MatrixMockServer,
 };
 use matrix_sdk_test::{async_test, event_factory::EventFactory, BOB};
@@ -74,7 +74,7 @@ async fn test_an_utd_from_the_event_cache_as_an_initial_item_is_decrypted() {
         // be decrypted. Damn. We want to see if decryption will trigger automatically.
         event_cache_store
             .handle_linked_chunk_updates(
-                room_id,
+                LinkedChunkId::Room(room_id),
                 vec![
                     // chunk #1
                     Update::NewItemsChunk {
@@ -134,7 +134,6 @@ async fn test_an_utd_from_the_event_cache_as_an_initial_item_is_decrypted() {
     // Set up the event cache.
     let event_cache = client.event_cache();
     event_cache.subscribe().unwrap();
-    event_cache.enable_storage().unwrap();
 
     let room = mock_server.sync_joined_room(&client, room_id).await;
     let timeline = room.timeline().await.unwrap();
@@ -214,7 +213,7 @@ async fn test_an_utd_from_the_event_cache_as_a_paginated_item_is_decrypted() {
         // automatically.
         event_cache_store
             .handle_linked_chunk_updates(
-                room_id,
+                LinkedChunkId::Room(room_id),
                 vec![
                     // chunk #1
                     Update::NewItemsChunk {
@@ -289,7 +288,6 @@ async fn test_an_utd_from_the_event_cache_as_a_paginated_item_is_decrypted() {
     // Set up the event cache.
     let event_cache = client.event_cache();
     event_cache.subscribe().unwrap();
-    event_cache.enable_storage().unwrap();
 
     let room = mock_server.sync_joined_room(&client, room_id).await;
     let timeline = room.timeline().await.unwrap();
@@ -318,13 +316,21 @@ async fn test_an_utd_from_the_event_cache_as_a_paginated_item_is_decrypted() {
     // let's test everything :-).
     assert!(reached_start);
 
+    assert_next_matches_with_timeout!(updates_stream, 250, updates => {
+        assert_eq!(updates.len(), 1, "We get the start of timeline item");
+
+        assert_matches!(&updates[0], VectorDiff::PushFront { value } => {
+            assert!(value.is_timeline_start());
+        });
+    });
+
     // Now, let's look at the updates. We must observe an update reflecting the UTD
     // has entered the `Timeline`.
     assert_next_matches_with_timeout!(updates_stream, 250, updates => {
         assert_eq!(updates.len(), 2, "Expecting 2 updates from the `Timeline`");
 
         // UTD! UTD!
-        assert_matches!(&updates[0], VectorDiff::Insert { index: 1, value: event } => {
+        assert_matches!(&updates[0], VectorDiff::Insert { index: 2, value: event } => {
             assert_matches!(event.as_event(), Some(event) => {
                 assert_eq!(event.event_id().unwrap().as_str(), "$ev0");
                 assert!(event.content().is_unable_to_decrypt());
@@ -332,7 +338,7 @@ async fn test_an_utd_from_the_event_cache_as_a_paginated_item_is_decrypted() {
         });
 
         // UTD is decrypted now!
-        assert_matches!(&updates[1], VectorDiff::Set { index: 1, value: event } => {
+        assert_matches!(&updates[1], VectorDiff::Set { index: 2, value: event } => {
             assert_matches!(event.as_event(), Some(event) => {
                 assert_eq!(event.event_id().unwrap().as_str(), "$ev0");
                 assert_matches!(event.content().as_message(), Some(message) => {

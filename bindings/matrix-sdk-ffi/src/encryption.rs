@@ -1,16 +1,19 @@
 use std::sync::Arc;
 
-use async_compat::get_runtime_handle;
 use futures_util::StreamExt;
 use matrix_sdk::{
     encryption,
     encryption::{backups, recovery},
 };
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use thiserror::Error;
 use tracing::{error, info};
 use zeroize::Zeroize;
 
-use crate::{client::Client, error::ClientError, ruma::AuthData, task_handle::TaskHandle};
+use crate::{
+    client::Client, error::ClientError, ruma::AuthData, runtime::get_runtime_handle,
+    task_handle::TaskHandle,
+};
 
 #[derive(uniffi::Object)]
 pub struct Encryption {
@@ -25,22 +28,22 @@ pub struct Encryption {
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait BackupStateListener: Sync + Send {
+pub trait BackupStateListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_update(&self, status: BackupState);
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait BackupSteadyStateListener: Sync + Send {
+pub trait BackupSteadyStateListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_update(&self, status: BackupUploadState);
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait RecoveryStateListener: Sync + Send {
+pub trait RecoveryStateListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_update(&self, status: RecoveryState);
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait VerificationStateListener: Sync + Send {
+pub trait VerificationStateListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_update(&self, status: VerificationState);
 }
 
@@ -164,7 +167,7 @@ impl From<recovery::RecoveryState> for RecoveryState {
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait EnableRecoveryProgressListener: Sync + Send {
+pub trait EnableRecoveryProgressListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_update(&self, status: EnableRecoveryProgress);
 }
 
@@ -369,12 +372,8 @@ impl Encryption {
     /// Completely reset the current user's crypto identity: reset the cross
     /// signing keys, delete the existing backup and recovery key.
     pub async fn reset_identity(&self) -> Result<Option<Arc<IdentityResetHandle>>, ClientError> {
-        if let Some(reset_handle) = self
-            .inner
-            .recovery()
-            .reset_identity()
-            .await
-            .map_err(|e| ClientError::Generic { msg: e.to_string() })?
+        if let Some(reset_handle) =
+            self.inner.recovery().reset_identity().await.map_err(ClientError::from_err)?
         {
             return Ok(Some(Arc::new(IdentityResetHandle { inner: reset_handle })));
         }
@@ -441,7 +440,7 @@ impl Encryption {
                 info!("No identity found in the store.");
             }
             Err(error) => {
-                error!("Failed fetching identity from the store: {}", error);
+                error!("Failed fetching identity from the store: {error}");
             }
         };
 
@@ -541,12 +540,9 @@ impl IdentityResetHandle {
     /// 4. Finally, re-enable key backups only if they were enabled before
     pub async fn reset(&self, auth: Option<AuthData>) -> Result<(), ClientError> {
         if let Some(auth) = auth {
-            self.inner
-                .reset(Some(auth.into()))
-                .await
-                .map_err(|e| ClientError::Generic { msg: e.to_string() })
+            self.inner.reset(Some(auth.into())).await.map_err(ClientError::from_err)
         } else {
-            self.inner.reset(None).await.map_err(|e| ClientError::Generic { msg: e.to_string() })
+            self.inner.reset(None).await.map_err(ClientError::from_err)
         }
     }
 

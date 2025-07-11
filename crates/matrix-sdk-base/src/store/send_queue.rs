@@ -103,6 +103,12 @@ pub enum QueuedRequestKind {
 
         /// To which media event transaction does this upload relate?
         related_to: OwnedTransactionId,
+
+        /// Accumulated list of infos for previously uploaded files and
+        /// thumbnails if used during a gallery transaction. Otherwise empty.
+        #[cfg(feature = "unstable-msc4274")]
+        #[serde(default)]
+        accumulated: Vec<AccumulatedSentMediaInfo>,
     },
 }
 
@@ -200,8 +206,7 @@ pub enum QueueWedgeError {
     },
 }
 
-/// The specific user intent that characterizes a
-/// [`DependentQueuedRequestKind`].
+/// The specific user intent that characterizes a [`DependentQueuedRequest`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DependentQueuedRequestKind {
     /// The event should be edited.
@@ -219,24 +224,32 @@ pub enum DependentQueuedRequestKind {
         key: String,
     },
 
-    /// Upload a file that had a thumbnail.
-    UploadFileWithThumbnail {
-        /// Content type for the file itself (not the thumbnail).
+    /// Upload a file or thumbnail depending on another file or thumbnail
+    /// upload.
+    #[serde(alias = "UploadFileWithThumbnail")]
+    UploadFileOrThumbnail {
+        /// Content type for the file or thumbnail.
         content_type: String,
 
-        /// Media request necessary to retrieve the file itself (not the
-        /// thumbnail).
+        /// Media request necessary to retrieve the file or thumbnail itself.
         cache_key: MediaRequestParameters,
 
         /// To which media transaction id does this upload relate to?
         related_to: OwnedTransactionId,
+
+        /// Whether the depended upon request was a thumbnail or a file upload.
+        #[cfg(feature = "unstable-msc4274")]
+        #[serde(default = "default_parent_is_thumbnail_upload")]
+        parent_is_thumbnail_upload: bool,
     },
 
     /// Finish an upload by updating references to the media cache and sending
     /// the final media event with the remote MXC URIs.
     FinishUpload {
         /// Local echo for the event (containing the local MXC URIs).
-        local_echo: RoomMessageEventContent,
+        ///
+        /// `Box` the local echo so that it reduces the size of the whole enum.
+        local_echo: Box<RoomMessageEventContent>,
 
         /// Transaction id for the file upload.
         file_upload: OwnedTransactionId,
@@ -244,6 +257,27 @@ pub enum DependentQueuedRequestKind {
         /// Information about the thumbnail, if present.
         thumbnail_info: Option<FinishUploadThumbnailInfo>,
     },
+
+    /// Finish a gallery upload by updating references to the media cache and
+    /// sending the final gallery event with the remote MXC URIs.
+    #[cfg(feature = "unstable-msc4274")]
+    FinishGallery {
+        /// Local echo for the event (containing the local MXC URIs).
+        ///
+        /// `Box` the local echo so that it reduces the size of the whole enum.
+        local_echo: Box<RoomMessageEventContent>,
+
+        /// Metadata about the gallery items.
+        item_infos: Vec<FinishGalleryItemInfo>,
+    },
+}
+
+/// If parent_is_thumbnail_upload is missing, we assume the request is for a
+/// file upload following a thumbnail upload. This was the only possible case
+/// before parent_is_thumbnail_upload was introduced.
+#[cfg(feature = "unstable-msc4274")]
+fn default_parent_is_thumbnail_upload() -> bool {
+    true
 }
 
 /// Detailed record about a thumbnail used when finishing a media upload.
@@ -261,6 +295,18 @@ pub struct FinishUploadThumbnailInfo {
     /// Used previously, kept for backwards compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<UInt>,
+}
+
+/// Detailed record about a file and thumbnail. When finishing a gallery
+/// upload, one [`FinishGalleryItemInfo`] will be used for each media in the
+/// gallery.
+#[cfg(feature = "unstable-msc4274")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FinishGalleryItemInfo {
+    /// Transaction id for the file upload.
+    pub file_upload: OwnedTransactionId,
+    /// Information about the thumbnail, if present.
+    pub thumbnail_info: Option<FinishUploadThumbnailInfo>,
 }
 
 /// A transaction id identifying a [`DependentQueuedRequest`] rather than its
@@ -308,7 +354,7 @@ impl From<OwnedTransactionId> for ChildTransactionId {
     }
 }
 
-/// Information about a media (and its thumbnail) that have been sent to an
+/// Information about a media (and its thumbnail) that have been sent to a
 /// homeserver.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SentMediaInfo {
@@ -322,6 +368,36 @@ pub struct SentMediaInfo {
     ///
     /// When uploading a thumbnail, this is set to `None`.
     pub thumbnail: Option<MediaSource>,
+
+    /// Accumulated list of infos for previously uploaded files and thumbnails
+    /// if used during a gallery transaction. Otherwise empty.
+    #[cfg(feature = "unstable-msc4274")]
+    #[serde(default)]
+    pub accumulated: Vec<AccumulatedSentMediaInfo>,
+}
+
+/// Accumulated information about a media (and its thumbnail) that have been
+/// sent to a homeserver.
+#[cfg(feature = "unstable-msc4274")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AccumulatedSentMediaInfo {
+    /// File that was uploaded by this request.
+    ///
+    /// If the request related to a thumbnail upload, this contains the
+    /// thumbnail media source.
+    pub file: MediaSource,
+
+    /// Optional thumbnail previously uploaded, when uploading a file.
+    ///
+    /// When uploading a thumbnail, this is set to `None`.
+    pub thumbnail: Option<MediaSource>,
+}
+
+#[cfg(feature = "unstable-msc4274")]
+impl From<AccumulatedSentMediaInfo> for SentMediaInfo {
+    fn from(value: AccumulatedSentMediaInfo) -> Self {
+        Self { file: value.file, thumbnail: value.thumbnail, accumulated: vec![] }
+    }
 }
 
 /// A unique key (identifier) indicating that a transaction has been
@@ -388,13 +464,18 @@ impl DependentQueuedRequest {
             DependentQueuedRequestKind::EditEvent { .. }
             | DependentQueuedRequestKind::RedactEvent
             | DependentQueuedRequestKind::ReactEvent { .. }
-            | DependentQueuedRequestKind::UploadFileWithThumbnail { .. } => {
+            | DependentQueuedRequestKind::UploadFileOrThumbnail { .. } => {
                 // These are all aggregated events, or non-visible items (file upload producing
                 // a new MXC ID).
                 false
             }
             DependentQueuedRequestKind::FinishUpload { .. } => {
                 // This one graduates into a new media event.
+                true
+            }
+            #[cfg(feature = "unstable-msc4274")]
+            DependentQueuedRequestKind::FinishGallery { .. } => {
+                // This one graduates into a new gallery event.
                 true
             }
         }

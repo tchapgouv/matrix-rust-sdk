@@ -12,7 +12,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#![cfg_attr(not(target_arch = "wasm32"), deny(clippy::future_not_send))]
+#![cfg_attr(not(target_family = "wasm"), deny(clippy::future_not_send))]
 
 #[cfg(feature = "sso-login")]
 use std::future::Future;
@@ -309,7 +309,7 @@ where
     /// Panics if a session was already restored or logged in.
     #[instrument(target = "matrix_sdk::client", name = "login", skip_all, fields(method = "sso"))]
     pub async fn send(self) -> Result<login::v3::Response> {
-        use std::io::{Error as IoError, ErrorKind as IoErrorKind};
+        use std::io::Error as IoError;
 
         use serde::Deserialize;
 
@@ -333,11 +333,10 @@ where
 
         (self.use_sso_login_url)(sso_url).await?;
 
-        let query_string = server_handle
-            .await
-            .ok_or_else(|| IoError::new(IoErrorKind::Other, "Could not get the loginToken"))?;
+        let query_string =
+            server_handle.await.ok_or_else(|| IoError::other("Could not get the loginToken"))?;
         let token = serde_html_form::from_str::<QueryParameters>(&query_string)
-            .map_err(|e| IoError::new(IoErrorKind::Other, e))?
+            .map_err(IoError::other)?
             .login_token;
 
         let login_builder = LoginBuilder {

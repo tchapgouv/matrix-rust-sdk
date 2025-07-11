@@ -53,7 +53,7 @@ use crate::{
     error::SignatureError,
     gossiping::{GossipMachine, GossipRequest},
     olm::{PrivateCrossSigningIdentity, StaticAccountData},
-    store::{Changes, CryptoStoreWrapper},
+    store::{types::Changes, CryptoStoreWrapper},
     types::{requests::OutgoingVerificationRequest, Signatures},
     CryptoStoreError, DeviceData, LocalTrust, OwnUserIdentityData, UserIdentityData,
 };
@@ -184,21 +184,23 @@ impl VerificationStore {
 #[non_exhaustive]
 pub enum Verification {
     /// The `m.sas.v1` verification variant.
-    SasV1(Sas),
+    // `Box` the `Sas` to reduce the enum size.
+    SasV1(Box<Sas>),
     /// The `m.qr_code.*.v1` verification variant.
+    // `Box` the `QrVerification` to reduce the enum size.
     #[cfg(feature = "qrcode")]
-    QrV1(QrVerification),
+    QrV1(Box<QrVerification>),
 }
 
 impl Verification {
     /// Try to deconstruct this verification enum into a SAS verification.
-    pub fn sas_v1(self) -> Option<Sas> {
+    pub fn sas_v1(self) -> Option<Box<Sas>> {
         as_variant!(self, Verification::SasV1)
     }
 
     /// Try to deconstruct this verification enum into a QR code verification.
     #[cfg(feature = "qrcode")]
-    pub fn qr_v1(self) -> Option<QrVerification> {
+    pub fn qr_v1(self) -> Option<Box<QrVerification>> {
         as_variant!(self, Verification::QrV1)
     }
 
@@ -267,14 +269,14 @@ impl Verification {
 
 impl From<Sas> for Verification {
     fn from(sas: Sas) -> Self {
-        Self::SasV1(sas)
+        Self::SasV1(Box::new(sas))
     }
 }
 
 #[cfg(feature = "qrcode")]
 impl From<QrVerification> for Verification {
     fn from(qr: QrVerification) -> Self {
-        Self::QrV1(qr)
+        Self::QrV1(Box::new(qr))
     }
 }
 
@@ -594,7 +596,7 @@ impl IdentitiesBeingVerified {
             changes.key_requests = secret_requests;
         }
 
-        // TODO store the signature upload request as well.
+        // TODO: store the signature upload request as well.
         self.store.save_changes(changes).await?;
 
         Ok(merged_request
@@ -745,7 +747,10 @@ pub(crate) mod tests {
     use super::{event_enums::OutgoingContent, VerificationStore};
     use crate::{
         olm::PrivateCrossSigningIdentity,
-        store::{Changes, CryptoStore, CryptoStoreWrapper, IdentityChanges, MemoryStore},
+        store::{
+            types::{Changes, IdentityChanges},
+            CryptoStore, CryptoStoreWrapper, MemoryStore,
+        },
         types::{
             events::ToDeviceEvents,
             requests::{AnyOutgoingRequest, OutgoingRequest, OutgoingVerificationRequest},
@@ -779,7 +784,7 @@ pub(crate) mod tests {
         let content = if let OutgoingContent::ToDevice(c) = content { c } else { unreachable!() };
         let sender = sender.to_owned();
 
-        match content {
+        match *content {
             AnyToDeviceEventContent::KeyVerificationRequest(c) => {
                 ToDeviceEvents::KeyVerificationRequest(ToDeviceEvent { sender, content: c })
             }

@@ -15,7 +15,7 @@
 #![allow(missing_docs)]
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::atomic::{AtomicU64, Ordering::SeqCst},
 };
 
@@ -25,6 +25,7 @@ use matrix_sdk_common::deserialized_responses::{
 };
 use ruma::{
     events::{
+        beacon::BeaconEventContent,
         member_hints::MemberHintsEventContent,
         poll::{
             unstable_end::UnstablePollEndEventContent,
@@ -36,26 +37,36 @@ use ruma::{
         },
         reaction::ReactionEventContent,
         receipt::{Receipt, ReceiptEventContent, ReceiptThread, ReceiptType},
-        relation::{Annotation, InReplyTo, Replacement, Thread},
+        relation::{Annotation, BundledThread, InReplyTo, Replacement, Thread},
         room::{
             avatar::{self, RoomAvatarEventContent},
+            canonical_alias::RoomCanonicalAliasEventContent,
+            create::{PreviousRoom, RoomCreateEventContent},
             encrypted::{EncryptedEventScheme, RoomEncryptedEventContent},
             member::{MembershipState, RoomMemberEventContent},
             message::{
-                FormattedBody, ImageMessageEventContent, MessageType, Relation,
+                FormattedBody, GalleryItemType, GalleryMessageEventContent,
+                ImageMessageEventContent, MessageType, Relation, RelationWithoutReplacement,
                 RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
             },
             name::RoomNameEventContent,
+            power_levels::RoomPowerLevelsEventContent,
             redaction::RoomRedactionEventContent,
+            server_acl::RoomServerAclEventContent,
             tombstone::RoomTombstoneEventContent,
             topic::RoomTopicEventContent,
+            ImageInfo,
         },
-        AnySyncTimelineEvent, AnyTimelineEvent, BundledMessageLikeRelations, EventContent,
-        RedactedMessageLikeEventContent, RedactedStateEventContent,
+        sticker::StickerEventContent,
+        typing::TypingEventContent,
+        AnyMessageLikeEvent, AnyStateEvent, AnySyncStateEvent, AnySyncTimelineEvent,
+        AnyTimelineEvent, BundledMessageLikeRelations, EventContent,
+        RedactedMessageLikeEventContent, RedactedStateEventContent, StateEventContent,
     },
     serde::Raw,
-    server_name, EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri,
-    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
+    server_name, EventId, Int, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri,
+    OwnedRoomAliasId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId,
+    TransactionId, UInt, UserId,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -106,18 +117,30 @@ struct Unsigned<C: EventContent> {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     redacted_because: Option<RedactedBecause>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age: Option<Int>,
 }
 
 // rustc can't derive Default because C isn't marked as `Default` 🤔 oh well.
 impl<C: EventContent> Default for Unsigned<C> {
     fn default() -> Self {
-        Self { prev_content: None, transaction_id: None, relations: None, redacted_because: None }
+        Self {
+            prev_content: None,
+            transaction_id: None,
+            relations: None,
+            redacted_because: None,
+            age: None,
+        }
     }
 }
 
 #[derive(Debug)]
 pub struct EventBuilder<C: EventContent> {
     sender: Option<OwnedUserId>,
+    /// Whether the event is an ephemeral one. As such, it doesn't require a
+    /// room id or a sender.
+    is_ephemeral: bool,
     room: Option<OwnedRoomId>,
     event_id: Option<OwnedEventId>,
     /// Whether the event should *not* have an event id. False by default.
@@ -166,18 +189,41 @@ where
         self
     }
 
-    /// Adds bundled relations to this event.
-    ///
-    /// Ideally, we'd type-check that an event passed as a relation is the same
-    /// type as this one, but it's not trivial to do so because this builder
-    /// is only generic on the event's *content*, not the event type itself;
-    /// doing so would require many changes, and this is testing code after
-    /// all.
-    pub fn bundled_relations(
+    /// Add age to unsigned data in this event.
+    pub fn age(mut self, age: impl Into<Int>) -> Self {
+        self.unsigned.get_or_insert_with(Default::default).age = Some(age.into());
+        self
+    }
+
+    /// Create a bundled thread summary in the unsigned bundled relations of
+    /// this event.
+    pub fn with_bundled_thread_summary(
         mut self,
-        relations: BundledMessageLikeRelations<Raw<AnySyncTimelineEvent>>,
+        latest_event: Raw<AnyMessageLikeEvent>,
+        count: usize,
+        current_user_participated: bool,
     ) -> Self {
-        self.unsigned.get_or_insert_with(Default::default).relations = Some(relations);
+        let relations = self
+            .unsigned
+            .get_or_insert_with(Default::default)
+            .relations
+            .get_or_insert_with(BundledMessageLikeRelations::new);
+        relations.thread = Some(Box::new(BundledThread::new(
+            latest_event,
+            UInt::try_from(count).unwrap(),
+            current_user_participated,
+        )));
+        self
+    }
+
+    /// Create a bundled edit in the unsigned bundled relations of this event.
+    pub fn with_bundled_edit(mut self, replacement: impl Into<Raw<AnySyncTimelineEvent>>) -> Self {
+        let relations = self
+            .unsigned
+            .get_or_insert_with(Default::default)
+            .relations
+            .get_or_insert_with(BundledMessageLikeRelations::new);
+        relations.replace = Some(Box::new(replacement.into()));
         self
     }
 
@@ -196,17 +242,31 @@ where
         // none has been set.
         let sender = self
             .sender
-            .or_else(|| Some(self.unsigned.as_ref()?.redacted_because.as_ref()?.sender.clone()))
-            .expect("we should have a sender user id at this point");
+            .or_else(|| Some(self.unsigned.as_ref()?.redacted_because.as_ref()?.sender.clone()));
+
+        if sender.is_none() {
+            assert!(
+                self.is_ephemeral,
+                "the sender must be known when building the JSON for a non read-receipt event"
+            );
+        } else {
+            assert!(
+                !self.is_ephemeral,
+                "event builder set is_ephemeral, but also has a sender field"
+            );
+        }
 
         let mut json = json!({
             "type": self.content.event_type(),
             "content": self.content,
-            "sender": sender,
             "origin_server_ts": self.server_ts,
         });
 
         let map = json.as_object_mut().unwrap();
+
+        if let Some(sender) = sender {
+            map.insert("sender".to_owned(), json!(sender));
+        }
 
         let event_id = self
             .event_id
@@ -218,7 +278,7 @@ where
             map.insert("event_id".to_owned(), json!(event_id));
         }
 
-        if requires_room {
+        if requires_room && !self.is_ephemeral {
             let room_id = self.room.expect("TimelineEvent requires a room id");
             map.insert("room_id".to_owned(), json!(room_id));
         }
@@ -248,7 +308,7 @@ where
     }
 
     pub fn into_raw_timeline(self) -> Raw<AnyTimelineEvent> {
-        Raw::new(&self.construct_json(true)).unwrap().cast()
+        self.into_raw()
     }
 
     pub fn into_raw_sync(self) -> Raw<AnySyncTimelineEvent> {
@@ -256,7 +316,7 @@ where
     }
 
     pub fn into_event(self) -> TimelineEvent {
-        TimelineEvent::new(self.into_raw_sync())
+        TimelineEvent::from_plaintext(self.into_raw_sync())
     }
 }
 
@@ -267,7 +327,7 @@ impl EventBuilder<RoomEncryptedEventContent> {
         let session_id = as_variant!(&self.content.scheme, EncryptedEventScheme::MegolmV1AesSha2)
             .map(|content| content.session_id.clone());
 
-        TimelineEvent::new_utd_event(
+        TimelineEvent::from_utd(
             self.into(),
             UnableToDecryptInfo {
                 session_id,
@@ -285,11 +345,19 @@ impl EventBuilder<RoomMessageEventContent> {
         self
     }
 
-    /// Adds a thread relation to the root event, setting the latest thread
-    /// event id too.
+    /// Adds a thread relation to the root event, setting the reply fallback to
+    /// the latest in-thread event.
     pub fn in_thread(mut self, root: &EventId, latest_thread_event: &EventId) -> Self {
         self.content.relates_to =
             Some(Relation::Thread(Thread::plain(root.to_owned(), latest_thread_event.to_owned())));
+        self
+    }
+
+    /// Adds a thread relation to the root event, that's a non-fallback reply to
+    /// another thread event.
+    pub fn in_thread_reply(mut self, root: &EventId, replied_to: &EventId) -> Self {
+        self.content.relates_to =
+            Some(Relation::Thread(Thread::reply(root.to_owned(), replied_to.to_owned())));
         self
     }
 
@@ -337,6 +405,52 @@ impl EventBuilder<RoomMessageEventContent> {
     }
 }
 
+impl EventBuilder<UnstablePollStartEventContent> {
+    /// Adds a reply relation to the current event.
+    pub fn reply_to(mut self, event_id: &EventId) -> Self {
+        if let UnstablePollStartEventContent::New(content) = &mut self.content {
+            content.relates_to = Some(RelationWithoutReplacement::Reply {
+                in_reply_to: InReplyTo::new(event_id.to_owned()),
+            });
+        };
+        self
+    }
+
+    /// Adds a thread relation to the root event, setting the reply to
+    /// event id as well.
+    pub fn in_thread(mut self, root: &EventId, reply_to_event_id: &EventId) -> Self {
+        let thread = Thread::reply(root.to_owned(), reply_to_event_id.to_owned());
+
+        if let UnstablePollStartEventContent::New(content) = &mut self.content {
+            content.relates_to = Some(RelationWithoutReplacement::Thread(thread));
+        };
+        self
+    }
+}
+
+impl EventBuilder<RoomCreateEventContent> {
+    /// Define the predecessor fields.
+    pub fn predecessor(mut self, room_id: &RoomId, event_id: &EventId) -> Self {
+        self.content.predecessor = Some(PreviousRoom::new(room_id.to_owned(), event_id.to_owned()));
+        self
+    }
+
+    /// Erase the predecessor if any.
+    pub fn no_predecessor(mut self) -> Self {
+        self.content.predecessor = None;
+        self
+    }
+}
+
+impl EventBuilder<StickerEventContent> {
+    /// Add reply [`Thread`] relation to root event and set replied-to event id.
+    pub fn reply_thread(mut self, root: &EventId, reply_to_event: &EventId) -> Self {
+        self.content.relates_to =
+            Some(Relation::Thread(Thread::reply(root.to_owned(), reply_to_event.to_owned())));
+        self
+    }
+}
+
 impl<E: EventContent> From<EventBuilder<E>> for Raw<AnySyncTimelineEvent>
 where
     E::EventType: Serialize,
@@ -361,6 +475,24 @@ where
 {
     fn from(val: EventBuilder<E>) -> Self {
         val.into_event()
+    }
+}
+
+impl<E: StateEventContent> From<EventBuilder<E>> for Raw<AnySyncStateEvent>
+where
+    E::EventType: Serialize,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::new(&val.construct_json(false)).unwrap().cast()
+    }
+}
+
+impl<E: StateEventContent> From<EventBuilder<E>> for Raw<AnyStateEvent>
+where
+    E::EventType: Serialize,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        Raw::new(&val.construct_json(true)).unwrap().cast()
     }
 }
 
@@ -399,6 +531,7 @@ impl EventFactory {
     pub fn event<E: EventContent>(&self, content: E) -> EventBuilder<E> {
         EventBuilder {
             sender: self.sender.clone(),
+            is_ephemeral: false,
             room: self.room.clone(),
             server_ts: self.next_server_ts(),
             event_id: None,
@@ -686,9 +819,131 @@ impl EventFactory {
         self.event(RoomMessageEventContent::new(MessageType::Image(image_event_content)))
     }
 
+    /// Create a gallery event containing a single plain (unencrypted) image
+    /// referencing the given MXC ID.
+    pub fn gallery(
+        &self,
+        body: String,
+        filename: String,
+        url: OwnedMxcUri,
+    ) -> EventBuilder<RoomMessageEventContent> {
+        let gallery_event_content = GalleryMessageEventContent::new(
+            body,
+            None,
+            vec![GalleryItemType::Image(ImageMessageEventContent::plain(filename, url))],
+        );
+        self.event(RoomMessageEventContent::new(MessageType::Gallery(gallery_event_content)))
+    }
+
+    /// Create a typing notification event.
+    pub fn typing(&self, user_ids: Vec<&UserId>) -> EventBuilder<TypingEventContent> {
+        let mut builder = self
+            .event(TypingEventContent::new(user_ids.into_iter().map(ToOwned::to_owned).collect()));
+        builder.is_ephemeral = true;
+        builder
+    }
+
     /// Create a read receipt event.
     pub fn read_receipts(&self) -> ReadReceiptBuilder<'_> {
         ReadReceiptBuilder { factory: self, content: ReceiptEventContent(Default::default()) }
+    }
+
+    /// Create a new `m.room.create` event.
+    pub fn create(
+        &self,
+        creator_user_id: &UserId,
+        room_version: RoomVersionId,
+    ) -> EventBuilder<RoomCreateEventContent> {
+        let mut event = self.event(RoomCreateEventContent::new_v1(creator_user_id.to_owned()));
+        event.content.room_version = room_version;
+
+        if self.sender.is_some() {
+            event.sender = self.sender.clone();
+        } else {
+            event.sender = Some(creator_user_id.to_owned());
+        }
+
+        event.state_key = Some("".to_owned());
+
+        event
+    }
+
+    /// Create a new `m.room.power_levels` event.
+    pub fn power_levels(
+        &self,
+        map: &mut BTreeMap<OwnedUserId, Int>,
+    ) -> EventBuilder<RoomPowerLevelsEventContent> {
+        let mut event = RoomPowerLevelsEventContent::new();
+        event.users.append(map);
+        self.event(event)
+    }
+
+    /// Create a new `m.room.server_acl` event.
+    pub fn server_acl(
+        &self,
+        allow_ip_literals: bool,
+        allow: Vec<String>,
+        deny: Vec<String>,
+    ) -> EventBuilder<RoomServerAclEventContent> {
+        self.event(RoomServerAclEventContent::new(allow_ip_literals, allow, deny))
+    }
+
+    /// Create a new `m.room.canonical_alias` event.
+    pub fn canonical_alias(
+        &self,
+        alias: Option<OwnedRoomAliasId>,
+        alt_aliases: Vec<OwnedRoomAliasId>,
+    ) -> EventBuilder<RoomCanonicalAliasEventContent> {
+        let mut event = RoomCanonicalAliasEventContent::new();
+        event.alias = alias;
+        event.alt_aliases = alt_aliases;
+        self.event(event)
+    }
+
+    /// Create a new `org.matrix.msc3672.beacon` event.
+    ///
+    /// ```
+    /// use matrix_sdk_test::event_factory::EventFactory;
+    /// use ruma::{
+    ///     events::{beacon::BeaconEventContent, MessageLikeEvent},
+    ///     owned_event_id, room_id,
+    ///     serde::Raw,
+    ///     user_id, MilliSecondsSinceUnixEpoch,
+    /// };
+    ///
+    /// let factory = EventFactory::new().room(room_id!("!test:localhost"));
+    ///
+    /// let event: Raw<MessageLikeEvent<BeaconEventContent>> = factory
+    ///     .beacon(
+    ///         owned_event_id!("$123456789abc:localhost"),
+    ///         10.1,
+    ///         15.2,
+    ///         5,
+    ///         Some(MilliSecondsSinceUnixEpoch(1000u32.into())),
+    ///     )
+    ///     .sender(user_id!("@alice:localhost"))
+    ///     .into_raw();
+    /// ```
+    pub fn beacon(
+        &self,
+        beacon_info_event_id: OwnedEventId,
+        latitude: f64,
+        longitude: f64,
+        uncertainty: u32,
+        ts: Option<MilliSecondsSinceUnixEpoch>,
+    ) -> EventBuilder<BeaconEventContent> {
+        let geo_uri = format!("geo:{latitude},{longitude};u={uncertainty}");
+        self.event(BeaconEventContent::new(beacon_info_event_id, geo_uri, ts))
+    }
+
+    /// Create a new `m.sticker` event.
+    pub fn sticker(
+        &self,
+        body: impl Into<String>,
+        info: ImageInfo,
+        url: OwnedMxcUri,
+    ) -> EventBuilder<StickerEventContent> {
+        self.event(StickerEventContent::new(body.into(), info, url))
     }
 
     /// Set the next server timestamp.
@@ -805,16 +1060,32 @@ pub struct ReadReceiptBuilder<'a> {
 impl ReadReceiptBuilder<'_> {
     /// Add a single read receipt to the event.
     pub fn add(
-        mut self,
+        self,
         event_id: &EventId,
         user_id: &UserId,
         tyype: ReceiptType,
         thread: ReceiptThread,
     ) -> Self {
+        let ts = self.factory.next_server_ts();
+        self.add_with_timestamp(event_id, user_id, tyype, thread, Some(ts))
+    }
+
+    /// Add a single read receipt to the event, with an optional timestamp.
+    pub fn add_with_timestamp(
+        mut self,
+        event_id: &EventId,
+        user_id: &UserId,
+        tyype: ReceiptType,
+        thread: ReceiptThread,
+        ts: Option<MilliSecondsSinceUnixEpoch>,
+    ) -> Self {
         let by_event = self.content.0.entry(event_id.to_owned()).or_default();
         let by_type = by_event.entry(tyype).or_default();
 
-        let mut receipt = Receipt::new(self.factory.next_server_ts());
+        let mut receipt = Receipt::default();
+        if let Some(ts) = ts {
+            receipt.ts = Some(ts);
+        }
         receipt.thread = thread;
 
         by_type.insert(user_id.to_owned(), receipt);
@@ -822,8 +1093,15 @@ impl ReadReceiptBuilder<'_> {
     }
 
     /// Finalize the builder into the receipt event content.
-    pub fn build(self) -> ReceiptEventContent {
+    pub fn into_content(self) -> ReceiptEventContent {
         self.content
+    }
+
+    /// Finalize the builder into an event builder.
+    pub fn into_event(self) -> EventBuilder<ReceiptEventContent> {
+        let mut builder = self.factory.event(self.into_content());
+        builder.is_ephemeral = true;
+        builder
     }
 }
 

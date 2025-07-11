@@ -36,12 +36,12 @@ use tracing::{debug, field::debug, instrument, trace};
 
 use crate::{config::RequestConfig, error::HttpError};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 mod native;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 mod wasm;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub(crate) use native::HttpSettings;
 
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -134,17 +134,8 @@ impl HttpClient {
 
     #[allow(clippy::too_many_arguments)]
     #[instrument(
-        skip(self, request, config, homeserver, access_token, send_progress),
-        fields(
-            config,
-            uri,
-            method,
-            request_size,
-            request_id,
-            status,
-            response_size,
-            sentry_event_id,
-        )
+        skip(self, request, config, homeserver, access_token, server_versions, send_progress),
+        fields(uri, method, request_size, request_id, status, response_size, sentry_event_id)
     )]
     pub async fn send<R>(
         &self,
@@ -204,7 +195,10 @@ impl HttpClient {
             // in conjunction with request bodies
             if [Method::POST, Method::PUT, Method::PATCH].contains(method) {
                 let request_size = request.body().len().try_into().unwrap_or(u64::MAX);
-                span.record("request_size", ByteSize(request_size).to_string_as(true));
+                span.record(
+                    "request_size",
+                    ByteSize(request_size).display().si_short().to_string(),
+                );
             }
 
             request
@@ -256,7 +250,7 @@ async fn response_to_http_response(
     Ok(http_builder.body(body).expect("Can't construct a response using the given body"))
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use std::{
         num::NonZeroUsize,
@@ -267,6 +261,7 @@ mod tests {
         time::Duration,
     };
 
+    use matrix_sdk_common::executor::spawn;
     use matrix_sdk_test::{async_test, test_json};
     use wiremock::{
         matchers::{method, path},
@@ -308,7 +303,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let bg_task = tokio::spawn(async move {
+        let bg_task = spawn(async move {
             futures_util::future::join_all((0..10).map(|_| client.whoami())).await
         });
 
@@ -352,7 +347,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let bg_task = tokio::spawn(async move {
+        let bg_task = spawn(async move {
             futures_util::future::join_all((0..254).map(|_| client.whoami())).await
         });
 

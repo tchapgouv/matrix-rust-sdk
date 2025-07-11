@@ -1,15 +1,14 @@
 use std::{
     collections::HashMap,
     fmt::{self, Debug},
-    path::PathBuf,
     sync::Arc,
 };
 
 use matrix_sdk::{
     authentication::oauth::{
-        error::{OAuthAuthorizationCodeError, OAuthRegistrationStoreError},
+        error::OAuthAuthorizationCodeError,
         registration::{ApplicationType, ClientMetadata, Localized, OAuthGrantType},
-        ClientId, OAuthError as SdkOAuthError, OAuthRegistrationStore,
+        ClientId, ClientRegistrationData, OAuthError as SdkOAuthError,
     },
     Error,
 };
@@ -120,17 +119,13 @@ pub struct OidcConfiguration {
     pub tos_uri: Option<String>,
     /// A URI that contains the client's privacy policy.
     pub policy_uri: Option<String>,
-    /// An array of e-mail addresses of people responsible for this client.
-    pub contacts: Option<Vec<String>>,
 
-    /// Pre-configured registrations for use with issuers that don't support
+    /// Pre-configured registrations for use with homeservers that don't support
     /// dynamic client registration.
-    pub static_registrations: HashMap<String, String>,
-
-    /// A file path where any dynamic registrations should be stored.
     ///
-    /// Suggested value: `{base_path}/oidc/registrations.json`
-    pub dynamic_registrations_file: String,
+    /// The keys of the map should be the URLs of the homeservers, but keys
+    /// using `issuer` URLs are also supported.
+    pub static_registrations: HashMap<String, String>,
 }
 
 impl OidcConfiguration {
@@ -165,12 +160,10 @@ impl OidcConfiguration {
         Raw::new(&metadata).map_err(|_| OidcError::MetadataInvalid)
     }
 
-    pub async fn registrations(&self) -> Result<OAuthRegistrationStore, OidcError> {
+    pub(crate) fn registration_data(&self) -> Result<ClientRegistrationData, OidcError> {
         let client_metadata = self.client_metadata()?;
 
-        let registrations_file = PathBuf::from(&self.dynamic_registrations_file);
-        let mut registrations =
-            OAuthRegistrationStore::new(registrations_file, client_metadata).await?;
+        let mut registration_data = ClientRegistrationData::new(client_metadata);
 
         if !self.static_registrations.is_empty() {
             let static_registrations = self
@@ -178,17 +171,17 @@ impl OidcConfiguration {
                 .iter()
                 .filter_map(|(issuer, client_id)| {
                     let Ok(issuer) = Url::parse(issuer) else {
-                        tracing::error!("Failed to parse {:?}", issuer);
+                        tracing::error!("Failed to parse {issuer:?}");
                         return None;
                     };
                     Some((issuer, ClientId::new(client_id.clone())))
                 })
                 .collect();
 
-            registrations = registrations.with_static_registrations(static_registrations);
+            registration_data.static_registrations = Some(static_registrations);
         }
 
-        Ok(registrations)
+        Ok(registration_data)
     }
 }
 
@@ -201,8 +194,6 @@ pub enum OidcError {
     NotSupported,
     #[error("Unable to use OIDC as the supplied client metadata is invalid.")]
     MetadataInvalid,
-    #[error("Failed to use the supplied registrations file path.")]
-    RegistrationsPathInvalid,
     #[error("The supplied callback URL used to complete OIDC is invalid.")]
     CallbackUrlInvalid,
     #[error("The OIDC login was cancelled by the user.")]
@@ -228,21 +219,10 @@ impl From<SdkOAuthError> for OidcError {
     }
 }
 
-impl From<OAuthRegistrationStoreError> for OidcError {
-    fn from(e: OAuthRegistrationStoreError) -> OidcError {
-        match e {
-            OAuthRegistrationStoreError::NotAFilePath | OAuthRegistrationStoreError::File(_) => {
-                OidcError::RegistrationsPathInvalid
-            }
-            _ => OidcError::Generic { message: e.to_string() },
-        }
-    }
-}
-
 impl From<Error> for OidcError {
     fn from(e: Error) -> OidcError {
         match e {
-            Error::OAuth(e) => e.into(),
+            Error::OAuth(e) => (*e).into(),
             _ => OidcError::Generic { message: e.to_string() },
         }
     }

@@ -1,23 +1,21 @@
 use std::{fs, num::NonZeroUsize, path::Path, sync::Arc, time::Duration};
 
-use async_compat::get_runtime_handle;
 use futures_util::StreamExt;
+#[cfg(not(target_family = "wasm"))]
+use matrix_sdk::reqwest::Certificate;
 use matrix_sdk::{
-    authentication::oauth::qrcode::{self, DeviceCodeErrorResponseType, LoginFailureReason},
     crypto::{
-        types::qr_login::{LoginQrCodeDecodeError, QrCodeModeData},
-        CollectStrategy, TrustRequirement,
+        types::qr_login::QrCodeModeData, CollectStrategy, DecryptionSettings, TrustRequirement,
     },
     encryption::{BackupDownloadStrategy, EncryptionSettings},
     event_cache::EventCacheError,
-    reqwest::Certificate,
     ruma::{ServerName, UserId},
     sliding_sync::{
         Error as MatrixSlidingSyncError, VersionBuilder as MatrixSlidingSyncVersionBuilder,
         VersionBuilderError,
     },
     Client as MatrixClient, ClientBuildError as MatrixClientBuildError, HttpError, IdParseError,
-    RumaApiError,
+    RumaApiError, SqliteStoreConfig,
 };
 use ruma::api::error::{DeserializationError, FromHttpResponseError};
 use tracing::{debug, error};
@@ -25,8 +23,13 @@ use zeroize::Zeroizing;
 
 use super::client::Client;
 use crate::{
-    authentication::OidcConfiguration, client::ClientSessionDelegate, error::ClientError,
-    helpers::unwrap_or_clone_arc, task_handle::TaskHandle,
+    authentication::OidcConfiguration,
+    client::ClientSessionDelegate,
+    error::ClientError,
+    helpers::unwrap_or_clone_arc,
+    qr_code::{HumanQrLoginError, QrCodeData, QrLoginProgressListener},
+    runtime::get_runtime_handle,
+    task_handle::TaskHandle,
 };
 
 /// A list of bytes containing a certificate in DER or PEM form.
@@ -37,152 +40,6 @@ enum HomeserverConfig {
     Url(String),
     ServerName(String),
     ServerNameOrUrl(String),
-}
-
-/// Data for the QR code login mechanism.
-///
-/// The [`QrCodeData`] can be serialized and encoded as a QR code or it can be
-/// decoded from a QR code.
-#[derive(Debug, uniffi::Object)]
-pub struct QrCodeData {
-    inner: qrcode::QrCodeData,
-}
-
-#[matrix_sdk_ffi_macros::export]
-impl QrCodeData {
-    /// Attempt to decode a slice of bytes into a [`QrCodeData`] object.
-    ///
-    /// The slice of bytes would generally be returned by a QR code decoder.
-    #[uniffi::constructor]
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Arc<Self>, QrCodeDecodeError> {
-        Ok(Self { inner: qrcode::QrCodeData::from_bytes(&bytes)? }.into())
-    }
-}
-
-/// Error type for the decoding of the [`QrCodeData`].
-#[derive(Debug, thiserror::Error, uniffi::Error)]
-#[uniffi(flat_error)]
-pub enum QrCodeDecodeError {
-    #[error("Error decoding QR code: {error:?}")]
-    Crypto {
-        #[from]
-        error: LoginQrCodeDecodeError,
-    },
-}
-
-#[derive(Debug, thiserror::Error, uniffi::Error)]
-pub enum HumanQrLoginError {
-    #[error("Linking with this device is not supported.")]
-    LinkingNotSupported,
-    #[error("The sign in was cancelled.")]
-    Cancelled,
-    #[error("The sign in was not completed in the required time.")]
-    Expired,
-    #[error("A secure connection could not have been established between the two devices.")]
-    ConnectionInsecure,
-    #[error("The sign in was declined.")]
-    Declined,
-    #[error("An unknown error has happened.")]
-    Unknown,
-    #[error("The homeserver doesn't provide sliding sync in its configuration.")]
-    SlidingSyncNotAvailable,
-    #[error("Unable to use OIDC as the supplied client metadata is invalid.")]
-    OidcMetadataInvalid,
-    #[error("The other device is not signed in and as such can't sign in other devices.")]
-    OtherDeviceNotSignedIn,
-}
-
-impl From<qrcode::QRCodeLoginError> for HumanQrLoginError {
-    fn from(value: qrcode::QRCodeLoginError) -> Self {
-        use qrcode::{QRCodeLoginError, SecureChannelError};
-
-        match value {
-            QRCodeLoginError::LoginFailure { reason, .. } => match reason {
-                LoginFailureReason::UnsupportedProtocol => HumanQrLoginError::LinkingNotSupported,
-                LoginFailureReason::AuthorizationExpired => HumanQrLoginError::Expired,
-                LoginFailureReason::UserCancelled => HumanQrLoginError::Cancelled,
-                _ => HumanQrLoginError::Unknown,
-            },
-
-            QRCodeLoginError::OAuth(e) => {
-                if let Some(e) = e.as_request_token_error() {
-                    match e {
-                        DeviceCodeErrorResponseType::AccessDenied => HumanQrLoginError::Declined,
-                        DeviceCodeErrorResponseType::ExpiredToken => HumanQrLoginError::Expired,
-                        _ => HumanQrLoginError::Unknown,
-                    }
-                } else {
-                    HumanQrLoginError::Unknown
-                }
-            }
-
-            QRCodeLoginError::SecureChannel(e) => match e {
-                SecureChannelError::Utf8(_)
-                | SecureChannelError::MessageDecode(_)
-                | SecureChannelError::Json(_)
-                | SecureChannelError::RendezvousChannel(_) => HumanQrLoginError::Unknown,
-                SecureChannelError::SecureChannelMessage { .. }
-                | SecureChannelError::Ecies(_)
-                | SecureChannelError::InvalidCheckCode => HumanQrLoginError::ConnectionInsecure,
-                SecureChannelError::InvalidIntent => HumanQrLoginError::OtherDeviceNotSignedIn,
-            },
-
-            QRCodeLoginError::UnexpectedMessage { .. }
-            | QRCodeLoginError::CrossProcessRefreshLock(_)
-            | QRCodeLoginError::DeviceKeyUpload(_)
-            | QRCodeLoginError::SessionTokens(_)
-            | QRCodeLoginError::UserIdDiscovery(_)
-            | QRCodeLoginError::SecretImport(_) => HumanQrLoginError::Unknown,
-        }
-    }
-}
-
-/// Enum describing the progress of the QR-code login.
-#[derive(Debug, Default, Clone, uniffi::Enum)]
-pub enum QrLoginProgress {
-    /// The login process is starting.
-    #[default]
-    Starting,
-    /// We established a secure channel with the other device.
-    EstablishingSecureChannel {
-        /// The check code that the device should display so the other device
-        /// can confirm that the channel is secure as well.
-        check_code: u8,
-        /// The string representation of the check code, will be guaranteed to
-        /// be 2 characters long, preserving the leading zero if the
-        /// first digit is a zero.
-        check_code_string: String,
-    },
-    /// We are waiting for the login and for the OAuth 2.0 authorization server
-    /// to give us an access token.
-    WaitingForToken { user_code: String },
-    /// The login has successfully finished.
-    Done,
-}
-
-#[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait QrLoginProgressListener: Sync + Send {
-    fn on_update(&self, state: QrLoginProgress);
-}
-
-impl From<qrcode::LoginProgress> for QrLoginProgress {
-    fn from(value: qrcode::LoginProgress) -> Self {
-        use qrcode::LoginProgress;
-
-        match value {
-            LoginProgress::Starting => Self::Starting,
-            LoginProgress::EstablishingSecureChannel { check_code } => {
-                let check_code = check_code.to_digit();
-
-                Self::EstablishingSecureChannel {
-                    check_code,
-                    check_code_string: format!("{check_code:02}"),
-                }
-            }
-            LoginProgress::WaitingForToken { user_code } => Self::WaitingForToken { user_code },
-            LoginProgress::Done => Self::Done,
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -255,27 +112,34 @@ impl From<ClientError> for ClientBuildError {
 #[derive(Clone, uniffi::Object)]
 pub struct ClientBuilder {
     session_paths: Option<SessionPaths>,
+    session_passphrase: Zeroizing<Option<String>>,
+    session_pool_max_size: Option<usize>,
+    session_cache_size: Option<u32>,
+    session_journal_size_limit: Option<u32>,
+    system_is_memory_constrained: bool,
     username: Option<String>,
     homeserver_cfg: Option<HomeserverConfig>,
-    passphrase: Zeroizing<Option<String>>,
-    user_agent: Option<String>,
     sliding_sync_version_builder: SlidingSyncVersionBuilder,
-    proxy: Option<String>,
-    disable_ssl_verification: bool,
     disable_automatic_token_refresh: bool,
     cross_process_store_locks_holder_name: Option<String>,
     enable_oidc_refresh_lock: bool,
     session_delegate: Option<Arc<dyn ClientSessionDelegate>>,
-    additional_root_certificates: Vec<Vec<u8>>,
-    disable_built_in_root_certificates: bool,
     encryption_settings: EncryptionSettings,
     room_key_recipient_strategy: CollectStrategy,
-    decryption_trust_requirement: TrustRequirement,
+    decryption_settings: DecryptionSettings,
+    enable_share_history_on_invite: bool,
     request_config: Option<RequestConfig>,
 
-    /// Whether to enable use of the event cache store, for reloading events
-    /// when building timelines et al.
-    use_event_cache_persistent_storage: bool,
+    #[cfg(not(target_family = "wasm"))]
+    user_agent: Option<String>,
+    #[cfg(not(target_family = "wasm"))]
+    proxy: Option<String>,
+    #[cfg(not(target_family = "wasm"))]
+    disable_ssl_verification: bool,
+    #[cfg(not(target_family = "wasm"))]
+    disable_built_in_root_certificates: bool,
+    #[cfg(not(target_family = "wasm"))]
+    additional_root_certificates: Vec<Vec<u8>>,
 }
 
 #[matrix_sdk_ffi_macros::export]
@@ -284,9 +148,13 @@ impl ClientBuilder {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             session_paths: None,
+            session_passphrase: Zeroizing::new(None),
+            session_pool_max_size: None,
+            session_cache_size: None,
+            session_journal_size_limit: None,
+            system_is_memory_constrained: false,
             username: None,
             homeserver_cfg: None,
-            passphrase: Zeroizing::new(None),
             user_agent: None,
             sliding_sync_version_builder: SlidingSyncVersionBuilder::None,
             proxy: None,
@@ -304,27 +172,12 @@ impl ClientBuilder {
                 auto_enable_backups: false,
             },
             room_key_recipient_strategy: Default::default(),
-            decryption_trust_requirement: TrustRequirement::Untrusted,
+            decryption_settings: DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::Untrusted,
+            },
+            enable_share_history_on_invite: false,
             request_config: Default::default(),
-            use_event_cache_persistent_storage: false,
         })
-    }
-
-    /// Whether to use the event cache persistent storage or not.
-    ///
-    /// This is a temporary feature flag, for testing the event cache's
-    /// persistent storage. Follow new developments in https://github.com/matrix-org/matrix-rust-sdk/issues/3280.
-    ///
-    /// This is disabled by default. When disabled, a one-time cleanup is
-    /// performed when creating the client, and it will clear all the events
-    /// previously stored in the event cache.
-    ///
-    /// When enabled, it will attempt to store events in the event cache as
-    /// they're received, and reuse them when reconstructing timelines.
-    pub fn use_event_cache_persistent_storage(self: Arc<Self>, value: bool) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.use_event_cache_persistent_storage = value;
-        Arc::new(builder)
     }
 
     pub fn cross_process_store_locks_holder_name(
@@ -363,6 +216,74 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
+    /// Set the passphrase for the stores given to
+    /// [`ClientBuilder::session_paths`].
+    pub fn session_passphrase(self: Arc<Self>, passphrase: Option<String>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.session_passphrase = Zeroizing::new(passphrase);
+        Arc::new(builder)
+    }
+
+    /// Set the pool max size for the SQLite stores given to
+    /// [`ClientBuilder::session_paths`].
+    ///
+    /// Each store exposes an async pool of connections. This method controls
+    /// the size of the pool. The larger the pool is, the more memory is
+    /// consumed, but also the more the app is reactive because it doesn't need
+    /// to wait on a pool to be available to run queries.
+    ///
+    /// See [`SqliteStoreConfig::pool_max_size`] to learn more.
+    pub fn session_pool_max_size(self: Arc<Self>, pool_max_size: Option<u32>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.session_pool_max_size = pool_max_size
+            .map(|size| size.try_into().expect("`pool_max_size` is too large to fit in `usize`"));
+        Arc::new(builder)
+    }
+
+    /// Set the cache size for the SQLite stores given to
+    /// [`ClientBuilder::session_paths`].
+    ///
+    /// Each store exposes a SQLite connection. This method controls the cache
+    /// size, in **bytes (!)**.
+    ///
+    /// The cache represents data SQLite holds in memory at once per open
+    /// database file. The default cache implementation does not allocate the
+    /// full amount of cache memory all at once. Cache memory is allocated
+    /// in smaller chunks on an as-needed basis.
+    ///
+    /// See [`SqliteStoreConfig::cache_size`] to learn more.
+    pub fn session_cache_size(self: Arc<Self>, cache_size: Option<u32>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.session_cache_size = cache_size;
+        Arc::new(builder)
+    }
+
+    /// Set the size limit for the SQLite WAL files of stores given to
+    /// [`ClientBuilder::session_paths`].
+    ///
+    /// Each store uses the WAL journal mode. This method controls the size
+    /// limit of the WAL files, in **bytes (!)**.
+    ///
+    /// See [`SqliteStoreConfig::journal_size_limit`] to learn more.
+    pub fn session_journal_size_limit(self: Arc<Self>, limit: Option<u32>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.session_journal_size_limit = limit;
+        Arc::new(builder)
+    }
+
+    /// Tell the client that the system is memory constrained, like in a push
+    /// notification process for example.
+    ///
+    /// So far, at the time of writing (2025-04-07), it changes the defaults of
+    /// [`SqliteStoreConfig`], so one might not need to call
+    /// [`ClientBuilder::session_cache_size`] and siblings for example. Please
+    /// check [`SqliteStoreConfig::with_low_memory_config`].
+    pub fn system_is_memory_constrained(self: Arc<Self>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.system_is_memory_constrained = true;
+        Arc::new(builder)
+    }
+
     pub fn username(self: Arc<Self>, username: String) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
         builder.username = Some(username);
@@ -387,18 +308,6 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
-    pub fn passphrase(self: Arc<Self>, passphrase: Option<String>) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.passphrase = Zeroizing::new(passphrase);
-        Arc::new(builder)
-    }
-
-    pub fn user_agent(self: Arc<Self>, user_agent: String) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.user_agent = Some(user_agent);
-        Arc::new(builder)
-    }
-
     pub fn sliding_sync_version_builder(
         self: Arc<Self>,
         version_builder: SlidingSyncVersionBuilder,
@@ -408,40 +317,9 @@ impl ClientBuilder {
         Arc::new(builder)
     }
 
-    pub fn proxy(self: Arc<Self>, url: String) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.proxy = Some(url);
-        Arc::new(builder)
-    }
-
-    pub fn disable_ssl_verification(self: Arc<Self>) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.disable_ssl_verification = true;
-        Arc::new(builder)
-    }
-
     pub fn disable_automatic_token_refresh(self: Arc<Self>) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
         builder.disable_automatic_token_refresh = true;
-        Arc::new(builder)
-    }
-
-    pub fn add_root_certificates(
-        self: Arc<Self>,
-        certificates: Vec<CertificateBytes>,
-    ) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.additional_root_certificates = certificates;
-
-        Arc::new(builder)
-    }
-
-    /// Don't trust any system root certificates, only trust the certificates
-    /// provided through
-    /// [`add_root_certificates`][ClientBuilder::add_root_certificates].
-    pub fn disable_built_in_root_certificates(self: Arc<Self>) -> Arc<Self> {
-        let mut builder = unwrap_or_clone_arc(self);
-        builder.disable_built_in_root_certificates = true;
         Arc::new(builder)
     }
 
@@ -483,12 +361,25 @@ impl ClientBuilder {
     }
 
     /// Set the trust requirement to be used when decrypting events.
-    pub fn room_decryption_trust_requirement(
+    pub fn decryption_settings(
         self: Arc<Self>,
-        trust_requirement: TrustRequirement,
+        decryption_settings: DecryptionSettings,
     ) -> Arc<Self> {
         let mut builder = unwrap_or_clone_arc(self);
-        builder.decryption_trust_requirement = trust_requirement;
+        builder.decryption_settings = decryption_settings;
+        Arc::new(builder)
+    }
+
+    /// Set whether to enable the experimental support for sending and receiving
+    /// encrypted room history on invite, per [MSC4268].
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    pub fn enable_share_history_on_invite(
+        self: Arc<Self>,
+        enable_share_history_on_invite: bool,
+    ) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.enable_share_history_on_invite = enable_share_history_on_invite;
         Arc::new(builder)
     }
 
@@ -508,27 +399,50 @@ impl ClientBuilder {
                 inner_builder.cross_process_store_locks_holder_name(holder_name.clone());
         }
 
-        if let Some(session_paths) = &builder.session_paths {
+        let store_path = if let Some(session_paths) = &builder.session_paths {
+            // This is the path where both the state store and the crypto store will live.
             let data_path = Path::new(&session_paths.data_path);
+            // This is the path where the event cache store will live.
             let cache_path = Path::new(&session_paths.cache_path);
 
             debug!(
                 data_path = %data_path.to_string_lossy(),
-                cache_path = %cache_path.to_string_lossy(),
-                "Creating directories for data and cache stores.",
+                event_cache_path = %cache_path.to_string_lossy(),
+                "Creating directories for data (state and crypto) and cache stores.",
             );
 
             fs::create_dir_all(data_path)?;
             fs::create_dir_all(cache_path)?;
 
-            inner_builder = inner_builder.sqlite_store_with_cache_path(
-                data_path,
-                cache_path,
-                builder.passphrase.as_deref(),
-            );
+            let mut sqlite_store_config = if builder.system_is_memory_constrained {
+                SqliteStoreConfig::with_low_memory_config(data_path)
+            } else {
+                SqliteStoreConfig::new(data_path)
+            };
+
+            sqlite_store_config =
+                sqlite_store_config.passphrase(builder.session_passphrase.as_deref());
+
+            if let Some(size) = builder.session_pool_max_size {
+                sqlite_store_config = sqlite_store_config.pool_max_size(size);
+            }
+
+            if let Some(size) = builder.session_cache_size {
+                sqlite_store_config = sqlite_store_config.cache_size(size);
+            }
+
+            if let Some(limit) = builder.session_journal_size_limit {
+                sqlite_store_config = sqlite_store_config.journal_size_limit(limit);
+            }
+
+            inner_builder = inner_builder
+                .sqlite_store_with_config_and_cache_path(sqlite_store_config, Some(cache_path));
+
+            Some(data_path.to_owned())
         } else {
             debug!("Not using a store path.");
-        }
+            None
+        };
 
         // Determine server either from URL, server name or user ID.
         inner_builder = match builder.homeserver_cfg {
@@ -552,52 +466,56 @@ impl ClientBuilder {
             }
         };
 
-        let mut certificates = Vec::new();
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let mut certificates = Vec::new();
 
-        for certificate in builder.additional_root_certificates {
-            // We don't really know what type of certificate we may get here, so let's try
-            // first one type, then the other.
-            match Certificate::from_der(&certificate) {
-                Ok(cert) => {
-                    certificates.push(cert);
-                }
-                Err(der_error) => {
-                    let cert = Certificate::from_pem(&certificate).map_err(|pem_error| {
-                        ClientBuildError::Generic {
-                            message: format!("Failed to add a root certificate as DER ({der_error:?}) or PEM ({pem_error:?})"),
-                        }
-                    })?;
-                    certificates.push(cert);
+            for certificate in builder.additional_root_certificates {
+                // We don't really know what type of certificate we may get here, so let's try
+                // first one type, then the other.
+                match Certificate::from_der(&certificate) {
+                    Ok(cert) => {
+                        certificates.push(cert);
+                    }
+                    Err(der_error) => {
+                        let cert = Certificate::from_pem(&certificate).map_err(|pem_error| {
+                            ClientBuildError::Generic {
+                                message: format!("Failed to add a root certificate as DER ({der_error:?}) or PEM ({pem_error:?})"),
+                            }
+                        })?;
+                        certificates.push(cert);
+                    }
                 }
             }
-        }
 
-        inner_builder = inner_builder.add_root_certificates(certificates);
+            inner_builder = inner_builder.add_root_certificates(certificates);
 
-        if builder.disable_built_in_root_certificates {
-            inner_builder = inner_builder.disable_built_in_root_certificates();
-        }
+            if builder.disable_built_in_root_certificates {
+                inner_builder = inner_builder.disable_built_in_root_certificates();
+            }
 
-        if let Some(proxy) = builder.proxy {
-            inner_builder = inner_builder.proxy(proxy);
-        }
+            if let Some(proxy) = builder.proxy {
+                inner_builder = inner_builder.proxy(proxy);
+            }
 
-        if builder.disable_ssl_verification {
-            inner_builder = inner_builder.disable_ssl_verification();
+            if builder.disable_ssl_verification {
+                inner_builder = inner_builder.disable_ssl_verification();
+            }
+
+            if let Some(user_agent) = builder.user_agent {
+                inner_builder = inner_builder.user_agent(user_agent);
+            }
         }
 
         if !builder.disable_automatic_token_refresh {
             inner_builder = inner_builder.handle_refresh_tokens();
         }
 
-        if let Some(user_agent) = builder.user_agent {
-            inner_builder = inner_builder.user_agent(user_agent);
-        }
-
         inner_builder = inner_builder
             .with_encryption_settings(builder.encryption_settings)
             .with_room_key_recipient_strategy(builder.room_key_recipient_strategy)
-            .with_decryption_trust_requirement(builder.decryption_trust_requirement);
+            .with_decryption_settings(builder.decryption_settings)
+            .with_enable_share_history_on_invite(builder.enable_share_history_on_invite);
 
         match builder.sliding_sync_version_builder {
             SlidingSyncVersionBuilder::None => {
@@ -617,7 +535,8 @@ impl ClientBuilder {
         if let Some(config) = builder.request_config {
             let mut updated_config = matrix_sdk::config::RequestConfig::default();
             if let Some(retry_limit) = config.retry_limit {
-                updated_config = updated_config.retry_limit(retry_limit);
+                updated_config =
+                    updated_config.retry_limit(retry_limit.try_into().unwrap_or(usize::MAX));
             }
             if let Some(timeout) = config.timeout {
                 updated_config = updated_config.timeout(Duration::from_millis(timeout));
@@ -629,30 +548,23 @@ impl ClientBuilder {
                     ));
                 }
             }
-            if let Some(retry_timeout) = config.retry_timeout {
-                updated_config = updated_config.retry_timeout(Duration::from_millis(retry_timeout));
+            if let Some(max_retry_time) = config.max_retry_time {
+                updated_config =
+                    updated_config.max_retry_time(Duration::from_millis(max_retry_time));
             }
             inner_builder = inner_builder.request_config(updated_config);
         }
 
         let sdk_client = inner_builder.build().await?;
 
-        if builder.use_event_cache_persistent_storage {
-            // Enable the persistent storage \o/
-            sdk_client.event_cache().enable_storage()?;
-        } else {
-            // Get rid of all the previous events, if any.
-            let store = sdk_client
-                .event_cache_store()
-                .lock()
-                .await
-                .map_err(EventCacheError::LockingStorage)?;
-            store.clear_all_rooms_chunks().await.map_err(EventCacheError::Storage)?;
-        }
-
         Ok(Arc::new(
-            Client::new(sdk_client, builder.enable_oidc_refresh_lock, builder.session_delegate)
-                .await?,
+            Client::new(
+                sdk_client,
+                builder.enable_oidc_refresh_lock,
+                builder.session_delegate,
+                store_path,
+            )
+            .await?,
         ))
     }
 
@@ -688,13 +600,12 @@ impl ClientBuilder {
             }
         })?;
 
-        let registrations = oidc_configuration
-            .registrations()
-            .await
+        let registration_data = oidc_configuration
+            .registration_data()
             .map_err(|_| HumanQrLoginError::OidcMetadataInvalid)?;
 
         let oauth = client.inner.oauth();
-        let login = oauth.login_with_qr_code(&qr_code_data.inner, registrations.into());
+        let login = oauth.login_with_qr_code(&qr_code_data.inner, Some(&registration_data));
 
         let mut progress = login.subscribe_to_progress();
 
@@ -712,8 +623,49 @@ impl ClientBuilder {
     }
 }
 
-#[derive(Clone)]
+#[cfg(not(target_family = "wasm"))]
+#[matrix_sdk_ffi_macros::export]
+impl ClientBuilder {
+    pub fn proxy(self: Arc<Self>, url: String) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.proxy = Some(url);
+        Arc::new(builder)
+    }
+
+    pub fn disable_ssl_verification(self: Arc<Self>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.disable_ssl_verification = true;
+        Arc::new(builder)
+    }
+
+    pub fn add_root_certificates(
+        self: Arc<Self>,
+        certificates: Vec<CertificateBytes>,
+    ) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.additional_root_certificates = certificates;
+
+        Arc::new(builder)
+    }
+
+    /// Don't trust any system root certificates, only trust the certificates
+    /// provided through
+    /// [`add_root_certificates`][ClientBuilder::add_root_certificates].
+    pub fn disable_built_in_root_certificates(self: Arc<Self>) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.disable_built_in_root_certificates = true;
+        Arc::new(builder)
+    }
+
+    pub fn user_agent(self: Arc<Self>, user_agent: String) -> Arc<Self> {
+        let mut builder = unwrap_or_clone_arc(self);
+        builder.user_agent = Some(user_agent);
+        Arc::new(builder)
+    }
+}
+
 /// The store paths the client will use when built.
+#[derive(Clone)]
 struct SessionPaths {
     /// The path that the client will use to store its data.
     data_path: String,
@@ -732,7 +684,7 @@ pub struct RequestConfig {
     /// Max number of concurrent requests. No value means no limits.
     max_concurrent_requests: Option<u64>,
     /// Base delay between retries.
-    retry_timeout: Option<u64>,
+    max_retry_time: Option<u64>,
 }
 
 #[derive(Clone, uniffi::Enum)]

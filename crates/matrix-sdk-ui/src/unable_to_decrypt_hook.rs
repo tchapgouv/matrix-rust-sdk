@@ -30,17 +30,19 @@ use matrix_sdk::{
     sleep::sleep,
     Client,
 };
-use matrix_sdk_base::{StateStoreDataKey, StateStoreDataValue, StoreError};
+use matrix_sdk_base::{
+    SendOutsideWasm, StateStoreDataKey, StateStoreDataValue, StoreError, SyncOutsideWasm,
+};
 use ruma::{
     time::{Duration, Instant},
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedServerName, UserId,
 };
 use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
-use tracing::error;
+use tracing::{error, trace};
 
 /// A generic interface which methods get called whenever we observe a
 /// unable-to-decrypt (UTD) event.
-pub trait UnableToDecryptHook: std::fmt::Debug + Send + Sync {
+pub trait UnableToDecryptHook: std::fmt::Debug + SendOutsideWasm + SyncOutsideWasm {
     /// Called every time the hook observes an encrypted event that couldn't be
     /// decrypted.
     ///
@@ -204,7 +206,7 @@ impl UtdHookManager {
     /// Otherwise, there is no effect.
     pub async fn reload_from_store(&mut self) -> Result<(), StoreError> {
         let existing_data =
-            self.client.store().get_kv_data(StateStoreDataKey::UtdHookManagerData).await?;
+            self.client.state_store().get_kv_data(StateStoreDataKey::UtdHookManagerData).await?;
 
         if let Some(existing_data) = existing_data {
             let bloom_filter = existing_data
@@ -234,6 +236,7 @@ impl UtdHookManager {
         event_timestamp: MilliSecondsSinceUnixEpoch,
         sender_user_id: &UserId,
     ) {
+        trace!(%event_id, "UtdHookManager: Observed UTD");
         // Hold the lock on `reported_utds` throughout, to avoid races with other
         // threads.
         let mut reported_utds_lock = self.reported_utds.lock().await;
@@ -331,6 +334,7 @@ impl UtdHookManager {
     /// Note: if this is called for an event that was never marked as a UTD
     /// before, it has no effect.
     pub(crate) async fn on_late_decrypt(&self, event_id: &EventId) {
+        trace!(%event_id, "UtdHookManager: On late decrypt");
         // Hold the lock on `reported_utds` throughout, to avoid races with other
         // threads.
         let mut reported_utds_lock = self.reported_utds.lock().await;
@@ -339,6 +343,7 @@ impl UtdHookManager {
         // a pending UTD. If so, remove the event from the pending list —
         // doing so will cause the reporting task to no-op if it runs.
         let Some(pending_utd_report) = self.pending_delayed.lock().unwrap().remove(event_id) else {
+            trace!(%event_id, "UtdHookManager: received a late decrypt report for an unknown utd");
             return;
         };
 
@@ -367,7 +372,7 @@ impl UtdHookManager {
         parent_hook.on_utd(info);
         reported_utds_lock.insert(event_id);
         if let Err(e) = client
-            .store()
+            .state_store()
             .set_kv_data(
                 StateStoreDataKey::UtdHookManagerData,
                 StateStoreDataValue::UtdHookManagerData(reported_utds_lock.clone()),
@@ -646,7 +651,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))] // wasm32 has no time for that
+    #[cfg(not(target_family = "wasm"))] // wasm32 has no time for that
     #[async_test]
     async fn test_delayed_utd() {
         // If I create a dummy hook,
@@ -690,7 +695,7 @@ mod tests {
         assert!(wrapper.pending_delayed.lock().unwrap().is_empty());
     }
 
-    #[cfg(not(target_arch = "wasm32"))] // wasm32 has no time for that
+    #[cfg(not(target_family = "wasm"))] // wasm32 has no time for that
     #[async_test]
     async fn test_delayed_late_decryption() {
         // If I create a dummy hook,

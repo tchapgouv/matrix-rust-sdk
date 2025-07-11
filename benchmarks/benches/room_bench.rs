@@ -1,13 +1,13 @@
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use matrix_sdk::test_utils::mocks::MatrixMockServer;
+use matrix_sdk::{store::RoomLoadSettings, test_utils::mocks::MatrixMockServer};
 use matrix_sdk_base::{
     store::StoreConfig, BaseClient, RoomInfo, RoomState, SessionMeta, StateChanges, StateStore,
 };
 use matrix_sdk_sqlite::SqliteStateStore;
 use matrix_sdk_test::{event_factory::EventFactory, JoinedRoomBuilder, StateTestEvent};
-use matrix_sdk_ui::{timeline::TimelineFocus, Timeline};
+use matrix_sdk_ui::timeline::{TimelineBuilder, TimelineFocus};
 use ruma::{
     api::client::membership::get_member_events,
     device_id,
@@ -29,7 +29,7 @@ pub fn receive_all_members_benchmark(c: &mut Criterion) {
     let f = EventFactory::new().room(&room_id);
     let mut member_events: Vec<Raw<RoomMemberEvent>> = Vec::with_capacity(MEMBERS_IN_ROOM);
     for i in 0..MEMBERS_IN_ROOM {
-        let user_id = OwnedUserId::try_from(format!("@user_{}:matrix.org", i)).unwrap();
+        let user_id = OwnedUserId::try_from(format!("@user_{i}:matrix.org")).unwrap();
         let event = f
             .member(&user_id)
             .membership(MembershipState::Join)
@@ -55,17 +55,18 @@ pub fn receive_all_members_benchmark(c: &mut Criterion) {
         .block_on(sqlite_store.save_changes(&changes))
         .expect("initial filling of sqlite failed");
 
-    let base_client = BaseClient::with_store_config(
+    let base_client = BaseClient::new(
         StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
             .state_store(sqlite_store),
     );
 
     runtime
-        .block_on(base_client.set_session_meta(
+        .block_on(base_client.activate(
             SessionMeta {
                 user_id: user_id!("@somebody:example.com").to_owned(),
                 device_id: device_id!("DEVICE_ID").to_owned(),
             },
+            RoomLoadSettings::default(),
             None,
         ))
         .expect("Could not set session meta");
@@ -172,9 +173,16 @@ pub fn load_pinned_events_benchmark(c: &mut Criterion) {
             assert_eq!(pinned_event_ids.len(), PINNED_EVENTS_COUNT);
 
             // Reset cache so it always loads the events from the mocked endpoint
-            client.event_cache().empty_immutable_cache().await;
+            client
+                .event_cache_store()
+                .lock()
+                .await
+                .unwrap()
+                .clear_all_linked_chunks()
+                .await
+                .unwrap();
 
-            let timeline = Timeline::builder(&room)
+            let timeline = TimelineBuilder::new(&room)
                 .with_focus(TimelineFocus::PinnedEvents {
                     max_events_to_load: 100,
                     max_concurrent_requests: 10,

@@ -45,6 +45,9 @@ use std::{
     task::{Context, Poll},
 };
 
+#[cfg(target_family = "wasm")]
+use anymap2::any::CloneAny;
+#[cfg(not(target_family = "wasm"))]
 use anymap2::any::CloneAnySendSync;
 use eyeball::{SharedObservable, Subscriber};
 use futures_core::Stream;
@@ -53,6 +56,7 @@ use matrix_sdk_base::{
     deserialized_responses::{EncryptionInfo, TimelineEvent},
     SendOutsideWasm, SyncOutsideWasm,
 };
+use matrix_sdk_common::deserialized_responses::ProcessedToDeviceEvent;
 use pin_project_lite::pin_project;
 use ruma::{events::AnySyncStateEvent, push::Action, serde::Raw, OwnedRoomId};
 use serde::{de::DeserializeOwned, Deserialize};
@@ -68,17 +72,20 @@ mod static_events;
 
 pub use self::context::{Ctx, EventHandlerContext, RawEvent};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 type EventHandlerFut = Pin<Box<dyn Future<Output = ()> + Send>>;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 type EventHandlerFut = Pin<Box<dyn Future<Output = ()>>>;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 type EventHandlerFn = dyn Fn(EventHandlerData<'_>) -> EventHandlerFut + Send + Sync;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 type EventHandlerFn = dyn Fn(EventHandlerData<'_>) -> EventHandlerFut;
 
+#[cfg(not(target_family = "wasm"))]
 type AnyMap = anymap2::Map<dyn CloneAnySendSync + Send + Sync>;
+#[cfg(target_family = "wasm")]
+type AnyMap = anymap2::Map<dyn CloneAny>;
 
 #[derive(Default)]
 pub(crate) struct EventHandlerStore {
@@ -349,6 +356,38 @@ impl Client {
         Ok(())
     }
 
+    pub(crate) async fn handle_sync_to_device_events(
+        &self,
+        events: &[ProcessedToDeviceEvent],
+    ) -> serde_json::Result<()> {
+        #[derive(Deserialize)]
+        struct ExtractType<'a> {
+            #[serde(borrow, rename = "type")]
+            event_type: Cow<'a, str>,
+        }
+
+        for processed_to_device in events {
+            let (raw_event, encryption_info) = match processed_to_device {
+                ProcessedToDeviceEvent::Decrypted { raw, encryption_info } => {
+                    (raw, Some(encryption_info))
+                }
+                other => (&other.to_raw(), None),
+            };
+            let event_type = raw_event.deserialize_as::<ExtractType<'_>>()?.event_type;
+            self.call_event_handlers(
+                None,
+                raw_event.json(),
+                HandlerKind::ToDevice,
+                &event_type,
+                encryption_info,
+                &[],
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
     pub(crate) async fn handle_sync_state_events(
         &self,
         room: Option<&Room>,
@@ -401,8 +440,8 @@ impl Client {
             };
 
             let raw_event = item.raw().json();
-            let encryption_info = item.encryption_info();
-            let push_actions = item.push_actions.as_deref().unwrap_or(&[]);
+            let encryption_info = item.encryption_info().map(|i| &**i);
+            let push_actions = item.push_actions().unwrap_or(&[]);
 
             // Event handlers for possibly-redacted timeline events
             self.call_event_handlers(
@@ -677,7 +716,7 @@ mod tests {
         InvitedRoomBuilder, JoinedRoomBuilder, DEFAULT_TEST_ROOM_ID,
     };
     use stream_assert::{assert_closed, assert_pending, assert_ready};
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
     use std::{
         future,
@@ -687,9 +726,9 @@ mod tests {
         },
     };
 
-    use matrix_sdk_test::{
-        EphemeralTestEvent, StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder,
-    };
+    use assert_matches2::assert_let;
+    use matrix_sdk_common::{deserialized_responses::EncryptionInfo, locks::Mutex};
+    use matrix_sdk_test::{StateTestEvent, StrippedStateTestEvent, SyncResponseBuilder};
     use once_cell::sync::Lazy;
     use ruma::{
         event_id,
@@ -700,7 +739,7 @@ mod tests {
                 power_levels::OriginalSyncRoomPowerLevelsEvent,
             },
             typing::SyncTypingEvent,
-            AnySyncStateEvent, AnySyncTimelineEvent,
+            AnySyncStateEvent, AnySyncTimelineEvent, AnyToDeviceEvent,
         },
         room_id,
         serde::Raw,
@@ -758,11 +797,14 @@ mod tests {
             }
         });
 
+        let f = EventFactory::new();
         let response = SyncResponseBuilder::default()
             .add_joined_room(
                 JoinedRoomBuilder::default()
                     .add_timeline_event(MEMBER_EVENT.clone())
-                    .add_ephemeral_event(EphemeralTestEvent::Typing)
+                    .add_typing(
+                        f.typing(vec![user_id!("@alice:matrix.org"), user_id!("@bob:example.com")]),
+                    )
                     .add_state_event(StateTestEvent::PowerLevels),
             )
             .add_invited_room(
@@ -811,6 +853,45 @@ mod tests {
         assert_eq!(power_levels_count.load(SeqCst), 1);
         assert_eq!(invited_member_count.load(SeqCst), 1);
 
+        Ok(())
+    }
+
+    #[async_test]
+    #[allow(dependency_on_unit_never_type_fallback)]
+    async fn test_add_to_device_event_handler() -> crate::Result<()> {
+        let client = logged_in_client(None).await;
+
+        let captured_event: Arc<Mutex<Option<AnyToDeviceEvent>>> = Arc::new(Mutex::new(None));
+        let captured_info: Arc<Mutex<Option<EncryptionInfo>>> = Arc::new(Mutex::new(None));
+
+        client.add_event_handler({
+            let captured = captured_event.clone();
+            let captured_info = captured_info.clone();
+            move |ev: AnyToDeviceEvent, encryption_info: Option<EncryptionInfo>| {
+                let mut captured_lock = captured.lock();
+                *captured_lock = Some(ev);
+                let mut captured_info_lock = captured_info.lock();
+                *captured_info_lock = encryption_info;
+                future::ready(())
+            }
+        });
+
+        let response = SyncResponseBuilder::default()
+            .add_to_device_event(json!({
+              "sender": "@alice:example.com",
+              "type": "m.custom.to.device.type",
+              "content": {
+                "a": "test",
+              }
+            }))
+            .build_sync_response();
+        client.process_sync(response).await?;
+
+        let captured = captured_event.lock().clone();
+        assert_let!(Some(received_event) = captured);
+        assert_eq!(received_event.event_type().to_string(), "m.custom.to.device.type");
+        let info = captured_info.lock().clone();
+        assert!(info.is_none());
         Ok(())
     }
 
@@ -963,7 +1044,7 @@ mod tests {
             // All of Client's async methods that do network requests (and
             // possibly some that don't) are `!Send` on wasm. We obviously want
             // to be able to use them in event handlers.
-            let _caps = client.get_capabilities().await?;
+            let _caps = client.get_capabilities().await.map_err(|e| anyhow::anyhow!("{}", e))?;
             anyhow::Ok(())
         });
     }

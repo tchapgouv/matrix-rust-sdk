@@ -16,7 +16,7 @@ use matrix_sdk_crypto::{
     },
     decrypt_room_key_export, encrypt_room_key_export,
     olm::ExportedRoomKey,
-    store::{BackupDecryptionKey, Changes},
+    store::types::{BackupDecryptionKey, Changes},
     types::requests::ToDeviceRequest,
     DecryptionSettings, LocalTrust, OlmMachine as InnerMachine, UserIdentity as SdkUserIdentity,
 };
@@ -96,8 +96,8 @@ pub struct RoomKeyInfo {
     pub session_id: String,
 }
 
-impl From<matrix_sdk_crypto::store::RoomKeyInfo> for RoomKeyInfo {
-    fn from(value: matrix_sdk_crypto::store::RoomKeyInfo) -> Self {
+impl From<matrix_sdk_crypto::store::types::RoomKeyInfo> for RoomKeyInfo {
+    fn from(value: matrix_sdk_crypto::store::types::RoomKeyInfo) -> Self {
         Self {
             algorithm: value.algorithm.to_string(),
             room_id: value.room_id.to_string(),
@@ -354,7 +354,7 @@ impl OlmMachine {
             .map(|d| d.into()))
     }
 
-    /// Manually the device of the given user with the given device ID.
+    /// Manually verify the device of the given user with the given device ID.
     ///
     /// This method will attempt to sign the device using our private cross
     /// signing key.
@@ -554,8 +554,10 @@ impl OlmMachine {
             }),
         )?;
 
-        let to_device_events =
-            to_device_events.into_iter().map(|event| event.json().get().to_owned()).collect();
+        let to_device_events = to_device_events
+            .into_iter()
+            .map(|event| event.to_raw().json().get().to_owned())
+            .collect();
         let room_key_infos = room_key_infos.into_iter().map(|info| info.into()).collect();
 
         Ok(SyncChangesResult { to_device_events, room_key_infos })
@@ -915,20 +917,25 @@ impl OlmMachine {
         let event_json: Event<'_> = serde_json::from_str(decrypted.event.json().get())?;
 
         Ok(match &encryption_info.algorithm_info {
-            AlgorithmInfo::MegolmV1AesSha2 { curve25519_key, sender_claimed_keys } => {
-                DecryptedEvent {
-                    clear_event: serde_json::to_string(&event_json)?,
-                    sender_curve25519_key: curve25519_key.to_owned(),
-                    claimed_ed25519_key: sender_claimed_keys
-                        .get(&DeviceKeyAlgorithm::Ed25519)
-                        .cloned(),
-                    forwarding_curve25519_chain: vec![],
-                    shield_state: if strict_shields {
-                        encryption_info.verification_state.to_shield_state_strict().into()
-                    } else {
-                        encryption_info.verification_state.to_shield_state_lax().into()
-                    },
-                }
+            AlgorithmInfo::MegolmV1AesSha2 {
+                curve25519_key,
+                sender_claimed_keys,
+                session_id: _,
+            } => DecryptedEvent {
+                clear_event: serde_json::to_string(&event_json)?,
+                sender_curve25519_key: curve25519_key.to_owned(),
+                claimed_ed25519_key: sender_claimed_keys.get(&DeviceKeyAlgorithm::Ed25519).cloned(),
+                forwarding_curve25519_chain: vec![],
+                shield_state: if strict_shields {
+                    encryption_info.verification_state.to_shield_state_strict().into()
+                } else {
+                    encryption_info.verification_state.to_shield_state_lax().into()
+                },
+            },
+            AlgorithmInfo::OlmV1Curve25519AesSha2 { .. } => {
+                // cannot happen because `decrypt_room_event` would have fail to decrypt olm for
+                // a room (EventError::UnsupportedAlgorithm)
+                panic!("Unsupported olm algorithm in room")
             }
         })
     }
@@ -1335,7 +1342,8 @@ impl OlmMachine {
                 let (sas, request) = self.runtime.block_on(device.start_verification())?;
 
                 Some(StartSasResult {
-                    sas: Sas { inner: sas, runtime: self.runtime.handle().to_owned() }.into(),
+                    sas: Sas { inner: Box::new(sas), runtime: self.runtime.handle().to_owned() }
+                        .into(),
                     request: request.into(),
                 })
             } else {

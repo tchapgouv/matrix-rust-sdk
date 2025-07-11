@@ -389,17 +389,17 @@ impl NotificationClientWrapper {
                 .expect("Failed to get_notification");
 
             if let Some(item) = item {
-                if let NotificationEvent::Timeline(AnySyncTimelineEvent::MessageLike(e)) =
-                    item.event
-                {
-                    if let AnyMessageLikeEventContent::RoomMessage(c) =
-                        e.original_content().expect("Empty original content")
-                    {
-                        self.events
-                            .lock()
-                            .unwrap()
-                            .push((event_info.0.clone(), c.body().to_owned()));
-                        return;
+                if let NotificationEvent::Timeline(sync_timeline_event) = item.event {
+                    if let AnySyncTimelineEvent::MessageLike(event) = sync_timeline_event.as_ref() {
+                        if let AnyMessageLikeEventContent::RoomMessage(event_content) =
+                            event.original_content().expect("Empty original content")
+                        {
+                            self.events
+                                .lock()
+                                .unwrap()
+                                .push((event_info.0.clone(), event_content.body().to_owned()));
+                            return;
+                        }
                     }
                 }
             };
@@ -424,7 +424,9 @@ async fn decrypt_event(
     room_id: &RoomId,
     event: &Raw<OriginalSyncMessageLikeEvent<RoomEncryptedEventContent>>,
 ) -> Option<(OwnedEventId, String)> {
-    let Ok(decrypted) = client.get_room(room_id).unwrap().decrypt_event(event).await else {
+    let room = client.get_room(room_id).unwrap();
+    let push_ctx = room.push_context().await.unwrap();
+    let Ok(decrypted) = room.decrypt_event(event, push_ctx.as_ref()).await else {
         return None;
     };
 

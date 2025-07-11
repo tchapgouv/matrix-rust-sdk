@@ -3,12 +3,16 @@ use std::time::Duration;
 use matrix_sdk::{
     attachment::{AttachmentConfig, AttachmentInfo, BaseImageInfo, BaseVideoInfo, Thumbnail},
     media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
+    room::reply::{EnforceThread, Reply},
     test_utils::mocks::MatrixMockServer,
 };
-use matrix_sdk_test::{async_test, DEFAULT_TEST_ROOM_ID};
+use matrix_sdk_test::{async_test, event_factory::EventFactory, ALICE, DEFAULT_TEST_ROOM_ID};
 use ruma::{
     event_id,
-    events::{room::MediaSource, Mentions},
+    events::{
+        room::{message::ReplyWithinThread, MediaSource},
+        Mentions,
+    },
     mxc_uri, owned_mxc_uri, owned_user_id, uint,
 };
 use serde_json::json;
@@ -16,6 +20,8 @@ use serde_json::json;
 #[async_test]
 async fn test_room_attachment_send() {
     let mock = MatrixMockServer::new().await;
+
+    mock.mock_authenticated_media_config().ok_default().mount().await;
 
     let expected_event_id = event_id!("$h29iv0s8:example.com");
 
@@ -54,9 +60,49 @@ async fn test_room_attachment_send() {
     assert_eq!(expected_event_id, response.event_id);
 }
 
+#[cfg(feature = "e2e-encryption")]
+#[async_test]
+async fn test_room_attachment_send_in_encrypted_room_has_binary_mime_type() {
+    let mock = MatrixMockServer::new().await;
+
+    mock.mock_authenticated_media_config().ok_default().mount().await;
+
+    let expected_event_id = event_id!("$h29iv0s8:example.com");
+
+    mock.mock_room_send().ok(expected_event_id).mock_once().mount().await;
+
+    mock.mock_upload()
+        .expect_mime_type("application/octet-stream")
+        .ok(mxc_uri!("mxc://example.com/AQwafuaFswefuhsfAFAgsw"))
+        .up_to_n_times(2)
+        .mount()
+        .await;
+
+    // Needed for the message to be sent in an encrypted room
+    mock.mock_get_members().ok(Vec::new()).mock_once().mount().await;
+
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, &DEFAULT_TEST_ROOM_ID).await;
+    mock.mock_room_state_encryption().encrypted().mount().await;
+
+    let response = room
+        .send_attachment(
+            "image",
+            &mime::IMAGE_JPEG,
+            b"Hello world".to_vec(),
+            AttachmentConfig::new(),
+        )
+        .await
+        .expect("Failed to send attachment");
+
+    assert_eq!(expected_event_id, response.event_id);
+}
+
 #[async_test]
 async fn test_room_attachment_send_info() {
     let mock = MatrixMockServer::new().await;
+
+    mock.mock_authenticated_media_config().ok_default().mount().await;
 
     let expected_event_id = event_id!("$h29iv0s8:example.com");
     mock.mock_room_send()
@@ -102,6 +148,8 @@ async fn test_room_attachment_send_info() {
 #[async_test]
 async fn test_room_attachment_send_wrong_info() {
     let mock = MatrixMockServer::new().await;
+
+    mock.mock_authenticated_media_config().ok_default().mount().await;
 
     // Note: this mock is NOT called because the height and width are lost, because
     // we're trying to send the attachment as an image, while we provide a
@@ -154,6 +202,8 @@ async fn test_room_attachment_send_wrong_info() {
 #[async_test]
 async fn test_room_attachment_send_info_thumbnail() {
     let mock = MatrixMockServer::new().await;
+
+    mock.mock_authenticated_media_config().ok_default().mount().await;
 
     let media_mxc = owned_mxc_uri!("mxc://example.com/media");
     let thumbnail_mxc = owned_mxc_uri!("mxc://example.com/thumbnail");
@@ -259,6 +309,8 @@ async fn test_room_attachment_send_info_thumbnail() {
 async fn test_room_attachment_send_mentions() {
     let mock = MatrixMockServer::new().await;
 
+    mock.mock_authenticated_media_config().ok_default().mount().await;
+
     let expected_event_id = event_id!("$h29iv0s8:example.com");
 
     mock.mock_room_send()
@@ -298,8 +350,274 @@ async fn test_room_attachment_send_mentions() {
 }
 
 #[async_test]
+async fn test_room_attachment_reply_outside_thread() {
+    let mock = MatrixMockServer::new().await;
+
+    let expected_event_id = event_id!("$h29iv0s8:example.com");
+    let replied_to_event_id = event_id!("$foo:bar.com");
+
+    mock.mock_authenticated_media_config().ok_default().mount().await;
+
+    mock.mock_room_send()
+        .body_matches_partial_json(json!({
+            "m.relates_to": {
+                "m.in_reply_to": {
+                    "event_id": replied_to_event_id
+                },
+            }
+        }))
+        .ok(expected_event_id)
+        .mock_once()
+        .mount()
+        .await;
+
+    let f = EventFactory::new();
+    mock.mock_room_event()
+        .match_event_id()
+        .ok(f
+            .text_msg("Send me your attachments")
+            .sender(*ALICE)
+            .event_id(replied_to_event_id)
+            .into())
+        .mock_once()
+        .mount()
+        .await;
+
+    mock.mock_upload()
+        .expect_mime_type("image/jpeg")
+        .ok(mxc_uri!("mxc://example.com/AQwafuaFswefuhsfAFAgsw"))
+        .mock_once()
+        .mount()
+        .await;
+
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, &DEFAULT_TEST_ROOM_ID).await;
+    mock.mock_room_state_encryption().plain().mount().await;
+
+    let response = room
+        .send_attachment(
+            "image",
+            &mime::IMAGE_JPEG,
+            b"Hello world".to_vec(),
+            AttachmentConfig::new()
+                .mentions(Some(Mentions::with_user_ids([owned_user_id!("@user:localhost")])))
+                .reply(Some(Reply {
+                    event_id: replied_to_event_id.into(),
+                    enforce_thread: EnforceThread::Unthreaded,
+                })),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(expected_event_id, response.event_id);
+}
+
+#[async_test]
+async fn test_room_attachment_start_thread() {
+    let mock = MatrixMockServer::new().await;
+
+    let expected_event_id = event_id!("$h29iv0s8:example.com");
+    let replied_to_event_id = event_id!("$foo:bar.com");
+
+    mock.mock_authenticated_media_config().ok_default().mount().await;
+
+    mock.mock_room_send()
+        .body_matches_partial_json(json!({
+            "m.relates_to": {
+                "rel_type": "m.thread",
+                "event_id": replied_to_event_id,
+                "m.in_reply_to": {
+                    "event_id": replied_to_event_id
+                },
+                "is_falling_back": true
+            },
+        }))
+        .ok(expected_event_id)
+        .mock_once()
+        .mount()
+        .await;
+
+    let f = EventFactory::new();
+    mock.mock_room_event()
+        .match_event_id()
+        .ok(f
+            .text_msg("Send me your attachments")
+            .sender(*ALICE)
+            .event_id(replied_to_event_id)
+            .into())
+        .mock_once()
+        .mount()
+        .await;
+
+    mock.mock_upload()
+        .expect_mime_type("image/jpeg")
+        .ok(mxc_uri!("mxc://example.com/AQwafuaFswefuhsfAFAgsw"))
+        .mock_once()
+        .mount()
+        .await;
+
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, &DEFAULT_TEST_ROOM_ID).await;
+    mock.mock_room_state_encryption().plain().mount().await;
+
+    let response = room
+        .send_attachment(
+            "image",
+            &mime::IMAGE_JPEG,
+            b"Hello world".to_vec(),
+            AttachmentConfig::new()
+                .mentions(Some(Mentions::with_user_ids([owned_user_id!("@user:localhost")])))
+                .reply(Some(Reply {
+                    event_id: replied_to_event_id.into(),
+                    enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
+                })),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(expected_event_id, response.event_id);
+}
+
+#[async_test]
+async fn test_room_attachment_reply_on_thread_as_reply() {
+    let mock = MatrixMockServer::new().await;
+
+    let expected_event_id = event_id!("$h29iv0s8:example.com");
+    let thread_root_event_id = event_id!("$bar:foo.com");
+    let replied_to_event_id = event_id!("$foo:bar.com");
+
+    mock.mock_authenticated_media_config().ok_default().mount().await;
+
+    mock.mock_room_send()
+        .body_matches_partial_json(json!({
+            "m.relates_to": {
+                "rel_type": "m.thread",
+                "event_id": thread_root_event_id,
+                "m.in_reply_to": {
+                    "event_id": replied_to_event_id
+                },
+            },
+        }))
+        .ok(expected_event_id)
+        .mock_once()
+        .mount()
+        .await;
+
+    let f = EventFactory::new();
+    mock.mock_room_event()
+        .match_event_id()
+        .ok(f
+            .text_msg("Send me your attachments")
+            .sender(*ALICE)
+            .event_id(replied_to_event_id)
+            .in_thread(thread_root_event_id, thread_root_event_id)
+            .into())
+        .mock_once()
+        .mount()
+        .await;
+
+    mock.mock_upload()
+        .expect_mime_type("image/jpeg")
+        .ok(mxc_uri!("mxc://example.com/AQwafuaFswefuhsfAFAgsw"))
+        .mock_once()
+        .mount()
+        .await;
+
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, &DEFAULT_TEST_ROOM_ID).await;
+    mock.mock_room_state_encryption().plain().mount().await;
+
+    let response = room
+        .send_attachment(
+            "image",
+            &mime::IMAGE_JPEG,
+            b"Hello world".to_vec(),
+            AttachmentConfig::new()
+                .mentions(Some(Mentions::with_user_ids([owned_user_id!("@user:localhost")])))
+                .reply(Some(Reply {
+                    event_id: replied_to_event_id.into(),
+                    enforce_thread: EnforceThread::Threaded(ReplyWithinThread::Yes),
+                })),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(expected_event_id, response.event_id);
+}
+
+#[async_test]
+async fn test_room_attachment_reply_forwarding_thread() {
+    let mock = MatrixMockServer::new().await;
+
+    mock.mock_authenticated_media_config().ok_default().mount().await;
+
+    let expected_event_id = event_id!("$h29iv0s8:example.com");
+    let thread_root_event_id = event_id!("$bar:foo.com");
+    let replied_to_event_id = event_id!("$foo:bar.com");
+
+    mock.mock_room_send()
+        .body_matches_partial_json(json!({
+            "m.relates_to": {
+                "rel_type": "m.thread",
+                "event_id": thread_root_event_id,
+                "m.in_reply_to": {
+                    "event_id": replied_to_event_id
+                },
+                "is_falling_back": true
+            },
+        }))
+        .ok(expected_event_id)
+        .mock_once()
+        .mount()
+        .await;
+
+    let f = EventFactory::new();
+    mock.mock_room_event()
+        .match_event_id()
+        .ok(f
+            .text_msg("Send me your attachments")
+            .sender(*ALICE)
+            .event_id(replied_to_event_id)
+            .in_thread(thread_root_event_id, thread_root_event_id)
+            .into())
+        .mock_once()
+        .mount()
+        .await;
+
+    mock.mock_upload()
+        .expect_mime_type("image/jpeg")
+        .ok(mxc_uri!("mxc://example.com/AQwafuaFswefuhsfAFAgsw"))
+        .mock_once()
+        .mount()
+        .await;
+
+    let client = mock.client_builder().build().await;
+    let room = mock.sync_joined_room(&client, &DEFAULT_TEST_ROOM_ID).await;
+    mock.mock_room_state_encryption().plain().mount().await;
+
+    let response = room
+        .send_attachment(
+            "image",
+            &mime::IMAGE_JPEG,
+            b"Hello world".to_vec(),
+            AttachmentConfig::new()
+                .mentions(Some(Mentions::with_user_ids([owned_user_id!("@user:localhost")])))
+                .reply(Some(Reply {
+                    event_id: replied_to_event_id.into(),
+                    enforce_thread: EnforceThread::MaybeThreaded,
+                })),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(expected_event_id, response.event_id);
+}
+
+#[async_test]
 async fn test_room_attachment_send_is_animated() {
     let mock = MatrixMockServer::new().await;
+
+    mock.mock_authenticated_media_config().ok_default().mount().await;
 
     let expected_event_id = event_id!("$h29iv0s8:example.com");
     mock.mock_room_send()

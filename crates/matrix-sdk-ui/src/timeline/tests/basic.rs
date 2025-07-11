@@ -17,21 +17,24 @@ use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use imbl::vector;
-use matrix_sdk::deserialized_responses::TimelineEvent;
 use matrix_sdk_test::{
-    async_test, event_factory::PreviousMembership, sync_timeline_event, ALICE, BOB, CAROL,
+    async_test,
+    event_factory::{EventFactory, PreviousMembership},
+    ALICE, BOB, CAROL,
 };
 use ruma::{
+    event_id,
     events::{
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
             member::{MembershipState, RedactedRoomMemberEventContent},
             message::MessageType,
             topic::RedactedRoomTopicEventContent,
+            ImageInfo,
         },
         FullStateEventContent,
     },
-    mxc_uri, owned_event_id, MilliSecondsSinceUnixEpoch,
+    mxc_uri, owned_event_id, owned_mxc_uri, user_id, MilliSecondsSinceUnixEpoch,
 };
 use stream_assert::assert_next_matches;
 
@@ -40,7 +43,8 @@ use crate::timeline::{
     controller::TimelineSettings,
     event_item::{AnyOtherFullStateEventContent, RemoteEventOrigin},
     tests::{ReadReceiptMap, TestRoomDataProvider, TestTimelineBuilder},
-    MembershipChange, TimelineDetails, TimelineItemContent, TimelineItemKind, VirtualTimelineItem,
+    MembershipChange, MsgLikeContent, MsgLikeKind, TimelineDetails, TimelineItemContent,
+    TimelineItemKind, VirtualTimelineItem,
 };
 
 #[async_test]
@@ -130,26 +134,27 @@ async fn test_sticker() {
     let mut stream = timeline.subscribe_events().await;
 
     timeline
-        .handle_live_event(TimelineEvent::new(sync_timeline_event!({
-            "content": {
-                "body": "Happy sticker",
-                "info": {
-                    "h": 398,
-                    "mimetype": "image/jpeg",
-                    "size": 31037,
-                    "w": 394
-                },
-                "url": "mxc://server.name/JWEIFJgwEIhweiWJE",
-            },
-            "event_id": "$143273582443PhrSn",
-            "origin_server_ts": 143273582,
-            "sender": "@alice:server.name",
-            "type": "m.sticker",
-        })))
+        .handle_live_event(
+            EventFactory::new()
+                .sticker(
+                    "Happy sticker",
+                    ImageInfo::new(),
+                    owned_mxc_uri!("mxc://server.name/JWEIFJgwEIhweiWJE"),
+                )
+                .reply_thread(event_id!("$thread_root"), event_id!("$in_reply_to"))
+                .event_id(event_id!("$143273582443PhrSn"))
+                .sender(user_id!("@alice:server.name"))
+                .into_event(),
+        )
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    assert_matches!(item.content(), TimelineItemContent::Sticker(_));
+    assert!(item.content().is_sticker());
+
+    assert_eq!(item.content().thread_root(), Some(event_id!("$thread_root").to_owned()));
+
+    assert_let!(Some(details) = item.content().in_reply_to());
+    assert_eq!(details.event_id, event_id!("$in_reply_to").to_owned())
 }
 
 #[async_test]
@@ -344,7 +349,7 @@ async fn test_sanitized() {
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let event = item.as_event().unwrap();
-    assert_let!(TimelineItemContent::Message(message) = event.content());
+    assert_let!(Some(message) = event.content().as_message());
     assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(
         text.formatted.as_ref().unwrap().body,
@@ -376,17 +381,19 @@ async fn test_reply() {
     let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
     assert!(date_divider.is_date_divider());
 
-    let reply_formatted_body = format!("\
-        <mx-reply>\
-            <blockquote>\
-                <a href=\"https://matrix.to/#/!my_room:server.name/{first_event_id}\">In reply to</a> \
-                <a href=\"https://matrix.to/#/{first_event_sender}\">{first_event_sender}</a>\
-                <br>\
-                I want you to reply\
-            </blockquote>\
-        </mx-reply>\
-        <p>I'm replying!</p>\
-    ");
+    let reply_formatted_body = format!(
+        "\
+            <mx-reply>\
+                <blockquote>\
+                    <a href=\"https://matrix.to/#/!my_room:server.name/{first_event_id}\">In reply to</a> \
+                    <a href=\"https://matrix.to/#/{first_event_sender}\">{first_event_sender}</a>\
+                    <br>\
+                    I want you to reply\
+                </blockquote>\
+            </mx-reply>\
+            <p>I'm replying!</p>\
+        "
+    );
     let reply_plain = format!(
         "> <{first_event_sender}> I want you to reply\n\
          I'm replying!"
@@ -399,16 +406,22 @@ async fn test_reply() {
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    assert_let!(TimelineItemContent::Message(message) = item.as_event().unwrap().content());
+    assert_let!(
+        TimelineItemContent::MsgLike(MsgLikeContent {
+            kind: MsgLikeKind::Message(message),
+            in_reply_to,
+            ..
+        }) = item.as_event().unwrap().content()
+    );
 
     assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(text.body, "I'm replying!");
     assert_eq!(text.formatted.as_ref().unwrap().body, "<p>I'm replying!</p>");
 
-    let in_reply_to = message.in_reply_to().unwrap();
+    let in_reply_to = in_reply_to.clone().unwrap();
     assert_eq!(in_reply_to.event_id, first_event_id);
     assert_let!(TimelineDetails::Ready(replied_to_event) = &in_reply_to.event);
-    assert_eq!(replied_to_event.sender(), *ALICE);
+    assert_eq!(replied_to_event.sender, *ALICE);
 }
 
 #[async_test]
@@ -435,16 +448,22 @@ async fn test_thread() {
         .await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
-    assert_let!(TimelineItemContent::Message(message) = item.as_event().unwrap().content());
+    assert_let!(
+        TimelineItemContent::MsgLike(MsgLikeContent {
+            kind: MsgLikeKind::Message(message),
+            in_reply_to,
+            ..
+        }) = item.as_event().unwrap().content()
+    );
 
     assert_let!(MessageType::Text(text) = message.msgtype());
     assert_eq!(text.body, "I'm replying in a thread");
     assert_matches!(text.formatted, None);
 
-    let in_reply_to = message.in_reply_to().unwrap();
+    let in_reply_to = in_reply_to.clone().unwrap();
     assert_eq!(in_reply_to.event_id, first_event_id);
     assert_let!(TimelineDetails::Ready(replied_to_event) = &in_reply_to.event);
-    assert_eq!(replied_to_event.sender(), *ALICE);
+    assert_eq!(replied_to_event.sender, *ALICE);
 }
 
 #[async_test]

@@ -8,7 +8,76 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
-- [**breaking**] Add support for the shared history flag defined in [MSC3061](https://github.com/matrix-org/matrix-spec-proposals/pull/3061).
+- [**breaking**] Add a new `VerificationLevel::MismatchedSender` to indicate that the sender of an event appears to have been tampered with.
+  ([#5219](https://github.com/matrix-org/matrix-rust-sdk/pull/5219))
+
+### Refactor
+
+- [**breaking**] The `PendingChanges`, `Changes`, `StoredRoomKeyBundleData`,
+  `TrackedUser`, `IdentityChanges`, `DeviceChanges`, `DeviceUpdates`,
+  `IdentityUpdates`, `BackupDecryptionKey`, `DehydratedDeviceKey`,
+  `RoomKeyCounts`, `BackupKeys`, `CrossSigningKeyExport`, `UserKeyQueryResult`,
+  `RoomSettings`, `RoomKeyInfo`, and `RoomKeyWithheldInfo` types have been moved
+  from the `store` module into a new `store/types` module.
+  ([#5177](https://github.com/matrix-org/matrix-rust-sdk/pull/5177))
+
+## [0.12.0] - 2025-06-10
+
+### Features
+
+- [**breaking**] The `ProcessedToDeviceEvent::Decrypted` variant now also have an `EncryptionInfo` field.
+  Format changed from `Decrypted(Raw<AnyToDeviceEvent>)` to `Decrypted { raw: Raw<AnyToDeviceEvent>, encryption_info: EncryptionInfo) }`
+  ([#5074](https://github.com/matrix-org/matrix-rust-sdk/pull/5074))
+
+- [**breaking**] Move `session_id` from `EncryptionInfo` to `AlgorithmInfo` as it is megolm specific. 
+  Use `EncryptionInfo::session_id()` helper for quick access.
+  ([#4981](https://github.com/matrix-org/matrix-rust-sdk/pull/4981))
+
+- Send stable identifier `sender_device_keys` for MSC4147 (Including device
+  keys with Olm-encrypted events).
+  ([#4964](https://github.com/matrix-org/matrix-rust-sdk/pull/4964))
+
+- Add experimental APIs for sharing encrypted room key history with new members, `Store::build_room_key_bundle` and `OlmMachine::share_room_key_bundle_data`.
+  ([#4775](https://github.com/matrix-org/matrix-rust-sdk/pull/4775), [#4864](https://github.com/matrix-org/matrix-rust-sdk/pull/4864))
+
+- Check the `sender_device_keys` field on *all* incoming Olm-encrypted to-device messages
+  and ignore any to-device messages which include the field but whose data is invalid
+  (as per [MSC4147](https://github.com/matrix-org/matrix-spec-proposals/pull/4147)).
+  ([#4922](https://github.com/matrix-org/matrix-rust-sdk/pull/4922))
+
+- Fix bug which caused room keys to be unnecessarily rotated on every send in the
+  presence of blacklisted/withheld devices in the room.
+  ([#4954](https://github.com/matrix-org/matrix-rust-sdk/pull/4954))
+
+- Fix [#2729](https://github.com/matrix-org/matrix-rust-sdk/issues/2729) which in rare
+  cases can cause room key oversharing.
+  ([#4975](https://github.com/matrix-org/matrix-rust-sdk/pull/4975))
+
+- [**breaking**] `OlmMachine.receive_sync_changes` returns now a list of `ProcessedToDeviceEvent` 
+  instead of a list of `Raw<AnyToDeviceEvent>`. With variants like `Decrypted`|`UnableToDecrypt`|`PlainText`|`NotProcessed`.
+  This allows for example to make the difference between an event sent in clear and an event successfully decrypted.
+  For quick compatibility a helper `ProcessedToDeviceEvent::to_raw` allows to map back to the previous behaviour.
+  ([#4935](https://github.com/matrix-org/matrix-rust-sdk/pull/4935))
+
+## [0.11.1] - 2025-06-10
+
+### Security Fixes
+- Check the sender of an event matches owner of session, preventing sender
+  spoofing by homeserver owners.
+  [13c1d20](https://github.com/matrix-org/matrix-rust-sdk/commit/13c1d2048286bbabf5e7bc6b015aafee98f04d55) (High, [CVE-2025-48937](https://www.cve.org/CVERecord?id=CVE-2025-48937), [GHSA-x958-rvg6-956w](https://github.com/matrix-org/matrix-rust-sdk/security/advisories/GHSA-x958-rvg6-956w)).
+
+### Bug Fixes
+- Remove a wildcard enum variant import which breaks compilation if used with
+  `tracing-attributes` version `0.1.29`. This is a workaround for a bug in
+  `tracing-attributes`.
+  ([#5190](https://github.com/matrix-org/matrix-rust-sdk/issues/5190)) ([#5191](https://github.com/matrix-org/matrix-rust-sdk/issues/5191)) ([#5193](https://github.com/matrix-org/matrix-rust-sdk/issues/5193))
+
+## [0.11.0] - 2025-04-11
+
+### Features
+
+- [**breaking**] Add support for the shared history flag defined in
+  [MSC3061](https://github.com/matrix-org/matrix-spec-proposals/pull/3061).
   The shared history flag is now respected when room keys are received as an
   `m.room_key` event as well as when they are imported from a backup or a file
   export. We also ensure to set the flag when we send out room keys. Due to
@@ -16,6 +85,10 @@ All notable changes to this project will be documented in this file.
   has been added and `PickledInboundGroupSession` has received a new
   `shared_history` field that defaults to `false.`
   ([#4700](https://github.com/matrix-org/matrix-rust-sdk/pull/4700))
+
+- Have the `RoomIdentityProvider` return processing changes when identities transition
+  to `IdentityState::Verified` too.
+  ([#4670](https://github.com/matrix-org/matrix-rust-sdk/pull/4670))
 
 ## [0.10.0] - 2025-02-04
 
@@ -33,19 +106,20 @@ All notable changes to this project will be documented in this file.
 - Room keys are not shared with unsigned dehydrated devices.
   ([#4551](https://github.com/matrix-org/matrix-rust-sdk/pull/4551))
   
-- Have the `RoomIdentityProvider` return processing changes when identities transition
-  to `IdentityState::Verified` too.
-  ([#4670](https://github.com/matrix-org/matrix-rust-sdk/pull/4670))
-
 ## [0.9.0] - 2024-12-18
 
 ### Features
 
-- Expose new API `DehydratedDevices::get_dehydrated_device_pickle_key`, `DehydratedDevices::save_dehydrated_device_pickle_key`
-  and `DehydratedDevices::delete_dehydrated_device_pickle_key` to store/load the dehydrated device pickle key.
-  This allows client to automatically rotate the dehydrated device to avoid one-time-keys exhaustion and to_device accumulation.
-  [**breaking**] `DehydratedDevices::keys_for_upload` and `DehydratedDevices::rehydrate` now use the `DehydratedDeviceKey`
-  as parameter instead of a raw byte array. Use `DehydratedDeviceKey::from_bytes` to migrate.
+- [**breaking**] Expose new API
+  `DehydratedDevices::get_dehydrated_device_pickle_key`,
+  `DehydratedDevices::save_dehydrated_device_pickle_key` and
+  `DehydratedDevices::delete_dehydrated_device_pickle_key` to store/load the
+  dehydrated device pickle key. This allows client to automatically rotate
+  the dehydrated device to avoid one-time-keys exhaustion and to_device
+  accumulation.
+  `DehydratedDevices::keys_for_upload` and
+  `DehydratedDevices::rehydrate` now use the `DehydratedDeviceKey` as parameter
+  instead of a raw byte array. Use `DehydratedDeviceKey::from_bytes` to migrate.
   ([#4383](https://github.com/matrix-org/matrix-rust-sdk/pull/4383))
 
 - Add extra logging in `OtherUserIdentity::pin_current_master_key` and

@@ -5,15 +5,14 @@ use std::{
     time::Duration,
 };
 
+use cfg_if::cfg_if;
 use matrix_sdk_common::timer;
 use ruma::{api::client::sync::sync_events::v5 as http, OwnedRoomId};
 use tokio::sync::{broadcast::channel, Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 use super::{
-    cache::{format_storage_key_prefix, restore_sliding_sync_state},
-    sticky_parameters::SlidingSyncStickyManager,
-    Error, SlidingSync, SlidingSyncInner, SlidingSyncListBuilder, SlidingSyncPositionMarkers,
-    Version,
+    cache::format_storage_key_prefix, sticky_parameters::SlidingSyncStickyManager, Error,
+    SlidingSync, SlidingSyncInner, SlidingSyncListBuilder, SlidingSyncPositionMarkers, Version,
 };
 use crate::{sliding_sync::SlidingSyncStickyParameters, Client, Result};
 
@@ -223,16 +222,14 @@ impl SlidingSyncBuilder {
     }
 
     /// Build the Sliding Sync.
-    ///
-    /// If `self.storage_key` is `Some(_)`, load the cached data from cold
-    /// storage.
+    #[allow(clippy::unused_async)] // Async is only used if the e2e-encryption feature is enabled.
     pub async fn build(self) -> Result<SlidingSync> {
         let client = self.client;
 
         let version = self.version.unwrap_or_else(|| client.sliding_sync_version());
 
         if matches!(version, Version::None) {
-            return Err(crate::error::Error::SlidingSync(Error::VersionIsMissing));
+            return Err(crate::error::Error::SlidingSync(Box::new(Error::VersionIsMissing)));
         }
 
         let (internal_channel_sender, _internal_channel_receiver) = channel(8);
@@ -245,27 +242,22 @@ impl SlidingSyncBuilder {
             lists.insert(list.name().to_owned(), list);
         }
 
-        // Reload existing state from the cache.
-        let restored_fields =
-            restore_sliding_sync_state(&client, &self.storage_key, &lists).await?;
-
-        let (pos, rooms) = if let Some(fields) = restored_fields {
-            #[cfg(feature = "e2e-encryption")]
-            let pos = if self.share_pos { fields.pos } else { None };
-            #[cfg(not(feature = "e2e-encryption"))]
-            let pos = None;
-
-            (pos, fields.rooms)
-        } else {
-            (None, BTreeMap::new())
+        let (share_pos, pos) = {
+            cfg_if! {
+                if #[cfg(feature = "e2e-encryption")] {
+                    if self.share_pos {
+                        // If the sliding sync instance is configured to share its current sync
+                        // position, we will restore it from the cache.
+                        (true, super::cache::restore_sliding_sync_state(&client, &self.storage_key).await?.and_then(|fields| fields.pos))
+                    } else {
+                        (false, None)
+                    }
+                } else {
+                    (false, None)
+                }
+            }
         };
 
-        #[cfg(feature = "e2e-encryption")]
-        let share_pos = self.share_pos;
-        #[cfg(not(feature = "e2e-encryption"))]
-        let share_pos = false;
-
-        let rooms = AsyncRwLock::new(rooms);
         let lists = AsyncRwLock::new(lists);
 
         Ok(SlidingSync::new(SlidingSyncInner {
@@ -276,7 +268,6 @@ impl SlidingSyncBuilder {
             share_pos,
 
             lists,
-            rooms,
 
             position: Arc::new(AsyncMutex::new(SlidingSyncPositionMarkers { pos })),
 

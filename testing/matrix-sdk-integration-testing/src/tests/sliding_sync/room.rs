@@ -400,6 +400,8 @@ async fn test_room_notification_count() -> Result<()> {
     let bob = TestClientBuilder::new("bob").use_sqlite().build().await?;
     let alice = TestClientBuilder::new("alice").use_sqlite().build().await?;
 
+    alice.event_cache().subscribe().unwrap();
+
     // Spawn sync for Bob.
     spawn({
         let bob = bob.clone();
@@ -807,7 +809,7 @@ async fn test_delayed_decryption_latest_event() -> Result<()> {
         &diffs[0],
         VectorDiff::Set { index: 0, value: room } => {
             // The latest event is not decrypted.
-            assert!(room.latest_event().await.is_none());
+            assert!(room.latest_event().is_none());
         }
     );
 
@@ -824,7 +826,7 @@ async fn test_delayed_decryption_latest_event() -> Result<()> {
         &diffs[0],
         VectorDiff::Set { index: 0, value: room } => {
             // The latest event is now decrypted!
-            assert_eq!(room.latest_event().await.unwrap().event_id().unwrap(), event.event_id);
+            assert_eq!(room.latest_event().unwrap().event().event_id().unwrap(), event.event_id);
         }
     );
 
@@ -1226,7 +1228,7 @@ fn assert_room_preview(preview: &RoomPreview, room_alias: &str) {
     assert_eq!(preview.avatar_url.as_ref().unwrap(), mxc_uri!("mxc://localhost/alice"));
     assert_eq!(preview.num_joined_members, 1);
     assert!(preview.room_type.is_none());
-    assert_eq!(preview.join_rule, SpaceRoomJoinRule::Invite);
+    assert_eq!(preview.join_rule, Some(SpaceRoomJoinRule::Invite));
     assert!(preview.is_world_readable.unwrap());
 }
 

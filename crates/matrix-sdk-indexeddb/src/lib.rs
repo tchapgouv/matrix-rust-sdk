@@ -1,4 +1,4 @@
-#![cfg_attr(not(target_arch = "wasm32"), allow(unused))]
+#![cfg_attr(not(target_family = "wasm"), allow(unused))]
 
 #[cfg(feature = "state-store")]
 use matrix_sdk_base::store::StoreError;
@@ -6,9 +6,13 @@ use thiserror::Error;
 
 #[cfg(feature = "e2e-encryption")]
 mod crypto_store;
+#[cfg(feature = "event-cache-store")]
+mod event_cache_store;
 mod safe_encode;
 #[cfg(feature = "e2e-encryption")]
 mod serialize_bool_for_indexeddb;
+#[cfg(feature = "e2e-encryption")]
+mod serializer;
 #[cfg(feature = "state-store")]
 mod state_store;
 

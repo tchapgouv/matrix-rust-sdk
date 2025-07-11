@@ -14,20 +14,23 @@
 
 use ruma::{
     api::client::{account::request_openid_token, delayed_events},
-    events::AnyTimelineEvent,
+    events::{AnyStateEvent, AnyTimelineEvent, AnyToDeviceEvent},
     serde::Raw,
 };
 use serde::{de, Deserialize, Deserializer};
 use serde_json::value::RawValue as RawJsonValue;
 use uuid::Uuid;
 
+#[cfg(doc)]
+use super::MatrixDriverRequestData;
 use super::{
     from_widget::{FromWidgetRequest, SendEventResponse},
     to_widget::ToWidgetResponse,
+    SendToDeviceEventResponse,
 };
 use crate::widget::Capabilities;
 
-/// Incoming event that the client API must process.
+/// Incoming message for the widget client side module that it must process.
 pub(crate) enum IncomingMessage {
     /// An incoming raw message from the widget.
     WidgetMessage(String),
@@ -37,35 +40,53 @@ pub(crate) enum IncomingMessage {
         /// The ID of the request that this response corresponds to.
         request_id: Uuid,
 
-        /// Result of the request: the response data, or a matrix sdk error.
+        /// Result of the request: the response data, or a Matrix sdk error.
         ///
         /// Http errors will be forwarded to the widget in a specified format so
         /// the widget can parse the error.
         response: Result<MatrixDriverResponse, crate::Error>,
     },
 
-    /// The `MatrixDriver` notified the `WidgetMachine` of a new matrix event.
+    /// The `MatrixDriver` notified the `WidgetMachine` of a new Matrix event.
+    ///
+    /// This means that the machine previously subscribed to some events
+    /// ([`crate::widget::Action::SubscribeTimeline`] request).
+    MatrixEventReceived(Raw<AnyTimelineEvent>),
+
+    /// The `MatrixDriver` notified the `WidgetMachine` of a change in room
+    /// state.
     ///
     /// This means that the machine previously subscribed to some events
     /// ([`crate::widget::Action::Subscribe`] request).
-    MatrixEventReceived(Raw<AnyTimelineEvent>),
+    StateUpdateReceived(Vec<Raw<AnyStateEvent>>),
+
+    /// The `MatrixDriver` notified the `WidgetMachine` of a new to-device
+    /// event.
+    ToDeviceReceived(Raw<AnyToDeviceEvent>),
 }
 
 pub(crate) enum MatrixDriverResponse {
     /// Client acquired capabilities from the user.
-    ///
-    /// A response to an `Action::AcquireCapabilities` command.
+    /// A response to a [`MatrixDriverRequestData::AcquireCapabilities`]
+    /// command.
     CapabilitiesAcquired(Capabilities),
     /// Client got OpenId token for a given request ID.
-    /// A response to an `Action::GetOpenId` command.
+    /// A response to a [`MatrixDriverRequestData::GetOpenId`] command.
     OpenIdReceived(request_openid_token::v3::Response),
-    /// Client read some matrix event(s).
-    /// A response to an `Action::ReadMatrixEvent` commands.
-    MatrixEventRead(Vec<Raw<AnyTimelineEvent>>),
-    /// Client sent some matrix event. The response contains the event ID.
-    /// A response to an `Action::SendMatrixEvent` command.
-    MatrixEventSent(SendEventResponse),
-    MatrixDelayedEventUpdate(delayed_events::update_delayed_event::unstable::Response),
+    /// Client read some Matrix event(s).
+    /// A response to a [`MatrixDriverRequestData::ReadEvents`] command.
+    EventsRead(Vec<Raw<AnyTimelineEvent>>),
+    /// Client read some Matrix room state entries.
+    /// A response to a [`MatrixDriverRequestData::ReadState`] command.
+    StateRead(Vec<Raw<AnyStateEvent>>),
+    /// Client sent some Matrix event. The response contains the event ID.
+    /// A response to a [`MatrixDriverRequestData::SendEvent`] command.
+    EventSent(SendEventResponse),
+    /// A response to a `Action::SendToDevice` command.
+    ToDeviceSent(SendToDeviceEventResponse),
+    /// Client updated a delayed event.
+    /// A response to a [`MatrixDriverRequestData::UpdateDelayedEvent`] command.
+    DelayedEventUpdated(delayed_events::update_delayed_event::unstable::Response),
 }
 
 pub(super) struct IncomingWidgetMessage {

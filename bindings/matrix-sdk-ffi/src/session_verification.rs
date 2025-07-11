@@ -1,6 +1,5 @@
 use std::sync::{Arc, RwLock};
 
-use async_compat::get_runtime_handle;
 use futures_util::StreamExt;
 use matrix_sdk::{
     encryption::{
@@ -11,10 +10,13 @@ use matrix_sdk::{
     ruma::events::key::verification::VerificationMethod,
     Account,
 };
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 use ruma::UserId;
 use tracing::{error, warn};
 
-use crate::{client::UserProfile, error::ClientError, utils::Timestamp};
+use crate::{
+    client::UserProfile, error::ClientError, runtime::get_runtime_handle, utils::Timestamp,
+};
 
 #[derive(uniffi::Object)]
 pub struct SessionVerificationEmoji {
@@ -51,7 +53,7 @@ pub struct SessionVerificationRequestDetails {
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait SessionVerificationControllerDelegate: Sync + Send {
+pub trait SessionVerificationControllerDelegate: SyncOutsideWasm + SendOutsideWasm {
     fn did_receive_verification_request(&self, details: SessionVerificationRequestDetails);
     fn did_accept_verification_request(&self);
     fn did_start_sas_verification(&self);
@@ -94,7 +96,7 @@ impl SessionVerificationController {
             .encryption
             .get_verification_request(&sender_id, flow_id)
             .await
-            .ok_or(ClientError::new("Unknown session verification request"))?;
+            .ok_or(ClientError::from_str("Unknown session verification request", None))?;
 
         self.set_ongoing_verification_request(verification_request)
     }
@@ -114,11 +116,8 @@ impl SessionVerificationController {
     /// Request verification for the current device
     pub async fn request_device_verification(&self) -> Result<(), ClientError> {
         let methods = vec![VerificationMethod::SasV1];
-        let verification_request = self
-            .user_identity
-            .request_verification_with_methods(methods)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let verification_request =
+            self.user_identity.request_verification_with_methods(methods).await?;
 
         self.set_ongoing_verification_request(verification_request)
     }
@@ -131,18 +130,15 @@ impl SessionVerificationController {
             .encryption
             .get_user_identity(&user_id)
             .await?
-            .ok_or(ClientError::new("Unknown user identity"))?;
+            .ok_or(ClientError::from_str("Unknown user identity", None))?;
 
         if user_identity.is_verified() {
-            return Err(ClientError::new("User is already verified"));
+            return Err(ClientError::from_str("User is already verified", None));
         }
 
         let methods = vec![VerificationMethod::SasV1];
 
-        let verification_request = user_identity
-            .request_verification_with_methods(methods)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let verification_request = user_identity.request_verification_with_methods(methods).await?;
 
         self.set_ongoing_verification_request(verification_request)
     }
@@ -153,7 +149,7 @@ impl SessionVerificationController {
         let verification_request = self.verification_request.read().unwrap().clone();
 
         let Some(verification_request) = verification_request else {
-            return Err(ClientError::new("Verification request missing."));
+            return Err(ClientError::from_str("Verification request missing.", None));
         };
 
         match verification_request.start_sas().await {
@@ -183,7 +179,7 @@ impl SessionVerificationController {
         let sas_verification = self.sas_verification.read().unwrap().clone();
 
         let Some(sas_verification) = sas_verification else {
-            return Err(ClientError::new("SAS verification missing"));
+            return Err(ClientError::from_str("SAS verification missing", None));
         };
 
         Ok(sas_verification.confirm().await?)
@@ -194,7 +190,7 @@ impl SessionVerificationController {
         let sas_verification = self.sas_verification.read().unwrap().clone();
 
         let Some(sas_verification) = sas_verification else {
-            return Err(ClientError::new("SAS verification missing"));
+            return Err(ClientError::from_str("SAS verification missing", None));
         };
 
         Ok(sas_verification.mismatch().await?)
@@ -205,7 +201,7 @@ impl SessionVerificationController {
         let verification_request = self.verification_request.read().unwrap().clone();
 
         let Some(verification_request) = verification_request else {
-            return Err(ClientError::new("Verification request missing."));
+            return Err(ClientError::from_str("Verification request missing.", None));
         };
 
         Ok(verification_request.cancel().await?)
@@ -239,7 +235,10 @@ impl SessionVerificationController {
         if sender != self.user_identity.user_id() {
             if let Some(status) = self.encryption.cross_signing_status().await {
                 if !status.is_complete() {
-                    warn!("Cannot verify other users until our own device's cross-signing status is complete: {:?}", status);
+                    warn!(
+                        "Cannot verify other users until our own device's cross-signing status \
+                         is complete: {status:?}"
+                    );
                     return;
                 }
             }
@@ -285,7 +284,10 @@ impl SessionVerificationController {
             if !ongoing_verification_request.is_done()
                 && !ongoing_verification_request.is_cancelled()
             {
-                return Err(ClientError::new("There is another verification flow ongoing."));
+                return Err(ClientError::from_str(
+                    "There is another verification flow ongoing.",
+                    None,
+                ));
             }
         }
 

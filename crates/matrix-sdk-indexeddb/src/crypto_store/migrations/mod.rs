@@ -18,15 +18,13 @@ use indexed_db_futures::{prelude::*, web_sys::DomException};
 use tracing::info;
 use wasm_bindgen::JsValue;
 
-use crate::{
-    crypto_store::{indexeddb_serializer::IndexeddbSerializer, Result},
-    IndexeddbCryptoStoreError,
-};
+use crate::{crypto_store::Result, serializer::IndexeddbSerializer, IndexeddbCryptoStoreError};
 
 mod old_keys;
 mod v0_to_v5;
 mod v10_to_v11;
 mod v11_to_v12;
+mod v12_to_v13;
 mod v5_to_v7;
 mod v7;
 mod v7_to_v8;
@@ -161,6 +159,10 @@ pub async fn open_and_upgrade_db(
         v11_to_v12::schema_add(name).await?;
     }
 
+    if old_version < 13 {
+        v12_to_v13::schema_add(name).await?;
+    }
+
     // If you add more migrations here, you'll need to update
     // `tests::EXPECTED_SCHEMA_VERSION`.
 
@@ -220,8 +222,8 @@ fn add_nonunique_index<'a>(
     name: &str,
     key_path: &str,
 ) -> Result<IdbIndex<'a>, DomException> {
-    let mut params = IdbIndexParameters::new();
-    params.unique(false);
+    let params = IdbIndexParameters::new();
+    params.set_unique(false);
     object_store.create_index_with_params(name, &IdbKeyPath::str(key_path), &params)
 }
 
@@ -230,12 +232,12 @@ fn add_unique_index<'a>(
     name: &str,
     key_path: &str,
 ) -> Result<IdbIndex<'a>, DomException> {
-    let mut params = IdbIndexParameters::new();
-    params.unique(true);
+    let params = IdbIndexParameters::new();
+    params.set_unique(true);
     object_store.create_index_with_params(name, &IdbKeyPath::str(key_path), &params)
 }
 
-#[cfg(all(test, target_arch = "wasm32"))]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use std::{cell::Cell, future::Future, rc::Rc, sync::Arc};
 
@@ -265,7 +267,7 @@ mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     /// The schema version we expect after we open the store.
-    const EXPECTED_SCHEMA_VERSION: u32 = 12;
+    const EXPECTED_SCHEMA_VERSION: u32 = 13;
 
     /// Adjust this to test do a more comprehensive perf test
     const NUM_RECORDS_FOR_PERF: usize = 2_000;

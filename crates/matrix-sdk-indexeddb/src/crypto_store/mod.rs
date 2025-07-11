@@ -29,8 +29,11 @@ use matrix_sdk_crypto::{
         StaticAccountData,
     },
     store::{
-        BackupKeys, Changes, CryptoStore, CryptoStoreError, DehydratedDeviceKey, PendingChanges,
-        RoomKeyCounts, RoomSettings,
+        types::{
+            BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts, RoomSettings,
+            StoredRoomKeyBundleData,
+        },
+        CryptoStore, CryptoStoreError,
     },
     types::events::room_key_withheld::RoomKeyWithheldEvent,
     vodozemac::base64_encode,
@@ -47,12 +50,11 @@ use tracing::{debug, warn};
 use wasm_bindgen::JsValue;
 use web_sys::IdbKeyRange;
 
-use self::indexeddb_serializer::MaybeEncrypted;
-use crate::crypto_store::{
-    indexeddb_serializer::IndexeddbSerializer, migrations::open_and_upgrade_db,
+use crate::{
+    crypto_store::migrations::open_and_upgrade_db,
+    serializer::{IndexeddbSerializer, IndexeddbSerializerError, MaybeEncrypted},
 };
 
-mod indexeddb_serializer;
 mod migrations;
 
 mod keys {
@@ -84,6 +86,8 @@ mod keys {
     pub const SECRETS_INBOX: &str = "secrets_inbox";
 
     pub const DIRECT_WITHHELD_INFO: &str = "direct_withheld_info";
+
+    pub const RECEIVED_ROOM_KEY_BUNDLES: &str = "received_room_key_bundles";
 
     // keys
     pub const STORE_CIPHER: &str = "store_cipher";
@@ -144,8 +148,25 @@ pub enum IndexeddbCryptoStoreError {
     },
     #[error(transparent)]
     CryptoStoreError(#[from] CryptoStoreError),
-    #[error("The schema version of the crypto store is too new. Existing version: {current_version}; max supported version: {max_supported_version}")]
+    #[error(
+        "The schema version of the crypto store is too new. \
+         Existing version: {current_version}; max supported version: {max_supported_version}"
+    )]
     SchemaTooNewError { max_supported_version: u32, current_version: u32 },
+}
+
+impl From<IndexeddbSerializerError> for IndexeddbCryptoStoreError {
+    fn from(value: IndexeddbSerializerError) -> Self {
+        match value {
+            IndexeddbSerializerError::Serialization(error) => Self::Serialization(error),
+            IndexeddbSerializerError::DomException { code, name, message } => {
+                Self::DomException { code, name, message }
+            }
+            IndexeddbSerializerError::CryptoStoreError(crypto_store_error) => {
+                Self::CryptoStoreError(crypto_store_error)
+            }
+        }
+    }
 }
 
 impl From<web_sys::DomException> for IndexeddbCryptoStoreError {
@@ -645,6 +666,18 @@ impl IndexeddbCryptoStore {
             }
         }
 
+        if !changes.received_room_key_bundles.is_empty() {
+            let mut bundle_store = indexeddb_changes.get(keys::RECEIVED_ROOM_KEY_BUNDLES);
+            for bundle in &changes.received_room_key_bundles {
+                let key = self.serializer.encode_key(
+                    keys::RECEIVED_ROOM_KEY_BUNDLES,
+                    (&bundle.bundle_data.room_id, &bundle.sender_user),
+                );
+                let value = self.serializer.serialize_value(&bundle)?;
+                bundle_store.put(key, value);
+            }
+        }
+
         Ok(indexeddb_changes)
     }
 }
@@ -657,7 +690,7 @@ impl IndexeddbCryptoStore {
 // this hack allows us to still have most of rust-analyzer's IDE functionality
 // within the impl block without having to set it up to check things against
 // the wasm target (which would disable many other parts of the codebase).
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 macro_rules! impl_crypto_store {
     ( $($body:tt)* ) => {
         #[async_trait(?Send)]
@@ -669,7 +702,7 @@ macro_rules! impl_crypto_store {
     };
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 macro_rules! impl_crypto_store {
     ( $($body:tt)* ) => {
         impl IndexeddbCryptoStore {
@@ -1079,7 +1112,7 @@ impl_crypto_store! {
                 idb_object.needs_backup = false;
                 object_store.put_key_val(&key, &serde_wasm_bindgen::to_value(&idb_object)?)?;
             } else {
-                warn!("Could not find inbound group session to mark it as backed up. key={:?}", key);
+                warn!(?key, "Could not find inbound group session to mark it as backed up.");
             }
         }
 
@@ -1141,7 +1174,7 @@ impl_crypto_store! {
             .object_store(keys::DEVICES)?
             .get(&key)?
             .await?
-            .map(|i| self.serializer.deserialize_value(i))
+            .map(|i| self.serializer.deserialize_value(i).map_err(Into::into))
             .transpose()
     }
 
@@ -1178,7 +1211,7 @@ impl_crypto_store! {
             .object_store(keys::IDENTITIES)?
             .get(&self.serializer.encode_key(keys::IDENTITIES, user_id))?
             .await?
-            .map(|i| self.serializer.deserialize_value(i))
+            .map(|i| self.serializer.deserialize_value(i).map_err(Into::into))
             .transpose()
     }
 
@@ -1355,8 +1388,22 @@ impl_crypto_store! {
             .object_store(keys::ROOM_SETTINGS)?
             .get(&key)?
             .await?
-            .map(|v| self.serializer.deserialize_value(v))
+            .map(|v| self.serializer.deserialize_value(v).map_err(Into::into))
             .transpose()
+    }
+
+    async fn get_received_room_key_bundle_data(&self, room_id: &RoomId, user_id: &UserId) -> Result<Option<StoredRoomKeyBundleData>> {
+        let key = self.serializer.encode_key(keys::RECEIVED_ROOM_KEY_BUNDLES, (room_id, user_id));
+        let result = self
+            .inner
+            .transaction_on_one_with_mode(keys::RECEIVED_ROOM_KEY_BUNDLES, IdbTransactionMode::Readonly)?
+            .object_store(keys::RECEIVED_ROOM_KEY_BUNDLES)?
+            .get(&key)?
+            .await?
+            .map(|v| self.serializer.deserialize_value(v))
+            .transpose()?;
+
+        Ok(result)
     }
 
     async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -1366,7 +1413,7 @@ impl_crypto_store! {
             .object_store(keys::CORE)?
             .get(&JsValue::from_str(key))?
             .await?
-            .map(|v| self.serializer.deserialize_value(v))
+            .map(|v| self.serializer.deserialize_value(v).map_err(Into::into))
             .transpose()
     }
 
@@ -1537,7 +1584,9 @@ async fn import_store_cipher_with_key(
             // Loading the cipher with the passphrase was successful. Let's update the
             // stored version of the cipher so that it is encrypted with a key,
             // to save doing this again.
-            debug!("IndexedDbCryptoStore: Migrating passphrase-encrypted store cipher to key-encryption");
+            debug!(
+                "IndexedDbCryptoStore: Migrating passphrase-encrypted store cipher to key-encryption"
+            );
 
             let export = cipher.export_with_key(chacha_key).map_err(CryptoStoreError::backend)?;
             save_store_cipher(db, &export).await?;
@@ -1763,7 +1812,7 @@ mod unit_tests {
     use ruma::{device_id, room_id, user_id};
 
     use super::InboundGroupSessionIndexedDbObject;
-    use crate::crypto_store::indexeddb_serializer::{IndexeddbSerializer, MaybeEncrypted};
+    use crate::serializer::{IndexeddbSerializer, MaybeEncrypted};
 
     #[test]
     fn needs_backup_is_serialized_as_a_u8_in_json() {
@@ -1847,7 +1896,7 @@ mod unit_tests {
     }
 }
 
-#[cfg(all(test, target_arch = "wasm32"))]
+#[cfg(all(test, target_family = "wasm"))]
 mod wasm_unit_tests {
     use std::collections::BTreeMap;
 
@@ -1911,7 +1960,7 @@ mod wasm_unit_tests {
     }
 }
 
-#[cfg(all(test, target_arch = "wasm32"))]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use matrix_sdk_crypto::cryptostore_integration_tests;
 
@@ -1940,12 +1989,12 @@ mod tests {
     cryptostore_integration_tests!();
 }
 
-#[cfg(all(test, target_arch = "wasm32"))]
+#[cfg(all(test, target_family = "wasm"))]
 mod encrypted_tests {
     use matrix_sdk_crypto::{
         cryptostore_integration_tests,
         olm::Account,
-        store::{CryptoStore, PendingChanges},
+        store::{types::PendingChanges, CryptoStore},
         vodozemac::base64_encode,
     };
     use matrix_sdk_test::async_test;

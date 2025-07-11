@@ -30,8 +30,8 @@ use matrix_sdk::{
     config::RequestConfig,
     crypto::OlmMachine,
     deserialized_responses::{EncryptionInfo, TimelineEvent},
-    event_cache::paginator::{PaginableRoom, PaginatorError},
-    room::{EventWithContextResponse, Messages, MessagesOptions},
+    paginators::{thread::PaginableThread, PaginableRoom, PaginatorError},
+    room::{EventWithContextResponse, Messages, MessagesOptions, PushContext, Relations},
     send_queue::RoomSendQueueUpdate,
     BoxFuture,
 };
@@ -58,9 +58,8 @@ use tokio::sync::RwLock;
 
 use super::{
     algorithms::rfind_event_by_item_id, controller::TimelineSettings,
-    event_handler::TimelineEventKind, event_item::RemoteEventOrigin, traits::RoomDataProvider,
-    EventTimelineItem, Profile, TimelineController, TimelineEventItemId, TimelineFocus,
-    TimelineItem,
+    event_item::RemoteEventOrigin, traits::RoomDataProvider, EventTimelineItem, Profile,
+    TimelineController, TimelineEventItemId, TimelineFocus, TimelineItem,
 };
 use crate::{
     timeline::pinned_events_loader::PinnedEventsRoom, unable_to_decrypt_hook::UtdHookManager,
@@ -122,16 +121,14 @@ impl TestTimelineBuilder {
     }
 
     fn build(self) -> TestTimeline {
-        let mut controller = TimelineController::new(
+        let controller = TimelineController::new(
             self.provider.unwrap_or_default(),
-            TimelineFocus::Live,
+            TimelineFocus::Live { hide_threaded_events: false },
             self.internal_id_prefix,
             self.utd_hook,
             self.is_room_encrypted,
+            self.settings.unwrap_or_default(),
         );
-        if let Some(settings) = self.settings {
-            controller = controller.with_settings(settings);
-        }
         TestTimeline { controller, factory: EventFactory::new() }
     }
 }
@@ -182,18 +179,12 @@ impl TestTimeline {
 
     async fn handle_local_event(&self, content: AnyMessageLikeEventContent) -> OwnedTransactionId {
         let txn_id = TransactionId::new();
-        self.controller
-            .handle_local_event(
-                txn_id.clone(),
-                TimelineEventKind::Message { content, relations: Default::default() },
-                None,
-            )
-            .await;
+        self.controller.handle_local_event(txn_id.clone(), content, None).await;
         txn_id
     }
 
     async fn handle_back_paginated_event(&self, event: Raw<AnyTimelineEvent>) {
-        let timeline_event = TimelineEvent::new(event.cast());
+        let timeline_event = TimelineEvent::from_plaintext(event.cast());
         self.controller
             .handle_remote_events_with_diffs(
                 vec![VectorDiff::PushFront { value: timeline_event }],
@@ -210,7 +201,7 @@ impl TestTimeline {
         for (event_id, tyype, user_id, thread) in receipts {
             read_receipt = read_receipt.add(&event_id, &user_id, tyype, thread);
         }
-        let ev_content = read_receipt.build();
+        let ev_content = read_receipt.into_content();
         self.controller.handle_read_receipts(ev_content).await;
     }
 
@@ -271,7 +262,7 @@ struct TestRoomDataProvider {
 
     /// The [`EncryptionInfo`] describing the Megolm sessions that were used to
     /// encrypt events.
-    pub encryption_info: HashMap<String, EncryptionInfo>,
+    pub encryption_info: HashMap<String, Arc<EncryptionInfo>>,
 }
 
 impl TestRoomDataProvider {
@@ -279,6 +270,7 @@ impl TestRoomDataProvider {
         self.initial_user_receipts = initial_user_receipts;
         self
     }
+
     fn with_fully_read_marker(mut self, event_id: OwnedEventId) -> Self {
         self.fully_read_marker = Some(event_id);
         self
@@ -287,7 +279,7 @@ impl TestRoomDataProvider {
     fn with_encryption_info(
         mut self,
         session_id: &str,
-        encryption_info: EncryptionInfo,
+        encryption_info: Arc<EncryptionInfo>,
     ) -> TestRoomDataProvider {
         self.encryption_info.insert(session_id.to_owned(), encryption_info);
         self
@@ -309,13 +301,30 @@ impl PaginableRoom for TestRoomDataProvider {
     }
 }
 
+impl PaginableThread for TestRoomDataProvider {
+    async fn relations(
+        &self,
+        _thread_root: OwnedEventId,
+        _opts: matrix_sdk::room::RelationsOptions,
+    ) -> Result<Relations, matrix_sdk::Error> {
+        unimplemented!();
+    }
+
+    async fn load_event(
+        &self,
+        _event_id: &OwnedEventId,
+    ) -> Result<TimelineEvent, matrix_sdk::Error> {
+        unimplemented!();
+    }
+}
+
 impl PinnedEventsRoom for TestRoomDataProvider {
     fn load_event_with_relations<'a>(
         &'a self,
         _event_id: &'a EventId,
         _request_config: Option<RequestConfig>,
         _related_event_filters: Option<Vec<RelationType>>,
-    ) -> BoxFuture<'a, Result<(TimelineEvent, Vec<TimelineEvent>), PaginatorError>> {
+    ) -> BoxFuture<'a, Result<(TimelineEvent, Vec<TimelineEvent>), matrix_sdk::Error>> {
         unimplemented!();
     }
 
@@ -387,22 +396,21 @@ impl RoomDataProvider for TestRoomDataProvider {
         map
     }
 
-    async fn push_rules_and_context(&self) -> Option<(Ruleset, PushConditionRoomCtx)> {
+    async fn push_context(&self) -> Option<PushContext> {
         let push_rules = Ruleset::server_default(&ALICE);
         let power_levels = PushConditionPowerLevelsCtx {
             users: BTreeMap::new(),
             users_default: int!(0),
             notifications: NotificationPowerLevels::new(),
         };
-        let push_context = PushConditionRoomCtx {
+        let push_condition_room_ctx = PushConditionRoomCtx {
             room_id: room_id!("!my_room:server.name").to_owned(),
             member_count: uint!(2),
             user_id: ALICE.to_owned(),
             user_display_name: "Alice".to_owned(),
             power_levels: Some(power_levels),
         };
-
-        Some((push_rules, push_context))
+        Some(PushContext::new(push_condition_room_ctx, push_rules))
     }
 
     async fn load_fully_read_marker(&self) -> Option<OwnedEventId> {
@@ -433,7 +441,11 @@ impl RoomDataProvider for TestRoomDataProvider {
         &self,
         session_id: &str,
         _sender: &UserId,
-    ) -> Option<EncryptionInfo> {
+    ) -> Option<Arc<EncryptionInfo>> {
         self.encryption_info.get(session_id).cloned()
+    }
+
+    async fn load_event<'a>(&'a self, _event_id: &'a EventId) -> matrix_sdk::Result<TimelineEvent> {
+        unimplemented!();
     }
 }

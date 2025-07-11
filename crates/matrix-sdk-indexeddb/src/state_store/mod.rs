@@ -26,10 +26,11 @@ use matrix_sdk_base::{
     deserialized_responses::{DisplayName, RawAnySyncOrStrippedState},
     store::{
         ChildTransactionId, ComposerDraft, DependentQueuedRequest, DependentQueuedRequestKind,
-        QueuedRequest, QueuedRequestKind, SentRequestKey, SerializableEventContent,
-        ServerCapabilities, StateChanges, StateStore, StoreError,
+        QueuedRequest, QueuedRequestKind, RoomLoadSettings, SentRequestKey,
+        SerializableEventContent, ServerInfo, StateChanges, StateStore, StoreError,
     },
     MinimalRoomMemberEvent, RoomInfo, RoomMemberships, StateStoreDataKey, StateStoreDataValue,
+    ROOM_VERSION_FALLBACK,
 };
 use matrix_sdk_store_encryption::{Error as EncryptionError, StoreCipher};
 use ruma::{
@@ -45,7 +46,7 @@ use ruma::{
     },
     serde::Raw,
     CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri,
-    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UserId,
+    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -68,7 +69,10 @@ pub enum IndexeddbStateStoreError {
     DomException { name: String, message: String, code: u16 },
     #[error(transparent)]
     StoreError(#[from] StoreError),
-    #[error("Can't migrate {name} from {old_version} to {new_version} without deleting data. See MigrationConflictStrategy for ways to configure.")]
+    #[error(
+        "Can't migrate {name} from {old_version} to {new_version} without deleting data. \
+         See MigrationConflictStrategy for ways to configure."
+    )]
     MigrationConflict { name: String, old_version: u32, new_version: u32 },
 }
 
@@ -400,10 +404,9 @@ impl IndexeddbStateStore {
             StateStoreDataKey::SyncToken => {
                 self.encode_key(StateStoreDataKey::SYNC_TOKEN, StateStoreDataKey::SYNC_TOKEN)
             }
-            StateStoreDataKey::ServerCapabilities => self.encode_key(
-                StateStoreDataKey::SERVER_CAPABILITIES,
-                StateStoreDataKey::SERVER_CAPABILITIES,
-            ),
+            StateStoreDataKey::ServerInfo => {
+                self.encode_key(StateStoreDataKey::SERVER_INFO, StateStoreDataKey::SERVER_INFO)
+            }
             StateStoreDataKey::Filter(filter_name) => {
                 self.encode_key(StateStoreDataKey::FILTER, (StateStoreDataKey::FILTER, filter_name))
             }
@@ -416,8 +419,15 @@ impl IndexeddbStateStore {
             StateStoreDataKey::UtdHookManagerData => {
                 self.encode_key(keys::KV, StateStoreDataKey::UTD_HOOK_MANAGER_DATA)
             }
-            StateStoreDataKey::ComposerDraft(room_id) => {
-                self.encode_key(keys::KV, (StateStoreDataKey::COMPOSER_DRAFT, room_id))
+            StateStoreDataKey::ComposerDraft(room_id, thread_root) => {
+                if let Some(thread_root) = thread_root {
+                    self.encode_key(
+                        keys::KV,
+                        (StateStoreDataKey::COMPOSER_DRAFT, (room_id, thread_root)),
+                    )
+                } else {
+                    self.encode_key(keys::KV, (StateStoreDataKey::COMPOSER_DRAFT, room_id))
+                }
             }
             StateStoreDataKey::SeenKnockRequests(room_id) => {
                 self.encode_key(keys::KV, (StateStoreDataKey::SEEN_KNOCK_REQUESTS, room_id))
@@ -493,7 +503,7 @@ impl PersistedQueuedRequest {
 // this hack allows us to still have most of rust-analyzer's IDE functionality
 // within the impl block without having to set it up to check things against
 // the wasm target (which would disable many other parts of the codebase).
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 macro_rules! impl_state_store {
     ({ $($body:tt)* }) => {
         #[async_trait(?Send)]
@@ -505,7 +515,7 @@ macro_rules! impl_state_store {
     };
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 macro_rules! impl_state_store {
     ({ $($body:tt)* }) => {
         impl IndexeddbStateStore {
@@ -530,10 +540,10 @@ impl_state_store!({
                 .map(|f| self.deserialize_value::<String>(&f))
                 .transpose()?
                 .map(StateStoreDataValue::SyncToken),
-            StateStoreDataKey::ServerCapabilities => value
-                .map(|f| self.deserialize_value::<ServerCapabilities>(&f))
+            StateStoreDataKey::ServerInfo => value
+                .map(|f| self.deserialize_value::<ServerInfo>(&f))
                 .transpose()?
-                .map(StateStoreDataValue::ServerCapabilities),
+                .map(StateStoreDataValue::ServerInfo),
             StateStoreDataKey::Filter(_) => value
                 .map(|f| self.deserialize_value::<String>(&f))
                 .transpose()?
@@ -550,7 +560,7 @@ impl_state_store!({
                 .map(|f| self.deserialize_value::<GrowableBloom>(&f))
                 .transpose()?
                 .map(StateStoreDataValue::UtdHookManagerData),
-            StateStoreDataKey::ComposerDraft(_) => value
+            StateStoreDataKey::ComposerDraft(_, _) => value
                 .map(|f| self.deserialize_value::<ComposerDraft>(&f))
                 .transpose()?
                 .map(StateStoreDataValue::ComposerDraft),
@@ -573,10 +583,8 @@ impl_state_store!({
         let serialized_value = match key {
             StateStoreDataKey::SyncToken => self
                 .serialize_value(&value.into_sync_token().expect("Session data not a sync token")),
-            StateStoreDataKey::ServerCapabilities => self.serialize_value(
-                &value
-                    .into_server_capabilities()
-                    .expect("Session data not containing server capabilities"),
+            StateStoreDataKey::ServerInfo => self.serialize_value(
+                &value.into_server_info().expect("Session data not containing server info"),
             ),
             StateStoreDataKey::Filter(_) => {
                 self.serialize_value(&value.into_filter().expect("Session data not a filter"))
@@ -592,7 +600,7 @@ impl_state_store!({
             StateStoreDataKey::UtdHookManagerData => self.serialize_value(
                 &value.into_utd_hook_manager_data().expect("Session data not UtdHookManagerData"),
             ),
-            StateStoreDataKey::ComposerDraft(_) => self.serialize_value(
+            StateStoreDataKey::ComposerDraft(_, _) => self.serialize_value(
                 &value.into_composer_draft().expect("Session data not a composer draft"),
             ),
             StateStoreDataKey::SeenKnockRequests(_) => self.serialize_value(
@@ -922,10 +930,10 @@ impl_state_store!({
                                         .get(&self.encode_key(keys::ROOM_INFOS, room_id))?
                                         .await?
                                         .and_then(|f| self.deserialize_value::<RoomInfo>(&f).ok())
-                                        .and_then(|info| info.room_version().cloned())
+                                        .map(|info| info.room_version_or_default())
                                         .unwrap_or_else(|| {
-                                            warn!(?room_id, "Unable to find the room version, assume version 9");
-                                            RoomVersionId::V9
+                                            warn!(?room_id, "Unable to find the room version, assuming {ROOM_VERSION_FALLBACK}");
+                                            ROOM_VERSION_FALLBACK
                                         })
                                     );
                                 }
@@ -1139,18 +1147,28 @@ impl_state_store!({
         Ok(profiles)
     }
 
-    async fn get_room_infos(&self) -> Result<Vec<RoomInfo>> {
-        let entries: Vec<_> = self
+    async fn get_room_infos(&self, room_load_settings: &RoomLoadSettings) -> Result<Vec<RoomInfo>> {
+        let transaction = self
             .inner
-            .transaction_on_one_with_mode(keys::ROOM_INFOS, IdbTransactionMode::Readonly)?
-            .object_store(keys::ROOM_INFOS)?
-            .get_all()?
-            .await?
-            .iter()
-            .filter_map(|f| self.deserialize_value::<RoomInfo>(&f).ok())
-            .collect();
+            .transaction_on_one_with_mode(keys::ROOM_INFOS, IdbTransactionMode::Readonly)?;
 
-        Ok(entries)
+        let object_store = transaction.object_store(keys::ROOM_INFOS)?;
+
+        Ok(match room_load_settings {
+            RoomLoadSettings::All => object_store
+                .get_all()?
+                .await?
+                .iter()
+                .map(|room_info| self.deserialize_value::<RoomInfo>(&room_info))
+                .collect::<Result<_>>()?,
+
+            RoomLoadSettings::One(room_id) => {
+                match object_store.get(&self.encode_key(keys::ROOM_INFOS, room_id))?.await? {
+                    Some(room_info) => vec![self.deserialize_value::<RoomInfo>(&room_info)?],
+                    None => vec![],
+                }
+            }
+        })
     }
 
     async fn get_users_with_display_name(
@@ -1840,9 +1858,9 @@ mod migration_tests {
     }
 }
 
-#[cfg(all(test, target_arch = "wasm32"))]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use matrix_sdk_base::statestore_integration_tests;
@@ -1858,9 +1876,9 @@ mod tests {
     statestore_integration_tests!();
 }
 
-#[cfg(all(test, target_arch = "wasm32"))]
+#[cfg(all(test, target_family = "wasm"))]
 mod encrypted_tests {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(target_family = "wasm")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 
     use matrix_sdk_base::statestore_integration_tests;

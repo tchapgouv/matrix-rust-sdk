@@ -7,7 +7,7 @@ use crate::{
     client::JoinRule,
     error::ClientError,
     room::{Membership, RoomHero},
-    room_member::RoomMember,
+    room_member::{RoomMember, RoomMemberWithSenderInfo},
     utils::AsyncRuntimeDropped,
 };
 
@@ -37,8 +37,9 @@ impl RoomPreview {
             membership: info.state.map(|state| state.into()),
             join_rule: info
                 .join_rule
-                .clone()
-                .try_into()
+                .as_ref()
+                .map(TryInto::try_into)
+                .transpose()
                 .map_err(|_| anyhow::anyhow!("unhandled SpaceRoomJoinRule kind"))?,
             is_direct: info.is_direct,
             heroes: info
@@ -59,15 +60,7 @@ impl RoomPreview {
         let room =
             self.client.get_room(&self.inner.room_id).context("missing room for a room preview")?;
 
-        let should_forget = matches!(room.state(), matrix_sdk::RoomState::Invited);
-
-        room.leave().await.map_err(ClientError::from)?;
-
-        if should_forget {
-            _ = self.forget().await;
-        }
-
-        Ok(())
+        Ok(room.leave().await?)
     }
 
     /// Get the user who created the invite, if any.
@@ -86,30 +79,10 @@ impl RoomPreview {
     }
 
     /// Get the membership details for the current user.
-    pub async fn own_membership_details(&self) -> Option<RoomMembershipDetails> {
+    pub async fn own_membership_details(&self) -> Option<RoomMemberWithSenderInfo> {
         let room = self.client.get_room(&self.inner.room_id)?;
-
-        let (own_member, sender_member) = match room.own_membership_details().await {
-            Ok(memberships) => memberships,
-            Err(error) => {
-                warn!("Couldn't get membership info: {error}");
-                return None;
-            }
-        };
-
-        Some(RoomMembershipDetails {
-            own_room_member: own_member.try_into().ok()?,
-            sender_room_member: sender_member.and_then(|member| member.try_into().ok()),
-        })
+        room.member_with_sender_info(self.client.user_id()?).await.ok()?.try_into().ok()
     }
-}
-
-/// Contains the current user's room member info and the optional room member
-/// info of the sender of the `m.room.member` event that this info represents.
-#[derive(uniffi::Record)]
-pub struct RoomMembershipDetails {
-    pub own_room_member: RoomMember,
-    pub sender_room_member: Option<RoomMember>,
 }
 
 impl RoomPreview {
@@ -142,17 +115,17 @@ pub struct RoomPreviewInfo {
     /// The membership state for the current user, if known.
     pub membership: Option<Membership>,
     /// The join rule for this room (private, public, knock, etc.).
-    pub join_rule: JoinRule,
+    pub join_rule: Option<JoinRule>,
     /// Whether the room is direct or not, if known.
     pub is_direct: Option<bool>,
     /// Room heroes.
     pub heroes: Option<Vec<RoomHero>>,
 }
 
-impl TryFrom<SpaceRoomJoinRule> for JoinRule {
+impl TryFrom<&SpaceRoomJoinRule> for JoinRule {
     type Error = ();
 
-    fn try_from(join_rule: SpaceRoomJoinRule) -> Result<Self, ()> {
+    fn try_from(join_rule: &SpaceRoomJoinRule) -> Result<Self, ()> {
         Ok(match join_rule {
             SpaceRoomJoinRule::Invite => JoinRule::Invite,
             SpaceRoomJoinRule::Knock => JoinRule::Knock,

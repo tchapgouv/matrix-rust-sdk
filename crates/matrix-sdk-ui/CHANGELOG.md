@@ -6,9 +6,61 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- Add `NotificationItem::room_topic` to the `NotificationItem` struct, which
+  contains the topic of the room. This is useful for displaying the room topic
+  in notifications. ([#5300](https://github.com/matrix-org/matrix-rust-sdk/pull/5300))
+- Add `EmbeddedEvent::timestamp` and `EmbeddedEvent::identifier` which are already
+  available in regular timeline items. ([#5331](https://github.com/matrix-org/matrix-rust-sdk/pull/5331))
+
+## [0.12.0] - 2025-06-10
+
+### Refactor
+
+- [**breaking**] [`TimelineItemContent::reactions()`] returns an `Option<&ReactionsByKeyBySender>`
+  instead of `ReactionsByKeyBySender`. This reflects the fact that some timeline items cannot hold
+  reactions at all.
+- `NotificationItem::room_join_rule` is now optional to reflect that the join rule
+  state event might be missing, in which case it will be set to `None`. The
+  `NotificationItem::is_public` field has been replaced with a method that returns an `Option<bool>`, based on the same logic.
+  ([#5278](https://github.com/matrix-org/matrix-rust-sdk/pull/5278))
+
+### Bug Fixes
+
+- Introduce `Timeline` regions, which helps to remove a class of bugs in the
+  `Timeline` where items could be inserted in the wrong _regions_, such as
+  a remote timeline item before the `TimelineStart` virtual timeline item.
+  ([#5000](https://github.com/matrix-org/matrix-rust-sdk/pull/5000))
+- `NotificationClient` will filter out events sent by ignored users on `get_notification` and `get_notifications`. ([#5081](https://github.com/matrix-org/matrix-rust-sdk/pull/5081))
+
+### Features
+
+- `Timeline::send_single_receipt()` and `Timeline::send_multiple_receipts()` now also unset the
+  unread flag of the room if an unthreaded read receipt is sent.
+  ([#5055](https://github.com/matrix-org/matrix-rust-sdk/pull/5055))
+- `Timeline::mark_as_read()` unsets the unread flag of the room if it was set.
+  ([#5055](https://github.com/matrix-org/matrix-rust-sdk/pull/5055))
+- Add new method `Timeline::send_gallery` to allow sending MSC4274-style
+  galleries.
+  ([#5125](https://github.com/matrix-org/matrix-rust-sdk/pull/5125))
+
+## [0.11.0] - 2025-04-11
+
 ### Bug Fixes
 
 ### Features
+
+- [**breaking**] Optionally allow starting threads with `Timeline::send_reply`.
+  ([#4819](https://github.com/matrix-org/matrix-rust-sdk/pull/4819))
+- [**breaking**] Push `RepliedToInfo`, `ReplyContent`, `EnforceThread` and
+  `UnsupportedReplyItem` (becoming `ReplyError`) down into matrix_sdk.
+  [`Timeline::send_reply()`] now takes an event ID rather than a `RepliedToInfo`.
+  `Timeline::replied_to_info_from_event_id` has been made private in `matrix_sdk`.
+  ([#4842](https://github.com/matrix-org/matrix-rust-sdk/pull/4842))
+- Allow sending media as (thread) replies. The reply behaviour can be configured
+  through new fields on [`AttachmentConfig`].
+  ([#4852](https://github.com/matrix-org/matrix-rust-sdk/pull/4852))
 
 ### Refactor
 
@@ -17,6 +69,9 @@ All notable changes to this project will be documented in this file.
   from an [`EventTimelineItem`] by calling `.content().reactions()`. They're also returned by
   ownership (cloned) instead of by reference.
   ([#4576](https://github.com/matrix-org/matrix-rust-sdk/pull/4576))
+- [**breaking**] The parameters `event_id` and `enforce_thread` on [`Timeline::send_reply()`]
+  have been wrapped in a `reply` struct parameter.
+  ([#4880](https://github.com/matrix-org/matrix-rust-sdk/pull/4880/))
 
 ## [0.10.0] - 2025-02-04
 

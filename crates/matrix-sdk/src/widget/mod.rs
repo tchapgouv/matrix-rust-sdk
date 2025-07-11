@@ -12,14 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Widget API implementation.
+#![allow(rustdoc::private_intra_doc_links)]
+#![doc = include_str!("README.md")]
 
 use std::{fmt, time::Duration};
 
 use async_channel::{Receiver, Sender};
+use futures_util::StreamExt;
+use matrix_sdk_common::executor::spawn;
 use ruma::api::client::delayed_events::DelayParameters;
 use serde::de::{self, Deserialize, Deserializer, Visitor};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use self::{
@@ -39,7 +43,7 @@ mod settings;
 
 pub use self::{
     capabilities::{Capabilities, CapabilitiesProvider},
-    filter::{EventFilter, MessageLikeEventFilter, StateEventFilter},
+    filter::{Filter, MessageLikeEventFilter, StateEventFilter, ToDeviceEventFilter},
     settings::{
         ClientProperties, EncryptionSystem, Intent, VirtualElementCallWidgetOptions, WidgetSettings,
     },
@@ -136,12 +140,18 @@ impl WidgetDriver {
         // - all incoming messages from the widget
         // - all responses from the Matrix driver
         // - all events from the Matrix driver, if subscribed
-        let (incoming_msg_tx, mut incoming_msg_rx) = unbounded_channel();
+        let (incoming_msg_tx, incoming_msg_rx) = unbounded_channel();
 
         // Forward all of the incoming messages from the widget.
-        tokio::spawn({
+        // TODO: This spawns a detached task, it would be nice to have an owner for this
+        // task. One way to achieve this if `WidgetDriver::run()` returns a handle that
+        // we can drop which will clean up the task and the channels. It's not too bad,
+        // since canelling `run()` will drop the sender this task listens which finishes
+        // the task.
+        spawn({
             let incoming_msg_tx = incoming_msg_tx.clone();
             let from_widget_rx = self.from_widget_rx.clone();
+
             async move {
                 while let Ok(msg) = from_widget_rx.recv().await {
                     let _ = incoming_msg_tx.send(IncomingMessage::WidgetMessage(msg));
@@ -149,7 +159,9 @@ impl WidgetDriver {
             }
         });
 
-        // Create widget API machine.
+        // Create the widget API machine. The widget machine will process messages it
+        // receives from the widget and convert it into actions the `MatrixDriver` will
+        // then execute on.
         let (mut widget_machine, initial_actions) = WidgetMachine::new(
             self.settings.widget_id().to_owned(),
             room.room_id().to_owned(),
@@ -158,23 +170,17 @@ impl WidgetDriver {
 
         let matrix_driver = MatrixDriver::new(room.clone());
 
-        // Process initial actions that "initialise" the widget api machine.
-        for action in initial_actions {
+        // Convert the incoming message receiver into a stream of actions.
+        let stream = UnboundedReceiverStream::new(incoming_msg_rx)
+            .flat_map(|message| tokio_stream::iter(widget_machine.process(message)));
+
+        // Let's combine our set of initial actions with the stream of received actions.
+        let mut combined = tokio_stream::iter(initial_actions).chain(stream);
+
+        // Let's now process all actions we receive forever.
+        while let Some(action) = combined.next().await {
             self.process_action(&matrix_driver, &incoming_msg_tx, &capabilities_provider, action)
                 .await?;
-        }
-
-        // Process incoming messages as they're coming in.
-        while let Some(msg) = incoming_msg_rx.recv().await {
-            for action in widget_machine.process(msg) {
-                self.process_action(
-                    &matrix_driver,
-                    &incoming_msg_tx,
-                    &capabilities_provider,
-                    action,
-                )
-                .await?;
-            }
         }
 
         Ok(())
@@ -206,17 +212,17 @@ impl WidgetDriver {
                         matrix_driver.get_open_id().await.map(MatrixDriverResponse::OpenIdReceived)
                     }
 
-                    MatrixDriverRequestData::ReadMessageLikeEvent(cmd) => matrix_driver
-                        .read_message_like_events(cmd.event_type.clone(), cmd.limit)
+                    MatrixDriverRequestData::ReadEvents(cmd) => matrix_driver
+                        .read_events(cmd.event_type.into(), cmd.state_key, cmd.limit)
                         .await
-                        .map(MatrixDriverResponse::MatrixEventRead),
+                        .map(MatrixDriverResponse::EventsRead),
 
-                    MatrixDriverRequestData::ReadStateEvent(cmd) => matrix_driver
-                        .read_state_events(cmd.event_type.clone(), &cmd.state_key)
+                    MatrixDriverRequestData::ReadState(cmd) => matrix_driver
+                        .read_state(cmd.event_type.into(), &cmd.state_key)
                         .await
-                        .map(MatrixDriverResponse::MatrixEventRead),
+                        .map(MatrixDriverResponse::StateRead),
 
-                    MatrixDriverRequestData::SendMatrixEvent(req) => {
+                    MatrixDriverRequestData::SendEvent(req) => {
                         let SendEventRequest { event_type, state_key, content, delay } = req;
                         // The widget api action does not use the unstable prefix:
                         // `org.matrix.msc4140.delay` so we
@@ -226,18 +232,28 @@ impl WidgetDriver {
                             timeout: Duration::from_millis(d),
                         });
                         matrix_driver
-                            .send(event_type, state_key, content, delay_event_parameter)
+                            .send(event_type.into(), state_key, content, delay_event_parameter)
                             .await
-                            .map(MatrixDriverResponse::MatrixEventSent)
+                            .map(MatrixDriverResponse::EventSent)
                     }
 
                     MatrixDriverRequestData::UpdateDelayedEvent(req) => matrix_driver
                         .update_delayed_event(req.delay_id, req.action)
                         .await
-                        .map(MatrixDriverResponse::MatrixDelayedEventUpdate),
+                        .map(MatrixDriverResponse::DelayedEventUpdated),
+
+                    MatrixDriverRequestData::SendToDeviceEvent(send_to_device_request) => {
+                        matrix_driver
+                            .send_to_device(
+                                send_to_device_request.event_type.into(),
+                                send_to_device_request.messages,
+                            )
+                            .await
+                            .map(MatrixDriverResponse::ToDeviceSent)
+                    }
                 };
 
-                // Forward the matrix driver response to the incoming message stream.
+                // Forward the Matrix driver response to the incoming message stream.
                 incoming_msg_tx
                     .send(IncomingMessage::MatrixDriverResponse { request_id, response })
                     .map_err(|_| ())?;
@@ -256,10 +272,12 @@ impl WidgetDriver {
 
                 self.event_forwarding_guard = Some(guard);
 
-                let mut matrix = matrix_driver.events();
+                let mut events = matrix_driver.events();
+                let mut state_updates = matrix_driver.state_updates();
+                let mut to_device_events = matrix_driver.to_device_events();
                 let incoming_msg_tx = incoming_msg_tx.clone();
 
-                tokio::spawn(async move {
+                spawn(async move {
                     loop {
                         tokio::select! {
                             _ = stop_forwarding.cancelled() => {
@@ -267,9 +285,19 @@ impl WidgetDriver {
                                 return;
                             }
 
-                            Some(event) = matrix.recv() => {
+                            Some(event) = events.recv() => {
                                 // Forward all events to the incoming messages stream.
                                 let _ = incoming_msg_tx.send(IncomingMessage::MatrixEventReceived(event));
+                            }
+
+                            Ok(state) = state_updates.recv() => {
+                                // Forward all state updates to the incoming messages stream.
+                                let _ = incoming_msg_tx.send(IncomingMessage::StateUpdateReceived(state));
+                            }
+
+                            Some(event) = to_device_events.recv() => {
+                                // Forward all events to the incoming messages stream.
+                                let _ = incoming_msg_tx.send(IncomingMessage::ToDeviceReceived(event));
                             }
                         }
                     }

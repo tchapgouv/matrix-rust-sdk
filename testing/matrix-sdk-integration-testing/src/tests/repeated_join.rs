@@ -10,6 +10,7 @@ use matrix_sdk::{
     },
     Client, Room, RoomMemberships, RoomState, StateStoreExt,
 };
+use matrix_sdk_common::executor::spawn;
 use tokio::sync::Notify;
 
 use crate::helpers::TestClientBuilder;
@@ -31,7 +32,7 @@ async fn test_repeated_join_leave() -> Result<()> {
     // Sync after 1 second to so that create_room receives the event it is waiting
     // for.
     let peter_clone = peter.clone();
-    tokio::spawn(async move {
+    spawn(async move {
         tokio::time::sleep(Duration::from_secs(1)).await;
         peter_clone.sync_once(Default::default()).await
     });
@@ -44,7 +45,7 @@ async fn test_repeated_join_leave() -> Result<()> {
 
     // Continuously sync karl from now on.
     let karl_clone = karl.clone();
-    let join_handle = tokio::spawn(async move {
+    let join_handle = spawn(async move {
         karl_clone.sync(Default::default()).await.unwrap();
     });
     let invite_signal = Arc::new(Notify::new());
@@ -97,15 +98,15 @@ async fn test_repeated_join_leave() -> Result<()> {
 
     // Now check the underlying state store that it also has the correct information
     // (for when the client restarts).
-    let invited = karl.store().get_user_ids(room_id, RoomMemberships::INVITE).await?;
+    let invited = karl.state_store().get_user_ids(room_id, RoomMemberships::INVITE).await?;
     assert_eq!(invited.len(), 1);
     assert_eq!(invited[0], karl_id);
 
-    let joined = karl.store().get_user_ids(room_id, RoomMemberships::JOIN).await?;
+    let joined = karl.state_store().get_user_ids(room_id, RoomMemberships::JOIN).await?;
     assert!(!joined.contains(&karl_id));
 
     let event = karl
-        .store()
+        .state_store()
         .get_member_event(room_id, &karl_id)
         .await?
         .expect("member event should exist")

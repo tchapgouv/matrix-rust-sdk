@@ -18,6 +18,7 @@ use http::{
     header::{CONTENT_TYPE, ETAG, EXPIRES, IF_MATCH, IF_NONE_MATCH, LAST_MODIFIED},
     HeaderMap, HeaderName, Method, StatusCode,
 };
+use matrix_sdk_base::sleep;
 use ruma::api::{
     error::{FromHttpResponseError, HeaderDeserializationError, IntoHttpError, MatrixError},
     EndpointError,
@@ -39,12 +40,14 @@ type Etag = String;
 fn get_header(
     header_map: &HeaderMap,
     header_name: &HeaderName,
-) -> Result<String, FromHttpResponseError<RumaApiError>> {
+) -> Result<String, Box<FromHttpResponseError<RumaApiError>>> {
     let header = header_map
         .get(header_name)
-        .ok_or(HeaderDeserializationError::MissingHeader(ETAG.to_string()))?;
+        .ok_or(HeaderDeserializationError::MissingHeader(ETAG.to_string()))
+        .map_err(|error| Box::new(FromHttpResponseError::from(error)))?;
 
-    let header = header.to_str()?.to_owned();
+    let header =
+        header.to_str().map_err(|error| Box::new(FromHttpResponseError::from(error)))?.to_owned();
 
     Ok(header)
 }
@@ -216,7 +219,7 @@ impl RendezvousChannel {
             {
                 return Ok(message.body);
             } else if message.status_code == StatusCode::NOT_MODIFIED {
-                tokio::time::sleep(POLL_TIMEOUT).await;
+                sleep::sleep(POLL_TIMEOUT).await;
                 continue;
             } else {
                 let error = response_to_error(message.status_code, message.body);
@@ -282,7 +285,7 @@ impl RendezvousChannel {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod test {
     use matrix_sdk_test::async_test;
     use serde_json::json;

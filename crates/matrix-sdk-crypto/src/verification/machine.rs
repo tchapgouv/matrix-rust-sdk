@@ -155,11 +155,7 @@ impl VerificationMachine {
     }
 
     pub fn get_requests(&self, user_id: &UserId) -> Vec<VerificationRequest> {
-        self.requests
-            .read()
-            .get(user_id)
-            .map(|v| v.iter().map(|(_, value)| value.clone()).collect())
-            .unwrap_or_default()
+        self.requests.read().get(user_id).map(|v| v.values().cloned().collect()).unwrap_or_default()
     }
 
     /// Add a new `VerificationRequest` object to the cache.
@@ -204,7 +200,7 @@ impl VerificationMachine {
         self.verifications.get(user_id, flow_id)
     }
 
-    pub fn get_sas(&self, user_id: &UserId, flow_id: &str) -> Option<Sas> {
+    pub fn get_sas(&self, user_id: &UserId, flow_id: &str) -> Option<Box<Sas>> {
         self.verifications.get_sas(user_id, flow_id)
     }
 
@@ -257,17 +253,16 @@ impl VerificationMachine {
         requests.extend(self.verifications.garbage_collect());
 
         for request in requests {
-            if let Ok(OutgoingContent::ToDevice(AnyToDeviceEventContent::KeyVerificationCancel(
-                content,
-            ))) = request.clone().try_into()
-            {
-                let event = ToDeviceEvent { content, sender: self.own_user_id().to_owned() };
+            if let Ok(OutgoingContent::ToDevice(to_device)) = request.clone().try_into() {
+                if let AnyToDeviceEventContent::KeyVerificationCancel(content) = *to_device {
+                    let event = ToDeviceEvent { content, sender: self.own_user_id().to_owned() };
 
-                events.push(
-                    Raw::new(&event)
-                        .expect("Failed to serialize m.key_verification.cancel event")
-                        .cast(),
-                );
+                    events.push(
+                        Raw::new(&event)
+                            .expect("Failed to serialize m.key_verification.cancel event")
+                            .cast(),
+                    );
+                }
             }
 
             self.verifications.add_verification_request(request)
@@ -353,7 +348,7 @@ impl VerificationMachine {
                 };
 
                 if !Self::is_timestamp_valid(timestamp) {
-                    trace!(
+                    info!(
                         from_device = r.from_device().as_str(),
                         ?timestamp,
                         "The received verification request was too old or too far into the future",
@@ -372,7 +367,10 @@ impl VerificationMachine {
                 let Some(device_data) =
                     self.store.get_device(event.sender(), r.from_device()).await?
                 else {
-                    warn!("Could not retrieve the device data for the incoming verification request, ignoring it");
+                    warn!(
+                        "Could not retrieve the device data for the incoming verification request, \
+                         ignoring it"
+                    );
                     return Ok(());
                 };
 

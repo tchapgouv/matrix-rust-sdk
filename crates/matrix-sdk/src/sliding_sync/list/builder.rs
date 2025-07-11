@@ -34,7 +34,6 @@ struct SlidingSyncListCachedData {
 pub struct SlidingSyncListBuilder {
     sync_mode: SlidingSyncMode,
     required_state: Vec<(StateEventType, String)>,
-    include_heroes: Option<bool>,
     filters: Option<http::request::ListFilters>,
     timeline_limit: Bound,
     pub(crate) name: String,
@@ -46,7 +45,10 @@ pub struct SlidingSyncListBuilder {
     /// `FrozenSlidingSyncList`.
     reloaded_cached_data: Option<SlidingSyncListCachedData>,
 
+    #[cfg(not(target_family = "wasm"))]
     once_built: Arc<Box<dyn Fn(SlidingSyncList) -> SlidingSyncList + Send + Sync>>,
+    #[cfg(target_family = "wasm")]
+    once_built: Arc<Box<dyn Fn(SlidingSyncList) -> SlidingSyncList>>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -57,7 +59,6 @@ impl fmt::Debug for SlidingSyncListBuilder {
             .debug_struct("SlidingSyncListBuilder")
             .field("sync_mode", &self.sync_mode)
             .field("required_state", &self.required_state)
-            .field("include_heroes", &self.include_heroes)
             .field("filters", &self.filters)
             .field("timeline_limit", &self.timeline_limit)
             .field("name", &self.name)
@@ -73,7 +74,6 @@ impl SlidingSyncListBuilder {
                 (StateEventType::RoomEncryption, "".to_owned()),
                 (StateEventType::RoomTombstone, "".to_owned()),
             ],
-            include_heroes: None,
             filters: None,
             timeline_limit: 1,
             name: name.into(),
@@ -88,9 +88,24 @@ impl SlidingSyncListBuilder {
     /// If the list was cached, then the cached fields won't be available in
     /// this callback. Use the streams to get published versions of the
     /// cached fields, once they've been set.
+    #[cfg(not(target_family = "wasm"))]
     pub fn once_built<C>(mut self, callback: C) -> Self
     where
         C: Fn(SlidingSyncList) -> SlidingSyncList + Send + Sync + 'static,
+    {
+        self.once_built = Arc::new(Box::new(callback));
+        self
+    }
+
+    /// Runs a callback once the list has been built.
+    ///
+    /// If the list was cached, then the cached fields won't be available in
+    /// this callback. Use the streams to get published versions of the
+    /// cached fields, once they've been set.
+    #[cfg(target_family = "wasm")]
+    pub fn once_built<C>(mut self, callback: C) -> Self
+    where
+        C: Fn(SlidingSyncList) -> SlidingSyncList + 'static,
     {
         self.once_built = Arc::new(Box::new(callback));
         self
@@ -105,12 +120,6 @@ impl SlidingSyncListBuilder {
     /// Required states to return per room.
     pub fn required_state(mut self, value: Vec<(StateEventType, String)>) -> Self {
         self.required_state = value;
-        self
-    }
-
-    /// Include heroes.
-    pub fn include_heroes(mut self, value: Option<bool>) -> Self {
-        self.include_heroes = value;
         self
     }
 
@@ -145,7 +154,7 @@ impl SlidingSyncListBuilder {
         self.cache_policy = SlidingSyncListCachePolicy::Enabled;
 
         if let Some(frozen_list) =
-            restore_sliding_sync_list(client.store(), storage_key, &self.name).await?
+            restore_sliding_sync_list(client.state_store(), storage_key, &self.name).await?
         {
             assert!(
                 self.reloaded_cached_data.is_none(),
@@ -172,11 +181,7 @@ impl SlidingSyncListBuilder {
 
                 // From the builder
                 sticky: StdRwLock::new(SlidingSyncStickyManager::new(
-                    SlidingSyncListStickyParameters::new(
-                        self.required_state,
-                        self.include_heroes,
-                        self.filters,
-                    ),
+                    SlidingSyncListStickyParameters::new(self.required_state, self.filters),
                 )),
                 timeline_limit: StdRwLock::new(self.timeline_limit),
                 name: self.name,

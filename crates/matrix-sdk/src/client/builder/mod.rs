@@ -15,10 +15,16 @@
 
 mod homeserver_config;
 
+#[cfg(feature = "sqlite")]
+use std::path::Path;
 use std::{fmt, sync::Arc};
 
 use homeserver_config::*;
+#[cfg(feature = "e2e-encryption")]
+use matrix_sdk_base::crypto::DecryptionSettings;
 use matrix_sdk_base::{store::StoreConfig, BaseClient};
+#[cfg(feature = "sqlite")]
+use matrix_sdk_sqlite::SqliteStoreConfig;
 use ruma::{
     api::{error::FromHttpResponseError, MatrixVersion},
     OwnedServerName, ServerName,
@@ -28,18 +34,24 @@ use tokio::sync::{broadcast, Mutex, OnceCell};
 use tracing::{debug, field::debug, instrument, Span};
 
 use super::{Client, ClientInner};
-#[cfg(feature = "experimental-oidc")]
-use crate::authentication::oauth::OAuthCtx;
 #[cfg(feature = "e2e-encryption")]
 use crate::crypto::{CollectStrategy, TrustRequirement};
 #[cfg(feature = "e2e-encryption")]
 use crate::encryption::EncryptionSettings;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use crate::http_client::HttpSettings;
 use crate::{
-    authentication::AuthCtx, client::ClientServerCapabilities, config::RequestConfig,
-    error::RumaApiError, http_client::HttpClient, send_queue::SendQueueData,
-    sliding_sync::VersionBuilder as SlidingSyncVersionBuilder, HttpError, IdParseError,
+    authentication::{oauth::OAuthCtx, AuthCtx},
+    client::{
+        CachedValue::{Cached, NotSet},
+        ClientServerInfo,
+    },
+    config::RequestConfig,
+    error::RumaApiError,
+    http_client::HttpClient,
+    send_queue::SendQueueData,
+    sliding_sync::VersionBuilder as SlidingSyncVersionBuilder,
+    HttpError, IdParseError,
 };
 
 /// Builder that allows creating and configuring various parts of a [`Client`].
@@ -97,7 +109,9 @@ pub struct ClientBuilder {
     #[cfg(feature = "e2e-encryption")]
     room_key_recipient_strategy: CollectStrategy,
     #[cfg(feature = "e2e-encryption")]
-    decryption_trust_requirement: TrustRequirement,
+    decryption_settings: DecryptionSettings,
+    #[cfg(feature = "e2e-encryption")]
+    enable_share_history_on_invite: bool,
     cross_process_store_locks_holder_name: String,
 }
 
@@ -122,7 +136,11 @@ impl ClientBuilder {
             #[cfg(feature = "e2e-encryption")]
             room_key_recipient_strategy: Default::default(),
             #[cfg(feature = "e2e-encryption")]
-            decryption_trust_requirement: TrustRequirement::Untrusted,
+            decryption_settings: DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::Untrusted,
+            },
+            #[cfg(feature = "e2e-encryption")]
+            enable_share_history_on_invite: false,
             cross_process_store_locks_holder_name:
                 Self::DEFAULT_CROSS_PROCESS_STORE_LOCKS_HOLDER_NAME.to_owned(),
         }
@@ -199,35 +217,47 @@ impl ClientBuilder {
         self
     }
 
-    /// Set up the store configuration for a SQLite store.
+    /// Set up the store configuration for an SQLite store.
     #[cfg(feature = "sqlite")]
-    pub fn sqlite_store(
-        mut self,
-        path: impl AsRef<std::path::Path>,
-        passphrase: Option<&str>,
-    ) -> Self {
-        self.store_config = BuilderStoreConfig::Sqlite {
-            path: path.as_ref().to_owned(),
-            cache_path: None,
-            passphrase: passphrase.map(ToOwned::to_owned),
-        };
+    pub fn sqlite_store(mut self, path: impl AsRef<Path>, passphrase: Option<&str>) -> Self {
+        let sqlite_store_config = SqliteStoreConfig::new(path).passphrase(passphrase);
+        self.store_config =
+            BuilderStoreConfig::Sqlite { config: sqlite_store_config, cache_path: None };
+
         self
     }
 
-    /// Set up the store configuration for a SQLite store with cached data
+    /// Set up the store configuration for an SQLite store with cached data
     /// separated out from state/crypto data.
     #[cfg(feature = "sqlite")]
     pub fn sqlite_store_with_cache_path(
         mut self,
-        path: impl AsRef<std::path::Path>,
-        cache_path: impl AsRef<std::path::Path>,
+        path: impl AsRef<Path>,
+        cache_path: impl AsRef<Path>,
         passphrase: Option<&str>,
     ) -> Self {
+        let sqlite_store_config = SqliteStoreConfig::new(path).passphrase(passphrase);
         self.store_config = BuilderStoreConfig::Sqlite {
-            path: path.as_ref().to_owned(),
+            config: sqlite_store_config,
             cache_path: Some(cache_path.as_ref().to_owned()),
-            passphrase: passphrase.map(ToOwned::to_owned),
         };
+
+        self
+    }
+
+    /// Set up the store configuration for an SQLite store with a store config,
+    /// and with an optional cache data separated out from state/crypto data.
+    #[cfg(feature = "sqlite")]
+    pub fn sqlite_store_with_config_and_cache_path(
+        mut self,
+        config: SqliteStoreConfig,
+        cache_path: Option<impl AsRef<Path>>,
+    ) -> Self {
+        self.store_config = BuilderStoreConfig::Sqlite {
+            config,
+            cache_path: cache_path.map(|cache_path| cache_path.as_ref().to_owned()),
+        };
+
         self
     }
 
@@ -295,21 +325,21 @@ impl ClientBuilder {
     ///
     /// let client_config = Client::builder().proxy("http://localhost:8080");
     /// ```
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn proxy(mut self, proxy: impl AsRef<str>) -> Self {
         self.http_settings().proxy = Some(proxy.as_ref().to_owned());
         self
     }
 
     /// Disable SSL verification for the HTTP requests.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn disable_ssl_verification(mut self) -> Self {
         self.http_settings().disable_ssl_verification = true;
         self
     }
 
     /// Set a custom HTTP user agent for the client.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn user_agent(mut self, user_agent: impl AsRef<str>) -> Self {
         self.http_settings().user_agent = Some(user_agent.as_ref().to_owned());
         self
@@ -323,7 +353,7 @@ impl ClientBuilder {
     ///
     /// Internally this will call the
     /// [`reqwest::ClientBuilder::add_root_certificate()`] method.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn add_root_certificates(mut self, certificates: Vec<reqwest::Certificate>) -> Self {
         self.http_settings().additional_root_certificates = certificates;
         self
@@ -332,7 +362,7 @@ impl ClientBuilder {
     /// Don't trust any system root certificates, only trust the certificates
     /// provided through
     /// [`add_root_certificates`][ClientBuilder::add_root_certificates].
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn disable_built_in_root_certificates(mut self) -> Self {
         self.http_settings().disable_built_in_root_certificates = true;
         self
@@ -361,7 +391,7 @@ impl ClientBuilder {
         self
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     fn http_settings(&mut self) -> &mut HttpSettings {
         self.http_cfg.get_or_insert_with(Default::default).settings()
     }
@@ -417,11 +447,21 @@ impl ClientBuilder {
 
     /// Set the trust requirement to be used when decrypting events.
     #[cfg(feature = "e2e-encryption")]
-    pub fn with_decryption_trust_requirement(
+    pub fn with_decryption_settings(mut self, decryption_settings: DecryptionSettings) -> Self {
+        self.decryption_settings = decryption_settings;
+        self
+    }
+
+    /// Whether to enable the experimental support for sending and receiving
+    /// encrypted room history on invite, per [MSC4268].
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    #[cfg(feature = "e2e-encryption")]
+    pub fn with_enable_share_history_on_invite(
         mut self,
-        trust_requirement: TrustRequirement,
+        enable_share_history_on_invite: bool,
     ) -> Self {
-        self.decryption_trust_requirement = trust_requirement;
+        self.enable_share_history_on_invite = enable_share_history_on_invite;
         self
     }
 
@@ -458,9 +498,9 @@ impl ClientBuilder {
         let homeserver_cfg = self.homeserver_cfg.ok_or(ClientBuildError::MissingHomeserver)?;
         Span::current().record("homeserver", debug(&homeserver_cfg));
 
-        #[cfg_attr(target_arch = "wasm32", allow(clippy::infallible_destructuring_match))]
+        #[cfg_attr(target_family = "wasm", allow(clippy::infallible_destructuring_match))]
         let inner_http_client = match self.http_cfg.unwrap_or_default() {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             HttpConfig::Settings(mut settings) => {
                 settings.timeout = self.request_config.timeout;
                 settings.make_client()?
@@ -472,7 +512,7 @@ impl ClientBuilder {
             base_client
         } else {
             #[allow(unused_mut)]
-            let mut client = BaseClient::with_store_config(
+            let mut client = BaseClient::new(
                 build_store_config(self.store_config, &self.cross_process_store_locks_holder_name)
                     .await?,
             );
@@ -480,7 +520,7 @@ impl ClientBuilder {
             #[cfg(feature = "e2e-encryption")]
             {
                 client.room_key_recipient_strategy = self.room_key_recipient_strategy;
-                client.decryption_trust_requirement = self.decryption_trust_requirement;
+                client.decryption_settings = self.decryption_settings;
             }
 
             client
@@ -489,7 +529,7 @@ impl ClientBuilder {
         let http_client = HttpClient::new(inner_http_client.clone(), self.request_config);
 
         #[allow(unused_variables)]
-        let HomeserverDiscoveryResult { server, homeserver, supported_versions } =
+        let HomeserverDiscoveryResult { server, homeserver, supported_versions, well_known } =
             homeserver_cfg.discover(&http_client).await?;
 
         let sliding_sync_version = {
@@ -508,7 +548,6 @@ impl ClientBuilder {
             version
         };
 
-        #[cfg(feature = "experimental-oidc")]
         let allow_insecure_oauth = homeserver.scheme() == "http";
 
         let auth_ctx = Arc::new(AuthCtx {
@@ -519,19 +558,24 @@ impl ClientBuilder {
             tokens: OnceCell::default(),
             reload_session_callback: OnceCell::default(),
             save_session_callback: OnceCell::default(),
-            #[cfg(feature = "experimental-oidc")]
             oauth: OAuthCtx::new(allow_insecure_oauth),
         });
 
         // Enable the send queue by default.
         let send_queue = Arc::new(SendQueueData::new(true));
 
-        let server_capabilities = ClientServerCapabilities {
-            server_versions: self.server_versions,
-            unstable_features: None,
+        let server_info = ClientServerInfo {
+            server_versions: match self.server_versions {
+                Some(versions) => Cached(versions),
+                None => NotSet,
+            },
+            unstable_features: NotSet,
+            well_known: Cached(well_known.map(Into::into)),
         };
 
         let event_cache = OnceCell::new();
+        let latest_events = OnceCell::new();
+
         let inner = ClientInner::new(
             auth_ctx,
             server,
@@ -539,12 +583,15 @@ impl ClientBuilder {
             sliding_sync_version,
             http_client,
             base_client,
-            server_capabilities,
+            server_info,
             self.respect_login_well_known,
             event_cache,
             send_queue,
+            latest_events,
             #[cfg(feature = "e2e-encryption")]
             self.encryption_settings,
+            #[cfg(feature = "e2e-encryption")]
+            self.enable_share_history_on_invite,
             self.cross_process_store_locks_holder_name,
         )
         .await;
@@ -572,22 +619,24 @@ async fn build_store_config(
     #[allow(clippy::infallible_destructuring_match)]
     let store_config = match builder_config {
         #[cfg(feature = "sqlite")]
-        BuilderStoreConfig::Sqlite { path, cache_path, passphrase } => {
+        BuilderStoreConfig::Sqlite { config, cache_path } => {
             let store_config = StoreConfig::new(cross_process_store_locks_holder_name.to_owned())
                 .state_store(
-                    matrix_sdk_sqlite::SqliteStateStore::open(&path, passphrase.as_deref()).await?,
+                    matrix_sdk_sqlite::SqliteStateStore::open_with_config(config.clone()).await?,
                 )
-                .event_cache_store(
-                    matrix_sdk_sqlite::SqliteEventCacheStore::open(
-                        cache_path.as_ref().unwrap_or(&path),
-                        passphrase.as_deref(),
-                    )
-                    .await?,
-                );
+                .event_cache_store({
+                    let mut config = config.clone();
+
+                    if let Some(cache_path) = cache_path {
+                        config = config.path(cache_path);
+                    }
+
+                    matrix_sdk_sqlite::SqliteEventCacheStore::open_with_config(config).await?
+                });
 
             #[cfg(feature = "e2e-encryption")]
             let store_config = store_config.crypto_store(
-                matrix_sdk_sqlite::SqliteCryptoStore::open(&path, passphrase.as_deref()).await?,
+                matrix_sdk_sqlite::SqliteCryptoStore::open_with_config(config).await?,
             );
 
             store_config
@@ -610,7 +659,7 @@ async fn build_store_config(
 
 // The indexeddb stores only implement `IntoStateStore` and `IntoCryptoStore` on
 // wasm32, so this only compiles there.
-#[cfg(all(target_arch = "wasm32", feature = "indexeddb"))]
+#[cfg(all(target_family = "wasm", feature = "indexeddb"))]
 async fn build_indexeddb_store_config(
     name: &str,
     passphrase: Option<&str>,
@@ -634,14 +683,17 @@ async fn build_indexeddb_store_config(
     };
 
     let store_config = {
-        tracing::warn!("The IndexedDB backend does not implement an event cache store, falling back to the in-memory event cache store…");
+        tracing::warn!(
+            "The IndexedDB backend does not implement an event cache store, \
+             falling back to the in-memory event cache store…"
+        );
         store_config.event_cache_store(matrix_sdk_base::event_cache::store::MemoryStore::new())
     };
 
     Ok(store_config)
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "indexeddb"))]
+#[cfg(all(not(target_family = "wasm"), feature = "indexeddb"))]
 #[allow(clippy::unused_async)]
 async fn build_indexeddb_store_config(
     _name: &str,
@@ -653,12 +705,12 @@ async fn build_indexeddb_store_config(
 
 #[derive(Clone, Debug)]
 enum HttpConfig {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     Settings(HttpSettings),
     Custom(reqwest::Client),
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 impl HttpConfig {
     fn settings(&mut self) -> &mut HttpSettings {
         match self {
@@ -676,10 +728,10 @@ impl HttpConfig {
 
 impl Default for HttpConfig {
     fn default() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         return Self::Settings(HttpSettings::default());
 
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         return Self::Custom(reqwest::Client::new());
     }
 }
@@ -688,9 +740,8 @@ impl Default for HttpConfig {
 enum BuilderStoreConfig {
     #[cfg(feature = "sqlite")]
     Sqlite {
-        path: std::path::PathBuf,
+        config: SqliteStoreConfig,
         cache_path: Option<std::path::PathBuf>,
-        passphrase: Option<String>,
     },
     #[cfg(feature = "indexeddb")]
     IndexedDb {
@@ -706,13 +757,17 @@ impl fmt::Debug for BuilderStoreConfig {
         #[allow(clippy::infallible_destructuring_match)]
         match self {
             #[cfg(feature = "sqlite")]
-            Self::Sqlite { path, .. } => {
-                f.debug_struct("Sqlite").field("path", path).finish_non_exhaustive()
-            }
+            Self::Sqlite { config, cache_path, .. } => f
+                .debug_struct("Sqlite")
+                .field("config", config)
+                .field("cache_path", cache_path)
+                .finish_non_exhaustive(),
+
             #[cfg(feature = "indexeddb")]
             Self::IndexedDb { name, .. } => {
                 f.debug_struct("IndexedDb").field("name", name).finish_non_exhaustive()
             }
+
             Self::Custom(store_config) => f.debug_tuple("Custom").field(store_config).finish(),
         }
     }
@@ -757,7 +812,7 @@ pub enum ClientBuildError {
 }
 
 // The http mocking library is not supported for wasm32
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_family = "wasm")))]
 pub(crate) mod tests {
     use assert_matches::assert_matches;
     use matrix_sdk_test::{async_test, test_json};
@@ -927,11 +982,13 @@ pub(crate) mod tests {
         let homeserver = make_mock_homeserver().await;
         let builder = ClientBuilder::new()
             .server_name_or_homeserver_url(homeserver.uri())
-            .with_decryption_trust_requirement(TrustRequirement::CrossSigned);
+            .with_decryption_settings(DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::CrossSigned,
+            });
 
         let client = builder.build().await.unwrap();
         assert_matches!(
-            client.base_client().decryption_trust_requirement,
+            client.base_client().decryption_settings.sender_device_trust_requirement,
             TrustRequirement::CrossSigned
         );
     }
@@ -943,11 +1000,13 @@ pub(crate) mod tests {
 
         let builder = ClientBuilder::new()
             .server_name_or_homeserver_url(homeserver.uri())
-            .with_decryption_trust_requirement(TrustRequirement::Untrusted);
+            .with_decryption_settings(DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::Untrusted,
+            });
 
         let client = builder.build().await.unwrap();
         assert_matches!(
-            client.base_client().decryption_trust_requirement,
+            client.base_client().decryption_settings.sender_device_trust_requirement,
             TrustRequirement::Untrusted
         );
     }

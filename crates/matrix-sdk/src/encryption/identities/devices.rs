@@ -44,7 +44,7 @@ pub struct DeviceUpdates {
 impl DeviceUpdates {
     pub(crate) fn new(
         client: Client,
-        updates: matrix_sdk_base::crypto::store::DeviceUpdates,
+        updates: matrix_sdk_base::crypto::store::types::DeviceUpdates,
     ) -> Self {
         let map_devices = |(user_id, devices)| {
             // For some reason we need to tell Rust the type of `devices`.
@@ -236,7 +236,7 @@ impl Device {
         let (sas, request) = self.inner.start_verification().await?;
         self.client.send_to_device(&request).await?;
 
-        Ok(SasVerification { inner: sas, client: self.client.clone() })
+        Ok(SasVerification { inner: Box::new(sas), client: self.client.clone() })
     }
 
     /// Manually verify this device.

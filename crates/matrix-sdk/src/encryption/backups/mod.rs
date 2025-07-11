@@ -26,7 +26,7 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use matrix_sdk_base::crypto::{
     backups::MegolmV1BackupKey,
-    store::BackupDecryptionKey,
+    store::types::BackupDecryptionKey,
     types::{requests::KeysBackupRequest, RoomKeyBackupInfo},
     OlmMachine, RoomKeyImportResult,
 };
@@ -702,7 +702,10 @@ impl Backups {
                 if let Some(kind) = error.client_api_error_kind() {
                     match kind {
                         ErrorKind::NotFound => {
-                            warn!("No backup found on the server, the backup likely got deleted, disabling backups.");
+                            warn!(
+                                "No backup found on the server, the backup likely got deleted, \
+                                 disabling backups."
+                            );
 
                             self.handle_deleted_backup_version(olm_machine).await?;
                         }
@@ -1030,7 +1033,7 @@ impl Backups {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod test {
     use std::time::Duration;
 

@@ -36,7 +36,8 @@ use std::{
 use as_variant::as_variant;
 use matrix_sdk_common::deserialized_responses::PrivOwnedStr;
 use ruma::{
-    serde::StringEnum, DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceKeyId, OwnedUserId, UserId,
+    serde::StringEnum, DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceKeyId, OwnedUserId, RoomId,
+    UserId,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature, KeyError};
@@ -52,7 +53,7 @@ pub mod requests;
 pub mod room_history;
 
 pub use self::{backup::*, cross_signing::*, device_keys::*, one_time_keys::*};
-use crate::store::BackupDecryptionKey;
+use crate::store::types::BackupDecryptionKey;
 
 macro_rules! from_base64 {
     ($foo:ident, $name:ident) => {
@@ -163,7 +164,7 @@ impl BackupSecrets {
 ///
 /// 1. If the claimed algorithm is supported *and* the payload has an expected
 ///    format, the signature will be represent by the enum variant corresponding
-///    to that algorithm. For example, decodeable Ed25519 signatures are
+///    to that algorithm. For example, decodable Ed25519 signatures are
 ///    represented as `Ed25519(...)`.
 /// 2. If the claimed algorithm is unsupported, the signature is represented as
 ///    `Other(...)`.
@@ -516,6 +517,18 @@ where
 {
     let keys: Vec<String> = keys.iter().map(|k| k.to_base64()).collect();
     keys.serialize(s)
+}
+
+/// Trait to express the various room key export formats we have in a unified
+/// manner.
+pub trait RoomKeyExport {
+    /// The ID of the room where the exported room key was used.
+    fn room_id(&self) -> &RoomId;
+    /// The unique ID of the exported room key.
+    fn session_id(&self) -> &str;
+    /// The [Curve25519PublicKey] long-term identity key of the sender of this
+    /// room key.
+    fn sender_key(&self) -> Curve25519PublicKey;
 }
 
 #[cfg(test)]
