@@ -30,7 +30,7 @@ futures-util.workspace = true
 language-tags = "0.3.2"
 log-panics = { version = "2", features = ["with-backtrace"] }
 matrix-sdk-ffi-macros.workspace = true
-matrix-sdk-ui = { workspace = true, features = ["uniffi"] }
+matrix-sdk-ui = { workspace = true, features = ["uniffi", "enable_external_content_scanner_setup"] }
 matrix-sdk-bwi = { workspace = true }
 matrix-sdk-base-bwi = { workspace = true }
 matrix-sdk-tchap = { workspace = true }
