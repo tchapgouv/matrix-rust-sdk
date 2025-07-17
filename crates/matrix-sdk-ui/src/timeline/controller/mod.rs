@@ -144,7 +144,7 @@ pub(in crate::timeline) enum TimelineFocusKind<P: RoomDataProvider> {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct TimelineController<P: RoomDataProvider = Room, D: Decryptor = Room> {
+pub(super) struct  TimelineController<P: RoomDataProvider = Room, D: Decryptor = Room> {
     /// Inner mutable state.
     state: Arc<RwLock<TimelineState<P>>>,
 
@@ -159,13 +159,14 @@ pub(super) struct TimelineController<P: RoomDataProvider = Room, D: Decryptor = 
     /// Settings applied to this timeline.
     pub(super) settings: TimelineSettings,
 
-    // BWI-specific
+   /// Long-running task used to retry decryption of timeline items without
+    /// blocking main processing.
+    decryption_retry_task: DecryptionRetryTask<P, D>,
+
+        // BWI-specific
     /// the used ContentScanner
     content_scanner: BWIContentScannerWrapper,
     // end BWI-specific
-    /// Long-running task used to retry decryption of timeline items without
-    /// blocking main processing.
-    decryption_retry_task: DecryptionRetryTask<P, D>,
 }
 
 #[derive(Clone)]
@@ -1617,7 +1618,7 @@ impl TimelineController {
             TimelineUniqueId(id_of_event_with_attachment.clone().0 + "__scan_state"),
         );
 
-        let mut state: RwLockWriteGuard<'_, TimelineState> = self.state.write().await;
+        let mut state = self.state.write().await;
         let mut transaction = state.items.transaction();
         transaction.push_back(scan_state_event, None);
         transaction.commit();

@@ -21,12 +21,6 @@ use std::time::Duration;
 #[cfg(not(target_family = "wasm"))]
 use std::{fmt, fs::File, path::Path};
 
-use crate::bwi_content_scanner::BWIDownloadMediaExt;
-use crate::Error::BWIError;
-use crate::{
-    attachment::Thumbnail, config::RequestConfig, futures::SendRequest, Client, Error, Result,
-    TransmissionProgress,
-};
 use eyeball::SharedObservable;
 use futures_util::future::try_join;
 use matrix_sdk_base::event_cache::store::media::IgnoreMediaRetentionPolicy;
@@ -53,6 +47,12 @@ use crate::{
     attachment::Thumbnail, client::futures::SendMediaUploadRequest, config::RequestConfig, Client,
     Error, Result, TransmissionProgress,
 };
+
+// BWI-specific
+use crate::bwi_content_scanner::BWIDownloadMediaExt;
+use crate::Error::BWIError;
+use tracing::log::debug;
+// end BWI-specific
 
 /// A conservative upload speed of 1Mbps
 const DEFAULT_UPLOAD_SPEED: u64 = 125_000;

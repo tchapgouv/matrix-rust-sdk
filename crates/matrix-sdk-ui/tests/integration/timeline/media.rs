@@ -17,16 +17,18 @@ use std::{fs::File, io::Write as _, path::PathBuf, time::Duration};
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
+use futures_util::StreamExt;
 // BWI-specific
 use matrix_sdk::bwi_extensions::client::BWIClientSetupExt;
 use matrix_sdk::test_utils::client::TEST_BEARER_TOKEN;
 use matrix_sdk_ui::timeline::Error::AttachmentSizeExceededLimit;
 use wiremock::matchers::{bearer_token, method, path};
+use wiremock::http::Method;
+use wiremock::Mock;
 // end BWI-specific
 use matrix_sdk::{
     assert_let_timeout,
-    attachment::AttachmentConfig,
-    room::reply::{EnforceThread, Reply},
+    attachment::{AttachmentConfig, AttachmentInfo, BaseFileInfo},
     test_utils::mocks::MatrixMockServer,
 };
 use matrix_sdk_test::{async_test, event_factory::EventFactory, JoinedRoomBuilder, ALICE};

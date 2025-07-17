@@ -134,10 +134,10 @@ impl TestTimelineBuilder {
             self.internal_id_prefix,
             self.utd_hook,
             self.is_room_encrypted,
+            self.settings.unwrap_or_default(),
             // BWI-specific
             create_dummy_content_scanner(),
             // end BWI-specific
-            self.settings.unwrap_or_default(),
         );
         TestTimeline { controller, factory: EventFactory::new() }
     }

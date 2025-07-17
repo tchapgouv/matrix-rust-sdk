@@ -140,10 +140,14 @@ impl OAuthCli {
         let cli = Self { client, restored: false, session_file };
 
         if let Err(error) = cli.register_and_login().await {
-            if let Some(error) = error.downcast_ref::<OAuthError>()
-                && let OAuthError::ClientRegistration(OAuthClientRegistrationError::NotSupported) =
-                    error
-            {
+            let mut unsupported = false;
+            if let Some(error) = error.downcast_ref::<OAuthError>() {
+                if let OAuthError::ClientRegistration(OAuthClientRegistrationError::NotSupported) = error {
+                    unsupported = true;
+                }
+            }
+
+            if unsupported {
                 // This would require to register with the authorization server manually, which
                 // we don't support here.
                 bail!(

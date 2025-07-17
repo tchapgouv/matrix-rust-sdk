@@ -426,7 +426,7 @@ async fn test_download_media_v1_7() {
     // Arrange
     const CONTENT: &str = "Hello World!";
     let (client, server) = logged_in_client_with_server().await;
-    client.reset_server_capabilities().await.unwrap();
+    client.reset_server_info().await.unwrap();
 
     // Declare Matrix version v1.7.
     provide_supported_versions_endpoint(&server, vec!["v1.7".to_owned()]).await;
@@ -449,7 +449,7 @@ async fn test_download_media_v1_11() {
     // Arrange
     const CONTENT: &str = "Hello World!";
     let (client, server) = logged_in_client_with_server().await;
-    client.reset_server_capabilities().await.unwrap();
+    client.reset_server_info().await.unwrap();
     provide_supported_versions_endpoint(
         &server,
         (7..12).map(|version| format!("v1.{version}")).collect(),
@@ -497,7 +497,7 @@ async fn test_scan_media_v1_7(
     // Arrange
     const CONTENT: &str = "Hello World!";
     let (client, server) = logged_in_client_with_server().await;
-    client.reset_server_capabilities().await.unwrap();
+    client.reset_server_info().await.unwrap();
 
     provide_supported_versions_endpoint(
         &server,
@@ -519,7 +519,7 @@ async fn test_scan_media_cache() {
     // Arrange
     const CONTENT: &str = "Hello World!";
     let (client, server) = logged_in_client_with_server().await;
-    client.reset_server_capabilities().await.unwrap();
+    client.reset_server_info().await.unwrap();
 
     provide_supported_versions_endpoint(
         &server,

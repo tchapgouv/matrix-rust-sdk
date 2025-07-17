@@ -1530,6 +1530,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
+name = "findshlibs"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40b9e59cd0f7e0806cca4be089683ecb6434e602038df21fe6bf6711b2f07f64"
+dependencies = [
+ "cc",
+ "lazy_static",
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "flate2"
 version = "1.0.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2843,7 +2855,7 @@ version = "0.12.0"
 dependencies = [
  "assert_matches",
  "assert_matches2",
- "eyeball-im",
+ "eyeball-im 0.7.0",
  "futures-core",
  "futures-executor",
  "futures-util",
@@ -2964,9 +2976,9 @@ dependencies = [
  "language-tags",
  "log-panics",
  "matrix-sdk",
- "matrix-sdk-common",
  "matrix-sdk-base-bwi",
  "matrix-sdk-bwi",
+ "matrix-sdk-common",
  "matrix-sdk-ffi-macros",
  "matrix-sdk-tchap",
  "matrix-sdk-ui",
@@ -3206,9 +3218,9 @@ dependencies = [
  "itertools 0.14.0",
  "matrix-sdk",
  "matrix-sdk-base",
- "matrix-sdk-common",
  "matrix-sdk-base-bwi",
  "matrix-sdk-bwi",
+ "matrix-sdk-common",
  "matrix-sdk-test",
  "mime",
  "once_cell",

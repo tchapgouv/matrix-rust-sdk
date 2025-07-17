@@ -58,7 +58,7 @@ async fn test_history_share_on_invite() -> Result<()> {
     let alice_room = alice
         .create_room(assign!(CreateRoomRequest::new(), {
             preset: Some(RoomPreset::PublicChat),
-        }))
+        }), false)
         .await?;
     alice_room.enable_encryption().await?;
 
