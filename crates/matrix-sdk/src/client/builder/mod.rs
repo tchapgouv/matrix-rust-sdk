@@ -20,6 +20,8 @@ use std::path::Path;
 use std::{fmt, sync::Arc};
 
 use homeserver_config::*;
+#[cfg(feature = "e2e-encryption")]
+use matrix_sdk_base::crypto::DecryptionSettings;
 use matrix_sdk_base::{store::StoreConfig, BaseClient};
 #[cfg(feature = "sqlite")]
 use matrix_sdk_sqlite::SqliteStoreConfig;
@@ -43,12 +45,15 @@ use super::{Client, ClientInner};
 use crate::crypto::{CollectStrategy, TrustRequirement};
 #[cfg(feature = "e2e-encryption")]
 use crate::encryption::EncryptionSettings;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 use crate::http_client::HttpSettings;
 use crate::ClientBuildError::ServerIsNotVerified;
 use crate::{
     authentication::{oauth::OAuthCtx, AuthCtx},
-    client::ClientServerCapabilities,
+    client::{
+        CachedValue::{Cached, NotSet},
+        ClientServerInfo,
+    },
     config::RequestConfig,
     error::RumaApiError,
     http_client::HttpClient,
@@ -116,7 +121,9 @@ pub struct ClientBuilder {
     #[cfg(feature = "e2e-encryption")]
     room_key_recipient_strategy: CollectStrategy,
     #[cfg(feature = "e2e-encryption")]
-    decryption_trust_requirement: TrustRequirement,
+    decryption_settings: DecryptionSettings,
+    #[cfg(feature = "e2e-encryption")]
+    enable_share_history_on_invite: bool,
     cross_process_store_locks_holder_name: String,
 }
 
@@ -145,7 +152,11 @@ impl ClientBuilder {
             #[cfg(feature = "e2e-encryption")]
             room_key_recipient_strategy: Default::default(),
             #[cfg(feature = "e2e-encryption")]
-            decryption_trust_requirement: TrustRequirement::Untrusted,
+            decryption_settings: DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::Untrusted,
+            },
+            #[cfg(feature = "e2e-encryption")]
+            enable_share_history_on_invite: false,
             cross_process_store_locks_holder_name:
                 Self::DEFAULT_CROSS_PROCESS_STORE_LOCKS_HOLDER_NAME.to_owned(),
         }
@@ -369,21 +380,21 @@ impl ClientBuilder {
     ///
     /// let client_config = Client::builder().proxy("http://localhost:8080");
     /// ```
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn proxy(mut self, proxy: impl AsRef<str>) -> Self {
         self.http_settings().proxy = Some(proxy.as_ref().to_owned());
         self
     }
 
     /// Disable SSL verification for the HTTP requests.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn disable_ssl_verification(mut self) -> Self {
         self.http_settings().disable_ssl_verification = true;
         self
     }
 
     /// Set a custom HTTP user agent for the client.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn user_agent(mut self, user_agent: impl AsRef<str>) -> Self {
         self.http_settings().user_agent = Some(user_agent.as_ref().to_owned());
         self
@@ -397,7 +408,7 @@ impl ClientBuilder {
     ///
     /// Internally this will call the
     /// [`reqwest::ClientBuilder::add_root_certificate()`] method.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn add_root_certificates(mut self, certificates: Vec<reqwest::Certificate>) -> Self {
         self.http_settings().additional_root_certificates = certificates;
         self
@@ -406,7 +417,7 @@ impl ClientBuilder {
     /// Don't trust any system root certificates, only trust the certificates
     /// provided through
     /// [`add_root_certificates`][ClientBuilder::add_root_certificates].
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn disable_built_in_root_certificates(mut self) -> Self {
         self.http_settings().disable_built_in_root_certificates = true;
         self
@@ -435,7 +446,7 @@ impl ClientBuilder {
         self
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     fn http_settings(&mut self) -> &mut HttpSettings {
         self.http_cfg.get_or_insert_with(Default::default).settings()
     }
@@ -491,11 +502,21 @@ impl ClientBuilder {
 
     /// Set the trust requirement to be used when decrypting events.
     #[cfg(feature = "e2e-encryption")]
-    pub fn with_decryption_trust_requirement(
+    pub fn with_decryption_settings(mut self, decryption_settings: DecryptionSettings) -> Self {
+        self.decryption_settings = decryption_settings;
+        self
+    }
+
+    /// Whether to enable the experimental support for sending and receiving
+    /// encrypted room history on invite, per [MSC4268].
+    ///
+    /// [MSC4268]: https://github.com/matrix-org/matrix-spec-proposals/pull/4268
+    #[cfg(feature = "e2e-encryption")]
+    pub fn with_enable_share_history_on_invite(
         mut self,
-        trust_requirement: TrustRequirement,
+        enable_share_history_on_invite: bool,
     ) -> Self {
-        self.decryption_trust_requirement = trust_requirement;
+        self.enable_share_history_on_invite = enable_share_history_on_invite;
         self
     }
 
@@ -532,9 +553,9 @@ impl ClientBuilder {
         let homeserver_cfg = self.homeserver_cfg.ok_or(ClientBuildError::MissingHomeserver)?;
         Span::current().record("homeserver", debug(&homeserver_cfg));
 
-        #[cfg_attr(target_arch = "wasm32", allow(clippy::infallible_destructuring_match))]
+        #[cfg_attr(target_family = "wasm", allow(clippy::infallible_destructuring_match))]
         let inner_http_client = match self.http_cfg.unwrap_or_default() {
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(target_family = "wasm"))]
             HttpConfig::Settings(mut settings) => {
                 settings.timeout = self.request_config.timeout;
                 settings.make_client()?
@@ -554,7 +575,7 @@ impl ClientBuilder {
             #[cfg(feature = "e2e-encryption")]
             {
                 client.room_key_recipient_strategy = self.room_key_recipient_strategy;
-                client.decryption_trust_requirement = self.decryption_trust_requirement;
+                client.decryption_settings = self.decryption_settings;
             }
 
             client
@@ -563,7 +584,7 @@ impl ClientBuilder {
         let http_client = HttpClient::new(inner_http_client.clone(), self.request_config);
 
         #[allow(unused_variables)]
-        let HomeserverDiscoveryResult { server, homeserver, supported_versions } =
+        let HomeserverDiscoveryResult { server, homeserver, supported_versions, well_known } =
             homeserver_cfg.discover(&http_client).await?;
 
         // BWI specific
@@ -603,15 +624,21 @@ impl ClientBuilder {
         // Enable the send queue by default.
         let send_queue = Arc::new(SendQueueData::new(true));
 
-        let server_capabilities = ClientServerCapabilities {
-            server_versions: self.server_versions,
-            unstable_features: None,
+        let server_info = ClientServerInfo {
+            server_versions: match self.server_versions {
+                Some(versions) => Cached(versions),
+                None => NotSet,
+            },
+            unstable_features: NotSet,
+            well_known: Cached(well_known.map(Into::into)),
         };
 
         let content_scanner =
             Arc::from(BWIContentScanner::new_with_url(&http_client.inner, &homeserver));
 
         let event_cache = OnceCell::new();
+        let latest_events = OnceCell::new();
+
         let inner = ClientInner::new(
             auth_ctx,
             server,
@@ -620,12 +647,15 @@ impl ClientBuilder {
             http_client,
             content_scanner,
             base_client,
-            server_capabilities,
+            server_info,
             self.respect_login_well_known,
             event_cache,
             send_queue,
+            latest_events,
             #[cfg(feature = "e2e-encryption")]
             self.encryption_settings,
+            #[cfg(feature = "e2e-encryption")]
+            self.enable_share_history_on_invite,
             self.cross_process_store_locks_holder_name,
         )
         .await;
@@ -709,7 +739,7 @@ async fn build_store_config(
 
 // The indexeddb stores only implement `IntoStateStore` and `IntoCryptoStore` on
 // wasm32, so this only compiles there.
-#[cfg(all(target_arch = "wasm32", feature = "indexeddb"))]
+#[cfg(all(target_family = "wasm", feature = "indexeddb"))]
 async fn build_indexeddb_store_config(
     name: &str,
     passphrase: Option<&str>,
@@ -733,14 +763,17 @@ async fn build_indexeddb_store_config(
     };
 
     let store_config = {
-        tracing::warn!("The IndexedDB backend does not implement an event cache store, falling back to the in-memory event cache store…");
+        tracing::warn!(
+            "The IndexedDB backend does not implement an event cache store, \
+             falling back to the in-memory event cache store…"
+        );
         store_config.event_cache_store(matrix_sdk_base::event_cache::store::MemoryStore::new())
     };
 
     Ok(store_config)
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "indexeddb"))]
+#[cfg(all(not(target_family = "wasm"), feature = "indexeddb"))]
 #[allow(clippy::unused_async)]
 async fn build_indexeddb_store_config(
     _name: &str,
@@ -752,12 +785,12 @@ async fn build_indexeddb_store_config(
 
 #[derive(Clone, Debug)]
 enum HttpConfig {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     Settings(HttpSettings),
     Custom(reqwest::Client),
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 impl HttpConfig {
     fn settings(&mut self) -> &mut HttpSettings {
         match self {
@@ -775,10 +808,10 @@ impl HttpConfig {
 
 impl Default for HttpConfig {
     fn default() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(target_family = "wasm"))]
         return Self::Settings(HttpSettings::default());
 
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(target_family = "wasm")]
         return Self::Custom(reqwest::Client::new());
     }
 }
@@ -866,7 +899,7 @@ pub enum ClientBuildError {
 }
 
 // The http mocking library is not supported for wasm32
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_family = "wasm")))]
 pub(crate) mod tests {
     use super::*;
     #[cfg(feature = "experimental-sliding-sync")]
@@ -1048,14 +1081,16 @@ pub(crate) mod tests {
         let homeserver = make_mock_homeserver().await;
         let builder = ClientBuilder::new()
             .server_name_or_homeserver_url(homeserver.uri())
-            .with_decryption_trust_requirement(TrustRequirement::CrossSigned)
+            .with_decryption_settings(DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::CrossSigned,
+            })
             // BWI-specific
             .without_server_jwt_token_validation();
         // end BWI-specific
 
         let client = builder.build().await.unwrap();
         assert_matches!(
-            client.base_client().decryption_trust_requirement,
+            client.base_client().decryption_settings.sender_device_trust_requirement,
             TrustRequirement::CrossSigned
         );
     }
@@ -1067,14 +1102,16 @@ pub(crate) mod tests {
 
         let builder = ClientBuilder::new()
             .server_name_or_homeserver_url(homeserver.uri())
-            .with_decryption_trust_requirement(TrustRequirement::Untrusted)
+            .with_decryption_settings(DecryptionSettings {
+                sender_device_trust_requirement: TrustRequirement::Untrusted,
+            })
             // BWI-specific
             .without_server_jwt_token_validation();
         // end BWI-specific
 
         let client = builder.build().await.unwrap();
         assert_matches!(
-            client.base_client().decryption_trust_requirement,
+            client.base_client().decryption_settings.sender_device_trust_requirement,
             TrustRequirement::Untrusted
         );
     }

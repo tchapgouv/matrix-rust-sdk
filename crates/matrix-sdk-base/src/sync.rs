@@ -16,7 +16,10 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use matrix_sdk_common::{debug::DebugRawEvent, deserialized_responses::TimelineEvent};
+use matrix_sdk_common::{
+    debug::DebugRawEvent,
+    deserialized_responses::{ProcessedToDeviceEvent, TimelineEvent},
+};
 pub use ruma::api::client::sync::sync_events::v3::{
     InvitedRoom as InvitedRoomUpdate, KnockedRoom as KnockedRoomUpdate,
 };
@@ -24,7 +27,7 @@ use ruma::{
     api::client::sync::sync_events::UnreadNotificationsCount as RumaUnreadNotificationsCount,
     events::{
         presence::PresenceEvent, AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent,
-        AnySyncEphemeralRoomEvent, AnySyncStateEvent, AnyToDeviceEvent,
+        AnySyncEphemeralRoomEvent, AnySyncStateEvent,
     },
     push::Action,
     serde::Raw,
@@ -33,7 +36,10 @@ use ruma::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    debug::{DebugInvitedRoom, DebugKnockedRoom, DebugListOfRawEvents, DebugListOfRawEventsNoId},
+    debug::{
+        DebugInvitedRoom, DebugKnockedRoom, DebugListOfProcessedToDeviceEvents,
+        DebugListOfRawEvents, DebugListOfRawEventsNoId,
+    },
     deserialized_responses::{AmbiguityChange, RawAnySyncOrStrippedTimelineEvent},
 };
 
@@ -50,7 +56,7 @@ pub struct SyncResponse {
     /// The global private data created by this user.
     pub account_data: Vec<Raw<AnyGlobalAccountDataEvent>>,
     /// Messages sent directly between devices.
-    pub to_device: Vec<Raw<AnyToDeviceEvent>>,
+    pub to_device: Vec<ProcessedToDeviceEvent>,
     /// New notifications per room.
     pub notifications: BTreeMap<OwnedRoomId, Vec<Notification>>,
 }
@@ -61,7 +67,7 @@ impl fmt::Debug for SyncResponse {
         f.debug_struct("SyncResponse")
             .field("rooms", &self.rooms)
             .field("account_data", &DebugListOfRawEventsNoId(&self.account_data))
-            .field("to_device", &DebugListOfRawEventsNoId(&self.to_device))
+            .field("to_device", &DebugListOfProcessedToDeviceEvents(&self.to_device))
             .field("notifications", &self.notifications)
             .finish_non_exhaustive()
     }
@@ -80,13 +86,87 @@ pub struct RoomUpdates {
     pub knocked: BTreeMap<OwnedRoomId, KnockedRoomUpdate>,
 }
 
+impl RoomUpdates {
+    /// Iterate over all room IDs, from [`RoomUpdates::left`],
+    /// [`RoomUpdates::joined`], [`RoomUpdates::invited`] and
+    /// [`RoomUpdates::knocked`].
+    pub(crate) fn iter_all_room_ids(&self) -> impl Iterator<Item = &OwnedRoomId> {
+        self.left
+            .keys()
+            .chain(self.joined.keys())
+            .chain(self.invited.keys())
+            .chain(self.knocked.keys())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use assert_matches::assert_matches;
+    use ruma::room_id;
+
+    use super::{
+        InvitedRoomUpdate, JoinedRoomUpdate, KnockedRoomUpdate, LeftRoomUpdate, RoomUpdates,
+    };
+
+    #[test]
+    fn test_room_updates_iter_all_room_ids() {
+        let room_id_0 = room_id!("!r0");
+        let room_id_1 = room_id!("!r1");
+        let room_id_2 = room_id!("!r2");
+        let room_id_3 = room_id!("!r3");
+        let room_id_4 = room_id!("!r4");
+        let room_id_5 = room_id!("!r5");
+        let room_id_6 = room_id!("!r6");
+        let room_id_7 = room_id!("!r7");
+        let room_updates = RoomUpdates {
+            left: {
+                let mut left = BTreeMap::new();
+                left.insert(room_id_0.to_owned(), LeftRoomUpdate::default());
+                left.insert(room_id_1.to_owned(), LeftRoomUpdate::default());
+                left
+            },
+            joined: {
+                let mut joined = BTreeMap::new();
+                joined.insert(room_id_2.to_owned(), JoinedRoomUpdate::default());
+                joined.insert(room_id_3.to_owned(), JoinedRoomUpdate::default());
+                joined
+            },
+            invited: {
+                let mut invited = BTreeMap::new();
+                invited.insert(room_id_4.to_owned(), InvitedRoomUpdate::default());
+                invited.insert(room_id_5.to_owned(), InvitedRoomUpdate::default());
+                invited
+            },
+            knocked: {
+                let mut knocked = BTreeMap::new();
+                knocked.insert(room_id_6.to_owned(), KnockedRoomUpdate::default());
+                knocked.insert(room_id_7.to_owned(), KnockedRoomUpdate::default());
+                knocked
+            },
+        };
+
+        let mut iter = room_updates.iter_all_room_ids();
+        assert_matches!(iter.next(), Some(room_id) => assert_eq!(room_id, room_id_0));
+        assert_matches!(iter.next(), Some(room_id) => assert_eq!(room_id, room_id_1));
+        assert_matches!(iter.next(), Some(room_id) => assert_eq!(room_id, room_id_2));
+        assert_matches!(iter.next(), Some(room_id) => assert_eq!(room_id, room_id_3));
+        assert_matches!(iter.next(), Some(room_id) => assert_eq!(room_id, room_id_4));
+        assert_matches!(iter.next(), Some(room_id) => assert_eq!(room_id, room_id_5));
+        assert_matches!(iter.next(), Some(room_id) => assert_eq!(room_id, room_id_6));
+        assert_matches!(iter.next(), Some(room_id) => assert_eq!(room_id, room_id_7));
+        assert!(iter.next().is_none());
+    }
+}
+
 #[cfg(not(tarpaulin_include))]
 impl fmt::Debug for RoomUpdates {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RoomUpdates")
-            .field("leave", &self.left)
-            .field("join", &self.joined)
-            .field("invite", &DebugInvitedRoomUpdates(&self.invited))
+            .field("left", &self.left)
+            .field("joined", &self.joined)
+            .field("invited", &DebugInvitedRoomUpdates(&self.invited))
             .field("knocked", &DebugKnockedRoomUpdates(&self.knocked))
             .finish()
     }

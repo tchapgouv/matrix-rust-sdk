@@ -53,7 +53,7 @@ use ruma::{
         direct::OwnedDirectUserIdentifier,
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::{
-            avatar::{self},
+            avatar,
             guest_access::GuestAccess,
             history_visibility::HistoryVisibility,
             join_rules::JoinRule,
@@ -340,13 +340,15 @@ impl Room {
     }
 
     /// Is the room considered to be public.
-    pub fn is_public(&self) -> bool {
-        matches!(self.join_rule(), JoinRule::Public)
+    ///
+    /// May return `None` if the join rule event is not available.
+    pub fn is_public(&self) -> Option<bool> {
+        self.inner.read().join_rule().map(|join_rule| matches!(join_rule, JoinRule::Public))
     }
 
-    /// Get the join rule policy of this room.
-    pub fn join_rule(&self) -> JoinRule {
-        self.inner.read().join_rule().clone()
+    /// Get the join rule policy of this room, if available.
+    pub fn join_rule(&self) -> Option<JoinRule> {
+        self.inner.read().join_rule().cloned()
     }
 
     /// Get the maximum power level that this room contains.
@@ -481,7 +483,10 @@ unsafe impl Sync for Room {}
 #[test]
 // See https://github.com/matrix-org/matrix-rust-sdk/pull/3749#issuecomment-2312939823.
 fn test_send_sync_for_room() {
-    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send_sync<
+        T: matrix_sdk_common::SendOutsideWasm + matrix_sdk_common::SyncOutsideWasm,
+    >() {
+    }
 
     assert_send_sync::<Room>();
 }

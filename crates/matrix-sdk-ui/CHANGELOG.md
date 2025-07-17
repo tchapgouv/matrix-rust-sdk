@@ -6,11 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- Add `NotificationItem::room_topic` to the `NotificationItem` struct, which
+  contains the topic of the room. This is useful for displaying the room topic
+  in notifications. ([#5300](https://github.com/matrix-org/matrix-rust-sdk/pull/5300))
+
+## [0.12.0] - 2025-06-10
+
 ### Refactor
 
 - [**breaking**] [`TimelineItemContent::reactions()`] returns an `Option<&ReactionsByKeyBySender>`
   instead of `ReactionsByKeyBySender`. This reflects the fact that some timeline items cannot hold
   reactions at all.
+- `NotificationItem::room_join_rule` is now optional to reflect that the join rule
+  state event might be missing, in which case it will be set to `None`. The
+  `NotificationItem::is_public` field has been replaced with a method that returns an `Option<bool>`, based on the same logic.
+  ([#5278](https://github.com/matrix-org/matrix-rust-sdk/pull/5278))
 
 ### Bug Fixes
 
@@ -27,6 +39,9 @@ All notable changes to this project will be documented in this file.
   ([#5055](https://github.com/matrix-org/matrix-rust-sdk/pull/5055))
 - `Timeline::mark_as_read()` unsets the unread flag of the room if it was set.
   ([#5055](https://github.com/matrix-org/matrix-rust-sdk/pull/5055))
+- Add new method `Timeline::send_gallery` to allow sending MSC4274-style
+  galleries.
+  ([#5125](https://github.com/matrix-org/matrix-rust-sdk/pull/5125))
 
 ## [0.11.0] - 2025-04-11
 

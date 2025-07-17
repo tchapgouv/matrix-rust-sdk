@@ -29,8 +29,11 @@ use matrix_sdk_crypto::{
         StaticAccountData,
     },
     store::{
-        BackupKeys, Changes, CryptoStore, CryptoStoreError, DehydratedDeviceKey, PendingChanges,
-        RoomKeyCounts, RoomSettings, StoredRoomKeyBundleData,
+        types::{
+            BackupKeys, Changes, DehydratedDeviceKey, PendingChanges, RoomKeyCounts, RoomSettings,
+            StoredRoomKeyBundleData,
+        },
+        CryptoStore, CryptoStoreError,
     },
     types::events::room_key_withheld::RoomKeyWithheldEvent,
     vodozemac::base64_encode,
@@ -83,6 +86,8 @@ mod keys {
     pub const SECRETS_INBOX: &str = "secrets_inbox";
 
     pub const DIRECT_WITHHELD_INFO: &str = "direct_withheld_info";
+
+    pub const RECEIVED_ROOM_KEY_BUNDLES: &str = "received_room_key_bundles";
 
     // keys
     pub const STORE_CIPHER: &str = "store_cipher";
@@ -143,7 +148,10 @@ pub enum IndexeddbCryptoStoreError {
     },
     #[error(transparent)]
     CryptoStoreError(#[from] CryptoStoreError),
-    #[error("The schema version of the crypto store is too new. Existing version: {current_version}; max supported version: {max_supported_version}")]
+    #[error(
+        "The schema version of the crypto store is too new. \
+         Existing version: {current_version}; max supported version: {max_supported_version}"
+    )]
     SchemaTooNewError { max_supported_version: u32, current_version: u32 },
 }
 
@@ -658,6 +666,18 @@ impl IndexeddbCryptoStore {
             }
         }
 
+        if !changes.received_room_key_bundles.is_empty() {
+            let mut bundle_store = indexeddb_changes.get(keys::RECEIVED_ROOM_KEY_BUNDLES);
+            for bundle in &changes.received_room_key_bundles {
+                let key = self.serializer.encode_key(
+                    keys::RECEIVED_ROOM_KEY_BUNDLES,
+                    (&bundle.bundle_data.room_id, &bundle.sender_user),
+                );
+                let value = self.serializer.serialize_value(&bundle)?;
+                bundle_store.put(key, value);
+            }
+        }
+
         Ok(indexeddb_changes)
     }
 }
@@ -670,7 +690,7 @@ impl IndexeddbCryptoStore {
 // this hack allows us to still have most of rust-analyzer's IDE functionality
 // within the impl block without having to set it up to check things against
 // the wasm target (which would disable many other parts of the codebase).
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 macro_rules! impl_crypto_store {
     ( $($body:tt)* ) => {
         #[async_trait(?Send)]
@@ -682,7 +702,7 @@ macro_rules! impl_crypto_store {
     };
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 macro_rules! impl_crypto_store {
     ( $($body:tt)* ) => {
         impl IndexeddbCryptoStore {
@@ -1092,7 +1112,7 @@ impl_crypto_store! {
                 idb_object.needs_backup = false;
                 object_store.put_key_val(&key, &serde_wasm_bindgen::to_value(&idb_object)?)?;
             } else {
-                warn!("Could not find inbound group session to mark it as backed up. key={:?}", key);
+                warn!(?key, "Could not find inbound group session to mark it as backed up.");
             }
         }
 
@@ -1372,10 +1392,18 @@ impl_crypto_store! {
             .transpose()
     }
 
-    #[allow(clippy::unused_async)]
-    async fn get_received_room_key_bundle_data(&self, _room_id: &RoomId, _user_id: &UserId) -> Result<Option<StoredRoomKeyBundleData>> {
-        // TODO: not yet implemented for indexeddb
-        Ok(None)
+    async fn get_received_room_key_bundle_data(&self, room_id: &RoomId, user_id: &UserId) -> Result<Option<StoredRoomKeyBundleData>> {
+        let key = self.serializer.encode_key(keys::RECEIVED_ROOM_KEY_BUNDLES, (room_id, user_id));
+        let result = self
+            .inner
+            .transaction_on_one_with_mode(keys::RECEIVED_ROOM_KEY_BUNDLES, IdbTransactionMode::Readonly)?
+            .object_store(keys::RECEIVED_ROOM_KEY_BUNDLES)?
+            .get(&key)?
+            .await?
+            .map(|v| self.serializer.deserialize_value(v))
+            .transpose()?;
+
+        Ok(result)
     }
 
     async fn get_custom_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -1556,7 +1584,9 @@ async fn import_store_cipher_with_key(
             // Loading the cipher with the passphrase was successful. Let's update the
             // stored version of the cipher so that it is encrypted with a key,
             // to save doing this again.
-            debug!("IndexedDbCryptoStore: Migrating passphrase-encrypted store cipher to key-encryption");
+            debug!(
+                "IndexedDbCryptoStore: Migrating passphrase-encrypted store cipher to key-encryption"
+            );
 
             let export = cipher.export_with_key(chacha_key).map_err(CryptoStoreError::backend)?;
             save_store_cipher(db, &export).await?;
@@ -1866,7 +1896,7 @@ mod unit_tests {
     }
 }
 
-#[cfg(all(test, target_arch = "wasm32"))]
+#[cfg(all(test, target_family = "wasm"))]
 mod wasm_unit_tests {
     use std::collections::BTreeMap;
 
@@ -1930,7 +1960,7 @@ mod wasm_unit_tests {
     }
 }
 
-#[cfg(all(test, target_arch = "wasm32"))]
+#[cfg(all(test, target_family = "wasm"))]
 mod tests {
     use matrix_sdk_crypto::cryptostore_integration_tests;
 
@@ -1959,12 +1989,12 @@ mod tests {
     cryptostore_integration_tests!();
 }
 
-#[cfg(all(test, target_arch = "wasm32"))]
+#[cfg(all(test, target_family = "wasm"))]
 mod encrypted_tests {
     use matrix_sdk_crypto::{
         cryptostore_integration_tests,
         olm::Account,
-        store::{CryptoStore, PendingChanges},
+        store::{types::PendingChanges, CryptoStore},
         vodozemac::base64_encode,
     };
     use matrix_sdk_test::async_test;

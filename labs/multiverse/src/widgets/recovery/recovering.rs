@@ -1,11 +1,12 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures_util::FutureExt as _;
 use matrix_sdk::{
-    encryption::{recovery::RecoveryError, CrossSigningResetAuthType},
+    Client,
+    encryption::{CrossSigningResetAuthType, recovery::RecoveryError},
     reqwest::Url,
     ruma::api::client::uiaa::{AuthData, Password},
-    Client,
 };
+use matrix_sdk_common::executor::spawn;
 use ratatui::{
     prelude::*,
     widgets::{Block, Paragraph},
@@ -13,7 +14,7 @@ use ratatui::{
 use throbber_widgets_tui::{Throbber, ThrobberState};
 use tokio::{
     sync::{
-        mpsc::{unbounded_channel, UnboundedSender},
+        mpsc::{UnboundedSender, unbounded_channel},
         oneshot,
     },
     task::JoinHandle,
@@ -21,7 +22,7 @@ use tokio::{
 use tui_textarea::TextArea;
 
 use super::ShouldExit;
-use crate::widgets::{recovery::create_centered_throbber_area, Hyperlink};
+use crate::widgets::{Hyperlink, recovery::create_centered_throbber_area};
 
 #[derive(Debug)]
 enum ResetState {
@@ -152,7 +153,7 @@ impl RecoveringView {
             .expect("We should have access to our user ID if we're resetting our identity")
             .to_owned();
 
-        let reset_task = tokio::spawn(async move {
+        let reset_task = spawn(async move {
             let handle = client.encryption().recovery().reset_identity().await?;
 
             if let Some(handle) = handle {
@@ -245,7 +246,7 @@ impl RecoveringView {
                         let recovery_key = recovery_text_area.lines().join("");
                         let client = self.client.clone();
 
-                        let recovery_task = tokio::spawn(async move {
+                        let recovery_task = spawn(async move {
                             client.encryption().recovery().recover(recovery_key.trim()).await
                         });
 

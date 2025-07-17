@@ -46,7 +46,7 @@ use crate::{
         InboundGroupSession, OutboundGroupSession, SenderData, SenderDataFinder, Session,
         ShareInfo, ShareState,
     },
-    store::{Changes, CryptoStoreWrapper, Result as StoreResult, Store},
+    store::{types::Changes, CryptoStoreWrapper, Result as StoreResult, Store},
     types::{
         events::{
             room::encrypted::{RoomEncryptedEventContent, ToDeviceEncryptedEventContent},
@@ -779,7 +779,10 @@ impl GroupSessionManager {
         // Only allow conservative sharing strategies
         let collect_strategy = match collect_strategy {
             CollectStrategy::AllDevices | CollectStrategy::ErrorOnVerifiedUserProblem => {
-                warn!("Ignoring request to use unsafe sharing strategy {:?} for room key history sharing", collect_strategy);
+                warn!(
+                    "Ignoring request to use unsafe sharing strategy {collect_strategy:?} \
+                     for room key history sharing",
+                );
                 &CollectStrategy::IdentityBasedStrategy
             }
             CollectStrategy::IdentityBasedStrategy | CollectStrategy::OnlyTrustedDevices => {
@@ -1031,7 +1034,7 @@ mod tests {
     };
 
     use assert_matches2::assert_let;
-    use matrix_sdk_common::deserialized_responses::WithheldCode;
+    use matrix_sdk_common::deserialized_responses::{ProcessedToDeviceEvent, WithheldCode};
     use matrix_sdk_test::{async_test, ruma_response_from_json};
     use ruma::{
         api::client::{
@@ -1063,7 +1066,7 @@ mod tests {
                 room_key_withheld::RoomKeyWithheldContent::{self, MegolmV1AesSha2},
             },
             requests::ToDeviceRequest,
-            DeviceKeys, EventEncryptionAlgorithm, ProcessedToDeviceEvent,
+            DeviceKeys, EventEncryptionAlgorithm,
         },
         EncryptionSettings, LocalTrust, OlmMachine,
     };
@@ -1823,10 +1826,10 @@ mod tests {
         assert_eq!(1, decrypted.len());
         use crate::types::events::EventType;
         assert_let!(
-            ProcessedToDeviceEvent::Decrypted(decrypted_event) = decrypted.first().unwrap().clone()
+            ProcessedToDeviceEvent::Decrypted { raw, .. } = decrypted.first().unwrap().clone()
         );
         assert_eq!(
-            decrypted_event.get_field::<String>("type").unwrap().unwrap(),
+            raw.get_field::<String>("type").unwrap().unwrap(),
             RoomKeyBundleContent::EVENT_TYPE,
         );
     }

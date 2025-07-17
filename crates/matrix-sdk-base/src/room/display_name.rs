@@ -209,10 +209,10 @@ impl Room {
                         names.push(member.name().to_owned());
                     }
                     Ok(None) => {
-                        warn!("Ignoring hero, no member info for {}", hero.user_id);
+                        warn!(user_id = ?hero.user_id, "Ignoring hero, no member info");
                     }
                     Err(error) => {
-                        warn!("Ignoring hero, error getting member: {}", error);
+                        warn!("Ignoring hero, error getting member: {error}");
                     }
                 }
             }
@@ -472,7 +472,7 @@ fn compute_display_name_from_heroes(
     heroes.sort_unstable();
 
     let names = if num_heroes == 0 && num_joined_invited > 1 {
-        format!("{} people", num_joined_invited)
+        format!("{num_joined_invited} people")
     } else if num_heroes >= num_joined_invited_except_self {
         heroes.join(", ")
     } else if num_heroes < num_joined_invited_except_self && num_joined_invited > 1 {

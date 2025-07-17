@@ -2,14 +2,15 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     path::PathBuf,
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use crate::client::BWIScanState::Infected;
 use anyhow::{anyhow, Context as _};
-use async_compat::get_runtime_handle;
-use futures_util::{pin_mut, StreamExt};
+use futures_util::pin_mut;
+#[cfg(not(target_family = "wasm"))]
+use matrix_sdk::media::MediaFileHandle as SdkMediaFileHandle;
 use matrix_sdk::bwi_extensions::attachment::ClientAttachmentExt;
 use matrix_sdk::bwi_extensions::client::BWIClientSetupExt;
 use matrix_sdk::{
@@ -17,14 +18,14 @@ use matrix_sdk::{
         AccountManagementActionFull, ClientId, OAuthAuthorizationData, OAuthSession,
     },
     event_cache::EventCacheError,
-    media::{
-        MediaFileHandle as SdkMediaFileHandle, MediaFormat, MediaRequestParameters,
-        MediaRetentionPolicy, MediaThumbnailSettings,
-    },
+    media::{MediaFormat, MediaRequestParameters, MediaRetentionPolicy, MediaThumbnailSettings},
     room::access_rules::{AccessRule, RoomAccessRulesEventContent},
     ruma::{
         api::client::{
-            discovery::get_authorization_server_metadata::msc2965::Prompt as RumaOidcPrompt,
+            discovery::{
+                discover_homeserver::RtcFocusInfo,
+                get_authorization_server_metadata::msc2965::Prompt as RumaOidcPrompt,
+            },
             push::{EmailPusherData, PusherIds, PusherInit, PusherKind as RumaPusherKind},
             room::{create_room, Visibility},
             session::get_login_types,
@@ -45,6 +46,7 @@ use matrix_sdk::{
     AuthApi, AuthSession, Client as MatrixClient, SessionChange, SessionTokens,
     STATE_STORE_DATABASE_NAME,
 };
+use matrix_sdk_common::{stream::StreamExt, SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_ui::{
     notification_client::{
         NotificationClient as MatrixNotificationClient,
@@ -90,20 +92,24 @@ use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, error, warn};
 use url::Url;
 
-use super::{room::Room, session_verification::SessionVerificationController};
+use super::{
+    room::{room_info::RoomInfo, Room},
+    session_verification::SessionVerificationController,
+};
 use crate::{
     authentication::{HomeserverLoginDetails, OidcConfiguration, OidcError, SsoError, SsoHandler},
     client,
     encryption::Encryption,
     notification::NotificationClient,
     notification_settings::NotificationSettings,
-    room::RoomHistoryVisibility,
+    room::{RoomHistoryVisibility, RoomInfoListener},
     room_directory_search::RoomDirectorySearch,
     room_preview::RoomPreview,
     ruma::{
         AccountDataEvent, AccountDataEventType, AuthData, InviteAvatars, MediaPreviewConfig,
         MediaPreviews, MediaSource, RoomAccountDataEvent, RoomAccountDataEventType,
     },
+    runtime::get_runtime_handle,
     sync_service::{SyncService, SyncServiceBuilder},
     task_handle::TaskHandle,
     utd::{UnableToDecryptDelegate, UtdHook},
@@ -211,24 +217,24 @@ impl From<PushFormat> for RumaPushFormat {
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait ClientDelegate: Sync + Send {
+pub trait ClientDelegate: SyncOutsideWasm + SendOutsideWasm {
     fn did_receive_auth_error(&self, is_soft_logout: bool);
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait ClientSessionDelegate: Sync + Send {
+pub trait ClientSessionDelegate: SyncOutsideWasm + SendOutsideWasm {
     fn retrieve_session_from_keychain(&self, user_id: String) -> Result<Session, ClientError>;
     fn save_session_in_keychain(&self, session: Session);
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait ProgressWatcher: Send + Sync {
+pub trait ProgressWatcher: SyncOutsideWasm + SendOutsideWasm {
     fn transmission_progress(&self, progress: TransmissionProgress);
 }
 
 /// A listener to the global (client-wide) error reporter of the send queue.
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait SendQueueRoomErrorListener: Sync + Send {
+pub trait SendQueueRoomErrorListener: SyncOutsideWasm + SendOutsideWasm {
     /// Called every time the send queue has ran into an error for a given room,
     /// which will disable the send queue for that particular room.
     fn on_error(&self, room_id: String, error: ClientError);
@@ -236,14 +242,14 @@ pub trait SendQueueRoomErrorListener: Sync + Send {
 
 /// A listener for changes of global account data events.
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait AccountDataListener: Sync + Send {
+pub trait AccountDataListener: SyncOutsideWasm + SendOutsideWasm {
     /// Called when a global account data event has changed.
     fn on_change(&self, event: AccountDataEvent);
 }
 
 /// A listener for changes of room account data events.
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait RoomAccountDataListener: Sync + Send {
+pub trait RoomAccountDataListener: SyncOutsideWasm + SendOutsideWasm {
     /// Called when a room account data event was changed.
     fn on_change(&self, event: RoomAccountDataEvent, room_id: String);
 }
@@ -533,32 +539,6 @@ impl Client {
         Ok(())
     }
 
-    pub async fn get_media_file(
-        &self,
-        media_source: Arc<MediaSource>,
-        filename: Option<String>,
-        mime_type: String,
-        use_cache: bool,
-        temp_dir: Option<String>,
-    ) -> Result<Arc<MediaFileHandle>, ClientError> {
-        let source = (*media_source).clone();
-        let mime_type: mime::Mime = mime_type.parse()?;
-
-        let handle = self
-            .inner
-            .media()
-            .get_media_file(
-                &MediaRequestParameters { source: source.media_source, format: MediaFormat::File },
-                filename,
-                &mime_type,
-                use_cache,
-                temp_dir,
-            )
-            .await?;
-
-        Ok(Arc::new(MediaFileHandle::new(handle)))
-    }
-
     /// Restores the client from a `Session`.
     ///
     /// It reloads the entire set of rooms from the previous session.
@@ -774,11 +754,44 @@ impl Client {
 
     /// Empty the server version and unstable features cache.
     ///
-    /// Since the SDK caches server capabilities (versions and unstable
-    /// features), it's possible to have a stale entry in the cache. This
-    /// functions makes it possible to force reset it.
-    pub async fn reset_server_capabilities(&self) -> Result<(), ClientError> {
-        Ok(self.inner.reset_server_capabilities().await?)
+    /// Since the SDK caches server info (versions, unstable features,
+    /// well-known etc), it's possible to have a stale entry in the cache.
+    /// This functions makes it possible to force reset it.
+    pub async fn reset_server_info(&self) -> Result<(), ClientError> {
+        Ok(self.inner.reset_server_info().await?)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[matrix_sdk_ffi_macros::export]
+impl Client {
+    /// Retrieves a media file from the media source
+    ///
+    /// Not available on Wasm platforms, due to lack of accessible file system.
+    pub async fn get_media_file(
+        &self,
+        media_source: Arc<MediaSource>,
+        filename: Option<String>,
+        mime_type: String,
+        use_cache: bool,
+        temp_dir: Option<String>,
+    ) -> Result<Arc<MediaFileHandle>, ClientError> {
+        let source = (*media_source).clone();
+        let mime_type: mime::Mime = mime_type.parse()?;
+
+        let handle = self
+            .inner
+            .media()
+            .get_media_file(
+                &MediaRequestParameters { source: source.media_source, format: MediaFormat::File },
+                filename,
+                &mime_type,
+                use_cache,
+                temp_dir,
+            )
+            .await?;
+
+        Ok(Arc::new(MediaFileHandle::new(handle)))
     }
 }
 
@@ -871,7 +884,7 @@ impl Client {
         .with_max_delay(UTD_HOOK_GRACE_PERIOD);
 
         if let Err(e) = utd_hook_manager.reload_from_store().await {
-            error!("Unable to reload UTD hook data from data store: {}", e);
+            error!("Unable to reload UTD hook data from data store: {e}");
             // Carry on with the setup anyway; we shouldn't fail setup just
             // because the UTD hook failed to load its data.
         }
@@ -1498,9 +1511,16 @@ impl Client {
     /// Clear all the non-critical caches for this Client instance.
     ///
     /// WARNING: This will clear all the caches, including the base store (state
-    /// store), so callers must make sure that any sync is inactive before
-    /// calling this method. In particular, the `SyncService` must not be
-    /// running. After the method returns, the Client will be in an unstable
+    /// store), so callers must make sure that the Client is at rest before
+    /// calling it.
+    ///
+    /// In particular, if a [`SyncService`] is running, it must be passed here
+    /// as a parameter, or stopped before calling this method. Ideally, the
+    /// send queues should have been disabled and must all be inactive (i.e.
+    /// not sending events); this method will disable them, but it might not
+    /// be enough if the queues are still processing events.
+    ///
+    /// After the method returns, the Client will be in an unstable
     /// state, and it is required that the caller reinstantiates a new
     /// Client instance, be it via dropping the previous and re-creating it,
     /// restarting their application, or any other similar means.
@@ -1510,8 +1530,23 @@ impl Client {
     ///   will start as if they were empty.
     /// - This will empty the media cache according to the current media
     ///   retention policy.
-    pub async fn clear_caches(&self) -> Result<(), ClientError> {
+    pub async fn clear_caches(
+        &self,
+        sync_service: Option<Arc<SyncService>>,
+    ) -> Result<(), ClientError> {
         let closure = async || -> Result<_, ClientError> {
+            // First, make sure to expire sessions in the sync service.
+            if let Some(sync_service) = sync_service {
+                sync_service.inner.expire_sessions().await;
+            }
+
+            // Disable the send queues, as they might read and write to the state store.
+            // Events being send might still be active, and cause errors if
+            // processing finishes, so this will only minimize damage. Since
+            // this method should only be called in exceptional cases, this has
+            // been deemed acceptable.
+            self.inner.send_queue().set_enabled(false).await;
+
             // Clean up the media cache according to the current media retention policy.
             self.inner
                 .event_cache_store()
@@ -1523,7 +1558,7 @@ impl Client {
                 .map_err(EventCacheError::from)?;
 
             // Clear all the room chunks. It's important to *not* call
-            // `EventCacheStore::clear_all_rooms_chunks` here, because there might be live
+            // `EventCacheStore::clear_all_linked_chunks` here, because there might be live
             // observers of the linked chunks, and that would cause some very bad state
             // mismatch.
             self.inner.event_cache().clear_all_rooms().await?;
@@ -1566,6 +1601,16 @@ impl Client {
     /// Checks if the server supports the report room API.
     pub async fn is_report_room_api_supported(&self) -> Result<bool, ClientError> {
         Ok(self.inner.server_versions().await?.contains(&ruma::api::MatrixVersion::V1_13))
+    }
+
+    /// Checks if the server supports the LiveKit RTC focus for placing calls.
+    pub async fn is_livekit_rtc_supported(&self) -> Result<bool, ClientError> {
+        Ok(self
+            .inner
+            .rtc_foci()
+            .await?
+            .iter()
+            .any(|focus| matches!(focus, RtcFocusInfo::LiveKit(_))))
     }
 
     /// Subscribe to changes in the media preview configuration.
@@ -1633,15 +1678,65 @@ impl Client {
     ) -> Result<Option<MediaPreviewConfig>, ClientError> {
         Ok(self.inner.account().fetch_media_preview_config_event_content().await?.map(Into::into))
     }
+
+    /// Gets the `max_upload_size` value from the homeserver, which controls the
+    /// max size a media upload request can have.
+    pub async fn get_max_media_upload_size(&self) -> Result<u64, ClientError> {
+        let max_upload_size = self.inner.load_or_fetch_max_upload_size().await?;
+        Ok(max_upload_size.into())
+    }
+
+    /// Subscribe to [`RoomInfo`] updates given a provided [`RoomId`].
+    ///
+    /// This works even for rooms we haven't received yet, so we can subscribe
+    /// to this and wait until we receive updates from them when sync responses
+    /// are processed.
+    ///
+    /// Note this method should be used sparingly since using callback
+    /// interfaces is expensive, as well as keeping them alive for a long
+    /// time. Usages of this method should be short-lived and dropped as
+    /// soon as possible.
+    pub async fn subscribe_to_room_info(
+        &self,
+        room_id: String,
+        listener: Box<dyn RoomInfoListener>,
+    ) -> Result<Arc<TaskHandle>, ClientError> {
+        let room_id = RoomId::parse(room_id)?;
+
+        // Emit the initial event, if present
+        if let Some(room) = self.inner.get_room(&room_id) {
+            if let Ok(room_info) = RoomInfo::new(&room).await {
+                listener.call(room_info);
+            }
+        }
+
+        Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn({
+            let client = self.inner.clone();
+            let mut receiver = client.room_info_notable_update_receiver();
+            async move {
+                while let Ok(room_update) = receiver.recv().await {
+                    if room_update.room_id != room_id {
+                        continue;
+                    }
+
+                    if let Some(room) = client.get_room(&room_id) {
+                        if let Ok(room_info) = RoomInfo::new(&room).await {
+                            listener.call(room_info);
+                        }
+                    }
+                }
+            }
+        }))))
+    }
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait MediaPreviewConfigListener: Sync + Send {
+pub trait MediaPreviewConfigListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_change(&self, media_preview_config: Option<MediaPreviewConfig>);
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
-pub trait IgnoredUsersListener: Sync + Send {
+pub trait IgnoredUsersListener: SyncOutsideWasm + SendOutsideWasm {
     fn call(&self, ignored_user_ids: Vec<String>);
 }
 
@@ -2189,17 +2284,20 @@ fn gen_transaction_id() -> String {
 
 /// A file handle that takes ownership of a media file on disk. When the handle
 /// is dropped, the file will be removed from the disk.
+#[cfg(not(target_family = "wasm"))]
 #[derive(uniffi::Object)]
 pub struct MediaFileHandle {
-    inner: RwLock<Option<SdkMediaFileHandle>>,
+    inner: std::sync::RwLock<Option<SdkMediaFileHandle>>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl MediaFileHandle {
-    pub(crate) fn new(handle: SdkMediaFileHandle) -> Self {
-        Self { inner: RwLock::new(Some(handle)) }
+    fn new(handle: SdkMediaFileHandle) -> Self {
+        Self { inner: std::sync::RwLock::new(Some(handle)) }
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 #[matrix_sdk_ffi_macros::export]
 impl MediaFileHandle {
     /// Get the media file's path.
@@ -2426,7 +2524,7 @@ impl TryFrom<RumaJoinRule> for JoinRule {
             }
             RumaJoinRule::Invite => Ok(JoinRule::Invite),
             RumaJoinRule::_Custom(_) => Ok(JoinRule::Custom { repr: value.as_str().to_owned() }),
-            _ => Err(format!("Unknown JoinRule: {:?}", value)),
+            _ => Err(format!("Unknown JoinRule: {value:?}")),
         }
     }
 }
@@ -2443,7 +2541,7 @@ impl TryFrom<RumaAllowRule> for AllowRule {
                     .map_err(|e| format!("Couldn't serialize custom AllowRule: {e:?}"))?;
                 Ok(Self::Custom { json })
             }
-            _ => Err(format!("Invalid AllowRule: {:?}", value)),
+            _ => Err(format!("Invalid AllowRule: {value:?}")),
         }
     }
 }

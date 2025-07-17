@@ -1,10 +1,10 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use futures_util::FutureExt;
-use matrix_sdk::{room::Invite, Room, RoomState};
+use matrix_sdk::{Room, RoomState, room::Invite};
 use ratatui::{prelude::*, widgets::*};
 use throbber_widgets_tui::{Throbber, ThrobberState};
 use tokio::{spawn, task::JoinHandle};
-use tui_framework_experiment::{button, Button};
+use tui_framework_experiment::{Button, button};
 
 use crate::widgets::recovery::create_centered_throbber_area;
 
@@ -183,7 +183,22 @@ impl InvitedRoomView {
 
     fn update(&mut self) {
         if !matches!(self.room.state(), RoomState::Invited) {
-            self.mode = Mode::Done;
+            match &mut self.mode {
+                // Don't go into the `Done` mode before the task doing the join finishes. This is
+                // especially important for the shared room history feature, since we do a bunch of
+                // work after the `/join` request is sent out to import the historic room keys.
+                //
+                // This prevents the task from being aborted because switching to the joined room
+                // view is decided by the `should_switch()` function.
+                Mode::Joining { task } => {
+                    if task.is_finished() {
+                        self.mode = Mode::Done
+                    }
+                }
+                Mode::Loading { .. } | Mode::Leaving { .. } | Mode::Loaded { .. } | Mode::Done => {
+                    self.mode = Mode::Done
+                }
+            }
         } else {
             match &mut self.mode {
                 Mode::Loading { task } => {

@@ -14,7 +14,7 @@
 // limitations under the License.
 
 #![doc = include_str!("../docs/encryption.md")]
-#![cfg_attr(target_arch = "wasm32", allow(unused_imports))]
+#![cfg_attr(target_family = "wasm", allow(unused_imports))]
 
 #[cfg(feature = "experimental-send-custom-to-device")]
 use std::ops::Deref;
@@ -33,7 +33,7 @@ use futures_util::{
     stream::{self, StreamExt},
 };
 use matrix_sdk_base::crypto::{
-    store::RoomKeyInfo,
+    store::types::{RoomKeyBundleInfo, RoomKeyInfo},
     types::requests::{
         OutgoingRequest, OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest,
     },
@@ -723,7 +723,6 @@ impl Encryption {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn import_secrets_bundle(
         &self,
         bundle: &matrix_sdk_base::crypto::types::SecretsBundle,
@@ -1353,7 +1352,7 @@ impl Encryption {
     ///     .await?;
     /// # anyhow::Ok(()) };
     /// ```
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub async fn export_room_keys(
         &self,
         path: PathBuf,
@@ -1415,7 +1414,7 @@ impl Encryption {
     /// );
     /// # anyhow::Ok(()) };
     /// ```
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(target_family = "wasm"))]
     pub async fn import_room_keys(
         &self,
         path: PathBuf,
@@ -1479,6 +1478,43 @@ impl Encryption {
         Some(olm.store().room_keys_received_stream())
     }
 
+    /// Receive notifications of historic room key bundles as a [`Stream`].
+    ///
+    /// Historic room key bundles are defined in [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268).
+    ///
+    /// Each time a historic room key bundle was received, an update will be
+    /// sent to the stream. This stream is useful for informative purposes
+    /// exclusively, historic room key bundles are handled by the SDK
+    /// automatically.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::Client;
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// # let client = Client::new(homeserver).await?;
+    /// use futures_util::StreamExt;
+    ///
+    /// let Some(mut bundle_stream) =
+    ///     client.encryption().historic_room_key_stream().await
+    /// else {
+    ///     return Ok(());
+    /// };
+    ///
+    /// while let Some(bundle_info) = bundle_stream.next().await {
+    ///     println!("Received a historic room key bundle {bundle_info:?}");
+    /// }
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn historic_room_key_stream(&self) -> Option<impl Stream<Item = RoomKeyBundleInfo>> {
+        let olm = self.client.olm_machine().await;
+        let olm = olm.as_ref()?;
+
+        Some(olm.store().historic_room_key_stream())
+    }
+
     /// Get the secret storage manager of the client.
     pub fn secret_storage(&self) -> SecretStorage {
         SecretStorage { client: self.client.to_owned() }
@@ -1512,7 +1548,10 @@ impl Encryption {
             if prev_holder == lock_value {
                 return Ok(());
             }
-            warn!("Recreating cross-process store lock with a different holder value: prev was {prev_holder}, new is {lock_value}");
+            warn!(
+                "Recreating cross-process store lock with a different holder value: \
+                 prev was {prev_holder}, new is {lock_value}"
+            );
         }
 
         let olm_machine = self.client.base_client().olm_machine().await;
@@ -1691,7 +1730,6 @@ impl Encryption {
     /// **Warning**: Do not use this method if we're already calling
     /// [`Client::send_outgoing_request()`]. This method is intended for
     /// explicitly uploading the device keys before starting a sync.
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn ensure_device_keys_upload(&self) -> Result<()> {
         let olm = self.client.olm_machine().await;
         let olm = olm.as_ref().ok_or(Error::NoOlmMachine)?;
@@ -1786,7 +1824,7 @@ impl Encryption {
 
         // TODO: parallelize that? it's already grouping 250 devices per chunk.
         for request in requests {
-            let request = RumaToDeviceRequest::new_raw(
+            let ruma_request = RumaToDeviceRequest::new_raw(
                 request.event_type.clone(),
                 request.txn_id.clone(),
                 request.messages.clone(),
@@ -1794,7 +1832,7 @@ impl Encryption {
 
             let send_result = self
                 .client
-                .send_inner(request, Some(RequestConfig::short_retry()), Default::default())
+                .send_inner(ruma_request, Some(RequestConfig::short_retry()), Default::default())
                 .await;
 
             // If the sending failed we need to collect the failures to report them
@@ -1819,7 +1857,7 @@ impl Encryption {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use std::{
         ops::Not,
@@ -2022,7 +2060,7 @@ mod tests {
             client1.olm_machine().await.clone().expect("must have an olm machine");
 
         // Also enable backup to check that new machine has the same backup keys.
-        let decryption_key = matrix_sdk_base::crypto::store::BackupDecryptionKey::new()
+        let decryption_key = matrix_sdk_base::crypto::store::types::BackupDecryptionKey::new()
             .expect("Can't create new recovery key");
         let backup_key = decryption_key.megolm_v1_public_key();
         backup_key.set_version("1".to_owned());

@@ -37,7 +37,7 @@
 //! to cater for the first use case, and to never lose any aggregations in the
 //! second use case.
 
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use as_variant::as_variant;
 use matrix_sdk::deserialized_responses::EncryptionInfo;
@@ -82,7 +82,11 @@ pub(in crate::timeline) struct PendingEdit {
     pub edit_json: Option<Raw<AnySyncTimelineEvent>>,
 
     /// The encryption info for this edit.
-    pub encryption_info: Option<EncryptionInfo>,
+    pub encryption_info: Option<Arc<EncryptionInfo>>,
+
+    /// If provided, this is the identifier of a remote event item that included
+    /// this bundled edit.
+    pub bundled_item_owner: Option<OwnedEventId>,
 }
 
 /// Which kind of aggregation (related event) is this?
@@ -423,7 +427,10 @@ impl Aggregations {
         };
 
         let Some(aggregation) = aggregation else {
-            warn!("incorrect internal state: {aggregation_id:?} was present in the inverted map, not in related-to map.");
+            warn!(
+                "incorrect internal state: {aggregation_id:?} was present in the inverted map, \
+                 not in related-to map."
+            );
             return Ok(false);
         };
 
@@ -598,7 +605,12 @@ fn resolve_edits(
 
                 TimelineEventItemId::EventId(event_id) => {
                     if let Some(best_edit_pos) = &mut best_edit_pos {
-                        let pos = items.position_by_event_id(event_id);
+                        // Find the position of the timeline owning the edit: either the bundled
+                        // item owner if this was a bundled edit, or the edit event itself.
+                        let pos = items.position_by_event_id(
+                            pending_edit.bundled_item_owner.as_ref().unwrap_or(event_id),
+                        );
+
                         if let Some(pos) = pos {
                             // If the edit is more recent (higher index) than the previous best
                             // edit we knew about, use this one.
@@ -638,8 +650,11 @@ fn resolve_edits(
 }
 
 /// Apply the selected edit to the given EventTimelineItem.
+///
+/// Returns true if the edit was applied, false otherwise (because the edit and
+/// original timeline item types didn't match, for instance).
 fn edit_item(item: &mut Cow<'_, EventTimelineItem>, edit: PendingEdit) -> bool {
-    let PendingEdit { kind: edit_kind, edit_json, encryption_info } = edit;
+    let PendingEdit { kind: edit_kind, edit_json, encryption_info, bundled_item_owner: _ } = edit;
 
     if let Some(event_json) = &edit_json {
         let Some(edit_sender) = event_json.get_field::<OwnedUserId>("sender").ok().flatten() else {
@@ -658,7 +673,7 @@ fn edit_item(item: &mut Cow<'_, EventTimelineItem>, edit: PendingEdit) -> bool {
     }
 
     let TimelineItemContent::MsgLike(content) = item.content() else {
-        info!("Edit of message event applies to {:?}, discarding", item.content().debug_string(),);
+        info!("Edit of message event applies to {:?}, discarding", item.content().debug_string());
         return false;
     };
 
@@ -795,6 +810,9 @@ pub(crate) enum AggregationError {
     #[error("a redaction can't be unapplied")]
     CantUndoRedaction,
 
-    #[error("trying to apply an aggregation of one type to an invalid target: expected {expected}, actual {actual}")]
+    #[error(
+        "trying to apply an aggregation of one type to an invalid target: \
+         expected {expected}, actual {actual}"
+    )]
     InvalidType { expected: String, actual: String },
 }

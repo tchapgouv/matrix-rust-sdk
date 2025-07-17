@@ -155,11 +155,7 @@ impl VerificationMachine {
     }
 
     pub fn get_requests(&self, user_id: &UserId) -> Vec<VerificationRequest> {
-        self.requests
-            .read()
-            .get(user_id)
-            .map(|v| v.iter().map(|(_, value)| value.clone()).collect())
-            .unwrap_or_default()
+        self.requests.read().get(user_id).map(|v| v.values().cloned().collect()).unwrap_or_default()
     }
 
     /// Add a new `VerificationRequest` object to the cache.
@@ -371,7 +367,10 @@ impl VerificationMachine {
                 let Some(device_data) =
                     self.store.get_device(event.sender(), r.from_device()).await?
                 else {
-                    warn!("Could not retrieve the device data for the incoming verification request, ignoring it");
+                    warn!(
+                        "Could not retrieve the device data for the incoming verification request, \
+                         ignoring it"
+                    );
                     return Ok(());
                 };
 

@@ -19,7 +19,7 @@ use std::{
 
 use bitflags::bitflags;
 use eyeball::Subscriber;
-use matrix_sdk_common::deserialized_responses::TimelineEventKind;
+use matrix_sdk_common::{deserialized_responses::TimelineEventKind, ROOM_VERSION_FALLBACK};
 use ruma::{
     api::client::sync::sync_events::v3::RoomSummary as RumaSummary,
     assign,
@@ -192,6 +192,7 @@ impl BaseRoomInfo {
             AnySyncStateEvent::RoomName(n) => {
                 self.name = Some(n.into());
             }
+            // `m.room.create` can NOT be overwritten.
             AnySyncStateEvent::RoomCreate(c) if self.create.is_none() => {
                 self.create = Some(c.into());
             }
@@ -309,7 +310,7 @@ impl BaseRoomInfo {
     }
 
     pub(super) fn handle_redaction(&mut self, redacts: &EventId) {
-        let room_version = self.room_version().unwrap_or(&RoomVersionId::V1).to_owned();
+        let room_version = self.room_version().unwrap_or(&ROOM_VERSION_FALLBACK).to_owned();
 
         // FIXME: Use let chains once available to get rid of unwrap()s
         if self.avatar.has_event_id(redacts) {
@@ -642,9 +643,9 @@ impl RoomInfo {
         event: &SyncRoomRedactionEvent,
         _raw: &Raw<SyncRoomRedactionEvent>,
     ) {
-        let room_version = self.base_info.room_version().unwrap_or(&RoomVersionId::V1);
+        let room_version = self.room_version_or_default();
 
-        let Some(redacts) = event.redacts(room_version) else {
+        let Some(redacts) = event.redacts(&room_version) else {
             info!("Can't apply redaction, redacts field is missing");
             return;
         };
@@ -653,7 +654,7 @@ impl RoomInfo {
         if let Some(latest_event) = &mut self.latest_event {
             tracing::trace!("Checking if redaction applies to latest event");
             if latest_event.event_id().as_deref() == Some(redacts) {
-                match apply_redaction(latest_event.event().raw(), _raw, room_version) {
+                match apply_redaction(latest_event.event().raw(), _raw, &room_version) {
                     Some(redacted) => {
                         // Even if the original event was encrypted, redaction removes all its
                         // fields so it cannot possibly be successfully decrypted after redaction.
@@ -813,10 +814,10 @@ impl RoomInfo {
                 .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
-                warn!("Unknown room version, falling back to v10");
+                warn!("Unknown room version, falling back to {ROOM_VERSION_FALLBACK}");
             }
 
-            RoomVersionId::V10
+            ROOM_VERSION_FALLBACK
         })
     }
 
@@ -866,13 +867,12 @@ impl RoomInfo {
         }
     }
 
-    /// Returns the join rule for this room.
-    ///
-    /// Defaults to `Public`, if missing.
-    pub fn join_rule(&self) -> &JoinRule {
+    /// Return the join rule for this room, if the `m.room.join_rules` event is
+    /// available.
+    pub fn join_rule(&self) -> Option<&JoinRule> {
         match &self.base_info.join_rules {
-            Some(MinimalStateEvent::Original(ev)) => &ev.content.join_rule,
-            _ => &JoinRule::Public,
+            Some(MinimalStateEvent::Original(ev)) => Some(&ev.content.join_rule),
+            _ => None,
         }
     }
 
@@ -882,7 +882,13 @@ impl RoomInfo {
         (!name.is_empty()).then_some(name)
     }
 
-    pub(super) fn tombstone(&self) -> Option<&RoomTombstoneEventContent> {
+    /// Get the content of the `m.room.create` event if any.
+    pub fn create(&self) -> Option<&RoomCreateWithCreatorEventContent> {
+        Some(&self.base_info.create.as_ref()?.as_original()?.content)
+    }
+
+    /// Get the content of the `m.room.tombstone` event if any.
+    pub fn tombstone(&self) -> Option<&RoomTombstoneEventContent> {
         Some(&self.base_info.tombstone.as_ref()?.as_original()?.content)
     }
 
@@ -1204,7 +1210,7 @@ mod tests {
             last_prev_batch: Some("pb".to_owned()),
             sync_info: SyncInfo::FullySynced,
             encryption_state_synced: true,
-            latest_event: Some(Box::new(LatestEvent::new(TimelineEvent::new(
+            latest_event: Some(Box::new(LatestEvent::new(TimelineEvent::from_plaintext(
                 Raw::from_json_string(json!({"sender": "@u:i.uk"}).to_string()).unwrap(),
             )))),
             base_info: Box::new(
@@ -1241,6 +1247,7 @@ mod tests {
             "latest_event": {
                 "event": {
                     "kind": {"PlainText": {"event": {"sender": "@u:i.uk"}}},
+                    "thread_summary": "None"
                 },
             },
             "base_info": {

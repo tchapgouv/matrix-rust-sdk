@@ -15,17 +15,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use matrix_sdk::crypto::types::events::UtdCause;
-use matrix_sdk_ui::timeline::TimelineDetails;
 use ruma::events::{room::MediaSource as RumaMediaSource, EventContent};
 
 use super::{
-    content::{Reaction, TimelineItemContent},
-    reply::InReplyToDetails,
+    content::Reaction,
+    reply::{EmbeddedEventDetails, InReplyToDetails},
 };
 use crate::{
     error::ClientError,
     ruma::{ImageInfo, MediaSource, MediaSourceExt, Mentions, MessageType, PollKind},
-    timeline::{content::ReactionSenderData, ProfileDetails},
+    timeline::content::ReactionSenderData,
     utils::Timestamp,
 };
 
@@ -241,40 +240,26 @@ pub struct PollAnswer {
 
 #[derive(Clone, uniffi::Object)]
 pub struct ThreadSummary {
-    pub latest_event: ThreadSummaryLatestEventDetails,
+    pub latest_event: EmbeddedEventDetails,
+    pub num_replies: u32,
 }
 
 #[matrix_sdk_ffi_macros::export]
 impl ThreadSummary {
-    pub fn latest_event(&self) -> ThreadSummaryLatestEventDetails {
+    pub fn latest_event(&self) -> EmbeddedEventDetails {
         self.latest_event.clone()
     }
-}
 
-#[derive(Clone, uniffi::Enum)]
-#[allow(clippy::large_enum_variant)]
-pub enum ThreadSummaryLatestEventDetails {
-    Unavailable,
-    Pending,
-    Ready { sender: String, sender_profile: ProfileDetails, content: TimelineItemContent },
-    Error { message: String },
+    pub fn num_replies(&self) -> u64 {
+        self.num_replies as u64
+    }
 }
 
 impl From<matrix_sdk_ui::timeline::ThreadSummary> for ThreadSummary {
     fn from(value: matrix_sdk_ui::timeline::ThreadSummary) -> Self {
-        let latest_event = match value.latest_event {
-            TimelineDetails::Unavailable => ThreadSummaryLatestEventDetails::Unavailable,
-            TimelineDetails::Pending => ThreadSummaryLatestEventDetails::Pending,
-            TimelineDetails::Ready(event) => ThreadSummaryLatestEventDetails::Ready {
-                content: event.content.into(),
-                sender: event.sender.to_string(),
-                sender_profile: (&event.sender_profile).into(),
-            },
-            TimelineDetails::Error(message) => {
-                ThreadSummaryLatestEventDetails::Error { message: message.to_string() }
-            }
-        };
-
-        Self { latest_event }
+        Self {
+            latest_event: EmbeddedEventDetails::from(value.latest_event),
+            num_replies: value.num_replies,
+        }
     }
 }

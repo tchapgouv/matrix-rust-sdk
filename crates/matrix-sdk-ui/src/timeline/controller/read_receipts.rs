@@ -157,7 +157,10 @@ impl ReadReceipts {
                 // The old receipt is more recent since we can't find the new receipt in the
                 // timeline and we supposedly have all events since the end of the timeline.
                 if !is_own_user_id {
-                    trace!("we had a previous read receipt, but couldn't find the event targeted by the new read receipt in the timeline, exiting");
+                    trace!(
+                        "we had a previous read receipt, but couldn't find the event \
+                         targeted by the new read receipt in the timeline, exiting"
+                    );
                 }
                 return;
             };
@@ -181,7 +184,15 @@ impl ReadReceipts {
         //   more recent because it has a place in the timeline.
 
         if !is_own_user_id {
-            trace!(from_event = ?old_event_id, from_visible_event = ?old_item_event_id, to_event = ?new_receipt.event_id, to_visible_event = ?new_item_event_id, ?old_item_pos, ?new_item_pos, "moving read receipt");
+            trace!(
+                from_event = ?old_event_id,
+                from_visible_event = ?old_item_event_id,
+                to_event = ?new_receipt.event_id,
+                to_visible_event = ?new_item_event_id,
+                ?old_item_pos,
+                ?new_item_pos,
+                "moving read receipt",
+            );
 
             // Remove the old receipt from the old event.
             if let Some(old_event_id) = old_event_id.cloned() {
@@ -443,13 +454,18 @@ impl ReadReceiptTimelineUpdate {
         });
 
         let Some(item_pos) = item_pos else {
-            debug!(%event_id, %user_id, "inconsistent state: new event item for read receipt was not found");
+            debug!(
+                %event_id, %user_id,
+                "inconsistent state: new event item for read receipt was not found",
+            );
             return;
         };
 
         debug_assert!(
             item_pos >= self.old_item_pos.unwrap_or(0),
-            "The new receipt must be added on a timeline item that is _after_ the timeline item that was holding the old receipt");
+            "The new receipt must be added on a timeline item that is _after_ the timeline item \
+             that was holding the old receipt"
+        );
 
         let event_item = &items[item_pos];
         let event_item_id = event_item.unique_id().to_owned();
@@ -480,7 +496,7 @@ impl ReadReceiptTimelineUpdate {
     }
 }
 
-impl TimelineStateTransaction<'_> {
+impl<P: RoomDataProvider> TimelineStateTransaction<'_, P> {
     pub(super) fn handle_explicit_read_receipts(
         &mut self,
         receipt_event_content: ReceiptEventContent,
@@ -520,7 +536,7 @@ impl TimelineStateTransaction<'_> {
     /// Load the read receipts from the store for the given event ID.
     ///
     /// Populates the read receipts in-memory caches.
-    pub(super) async fn load_read_receipts_for_event<P: RoomDataProvider>(
+    pub(super) async fn load_read_receipts_for_event(
         &mut self,
         event_id: &EventId,
         room_data_provider: &P,
@@ -633,10 +649,10 @@ impl TimelineStateTransaction<'_> {
     }
 }
 
-impl TimelineState {
+impl<P: RoomDataProvider> TimelineState<P> {
     /// Populates our own latest read receipt in the in-memory by-user read
     /// receipt cache.
-    pub(super) async fn populate_initial_user_receipt<P: RoomDataProvider>(
+    pub(super) async fn populate_initial_user_receipt(
         &mut self,
         room_data_provider: &P,
         receipt_type: ReceiptType,
@@ -662,7 +678,7 @@ impl TimelineState {
     /// Get the latest read receipt for the given user.
     ///
     /// Useful to get the latest read receipt, whether it's private or public.
-    pub(super) async fn latest_user_read_receipt<P: RoomDataProvider>(
+    pub(super) async fn latest_user_read_receipt(
         &self,
         user_id: &UserId,
         room_data_provider: &P,

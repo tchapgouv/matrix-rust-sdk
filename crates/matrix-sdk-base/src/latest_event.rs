@@ -227,9 +227,10 @@ impl<'de> Deserialize<'de> for LatestEvent {
             Err(err) => variant_errors.push(err),
         }
 
-        Err(serde::de::Error::custom(
-            format!("data did not match any variant of serialized LatestEvent (using serde_json). Observed errors: {variant_errors:?}")
-        ))
+        Err(serde::de::Error::custom(format!(
+            "data did not match any variant of serialized LatestEvent (using serde_json). \
+             Observed errors: {variant_errors:?}"
+        )))
     }
 }
 
@@ -629,7 +630,7 @@ mod tests {
             latest_event: LatestEvent,
         }
 
-        let event = TimelineEvent::new(
+        let event = TimelineEvent::from_plaintext(
             Raw::from_json_string(json!({ "event_id": "$1" }).to_string()).unwrap(),
         );
 
@@ -654,8 +655,9 @@ mod tests {
                                     "event_id": "$1"
                                 }
                             }
-                        }
-                    },
+                        },
+                        "thread_summary": "None",
+                    }
                 }
             })
         );

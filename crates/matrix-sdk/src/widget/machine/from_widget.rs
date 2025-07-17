@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
+
 use as_variant::as_variant;
 use ruma::{
     api::client::{
@@ -23,9 +25,16 @@ use ruma::{
     OwnedEventId, OwnedRoomId,
 };
 use serde::{Deserialize, Serialize};
+use tracing::error;
 
-use super::{driver_req::SendToDeviceRequest, SendEventRequest, UpdateDelayedEventRequest};
-use crate::{widget::StateKeySelector, Error, HttpError, RumaApiError};
+use super::{
+    driver_req::SendToDeviceRequest, MatrixDriverResponse, SendEventRequest,
+    UpdateDelayedEventRequest,
+};
+use crate::{
+    widget::{machine::driver_req::FromMatrixDriverResponse, StateKeySelector},
+    Error, HttpError, RumaApiError,
+};
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "action", rename_all = "snake_case", content = "data")]
@@ -35,7 +44,7 @@ pub(super) enum FromWidgetRequest {
     #[serde(rename = "get_openid")]
     GetOpenId {},
     #[serde(rename = "org.matrix.msc2876.read_events")]
-    ReadEvent(ReadEventRequest),
+    ReadEvent(ReadEventsRequest),
     SendEvent(SendEventRequest),
     SendToDevice(SendToDeviceRequest),
     #[serde(rename = "org.matrix.msc4157.update_delayed_event")]
@@ -133,6 +142,7 @@ impl SupportedApiVersionsResponse {
                 ApiVersion::V0_0_1,
                 ApiVersion::V0_0_2,
                 ApiVersion::MSC2762,
+                ApiVersion::MSC2762UpdateState,
                 ApiVersion::MSC2871,
                 ApiVersion::MSC3819,
             ],
@@ -151,11 +161,15 @@ pub(super) enum ApiVersion {
     #[serde(rename = "0.0.2")]
     V0_0_2,
 
-    /// Supports sending and receiving of events.
+    /// Supports sending and receiving events.
     #[serde(rename = "org.matrix.msc2762")]
     MSC2762,
 
-    /// Supports sending of approved capabilities back to the widget.
+    /// Supports receiving room state with the `update_state` action.
+    #[serde(rename = "org.matrix.msc2762_update_state")]
+    MSC2762UpdateState,
+
+    /// Supports sending approved capabilities back to the widget.
     #[serde(rename = "org.matrix.msc2871")]
     MSC2871,
 
@@ -171,7 +185,7 @@ pub(super) enum ApiVersion {
     #[serde(rename = "org.matrix.msc2876")]
     MSC2876,
 
-    /// Supports sending and receiving of to-device events.
+    /// Supports sending and receiving to-device events.
     #[serde(rename = "org.matrix.msc3819")]
     MSC3819,
 
@@ -181,22 +195,15 @@ pub(super) enum ApiVersion {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(untagged)]
-pub(super) enum ReadEventRequest {
-    ReadStateEvent {
-        #[serde(rename = "type")]
-        event_type: String,
-        state_key: StateKeySelector,
-    },
-    ReadMessageLikeEvent {
-        #[serde(rename = "type")]
-        event_type: String,
-        limit: Option<u32>,
-    },
+pub(super) struct ReadEventsRequest {
+    #[serde(rename = "type")]
+    pub(super) event_type: String,
+    pub(super) state_key: Option<StateKeySelector>,
+    pub(super) limit: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct ReadEventResponse {
+pub(super) struct ReadEventsResponse {
     pub(super) events: Vec<Raw<AnyTimelineEvent>>,
 }
 
@@ -247,10 +254,25 @@ impl From<update_delayed_event::unstable::Response> for UpdateDelayedEventRespon
     }
 }
 
-/// The response to the widget that it received the to-device event.
-/// Only used as the response for the successful send case.
-/// FromWidgetErrorResponse will be used otherwise.
-/// This is intentionally an empty tuple struct (not a unit struct), so that it
-/// serializes to `{}` instead of `Null` when returned to the widget as json.
-#[derive(Serialize, Debug)]
-pub(crate) struct SendToDeviceEventResponse {}
+/// Response for a send-to-device request.
+/// The failure map contains recipients that didn't receive the content due to:
+/// - Recipient devices not being found
+/// - Encryption failures (e.g., missing one-time keys)
+/// - Network/Server errors during sending
+#[derive(Serialize, Debug, Default)]
+pub(crate) struct SendToDeviceEventResponse {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub failures: BTreeMap<String, Vec<String>>,
+}
+
+impl FromMatrixDriverResponse for SendToDeviceEventResponse {
+    fn from_response(matrix_driver_response: MatrixDriverResponse) -> Option<Self> {
+        match matrix_driver_response {
+            MatrixDriverResponse::ToDeviceSent(resp) => Some(Self { failures: resp.failures }),
+            _ => {
+                error!("bug in MatrixDriver, received wrong event response");
+                None
+            }
+        }
+    }
+}

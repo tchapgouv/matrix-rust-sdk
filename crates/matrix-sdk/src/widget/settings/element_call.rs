@@ -45,7 +45,11 @@ struct ElementCallParams {
     skip_lobby: Option<bool>,
     confine_to_room: bool,
     app_prompt: bool,
-    hide_header: bool,
+    /// Supported since Element Call v0.13.0.
+    header: HeaderStyle,
+    /// Deprecated since Element Call v0.13.0. Included for backwards
+    /// compatibility. Use header: "standard"|"none" instead.
+    hide_header: Option<bool>,
     preload: bool,
     /// Deprecated since Element Call v0.9.0. Included for backwards
     /// compatibility. Set to the same as `posthog_user_id`.
@@ -76,7 +80,7 @@ struct ElementCallParams {
 /// Defines if a call is encrypted and which encryption system should be used.
 ///
 /// This controls the url parameters: `perParticipantE2EE`, `password`.
-#[derive(Debug, PartialEq, Default)]
+#[derive(Debug, PartialEq, Default, uniffi::Enum, Clone)]
 pub enum EncryptionSystem {
     /// Equivalent to the element call url parameter: `perParticipantE2EE=false`
     /// and no password.
@@ -96,7 +100,7 @@ pub enum EncryptionSystem {
 /// Defines the intent of showing the call.
 ///
 /// This controls whether to show or skip the lobby.
-#[derive(Debug, PartialEq, Serialize, Default)]
+#[derive(Debug, PartialEq, Serialize, Default, uniffi::Enum, Clone)]
 #[serde(rename_all = "snake_case")]
 pub enum Intent {
     #[default]
@@ -106,8 +110,21 @@ pub enum Intent {
     JoinExisting,
 }
 
+/// Defines how (if) element-call renders a header.
+#[derive(Debug, PartialEq, Serialize, Default, uniffi::Enum, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderStyle {
+    /// The normal header with branding.
+    #[default]
+    Standard,
+    /// Render a header with a back button (useful on mobile platforms).
+    AppBar,
+    /// No Header (useful for webapps).
+    None,
+}
+
 /// Properties to create a new virtual Element Call widget.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, uniffi::Record, Clone)]
 pub struct VirtualElementCallWidgetOptions {
     /// The url to the app.
     ///
@@ -132,9 +149,16 @@ pub struct VirtualElementCallWidgetOptions {
     /// usecase.
     pub parent_url: Option<String>,
 
+    /// Whether the branding header of Element call should be shown or if a
+    /// mobile header navbar should be render.
+    ///
+    /// Default: [`HeaderStyle::Standard`]
+    pub header: Option<HeaderStyle>,
+
     /// Whether the branding header of Element call should be hidden.
     ///
     /// Default: `true`
+    #[deprecated(note = "Use `header` instead", since = "0.12.1")]
     pub hide_header: Option<bool>,
 
     /// If set, the lobby will be skipped and the widget will join the
@@ -225,7 +249,7 @@ impl WidgetSettings {
         } else {
             None
         };
-
+        #[allow(deprecated)]
         let query_params = ElementCallParams {
             user_id: url_params::USER_ID.to_owned(),
             room_id: url_params::ROOM_ID.to_owned(),
@@ -239,9 +263,10 @@ impl WidgetSettings {
 
             parent_url: props.parent_url.unwrap_or(props.element_call_url.clone()),
             confine_to_room: props.confine_to_room.unwrap_or(true),
-            app_prompt: props.app_prompt.unwrap_or(false),
-            hide_header: props.hide_header.unwrap_or(true),
-            preload: props.preload.unwrap_or(false),
+            app_prompt: props.app_prompt.unwrap_or_default(),
+            header: props.header.unwrap_or_default(),
+            hide_header: props.hide_header,
+            preload: props.preload.unwrap_or_default(),
             font_scale: props.font_scale,
             font: props.font,
             per_participant_e2ee: props.encryption == EncryptionSystem::PerParticipantKeys,
@@ -271,7 +296,7 @@ impl WidgetSettings {
 
         // All the params will be set inside the fragment (to keep the traffic to the
         // server minimal and most importantly don't send the passwords).
-        raw_url.set_fragment(Some(&format!("?{}", query)));
+        raw_url.set_fragment(Some(&format!("?{query}")));
 
         // for EC we always want init on content load to be true.
         Ok(Self { widget_id: props.widget_id, init_on_content_load: true, raw_url })
@@ -300,7 +325,6 @@ mod tests {
         let mut props = VirtualElementCallWidgetOptions {
             element_call_url: "https://call.element.io".to_owned(),
             widget_id: WIDGET_ID.to_owned(),
-            hide_header: Some(true),
             preload: Some(true),
             app_prompt: Some(true),
             confine_to_room: Some(true),
@@ -375,7 +399,7 @@ mod tests {
                 &parentUrl=https%3A%2F%2Fcall.element.io\
                 &confineToRoom=true\
                 &appPrompt=true\
-                &hideHeader=true\
+                &header=standard\
                 &preload=true\
                 &perParticipantE2EE=true\
                 &hideScreensharing=false\
@@ -428,7 +452,7 @@ mod tests {
                 &roomId=%21room_id%3Aroom.org\
                 &lang=en-US&theme=light\
                 &baseUrl=https%3A%2F%2Fclient-matrix.server.org%2F\
-                &hideHeader=true\
+                &header=standard\
                 &preload=true\
                 &confineToRoom=true\
                 &displayName=hello\
@@ -462,7 +486,7 @@ mod tests {
                 &roomId=%21room_id%3Aroom.org\
                 &lang=en-US&theme=light\
                 &baseUrl=https%3A%2F%2Fclient-matrix.server.org%2F\
-                &hideHeader=true\
+                &header=standard\
                 &preload=true\
                 &confineToRoom=true\
                 &displayName=hello\
@@ -510,9 +534,7 @@ mod tests {
             for e in expected_elements {
                 assert!(
                     query_set.contains(&e),
-                    "The query elements: \n{:?}\nDid not contain: \n{:?}",
-                    query_set,
-                    e
+                    "The query elements: \n{query_set:?}\nDid not contain: \n{e:?}"
                 );
             }
         }
@@ -530,9 +552,7 @@ mod tests {
             let expected_elements = ("perParticipantE2EE".to_owned(), "false".to_owned());
             assert!(
                 query_set.contains(&expected_elements),
-                "The url query elements for an unencrypted call: \n{:?}\nDid not contain: \n{:?}",
-                query_set,
-                expected_elements
+                "The url query elements for an unencrypted call: \n{query_set:?}\nDid not contain: \n{expected_elements:?}"
             );
         }
         {
@@ -550,9 +570,7 @@ mod tests {
             for e in expected_elements {
                 assert!(
                     query_set.contains(&e),
-                    "The query elements: \n{:?}\nDid not contain: \n{:?}",
-                    query_set,
-                    e
+                    "The query elements: \n{query_set:?}\nDid not contain: \n{e:?}"
                 );
             }
         }
@@ -574,9 +592,7 @@ mod tests {
             let query_set = get_query_sets(&Url::parse(&url).unwrap()).unwrap().1;
             assert!(
                 query_set.contains(&controlled_media_element),
-                "The query elements: \n{:?}\nDid not contain: \n{:?}",
-                query_set,
-                controlled_media_element
+                "The query elements: \n{query_set:?}\nDid not contain: \n{controlled_media_element:?}"
             );
         }
     }
@@ -595,9 +611,7 @@ mod tests {
             for e in expected_unset_elements {
                 assert!(
                     !query_set.iter().any(|x| x.0 == e),
-                    "The query elements: \n{:?}\nShould not have contained: \n{:?}",
-                    query_set,
-                    e
+                    "The query elements: \n{query_set:?}\nShould not have contained: \n{e:?}"
                 );
             }
         }
@@ -615,9 +629,7 @@ mod tests {
             let expected_elements = ("intent".to_owned(), "join_existing".to_owned());
             assert!(
                 query_set.contains(&expected_elements),
-                "The url query elements for an unencrypted call: \n{:?}\nDid not contain: \n{:?}",
-                query_set,
-                expected_elements
+                "The url query elements for an unencrypted call: \n{query_set:?}\nDid not contain: \n{expected_elements:?}"
             );
 
             let expected_unset_elements = ["skipLobby".to_owned()];
@@ -625,9 +637,7 @@ mod tests {
             for e in expected_unset_elements {
                 assert!(
                     !query_set.iter().any(|x| x.0 == e),
-                    "The query elements: \n{:?}\nShould not have contained: \n{:?}",
-                    query_set,
-                    e
+                    "The query elements: \n{query_set:?}\nShould not have contained: \n{e:?}"
                 );
             }
         }
@@ -651,9 +661,7 @@ mod tests {
             for e in expected_elements {
                 assert!(
                     query_set.contains(&e),
-                    "The query elements: \n{:?}\nDid not contain: \n{:?}",
-                    query_set,
-                    e
+                    "The query elements: \n{query_set:?}\nDid not contain: \n{e:?}"
                 );
             }
         }

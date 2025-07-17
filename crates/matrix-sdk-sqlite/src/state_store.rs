@@ -16,7 +16,7 @@ use matrix_sdk_base::{
         RoomLoadSettings, SentRequestKey,
     },
     MinimalRoomMemberEvent, RoomInfo, RoomMemberships, RoomState, StateChanges, StateStore,
-    StateStoreDataKey, StateStoreDataValue,
+    StateStoreDataKey, StateStoreDataValue, ROOM_VERSION_FALLBACK,
 };
 use matrix_sdk_store_encryption::StoreCipher;
 use ruma::{
@@ -33,7 +33,7 @@ use ruma::{
     },
     serde::Raw,
     CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId,
-    OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UInt, UserId,
+    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -410,9 +410,7 @@ impl SqliteStateStore {
     fn encode_state_store_data_key(&self, key: StateStoreDataKey<'_>) -> Key {
         let key_s = match key {
             StateStoreDataKey::SyncToken => Cow::Borrowed(StateStoreDataKey::SYNC_TOKEN),
-            StateStoreDataKey::ServerCapabilities => {
-                Cow::Borrowed(StateStoreDataKey::SERVER_CAPABILITIES)
-            }
+            StateStoreDataKey::ServerInfo => Cow::Borrowed(StateStoreDataKey::SERVER_INFO),
             StateStoreDataKey::Filter(f) => {
                 Cow::Owned(format!("{}:{f}", StateStoreDataKey::FILTER))
             }
@@ -425,8 +423,15 @@ impl SqliteStateStore {
             StateStoreDataKey::UtdHookManagerData => {
                 Cow::Borrowed(StateStoreDataKey::UTD_HOOK_MANAGER_DATA)
             }
-            StateStoreDataKey::ComposerDraft(room_id) => {
-                Cow::Owned(format!("{}:{room_id}", StateStoreDataKey::COMPOSER_DRAFT))
+            StateStoreDataKey::ComposerDraft(room_id, thread_root) => {
+                if let Some(thread_root) = thread_root {
+                    Cow::Owned(format!(
+                        "{}:{room_id}:{thread_root}",
+                        StateStoreDataKey::COMPOSER_DRAFT
+                    ))
+                } else {
+                    Cow::Owned(format!("{}:{room_id}", StateStoreDataKey::COMPOSER_DRAFT))
+                }
             }
             StateStoreDataKey::SeenKnockRequests(room_id) => {
                 Cow::Owned(format!("{}:{room_id}", StateStoreDataKey::SEEN_KNOCK_REQUESTS))
@@ -447,18 +452,7 @@ impl SqliteStateStore {
     }
 
     async fn acquire(&self) -> Result<SqliteAsyncConn> {
-        let conn = self.pool.get().await?;
-
-        // Specify a busy timeout so that operations are automatically retried, in case
-        // the database was marked as locked, which can happen under very
-        // peculiar circumstances in WAL mode.
-        //
-        // The timeout value is in milliseconds.
-        //
-        // See also https://www.sqlite.org/wal.html#sometimes_queries_return_sqlite_busy_in_wal_mode.
-        conn.execute_batch("PRAGMA busy_timeout = 2000;").await?;
-
-        Ok(conn)
+        Ok(self.pool.get().await?)
     }
 
     fn remove_maybe_stripped_room_data(
@@ -1033,8 +1027,8 @@ impl StateStore for SqliteStateStore {
                     StateStoreDataKey::SyncToken => {
                         StateStoreDataValue::SyncToken(self.deserialize_value(&data)?)
                     }
-                    StateStoreDataKey::ServerCapabilities => {
-                        StateStoreDataValue::ServerCapabilities(self.deserialize_value(&data)?)
+                    StateStoreDataKey::ServerInfo => {
+                        StateStoreDataValue::ServerInfo(self.deserialize_value(&data)?)
                     }
                     StateStoreDataKey::Filter(_) => {
                         StateStoreDataValue::Filter(self.deserialize_value(&data)?)
@@ -1048,7 +1042,7 @@ impl StateStore for SqliteStateStore {
                     StateStoreDataKey::UtdHookManagerData => {
                         StateStoreDataValue::UtdHookManagerData(self.deserialize_value(&data)?)
                     }
-                    StateStoreDataKey::ComposerDraft(_) => {
+                    StateStoreDataKey::ComposerDraft(_, _) => {
                         StateStoreDataValue::ComposerDraft(self.deserialize_value(&data)?)
                     }
                     StateStoreDataKey::SeenKnockRequests(_) => {
@@ -1068,10 +1062,8 @@ impl StateStore for SqliteStateStore {
             StateStoreDataKey::SyncToken => self.serialize_value(
                 &value.into_sync_token().expect("Session data not a sync token"),
             )?,
-            StateStoreDataKey::ServerCapabilities => self.serialize_value(
-                &value
-                    .into_server_capabilities()
-                    .expect("Session data not containing server capabilities"),
+            StateStoreDataKey::ServerInfo => self.serialize_value(
+                &value.into_server_info().expect("Session data not containing server info"),
             )?,
             StateStoreDataKey::Filter(_) => {
                 self.serialize_value(&value.into_filter().expect("Session data not a filter"))?
@@ -1085,7 +1077,7 @@ impl StateStore for SqliteStateStore {
             StateStoreDataKey::UtdHookManagerData => self.serialize_value(
                 &value.into_utd_hook_manager_data().expect("Session data not UtdHookManagerData"),
             )?,
-            StateStoreDataKey::ComposerDraft(_) => self.serialize_value(
+            StateStoreDataKey::ComposerDraft(_, _) => self.serialize_value(
                 &value.into_composer_draft().expect("Session data not a composer draft"),
             )?,
             StateStoreDataKey::SeenKnockRequests(_) => self.serialize_value(
@@ -1327,13 +1319,13 @@ impl StateStore for SqliteStateStore {
                             .ok()
                             .flatten()
                             .and_then(|v| this.deserialize_json::<RoomInfo>(&v).ok())
-                            .and_then(|info| info.room_version().cloned())
+                            .map(|info| info.room_version_or_default())
                             .unwrap_or_else(|| {
                                 warn!(
                                     ?room_id,
-                                    "Unable to find the room version, assume version 9"
+                                    "Unable to find the room version, assuming {ROOM_VERSION_FALLBACK}"
                                 );
-                                RoomVersionId::V9
+                                ROOM_VERSION_FALLBACK
                             })
                     };
 

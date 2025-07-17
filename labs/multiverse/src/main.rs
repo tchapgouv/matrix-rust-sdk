@@ -1,8 +1,8 @@
 #![allow(clippy::large_enum_variant)]
 
 use std::{
-    collections::HashMap,
-    io::{self, stdout, Write},
+    collections::{HashMap, HashSet},
+    io::{self, Write, stdout},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -16,23 +16,23 @@ use crossterm::{
     },
     execute,
 };
-use futures_util::{pin_mut, StreamExt as _};
+use futures_util::{StreamExt as _, pin_mut};
 use imbl::Vector;
 use layout::Flex;
 use matrix_sdk::{
+    AuthSession, Client, SqliteCryptoStore, SqliteEventCacheStore, SqliteStateStore,
     authentication::matrix::MatrixSession,
     config::StoreConfig,
     encryption::{BackupDownloadStrategy, EncryptionSettings},
     reqwest::Url,
     ruma::OwnedRoomId,
-    AuthSession, Client, Room, SqliteCryptoStore, SqliteEventCacheStore, SqliteStateStore,
 };
 use matrix_sdk_common::locks::Mutex;
 use matrix_sdk_ui::{
+    Timeline as SdkTimeline,
     room_list_service::{self, filters::new_filter_non_left},
     sync_service::SyncService,
-    timeline::{RoomExt as _, TimelineItem},
-    Timeline as SdkTimeline,
+    timeline::{RoomExt as _, TimelineFocus, TimelineItem},
 };
 use ratatui::{prelude::*, style::palette::tailwind, widgets::*};
 use throbber_widgets_tui::{Throbber, ThrobberState};
@@ -57,7 +57,6 @@ const ALT_ROW_COLOR: Color = tailwind::SLATE.c900;
 const SELECTED_STYLE_FG: Color = tailwind::BLUE.c300;
 const TEXT_COLOR: Color = tailwind::SLATE.c200;
 
-type UiRooms = Arc<Mutex<HashMap<OwnedRoomId, Room>>>;
 type Timelines = Arc<Mutex<HashMap<OwnedRoomId, Timeline>>>;
 
 #[derive(Debug, Parser)]
@@ -99,7 +98,8 @@ fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let file_writer = tracing_appender::rolling::hourly("/tmp/", "logs-");
+    let cli = Cli::parse();
+    let file_writer = tracing_appender::rolling::hourly(&cli.session_path, "logs-");
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -109,7 +109,6 @@ async fn main() -> Result<()> {
 
     color_eyre::install()?;
 
-    let cli = Cli::parse();
     let client = configure_client(cli).await?;
 
     let event_cache = client.event_cache();
@@ -158,7 +157,7 @@ struct App {
     /// Task listening to room list service changes, and spawning timelines.
     listen_task: JoinHandle<()>,
 
-    /// The status widet at the bottom of the screen.
+    /// The status widget at the bottom of the screen.
     status: Status,
 
     state: AppState,
@@ -174,7 +173,6 @@ impl App {
 
         let rooms = Rooms::default();
         let room_infos = RoomInfos::default();
-        let ui_rooms = UiRooms::default();
         let timelines = Timelines::default();
 
         let room_list_service = sync_service.room_list_service();
@@ -183,7 +181,6 @@ impl App {
         let listen_task = spawn(Self::listen_task(
             rooms.clone(),
             room_infos.clone(),
-            ui_rooms.clone(),
             timelines.clone(),
             all_rooms,
         ));
@@ -193,15 +190,10 @@ impl App {
         sync_service.start().await;
 
         let status = Status::new();
-        let room_list = RoomList::new(
-            rooms,
-            ui_rooms.clone(),
-            room_infos,
-            sync_service.clone(),
-            status.handle(),
-        );
+        let room_list =
+            RoomList::new(client.clone(), rooms, room_infos, sync_service.clone(), status.handle());
 
-        let room_view = RoomView::new(ui_rooms, timelines.clone(), status.handle());
+        let room_view = RoomView::new(client.clone(), timelines.clone(), status.handle());
 
         Ok(Self {
             sync_service,
@@ -219,7 +211,6 @@ impl App {
     async fn listen_task(
         rooms: Rooms,
         room_infos: RoomInfos,
-        ui_rooms: UiRooms,
         timelines: Timelines,
         all_rooms: room_list_service::RoomList,
     ) {
@@ -227,6 +218,8 @@ impl App {
         entries_controller.set_filter(Box::new(new_filter_non_left()));
 
         pin_mut!(stream);
+
+        let mut previous_rooms = HashSet::new();
 
         while let Some(diffs) = stream.next().await {
             let all_rooms = {
@@ -240,12 +233,6 @@ impl App {
                 // Collect rooms early to release the room entries list lock.
                 (*rooms).clone()
             };
-
-            // Clone the previous set of ui rooms to avoid keeping the ui_rooms lock (which
-            // we couldn't do below, because it's a sync lock, and has to be
-            // sync b/o rendering; and we'd have to cross await points
-            // below).
-            let previous_rooms = ui_rooms.lock().clone();
 
             let mut new_rooms = HashMap::new();
             let mut new_timelines = Vec::new();
@@ -270,10 +257,15 @@ impl App {
 
             // Initialize all the new rooms.
             for room in
-                all_rooms.into_iter().filter(|room| !previous_rooms.contains_key(room.room_id()))
+                all_rooms.into_iter().filter(|room| !previous_rooms.contains(room.room_id()))
             {
                 // Initialize the timeline.
-                let Ok(timeline) = room.timeline_builder().build().await else {
+                let Ok(timeline) = room
+                    .timeline_builder()
+                    .with_focus(TimelineFocus::Live { hide_threaded_events: true })
+                    .build()
+                    .await
+                else {
                     error!("error when creating default timeline");
                     continue;
                 };
@@ -305,7 +297,8 @@ impl App {
                 new_rooms.insert(room.room_id().to_owned(), room);
             }
 
-            ui_rooms.lock().extend(new_rooms);
+            previous_rooms.extend(new_rooms.into_keys());
+
             timelines.lock().extend(new_timelines);
         }
     }
@@ -404,18 +397,18 @@ impl App {
                         }
                     }
                     GlobalMode::Help => {
-                        if let Event::Key(key) = event {
-                            if let (KeyModifiers::NONE, Char('q') | Esc) = (key.modifiers, key.code)
-                            {
-                                self.set_global_mode(GlobalMode::Default)
-                            }
+                        if let Event::Key(key) = event
+                            && let KeyModifiers::NONE = key.modifiers
+                            && let Char('q') | Esc = key.code
+                        {
+                            self.set_global_mode(GlobalMode::Default)
                         }
                     }
                     GlobalMode::Settings { view } => {
-                        if let Event::Key(key) = event {
-                            if view.handle_key_press(key).await {
-                                self.set_global_mode(GlobalMode::Default);
-                            }
+                        if let Event::Key(key) = event
+                            && view.handle_key_press(key).await
+                        {
+                            self.set_global_mode(GlobalMode::Default);
                         }
                     }
                     GlobalMode::Exiting { .. } => {}
@@ -518,7 +511,8 @@ async fn configure_client(cli: Cli) -> Result<Client> {
             auto_enable_cross_signing: true,
             backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
             auto_enable_backups: true,
-        });
+        })
+        .with_enable_share_history_on_invite(true);
 
     if let Some(proxy_url) = proxy {
         client_builder = client_builder.proxy(proxy_url).disable_ssl_verification();

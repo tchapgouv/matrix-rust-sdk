@@ -17,10 +17,12 @@ use std::{fs::File, io::Write as _, path::PathBuf, time::Duration};
 use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
-use futures_util::{FutureExt, StreamExt};
-use matrix_sdk::attachment::{AttachmentInfo, BaseFileInfo};
+// BWI-specific
 use matrix_sdk::bwi_extensions::client::BWIClientSetupExt;
 use matrix_sdk::test_utils::client::TEST_BEARER_TOKEN;
+use matrix_sdk_ui::timeline::Error::AttachmentSizeExceededLimit;
+use wiremock::matchers::{bearer_token, method, path};
+// end BWI-specific
 use matrix_sdk::{
     assert_let_timeout,
     attachment::AttachmentConfig,
@@ -28,8 +30,14 @@ use matrix_sdk::{
     test_utils::mocks::MatrixMockServer,
 };
 use matrix_sdk_test::{async_test, event_factory::EventFactory, JoinedRoomBuilder, ALICE};
-use matrix_sdk_ui::timeline::Error::AttachmentSizeExceededLimit;
-use matrix_sdk_ui::timeline::{AttachmentSource, EventSendState, RoomExt, TimelineItemContent};
+
+use matrix_sdk_ui::timeline::{AttachmentSource, EventSendState, RoomExt};
+#[cfg(feature = "unstable-msc4274")]
+use matrix_sdk_ui::timeline::{GalleryConfig, GalleryItemInfo};
+#[cfg(feature = "unstable-msc4274")]
+use ruma::events::room::message::GalleryItemType;
+#[cfg(feature = "unstable-msc4274")]
+use ruma::owned_mxc_uri;
 use ruma::{
     event_id,
     events::room::{
@@ -39,11 +47,9 @@ use ruma::{
     room_id, uint, UInt,
 };
 use serde_json::json;
+use stream_assert::assert_pending;
 use tempfile::TempDir;
-use tokio::time::sleep;
-use wiremock::http::Method;
-use wiremock::matchers::{bearer_token, method, path};
-use wiremock::{Mock, ResponseTemplate};
+use wiremock::ResponseTemplate;
 
 fn create_temporary_file(filename: &str) -> (TempDir, PathBuf) {
     let tmp_dir = TempDir::new().unwrap();
@@ -106,7 +112,7 @@ async fn test_send_attachment_from_file() {
     assert_eq!(msg.body(), "hello");
 
     // No other updates.
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 
     // Store a file in a temporary directory.
     let (_tmp_dir, file_path) = create_temporary_file("test.bin");
@@ -152,10 +158,9 @@ async fn test_send_attachment_from_file() {
     }
 
     // Eventually, the media is updated with the final MXC IDs…
-    sleep(Duration::from_secs(2)).await;
-
     {
         assert_let_timeout!(
+            Duration::from_secs(3),
             Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next()
         );
         assert_let!(Some(msg) = item.content().as_message());
@@ -179,7 +184,7 @@ async fn test_send_attachment_from_file() {
     }
 
     // That's all, folks!
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 }
 
 #[async_test]
@@ -187,6 +192,7 @@ async fn test_send_attachment_from_bytes() {
     let mock = MatrixMockServer::new().await;
     let client = mock.client_builder().build().await;
 
+    mock.mock_authenticated_media_config().ok_default().mount().await;
     mock.mock_room_state_encryption().plain().mount().await;
 
     let room_id = room_id!("!a98sd12bjh:example.org");
@@ -211,7 +217,7 @@ async fn test_send_attachment_from_bytes() {
     assert_eq!(msg.body(), "hello");
 
     // No other updates.
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 
     // The data of the file.
     let filename = "test.bin";
@@ -255,10 +261,9 @@ async fn test_send_attachment_from_bytes() {
     }
 
     // Eventually, the media is updated with the final MXC IDs…
-    sleep(Duration::from_secs(2)).await;
-
     {
         assert_let_timeout!(
+            Duration::from_secs(3),
             Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next()
         );
         assert_let!(Some(msg) = item.content().as_message());
@@ -282,7 +287,135 @@ async fn test_send_attachment_from_bytes() {
     }
 
     // That's all, folks!
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
+}
+
+#[cfg(feature = "unstable-msc4274")]
+#[async_test]
+async fn test_send_gallery_from_bytes() {
+    let mock = MatrixMockServer::new().await;
+    let client = mock.client_builder().build().await;
+
+    mock.mock_authenticated_media_config().ok_default().mount().await;
+    mock.mock_room_state_encryption().plain().mount().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = mock.sync_joined_room(&client, room_id).await;
+    let timeline = room.timeline().await.unwrap();
+
+    let (items, mut timeline_stream) =
+        timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
+
+    assert!(items.is_empty());
+
+    let f = EventFactory::new();
+    mock.sync_room(
+        &client,
+        JoinedRoomBuilder::new(room_id).add_timeline_event(
+            f.gallery(
+                "check out my favourite gifs".to_owned(),
+                "rickroll.gif".to_owned(),
+                owned_mxc_uri!("mxc://sdk.rs/rickroll"),
+            )
+            .sender(&ALICE),
+        ),
+    )
+    .await;
+
+    // Sanity check.
+    assert_let_timeout!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next());
+    assert_let!(Some(msg) = item.content().as_message());
+    assert_eq!(msg.body(), "check out my favourite gifs");
+
+    // No other updates.
+    assert_pending!(timeline_stream);
+
+    // The data of the file.
+    let filename = "test.bin";
+    let data = b"hello world".to_vec();
+
+    // Set up mocks for the file upload.
+    mock.mock_upload()
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)).set_body_json(
+            json!({
+              "content_uri": "mxc://sdk.rs/media"
+            }),
+        ))
+        .mock_once()
+        .mount()
+        .await;
+
+    mock.mock_room_send().ok(event_id!("$media")).mock_once().mount().await;
+
+    // Queue sending of a gallery.
+    let gallery =
+        GalleryConfig::new().caption(Some("caption".to_owned())).add_item(GalleryItemInfo {
+            source: AttachmentSource::Data { bytes: data, filename: filename.to_owned() },
+            content_type: mime::TEXT_PLAIN,
+            attachment_info: AttachmentInfo::File(BaseFileInfo { size: None }),
+            caption: Some("item caption".to_owned()),
+            formatted_caption: None,
+            thumbnail: None,
+        });
+    timeline.send_gallery(gallery).await.unwrap();
+
+    {
+        assert_let_timeout!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next());
+        assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
+        assert_let!(Some(msg) = item.content().as_message());
+
+        // Body matches gallery caption.
+        assert_eq!(msg.body(), "caption");
+
+        // Message is gallery of expected length
+        assert_let!(MessageType::Gallery(content) = msg.msgtype());
+        assert_eq!(1, content.itemtypes.len());
+        assert_let!(GalleryItemType::File(file) = content.itemtypes.first().unwrap());
+
+        // Item has filename and caption
+        assert_eq!(filename, file.filename());
+        assert_eq!(Some("item caption"), file.caption());
+
+        // The URI refers to the local cache.
+        assert_let!(MediaSource::Plain(uri) = &file.source);
+        assert!(uri.to_string().contains("localhost"));
+    }
+
+    // Eventually, the media is updated with the final MXC IDs…
+    {
+        assert_let_timeout!(
+            Duration::from_secs(3),
+            Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next()
+        );
+        assert_let!(Some(msg) = item.content().as_message());
+        assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
+
+        // Message is gallery of expected length
+        assert_let!(MessageType::Gallery(content) = msg.msgtype());
+        assert_eq!(1, content.itemtypes.len());
+        assert_let!(GalleryItemType::File(file) = content.itemtypes.first().unwrap());
+
+        // Item has filename and caption
+        assert_eq!(filename, file.filename());
+        assert_eq!(Some("item caption"), file.caption());
+
+        // The URI now refers to the final MXC URI.
+        assert_let!(MediaSource::Plain(uri) = &file.source);
+        assert_eq!(uri.to_string(), "mxc://sdk.rs/media");
+    }
+
+    // And eventually the event itself is sent.
+    {
+        assert_let_timeout!(
+            Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next()
+        );
+        assert_matches!(item.send_state(), Some(EventSendState::Sent{ event_id }) => {
+            assert_eq!(event_id, event_id!("$media"));
+        });
+    }
+
+    // That's all, folks!
+    assert_pending!(timeline_stream);
 }
 
 #[async_test]
@@ -315,7 +448,7 @@ async fn test_react_to_local_media() {
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
 
     assert!(items.is_empty());
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 
     // Store a file in a temporary directory.
     let (_tmp_dir, file_path) = create_temporary_file("test.bin");
@@ -353,7 +486,7 @@ async fn test_react_to_local_media() {
     reactions.get("🤪").unwrap().get(own_user_id).unwrap();
 
     // That's all, folks!
-    assert!(timeline_stream.next().now_or_never().is_none());
+    assert_pending!(timeline_stream);
 }
 
 // BWI-specific

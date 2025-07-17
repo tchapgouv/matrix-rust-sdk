@@ -1,7 +1,7 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -10,12 +10,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use futures_util::FutureExt as _;
 use layout::Flex;
 use matrix_sdk::{
+    Client,
     encryption::{
         backups::BackupState,
         recovery::{RecoveryError, RecoveryState},
     },
-    Client,
 };
+use matrix_sdk_common::executor::spawn;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
@@ -23,7 +24,7 @@ use ratatui::{
 use throbber_widgets_tui::{Throbber, ThrobberState};
 use tokio::task::JoinHandle;
 
-use super::{create_centered_throbber_area, ShouldExit};
+use super::{ShouldExit, create_centered_throbber_area};
 
 #[derive(Debug)]
 pub struct DefaultRecoveryView {
@@ -94,7 +95,7 @@ impl DefaultRecoveryView {
         let backup_state = client.encryption().backups().state();
         let backup_exists = Arc::new(AtomicBool::default());
 
-        let backup_update_task = tokio::spawn({
+        let backup_update_task = spawn({
             let client = client.clone();
             let backup_exists = backup_exists.clone();
 
@@ -119,12 +120,11 @@ impl DefaultRecoveryView {
         let client = self.client.clone();
 
         if matches!(self.recovery_state, RecoveryState::Disabled) {
-            let enable_task =
-                tokio::spawn(async move { client.encryption().recovery().enable().await });
+            let enable_task = spawn(async move { client.encryption().recovery().enable().await });
 
             self.mode = Mode::Enabling { enable_task, throbber_state: ThrobberState::default() };
         } else {
-            let disable_task = tokio::spawn(async move {
+            let disable_task = spawn(async move {
                 // TODO: Handle errors here?
                 let _ = client.encryption().recovery().disable().await;
                 Ok(())

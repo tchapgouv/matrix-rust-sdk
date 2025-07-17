@@ -9,7 +9,7 @@ name = "matrix-sdk"
 readme = "README.md"
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
 rust-version.workspace = true
-version = "0.11.0"
+version = "0.12.0"
 
 [package.metadata.docs.rs]
 features = ["docsrs"]
@@ -57,10 +57,9 @@ sso-login = ["local-server"]
 
 uniffi = ["dep:uniffi", "matrix-sdk-base/uniffi", "dep:matrix-sdk-ffi-macros"]
 
-experimental-widgets = ["dep:uuid"]
+experimental-widgets = ["dep:uuid", "experimental-send-custom-to-device"]
 
 docsrs = ["e2e-encryption", "sqlite", "indexeddb", "sso-login", "qrcode"]
-experimental-share-history-on-invite = []
 
 # Add support for inline media galleries via msgtypes
 unstable-msc4274 = ["ruma/unstable-msc4274", "matrix-sdk-base/unstable-msc4274"]
@@ -136,7 +135,7 @@ uuid = { workspace = true, features = ["serde", "v4"], optional = true }
 vodozemac.workspace = true
 zeroize.workspace = true
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 backon = "1.5.0"
 # only activate reqwest's stream feature on non-wasm, the wasm part seems to not
 # support *sending* streams, which makes it useless for us.
@@ -144,7 +143,7 @@ reqwest = { workspace = true, features = ["stream", "gzip", "http2"] }
 tokio = { workspace = true, features = ["fs", "rt", "macros"] }
 wiremock = { workspace = true, optional = true }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+[target.'cfg(target_family = "wasm")'.dependencies]
 gloo-timers = { workspace = true, features = ["futures"] }
 reqwest = { workspace = true, features = ["gzip", "http2"] }
 tokio = { workspace = true, features = ["macros"] }
@@ -165,12 +164,12 @@ stream_assert.workspace = true
 tokio-test = "0.4.4"
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 wiremock.workspace = true
 
-[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
 wasm-bindgen-test.workspace = true
 
 [[test]]

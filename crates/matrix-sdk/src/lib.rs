@@ -15,7 +15,7 @@
 
 #![doc = include_str!("../README.md")]
 #![warn(missing_debug_implementations, missing_docs)]
-#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+#![cfg_attr(target_family = "wasm", allow(clippy::arc_with_non_send_sync))]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 pub use async_trait::async_trait;
@@ -50,8 +50,10 @@ mod error;
 pub mod event_cache;
 pub mod event_handler;
 mod http_client;
+pub mod latest_events;
 pub mod media;
 pub mod notification_settings;
+pub mod paginators;
 pub mod pusher;
 pub mod room;
 pub mod room_directory_search;

@@ -498,6 +498,7 @@ impl NotificationClient {
             (StateEventType::RoomCanonicalAlias, "".to_owned()),
             (StateEventType::RoomName, "".to_owned()),
             (StateEventType::RoomPowerLevels, "".to_owned()),
+            (StateEventType::RoomJoinRules, "".to_owned()),
             (StateEventType::CallMember, "*".to_owned()),
         ];
 
@@ -633,8 +634,9 @@ impl NotificationClient {
                     RawNotificationEvent::Timeline(timeline_event) => {
                         // Timeline events may be encrypted, so make sure they get decrypted first.
                         match self.retry_decryption(&room, timeline_event).await {
-                            Ok(Some(mut timeline_event)) => {
-                                let push_actions = timeline_event.push_actions.take();
+                            Ok(Some(timeline_event)) => {
+                                let push_actions =
+                                    timeline_event.push_actions().map(ToOwned::to_owned);
                                 (
                                     RawNotificationEvent::Timeline(timeline_event.into_raw()),
                                     push_actions,
@@ -753,13 +755,13 @@ impl NotificationClient {
             timeline_event = decrypted_event;
         }
 
-        if let Some(actions) = timeline_event.push_actions.as_ref() {
+        if let Some(actions) = timeline_event.push_actions() {
             if !actions.iter().any(|a| a.should_notify()) {
                 return Ok(None);
             }
         }
 
-        let push_actions = timeline_event.push_actions.take();
+        let push_actions = timeline_event.push_actions().map(ToOwned::to_owned);
         let notification_item = NotificationItem::new(
             &room,
             RawNotificationEvent::Timeline(timeline_event.into_raw()),
@@ -907,12 +909,14 @@ pub struct NotificationItem {
     pub room_avatar_url: Option<String>,
     /// Room canonical alias.
     pub room_canonical_alias: Option<String>,
+    /// Room topic.
+    pub room_topic: Option<String>,
     /// Room join rule.
-    pub room_join_rule: JoinRule,
+    ///
+    /// Set to `None` if the join rule for this room is not available.
+    pub room_join_rule: Option<JoinRule>,
     /// Is this room encrypted?
     pub is_room_encrypted: Option<bool>,
-    /// Is this a public room?
-    pub is_room_public: bool,
     /// Is this room considered a direct message?
     pub is_direct_message_room: bool,
     /// Numbers of members who joined the room.
@@ -968,8 +972,12 @@ impl NotificationItem {
         if sender_display_name.is_none() || sender_avatar_url.is_none() {
             let sender_id = event.sender();
             for ev in state_events {
-                let Ok(ev) = ev.deserialize() else {
-                    continue;
+                let ev = match ev.deserialize() {
+                    Ok(ev) => ev,
+                    Err(error) => {
+                        warn!(?error, "Failed to deserialize a state event");
+                        continue;
+                    }
                 };
                 if ev.sender() != sender_id {
                     continue;
@@ -1002,9 +1010,9 @@ impl NotificationItem {
             room_computed_display_name: room.display_name().await?.to_string(),
             room_avatar_url: room.avatar_url().map(|s| s.to_string()),
             room_canonical_alias: room.canonical_alias().map(|c| c.to_string()),
+            room_topic: room.topic(),
             room_join_rule: room.join_rule(),
             is_direct_message_room: room.is_direct().await?,
-            is_room_public: room.is_public(),
             is_room_encrypted: room
                 .latest_encryption_state()
                 .await
@@ -1017,6 +1025,13 @@ impl NotificationItem {
         };
 
         Ok(item)
+    }
+
+    /// Returns whether this room is public or not, based on the join rule.
+    ///
+    /// Maybe return `None` if the join rule is not available.
+    pub fn is_public(&self) -> Option<bool> {
+        self.room_join_rule.as_ref().map(|rule| matches!(rule, JoinRule::Public))
     }
 }
 

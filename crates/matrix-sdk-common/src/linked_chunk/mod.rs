@@ -93,18 +93,88 @@ macro_rules! assert_items_eq {
 
 mod as_vector;
 pub mod lazy_loader;
+mod order_tracker;
 pub mod relational;
 mod updates;
 
 use std::{
-    fmt,
+    fmt::{self, Display},
     marker::PhantomData,
     ptr::NonNull,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{self, AtomicU64},
 };
 
 pub use as_vector::*;
+pub use order_tracker::OrderTracker;
+use ruma::{OwnedRoomId, RoomId};
 pub use updates::*;
+
+/// An identifier for a linked chunk; borrowed variant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LinkedChunkId<'a> {
+    Room(&'a RoomId),
+    // TODO(bnjbvr): Soon™.
+    // Thread(&'a RoomId, &'a EventId),
+}
+
+impl LinkedChunkId<'_> {
+    pub fn storage_key(&self) -> impl '_ + AsRef<[u8]> {
+        match self {
+            LinkedChunkId::Room(room_id) => room_id,
+        }
+    }
+
+    pub fn to_owned(&self) -> OwnedLinkedChunkId {
+        match self {
+            LinkedChunkId::Room(room_id) => OwnedLinkedChunkId::Room((*room_id).to_owned()),
+        }
+    }
+}
+
+impl PartialEq<&OwnedLinkedChunkId> for LinkedChunkId<'_> {
+    fn eq(&self, other: &&OwnedLinkedChunkId) -> bool {
+        match (self, other) {
+            (LinkedChunkId::Room(a), OwnedLinkedChunkId::Room(b)) => *a == b,
+        }
+    }
+}
+
+impl PartialEq<LinkedChunkId<'_>> for OwnedLinkedChunkId {
+    fn eq(&self, other: &LinkedChunkId<'_>) -> bool {
+        other.eq(&self)
+    }
+}
+
+/// An identifier for a linked chunk; owned variant.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum OwnedLinkedChunkId {
+    Room(OwnedRoomId),
+    // TODO(bnjbvr): Soon™.
+    // Thread(OwnedRoomId, OwnedEventId),
+}
+
+impl Display for OwnedLinkedChunkId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OwnedLinkedChunkId::Room(room_id) => write!(f, "{room_id}"),
+        }
+    }
+}
+
+impl OwnedLinkedChunkId {
+    #[cfg(test)]
+    fn as_ref(&self) -> LinkedChunkId<'_> {
+        match self {
+            OwnedLinkedChunkId::Room(room_id) => LinkedChunkId::Room(room_id.as_ref()),
+        }
+    }
+
+    pub fn room_id(&self) -> &RoomId {
+        match self {
+            OwnedLinkedChunkId::Room(room_id) => room_id,
+        }
+    }
+}
 
 /// Errors of [`LinkedChunk`].
 #[derive(thiserror::Error, Debug)]
@@ -413,7 +483,7 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
 
         let chunk = match &mut chunk.content {
             ChunkContent::Gap(..) => {
-                return Err(Error::ChunkIsAGap { identifier: chunk_identifier })
+                return Err(Error::ChunkIsAGap { identifier: chunk_identifier });
             }
 
             ChunkContent::Items(current_items) => {
@@ -501,7 +571,7 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
 
             let can_unlink_chunk = match &mut chunk.content {
                 ChunkContent::Gap(..) => {
-                    return Err(Error::ChunkIsAGap { identifier: chunk_identifier })
+                    return Err(Error::ChunkIsAGap { identifier: chunk_identifier });
                 }
 
                 ChunkContent::Items(current_items) => {
@@ -571,7 +641,7 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
 
         match &mut chunk.content {
             ChunkContent::Gap(..) => {
-                return Err(Error::ChunkIsAGap { identifier: chunk_identifier })
+                return Err(Error::ChunkIsAGap { identifier: chunk_identifier });
             }
 
             ChunkContent::Items(current_items) => {
@@ -1012,6 +1082,42 @@ impl<const CAP: usize, Item, Gap> LinkedChunk<CAP, Item, Gap> {
         Some(AsVector::new(updates, token, chunk_iterator))
     }
 
+    /// Get an [`OrderTracker`] for the linked chunk, which can be used to
+    /// compare the relative position of two events in this linked chunk.
+    ///
+    /// A pre-requisite is that the linked chunk has been constructed with
+    /// [`Self::new_with_update_history`], and that if the linked chunk is
+    /// lazily-loaded, an iterator over the fully-loaded linked chunk is
+    /// passed at construction time here.
+    pub fn order_tracker(
+        &mut self,
+        all_chunks: Option<Vec<ChunkMetadata>>,
+    ) -> Option<OrderTracker<Item, Gap>>
+    where
+        Item: Clone,
+    {
+        let (updates, token) = self
+            .updates
+            .as_mut()
+            .map(|updates| (updates.inner.clone(), updates.new_reader_token()))?;
+
+        Some(OrderTracker::new(
+            updates,
+            token,
+            all_chunks.unwrap_or_else(|| {
+                // Consider the linked chunk as fully loaded.
+                self.chunks()
+                    .map(|chunk| ChunkMetadata {
+                        identifier: chunk.identifier(),
+                        num_items: chunk.num_items(),
+                        previous: chunk.previous().map(|prev| prev.identifier()),
+                        next: chunk.next().map(|next| next.identifier()),
+                    })
+                    .collect()
+            }),
+        ))
+    }
+
     /// Returns the number of items of the linked chunk.
     pub fn num_items(&self) -> usize {
         self.items().count()
@@ -1080,12 +1186,15 @@ impl ChunkIdentifierGenerator {
     /// Note that it can fail if there is no more unique identifier available.
     /// In this case, this method will panic.
     fn next(&self) -> ChunkIdentifier {
-        let previous = self.next.fetch_add(1, Ordering::Relaxed);
+        let previous = self.next.fetch_add(1, atomic::Ordering::Relaxed);
 
         // Check for overflows.
         // unlikely — TODO: call `std::intrinsics::unlikely` once it's stable.
         if previous == u64::MAX {
-            panic!("No more chunk identifiers available. Congrats, you did it. 2^64 identifiers have been consumed.")
+            panic!(
+                "No more chunk identifiers available. Congrats, you did it. \
+                 2^64 identifiers have been consumed."
+            )
         }
 
         ChunkIdentifier(previous + 1)
@@ -1096,7 +1205,7 @@ impl ChunkIdentifierGenerator {
     // This is hidden because it's used only in the tests.
     #[doc(hidden)]
     pub fn current(&self) -> ChunkIdentifier {
-        ChunkIdentifier(self.next.load(Ordering::Relaxed))
+        ChunkIdentifier(self.next.load(atomic::Ordering::Relaxed))
     }
 }
 
@@ -1637,6 +1746,25 @@ where
 pub struct RawChunk<Item, Gap> {
     /// Content section of the linked chunk.
     pub content: ChunkContent<Item, Gap>,
+
+    /// Link to the previous chunk, via its identifier.
+    pub previous: Option<ChunkIdentifier>,
+
+    /// Current chunk's identifier.
+    pub identifier: ChunkIdentifier,
+
+    /// Link to the next chunk, via its identifier.
+    pub next: Option<ChunkIdentifier>,
+}
+
+/// A simplified [`RawChunk`] that only contains the number of items in a chunk,
+/// instead of its type.
+#[derive(Clone, Debug)]
+pub struct ChunkMetadata {
+    /// The number of items in this chunk.
+    ///
+    /// By convention, a gap chunk contains 0 items.
+    pub num_items: usize,
 
     /// Link to the previous chunk, via its identifier.
     pub previous: Option<ChunkIdentifier>,
