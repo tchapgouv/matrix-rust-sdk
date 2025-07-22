@@ -735,12 +735,24 @@ impl Room {
     }
 
     pub async fn matrix_to_permalink(&self) -> Result<String, ClientError> {
-        Ok(self.inner.matrix_to_permalink().await?.to_string())
+        Ok(
+            self.inner
+                .matrix_to_permalink()
+                .await?
+                .to_string()
+                .replace("https://matrix.to", "https://tchap.gouv.fr"), // Share Tchap permalinks
+        )
     }
 
     pub async fn matrix_to_event_permalink(&self, event_id: String) -> Result<String, ClientError> {
         let event_id = EventId::parse(event_id)?;
-        Ok(self.inner.matrix_to_event_permalink(event_id).await?.to_string())
+        Ok(
+            self.inner
+                .matrix_to_event_permalink(event_id)
+                .await?
+                .to_string()
+                .replace("https://matrix.to", "https://tchap.gouv.fr"), // Share Tchap permalinks
+        )
     }
 
     /// This will only send a call notification event if appropriate.
@@ -1256,7 +1268,12 @@ pub fn matrix_to_room_alias_permalink(
     room_alias: String,
 ) -> std::result::Result<String, ClientError> {
     let room_alias = RoomAliasId::parse(room_alias)?;
-    Ok(room_alias.matrix_to_uri().to_string())
+    Ok(
+        room_alias
+            .matrix_to_uri()
+            .to_string()
+            .replace("https://matrix.to", "https://tchap.gouv.fr"), // Share Tchap permalinks
+    )
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
