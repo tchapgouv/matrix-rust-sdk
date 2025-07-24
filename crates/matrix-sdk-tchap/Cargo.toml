@@ -1,0 +1,17 @@
+[package]
+name = "matrix-sdk-tchap"
+version = "0.1.0"
+authors = ["Nicolas Buquet <nbuquet@buquet-net.com>"]
+edition = "2021"
+rust-version.workspace = true
+license = "Apache-2.0"
+
+[dependencies]
+ruma = { workspace = true }
+uniffi = { workspace = true, features = ["cli"] }
+
+[build-dependencies]
+uniffi = { workspace = true, features = [ "build" ] }
+
+[lints]
+workspace = true

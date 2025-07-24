@@ -3113,6 +3113,7 @@ dependencies = [
  "matrix-sdk",
  "matrix-sdk-common",
  "matrix-sdk-ffi-macros",
+ "matrix-sdk-tchap",
  "matrix-sdk-ui",
  "mime",
  "once_cell",
@@ -3274,6 +3275,14 @@ dependencies = [
  "sha2",
  "thiserror 2.0.11",
  "zeroize",
+]
+
+[[package]]
+name = "matrix-sdk-tchap"
+version = "0.1.0"
+dependencies = [
+ "ruma",
+ "uniffi",
 ]
 
 [[package]]

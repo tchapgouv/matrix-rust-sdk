@@ -94,6 +94,9 @@ use crate::{
     utils::u64_to_uint,
 };
 
+// Tchap: adapt permalinks
+use matrix_sdk_tchap::permalinks::TchapStringForMatrixUri;
+
 #[derive(uniffi::Enum)]
 pub enum AuthData {
     /// Password-based authentication (`m.login.password`).
@@ -135,7 +138,9 @@ pub fn parse_matrix_entity_from(uri: String) -> Option<MatrixEntity> {
         });
     }
 
-    if let Ok(matrix_to_uri) = MatrixToUri::parse(&uri) {
+    // Tchap: adapt permalink
+    // if let Ok(matrix_to_uri) = MatrixToUri::parse(&uri) {
+    if let Ok(matrix_to_uri) = MatrixToUri::parse(&uri.to_matrix_string()) {
         return Some(MatrixEntity {
             id: matrix_to_uri.id().into(),
             via: matrix_to_uri.via().iter().map(|via| via.to_string()).collect(),

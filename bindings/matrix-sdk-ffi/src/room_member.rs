@@ -3,6 +3,9 @@ use ruma::UserId;
 
 use crate::error::{ClientError, NotYetImplemented};
 
+// Tchap: adapt permalinks
+use matrix_sdk_tchap::permalinks::MatrixToUriToTchapString;
+
 #[derive(Clone, uniffi::Enum)]
 pub enum MembershipState {
     /// The user is banned.
@@ -73,7 +76,9 @@ pub fn suggested_power_level_for_role(role: RoomMemberRole) -> i64 {
 #[matrix_sdk_ffi_macros::export]
 pub fn matrix_to_user_permalink(user_id: String) -> Result<String, ClientError> {
     let user_id = UserId::parse(user_id)?;
-    Ok(user_id.matrix_to_uri().to_string())
+    // Tchap: adapt permalink
+    // Ok(user_id.matrix_to_uri().to_string())
+    Ok(user_id.matrix_to_uri().to_tchap_string())
 }
 
 #[derive(Clone, uniffi::Record)]
