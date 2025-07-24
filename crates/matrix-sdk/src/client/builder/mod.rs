@@ -667,6 +667,7 @@ impl ClientBuilder {
 
     // BWI specific
     /// verify the jwt token of the given homeserver with the provided Public Keys
+    #[allow(dead_code)]
     async fn verify_jwt_token(
         public_keys_for_jwt_validation: Option<Vec<BWIPublicKeyForJWTTokenValidation>>,
         homeserver_url: &Url,

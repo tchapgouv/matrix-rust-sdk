@@ -15,5 +15,6 @@
  */
 
 pub mod get_instance_from_email;
+pub mod permalinks;
 
 uniffi::setup_scaffolding!();
