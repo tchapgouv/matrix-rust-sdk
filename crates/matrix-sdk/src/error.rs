@@ -415,6 +415,21 @@ pub enum Error {
     /// An error happened while attempting to reply to an event.
     #[error(transparent)]
     ReplyError(#[from] ReplyError),
+
+    // BWI-specific
+    /// The attachment could not be sent because it exceeded the maximal size allowed by the server.
+    #[error("Attachment exceeded the maximal allowed size")]
+    AttachmentSizeExceededMaxSize,
+
+    /// The attachment could not be sent because it exceeded the maximal size allowed by the server.
+    #[error("Attachment provides no size")]
+    AttachmentSizeNotDefined,
+
+    /// Error indicating that a specific error was raised
+    /// Used as a workaround as we don't want to extend the Error Enum each time something new happens
+    #[error("bwi specific error: {0}")]
+    BWIError(Box<dyn std::error::Error + Send + Sync>),
+    // end BWI-specific
 }
 
 #[rustfmt::skip] // stop rustfmt breaking the `<code>` in docs across multiple lines

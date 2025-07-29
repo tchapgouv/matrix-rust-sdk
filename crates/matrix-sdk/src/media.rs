@@ -26,6 +26,9 @@ use futures_util::future::try_join;
 use matrix_sdk_base::event_cache::store::media::IgnoreMediaRetentionPolicy;
 pub use matrix_sdk_base::{event_cache::store::media::MediaRetentionPolicy, media::*};
 use mime::Mime;
+use ruma::events::room::EncryptedFile;
+use ruma::serde::base64::Standard;
+use ruma::serde::Base64;
 use ruma::{
     api::{
         client::{authenticated_media, error::ErrorKind, media},
@@ -44,6 +47,12 @@ use crate::{
     attachment::Thumbnail, client::futures::SendMediaUploadRequest, config::RequestConfig, Client,
     Error, Result, TransmissionProgress,
 };
+
+// BWI-specific
+use crate::bwi_content_scanner::BWIDownloadMediaExt;
+use crate::Error::BWIError;
+use tracing::log::debug;
+// end BWI-specific
 
 /// A conservative upload speed of 1Mbps
 const DEFAULT_UPLOAD_SPEED: u64 = 125_000;
@@ -458,15 +467,15 @@ impl Media {
 
         let content: Vec<u8> = match &request.source {
             MediaSource::Encrypted(file) => {
-                let content = if use_auth {
-                    let request =
-                        authenticated_media::get_content::v1::Request::from_uri(&file.url)?;
-                    self.client.send(request).with_request_config(request_config).await?.file
-                } else {
-                    #[allow(deprecated)]
-                    let request = media::get_content::v3::Request::from_url(&file.url)?;
-                    self.client.send(request).await?.file
-                };
+                let content = match use_auth {
+                    true => {
+                        self.download_authenticated_media_via_content_scanner(request_config, file)
+                            .await
+                    }
+                    false => self.download_unauthenticated_media_via_content_scanner(file).await,
+                }?;
+
+                debug!("###BWI### received content {:?}", Base64::<Standard>::new(content.clone()));
 
                 #[cfg(feature = "e2e-encryption")]
                 let content = {
@@ -491,39 +500,9 @@ impl Media {
 
             MediaSource::Plain(uri) => {
                 if let MediaFormat::Thumbnail(settings) = &request.format {
-                    if use_auth {
-                        let mut request =
-                            authenticated_media::get_content_thumbnail::v1::Request::from_uri(
-                                uri,
-                                settings.width,
-                                settings.height,
-                            )?;
-                        request.method = Some(settings.method.clone());
-                        request.animated = Some(settings.animated);
-
-                        self.client.send(request).with_request_config(request_config).await?.file
-                    } else {
-                        #[allow(deprecated)]
-                        let request = {
-                            let mut request = media::get_content_thumbnail::v3::Request::from_url(
-                                uri,
-                                settings.width,
-                                settings.height,
-                            )?;
-                            request.method = Some(settings.method.clone());
-                            request.animated = Some(settings.animated);
-                            request
-                        };
-
-                        self.client.send(request).await?.file
-                    }
-                } else if use_auth {
-                    let request = authenticated_media::get_content::v1::Request::from_uri(uri)?;
-                    self.client.send(request).with_request_config(request_config).await?.file
+                    self.fetch_thumbnail(use_auth, request_config, uri, settings).await?
                 } else {
-                    #[allow(deprecated)]
-                    let request = media::get_content::v3::Request::from_url(uri)?;
-                    self.client.send(request).await?.file
+                    self.fetch_media(use_auth, request_config, uri).await?
                 }
             }
         };
@@ -539,6 +518,127 @@ impl Media {
 
         Ok(content)
     }
+
+    // BWI-specific
+    async fn download_authenticated_media_via_content_scanner(
+        &self,
+        request_config: Option<RequestConfig>,
+        file: &EncryptedFile,
+    ) -> Result<Vec<u8>, Error> {
+        let content = self
+            .client
+            .download_authenticated_media(file, request_config)
+            .await
+            .map_err(|e| BWIError(Box::new(e)))?;
+        Ok(content.value())
+    }
+
+    async fn download_unauthenticated_media_via_content_scanner(
+        &self,
+        file: &EncryptedFile,
+    ) -> Result<Vec<u8>, Error> {
+        #[allow(deprecated)]
+        let content = self
+            .client
+            .download_unauthenticated_media(file)
+            .await
+            .map_err(|e| BWIError(Box::new(e)))?;
+        Ok(content.value())
+    }
+
+    async fn fetch_thumbnail(
+        &self,
+        use_auth: bool,
+        request_config: Option<RequestConfig>,
+        uri: &OwnedMxcUri,
+        settings: &MediaThumbnailSettings,
+    ) -> Result<Vec<u8>, Error> {
+        Ok(if use_auth {
+            self.fetch_thumbnail_authenticated(request_config, uri, settings).await?
+        } else {
+            #[allow(deprecated)]
+            self.fetch_thumbnail_unauthenticated(uri, settings).await?
+        })
+    }
+
+    async fn fetch_thumbnail_authenticated(
+        &self,
+        request_config: Option<RequestConfig>,
+        uri: &OwnedMxcUri,
+        settings: &MediaThumbnailSettings,
+    ) -> Result<Vec<u8>, Error> {
+        let mut request = authenticated_media::get_content_thumbnail::v1::Request::from_uri(
+            uri,
+            settings.width,
+            settings.height,
+        )?;
+        request.method = Some(settings.method.clone());
+        request.animated = Some(settings.animated);
+
+        let thumbnail = match request_config {
+            Some(request_config) => {
+                self.client.send(request).with_request_config(request_config).await?.file
+            }
+            None => self.client.send(request).await?.file,
+        };
+
+        Ok(thumbnail)
+    }
+
+    #[deprecated]
+    async fn fetch_thumbnail_unauthenticated(
+        &self,
+        uri: &OwnedMxcUri,
+        settings: &MediaThumbnailSettings,
+    ) -> Result<Vec<u8>, Error> {
+        #[allow(deprecated)]
+        {
+            let mut request = media::get_content_thumbnail::v3::Request::from_url(
+                uri,
+                settings.width,
+                settings.height,
+            )?;
+            request.method = Some(settings.method.clone());
+            request.animated = Some(settings.animated);
+
+            Ok(self.client.send(request).await?.file)
+        }
+    }
+
+    async fn fetch_media(
+        &self,
+        use_auth: bool,
+        request_config: Option<RequestConfig>,
+        uri: &OwnedMxcUri,
+    ) -> Result<Vec<u8>, Error> {
+        Ok(if use_auth {
+            self.fetch_authenticated_media(request_config, uri).await?
+        } else {
+            self.fetch_unauthenticated_media(uri).await?
+        })
+    }
+
+    async fn fetch_unauthenticated_media(&self, uri: &OwnedMxcUri) -> Result<Vec<u8>, Error> {
+        #[allow(deprecated)]
+        let request = media::get_content::v3::Request::from_url(uri)?;
+        Ok(self.client.send(request).await?.file)
+    }
+
+    async fn fetch_authenticated_media(
+        &self,
+        request_config: Option<RequestConfig>,
+        uri: &OwnedMxcUri,
+    ) -> Result<Vec<u8>, Error> {
+        let request = authenticated_media::get_content::v1::Request::from_uri(uri)?;
+        let media = match request_config {
+            Some(request_config) => {
+                self.client.send(request).with_request_config(request_config).await?.file
+            }
+            None => self.client.send(request).await?.file,
+        };
+        Ok(media)
+    }
+    // end BWI-specific
 
     /// Get a media file's content that is only available in the media cache.
     ///

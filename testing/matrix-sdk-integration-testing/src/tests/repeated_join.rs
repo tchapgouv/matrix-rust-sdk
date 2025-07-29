@@ -37,7 +37,7 @@ async fn test_repeated_join_leave() -> Result<()> {
         peter_clone.sync_once(Default::default()).await
     });
 
-    let created_room = peter.create_room(request).await?;
+    let created_room = peter.create_room_federated(request).await?;
     let room_id = created_room.room_id();
 
     // Sync karl once to ensure he got the invite.

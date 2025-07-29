@@ -208,7 +208,7 @@ impl ClientWrapper {
             is_direct: true,
         });
 
-        let room = self.client.create_room(request).await.expect("Failed to create room");
+        let room = self.client.create_room_federated(request).await.expect("Failed to create room");
         self.enable_encryption(&room, 1).await;
         room.room_id().to_owned()
     }

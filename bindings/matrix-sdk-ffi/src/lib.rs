@@ -3,6 +3,9 @@
 #![allow(clippy::empty_line_after_doc_comments)]
 
 mod authentication;
+/// BWI extension for exposing api calls
+mod bwi_bindings;
+/// BWI end
 mod chunk_iterator;
 mod client;
 mod client_builder;
@@ -27,6 +30,9 @@ mod runtime;
 mod session_verification;
 mod sync_service;
 mod task_handle;
+/// Tchap extension
+mod tchap_bindings;
+/// Tchap end
 mod timeline;
 mod tracing;
 mod utd;

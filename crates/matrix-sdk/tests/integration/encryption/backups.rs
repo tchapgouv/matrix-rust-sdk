@@ -661,7 +661,7 @@ async fn test_incremental_upload_of_keys() -> Result<()> {
     backups.create().await.expect("We should be able to create a new backup");
 
     let alice_room = client
-        .create_room(assign!(CreateRoomRequest::new(), {
+        .create_room_federated(assign!(CreateRoomRequest::new(), {
             invite: vec![],
             is_direct: true,
         }))
@@ -745,7 +745,7 @@ async fn test_incremental_upload_of_keys_sliding_sync() -> Result<()> {
         is_direct: true,
     });
 
-    let alice_room = client.create_room(request).await?;
+    let alice_room = client.create_room_federated(request).await?;
 
     alice_room.enable_encryption().await?;
 

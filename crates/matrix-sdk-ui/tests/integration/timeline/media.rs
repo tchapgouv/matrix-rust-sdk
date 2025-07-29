@@ -18,15 +18,21 @@ use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
-#[cfg(feature = "unstable-msc4274")]
-use matrix_sdk::attachment::{AttachmentInfo, BaseFileInfo};
+// BWI-specific
+use matrix_sdk::bwi_extensions::client::BWIClientSetupExt;
+use matrix_sdk::test_utils::client::TEST_BEARER_TOKEN;
+use matrix_sdk_ui::timeline::Error::AttachmentSizeExceededLimit;
+use wiremock::matchers::{bearer_token, method, path};
+use wiremock::http::Method;
+use wiremock::Mock;
+// end BWI-specific
 use matrix_sdk::{
     assert_let_timeout,
-    attachment::AttachmentConfig,
-    room::reply::{EnforceThread, Reply},
+    attachment::{AttachmentConfig, AttachmentInfo, BaseFileInfo},
     test_utils::mocks::MatrixMockServer,
 };
 use matrix_sdk_test::{async_test, event_factory::EventFactory, JoinedRoomBuilder, ALICE};
+
 use matrix_sdk_ui::timeline::{AttachmentSource, EventSendState, RoomExt};
 #[cfg(feature = "unstable-msc4274")]
 use matrix_sdk_ui::timeline::{GalleryConfig, GalleryItemInfo};
@@ -40,7 +46,7 @@ use ruma::{
         message::{MessageType, ReplyWithinThread},
         MediaSource,
     },
-    room_id,
+    room_id, uint, UInt,
 };
 use serde_json::json;
 use stream_assert::assert_pending;
@@ -70,7 +76,18 @@ async fn test_send_attachment_from_file() {
     let mock = MatrixMockServer::new().await;
     let client = mock.client_builder().build().await;
 
-    mock.mock_authenticated_media_config().ok_default().mount().await;
+    // BWI-specific
+    Mock::given(method(Method::GET))
+        .and(path("/_matrix/client/v1/media/config"))
+        .and(bearer_token(TEST_BEARER_TOKEN))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"m.upload.size": 20 * 1024 * 1024})),
+        )
+        .mount(mock.server())
+        .await;
+    client.sync_settings().await.unwrap();
+    // end BWI-specific
+
     mock.mock_room_state_encryption().plain().mount().await;
 
     let room_id = room_id!("!a98sd12bjh:example.org");
@@ -116,10 +133,11 @@ async fn test_send_attachment_from_file() {
     mock.mock_room_send().ok(event_id!("$media")).mock_once().mount().await;
 
     // Queue sending of an attachment.
-    let config = AttachmentConfig::new().caption(Some("caption".to_owned())).reply(Some(Reply {
-        event_id: event_id.to_owned(),
-        enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
-    }));
+    // BWI-specific // Workaround for bad design
+    let info = BaseFileInfo { size: Some(UInt::new(8u64).unwrap()) };
+    let mut config = AttachmentConfig::new().caption(Some("caption".to_owned()));
+    config.set_info(AttachmentInfo::File(info));
+    // end BWI-specific
     timeline.send_attachment(&file_path, mime::TEXT_PLAIN, config).use_send_queue().await.unwrap();
 
     {
@@ -222,7 +240,11 @@ async fn test_send_attachment_from_bytes() {
     mock.mock_room_send().ok(event_id!("$media")).mock_once().mount().await;
 
     // Queue sending of an attachment.
-    let config = AttachmentConfig::new().caption(Some("caption".to_owned()));
+    // BWI-specific
+    let config = AttachmentConfig::new()
+        .caption(Some("caption".to_owned()))
+        .info(AttachmentInfo::File(BaseFileInfo { size: Some(uint!(42)), ..Default::default() }));
+    // end BWI-specific
     timeline.send_attachment(source, mime::TEXT_PLAIN, config).use_send_queue().await.unwrap();
 
     {
@@ -403,6 +425,18 @@ async fn test_react_to_local_media() {
     let mock = MatrixMockServer::new().await;
     let client = mock.client_builder().build().await;
 
+    // BWI-specific
+    Mock::given(method(Method::GET))
+        .and(path("/_matrix/client/v1/media/config"))
+        .and(bearer_token(TEST_BEARER_TOKEN))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"m.upload.size": 20 * 1024 * 1024})),
+        )
+        .mount(mock.server())
+        .await;
+    client.sync_settings().await.unwrap();
+    // end BWI-specific
+
     // Disable the sending queue, to simulate offline mode.
     client.send_queue().set_enabled(false).await;
 
@@ -422,8 +456,13 @@ async fn test_react_to_local_media() {
     let (_tmp_dir, file_path) = create_temporary_file("test.bin");
 
     // Queue sending of an attachment (no captions).
-    let config = AttachmentConfig::new();
+    // BWI-specific // Workaround for bad design
+    let kb_as_bytes = UInt::new(1024).unwrap();
+    let info = BaseFileInfo { size: Some(kb_as_bytes) };
+    let mut config = AttachmentConfig::new();
+    config.set_info(AttachmentInfo::File(info));
     timeline.send_attachment(&file_path, mime::TEXT_PLAIN, config).use_send_queue().await.unwrap();
+    // end BWI-specific
 
     let item_id = {
         assert_let_timeout!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next());
@@ -451,3 +490,53 @@ async fn test_react_to_local_media() {
     // That's all, folks!
     assert_pending!(timeline_stream);
 }
+
+// BWI-specific
+#[async_test]
+async fn test_send_attachment_to_big_should_return_error() {
+    let mock = MatrixMockServer::new().await;
+    let client = mock.client_builder().build().await;
+
+    Mock::given(method(Method::GET))
+        .and(path("/_matrix/client/v1/media/config"))
+        .and(bearer_token(TEST_BEARER_TOKEN))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"m.upload.size": 20 * 1024 * 1024})),
+        )
+        .mount(mock.server())
+        .await;
+    client.sync_settings().await.unwrap();
+
+    mock.mock_room_state_encryption().plain().mount().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = mock.sync_joined_room(&client, room_id).await;
+    let timeline = room.timeline().await.unwrap();
+
+    // Store a file in a temporary directory.
+    let (_tmp_dir, file_path) = create_temporary_file("test.bin");
+
+    // Set up mocks for the file upload that should not be called.
+    mock.mock_upload()
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)).set_body_json(
+            json!({
+              "content_uri": "mxc://sdk.rs/media"
+            }),
+        ))
+        .expect(0)
+        .mount()
+        .await;
+
+    // BWI-specific // Workaround for bad design
+    let gb_as_byte = UInt::new(8589934592u64).unwrap();
+    let info = BaseFileInfo { size: Some(gb_as_byte) };
+    let mut config = AttachmentConfig::new().caption(Some("caption".to_owned()));
+    config.set_info(AttachmentInfo::File(info));
+    // end BWI-specific
+    let send_result =
+        timeline.send_attachment(&file_path, mime::TEXT_PLAIN, config).use_send_queue().await;
+
+    assert!(matches!(send_result, Err(AttachmentSizeExceededLimit)))
+}
+
+// end BWI-specific

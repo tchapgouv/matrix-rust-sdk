@@ -277,6 +277,7 @@ impl TimelineAction {
                         ))
                     }
                 },
+                // Tchap: tests for Access rules.
                 ev => {
                     let ev_content = ev.content();
                     let event_type_str = ev_content.event_type().to_string();

@@ -27,10 +27,9 @@ syncing, and room state, so you can focus on your app's logic and UI. Whether
 you're writing a small bot, a desktop client, or something in between, the SDK
 is designed to be flexible, async-friendly, and ready to use out of the box.
 
-[Matrix]: https://matrix.org/
-[Rust]: https://www.rust-lang.org/
+## Repository
 
-## Project structure
+https://gitlab.opencode.de/bwi/bundesmessenger/clients/bundesmessenger-matrix-rust-sdk.git
 
 The Matrix Rust SDK is made up of several crates that build on top of each other. Here are the key ones:
 
@@ -45,7 +44,7 @@ The Matrix Rust SDK is made up of several crates that build on top of each other
   See the [crypto tutorial](https://docs.rs/matrix-sdk-crypto/latest/matrix_sdk_crypto/tutorial/index.html)
   for a step-by-step introduction.
 
-## Status
+## Struktur
 
 The library is considered production ready and backs multiple client
 implementations such as Element X
@@ -57,13 +56,61 @@ confident to build upon it.
 Development of the SDK has been primarily sponsored by Element though accepts
 contributions from all.
 
-## Bindings
+* **matirx-sdk-base-bwi** - Alle Bundesmessenger-Erweiterungen, welche keine Abhängigkeiten zu den bestehenden
+  matirx-sdk crates haben.
+* **matirx-sdk-bwi** - Alle Bundesmessenger-Erweiterungen, welche Abhängigkeiten zu der matirx-sdk crate haben.
 
 The higher-level crates of the Matrix Rust SDK can be embedded in other
 environments such as Swift, Kotlin, JavaScript, and Node.js. Check out the
 [bindings/](./bindings/) directory to learn more about how to integrate the SDK
 into your language of choice.
 
-## License
 
-[Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0)
+[Matrix Rust SDK](https://github.com/matrix-org/matrix-rust-sdk)
+
+## Für Entwickler
+
+### Commit-Hooks
+
+Durch das erstmalige ausführen von `cargo test` werden die Git-Hooks automatisch initialisiert.
+Ob die Initialisierung erfolgreich war, kann mit `less .git/hooks/pre-commit` überprüft werden.
+
+Wenn der Output `.git/hooks/pre-commit: No such file or directory` lautet, so muss zuerst ein _.git/hooks_-Verzeichnis
+mittels `mkdir .git/hooks` erzeugt werden.
+Anschließend können mittels `rusty-hook init` die hooks initialisiert werden.
+
+### Für Android
+
+Das Rust-SDK wird mittels eines *.aar Archives in den Android Messenger X eingebunden.
+Zur Erstellung dieses Archives wird folgender Befehl im root dieses Projektes ausgeführt:
+
+```./android-scripts/build.sh -p . -t $TARGET_ARCHITECTURE $PROFILE```
+
+Dabei ist `$TARGET_ARCHITECTURE` die Zielarchitektur (z.B. `aarch64-linux-android`, `i686-linux-android` oder
+`armv7-linux-androideabi`).
+`$PROFILE` kann dabei durch `-r` ersetzt werden, wenn es sich um einen Build für ein Release handeln soll.
+
+Das entstandene *.aar Archiv kann dann von der Android-App verwendet werden.
+Genauere Informationen dazu können dem _BundesMessenger X Android_ Projekt entnommen werden.
+
+### Für iOS
+
+Das Rust-SDK wird mittels eines GitSubmoduls eingebunden.
+Anschießend wird ein Swift-Package erzeugt, welches von XCode angesprochen werden kann.
+Um ein Swift-Package zu erzeugen, steht folgender Befehlt zu Verfügung:
+
+```xtask swift build-framework -t $TARGET_ARCHITECTURE --profile $PROFILE```
+
+Dabei ist `$TARGET_ARCHITECTURE` die Zielarchitektur (z.B. `aarch64-apple-ios`, `aarch64-apple-ios-sim` oder
+`x86_64-apple-ios`).
+Für `$PROFILE` stehen dabei `bwibuild` (schneller Build) und `bwidbg` (Build für Debugging) zu Verfügung.
+Anschließend kann das Rust-SDK über die generierte Package.swift lokal eingebunden werden.
+
+## Rechtliches
+
+Die Lizenz des BundesMessenger - Matrix Rust SDK ist die [Apache License Version 2.0](./LICENSE).
+
+### Copyright
+
+- [BWI GmbH](https://messenger.bwi.de/copyright)
+- [Matrix](https://matrix.org/)

@@ -24,6 +24,7 @@ use eyeball_im::VectorDiff;
 #[cfg(feature = "unstable-msc4274")]
 use futures::SendGallery;
 use futures_core::Stream;
+use futures_util::{future, pin_mut, StreamExt};
 use imbl::Vector;
 #[cfg(feature = "unstable-msc4274")]
 use matrix_sdk::attachment::{AttachmentInfo, Thumbnail};
@@ -58,7 +59,7 @@ use ruma::{
 };
 use subscriber::TimelineWithDropHandle;
 use thiserror::Error;
-use tracing::{instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use self::{
     algorithms::rfind_event_by_id, controller::TimelineController, futures::SendAttachment,
@@ -218,6 +219,71 @@ impl Timeline {
             .retry_event_decryption(Some(session_ids.into_iter().map(Into::into).collect()))
             .await;
     }
+
+    // BWI-specific
+    #[cfg(feature = "enable_external_content_scanner_setup")]
+    pub async fn setup_content_scanner_hook_ext(&self) -> &Self {
+        self.setup_content_scanner_hook().await
+    }
+
+    pub(crate) async fn setup_content_scanner_hook(&self) -> &Self {
+        info!("###BWI### setup content scanner hook");
+        let (timeline_items, timeline_stream) = self.subscribe().await;
+
+        let timeline_controller = self.controller.clone();
+
+        tokio::spawn(async move {
+            pin_mut!(timeline_stream);
+
+            future::join_all(
+                timeline_items
+                    .iter()
+                    .map(|item| timeline_controller.handle_single_timeline_item(item)),
+            )
+            .await;
+
+            while let Some(diffs) = timeline_stream.next().await {
+                for diff in diffs {
+                    Timeline::handle_diff(&timeline_controller, diff).await;
+                }
+            }
+        });
+        self
+    }
+
+    async fn handle_diff(
+        timeline_controller: &TimelineController,
+        diff: VectorDiff<Arc<TimelineItem>>,
+    ) {
+        match diff {
+            VectorDiff::PushBack { value } => {
+                debug!("###BWI### Push back: {value:?}");
+                timeline_controller.handle_single_timeline_item(&value).await
+            }
+            VectorDiff::PushFront { value } => {
+                debug!("###BWI### Push front: {value:?}");
+                timeline_controller.handle_single_timeline_item(&value).await
+            }
+            VectorDiff::Insert { index, value } => {
+                debug!("###BWI### Insert at {index:?}: {value:?}");
+                timeline_controller.handle_single_timeline_item(&value).await
+            }
+            VectorDiff::Set { index, value } => {
+                debug!("###BWI### Set at {index:?}: {value:?}");
+                timeline_controller.handle_single_timeline_item(&value).await
+            }
+            VectorDiff::Append { values } => {
+                debug!("###BWI### Append: {values:?}");
+                for value in values {
+                    timeline_controller.handle_single_timeline_item(&value).await;
+                }
+            }
+            _ => {
+                info!("###BWI### handle unhandled diff: {:?}", diff);
+            }
+        }
+    }
+    // end BWI-specific
 
     #[tracing::instrument(skip(self))]
     async fn retry_decryption_for_all_events(&self) {

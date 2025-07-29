@@ -1,0 +1,46 @@
+publiccodeYmlVersion: "0.4"
+name: BundesMessenger Matrix Rust SDK
+applicationSuite: BundesMessenger X
+url: https://gitlab.opencode.de/bwi/bundesmessenger/clients/bundesmessenger-matrix-rust-sdk.git
+platforms:
+  - iOS
+  - android
+categories:
+  - communications
+  - collaboration
+developmentStatus: beta
+softwareType: library
+intendedAudience:
+  countries:
+    - de
+  scope:
+    - government
+    - local-authorities
+description:
+  de:
+    genericName: BundesMessenger Matrix Rust SDK
+    shortDescription: BundesMessenger - Matrix Rust SDK ist ein Matrix Client-Server SDK basierend auf Matrix Rust SDK.
+    longDescription: >
+      BundesMessenger - Matrix Rust SDK ist ein Matrix Client-Server SDK basierend auf Matrix Rust SDK.
+      Das SDK wird verwendet von BundesMessenger X Android und BundesMessenger X iOS.
+    features:
+      - Matrix Client-Server SDK
+legal:
+  license: Apache-2.0
+  mainCopyrightOwner: BWI GmbH
+maintenance:
+  type: internal
+  contractors:
+    - name: BWI GmbH
+      until: 2025-12-31
+      email: bundesmessenger@bwi.de
+      website: https://messenger.bwi.de/
+  contacts:
+    - name: BWI GmbH
+      email: bundesmessenger@bwi.de
+      phone: ""
+      affiliation: ""
+localisation:
+  localisationReady: true
+  availableLanguages:
+    - en

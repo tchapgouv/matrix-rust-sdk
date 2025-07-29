@@ -35,7 +35,7 @@ use matrix_sdk_common::{
     stream::StreamExt,
 };
 use matrix_sdk_ui::timeline::{
-    self, AttachmentSource, EventItemOrigin, Profile, TimelineDetails,
+    self, Error, AttachmentSource, EventItemOrigin, Profile, TimelineDetails,
     TimelineUniqueId as SdkTimelineUniqueId,
 };
 use mime::Mime;
@@ -85,9 +85,11 @@ mod content;
 mod msg_like;
 mod reply;
 
+use matrix_sdk::bwi_extensions::attachment::ClientAttachmentExt;
 use matrix_sdk::utils::formatted_body_from;
 use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
 
+use crate::client::BWIScanState;
 use crate::error::QueueWedgeError;
 
 #[derive(uniffi::Object)]
@@ -143,7 +145,14 @@ impl Timeline {
                 });
             }
 
-            request.await.map_err(|_| RoomError::FailedSendingAttachment)?;
+            // BWI-specific
+            request.await.map_err(|e| match e {
+                Error::AttachmentSizeExceededLimit => RoomError::AttachmentSizeExceededUploadLimit,
+                Error::AttachmentSizeNotAvailable => RoomError::FailedSendingAttachment,
+                _ => RoomError::FailedSendingAttachment,
+            })?;
+            // end BWI-specific
+
             Ok(())
         }));
 
@@ -367,6 +376,20 @@ impl Timeline {
         self.inner.mark_as_read(receipt_type.into()).await?;
         Ok(())
     }
+
+    // BWI-specific
+    pub async fn get_file_size_limit_for_file_upload(
+        &self,
+    ) -> std::result::Result<u64, ClientError> {
+        self.inner
+            .room()
+            .client()
+            .get_size_limit_for_file_upload()
+            .await
+            .map(|size| size.0)
+            .ok_or(ClientError::Generic { msg: "File size limit not synced".to_string(), details: None, })
+    }
+    // end BWI-specific
 
     /// Queues an event in the room's send queue so it's processed for
     /// sending later.
@@ -1004,6 +1027,13 @@ impl TimelineItem {
             VItem::DateDivider(ts) => Some(VirtualTimelineItem::DateDivider { ts: (*ts).into() }),
             VItem::ReadMarker => Some(VirtualTimelineItem::ReadMarker),
             VItem::TimelineStart => Some(VirtualTimelineItem::TimelineStart),
+            // BWI-specific
+            VItem::ScanStateChanged(event_id, new_scan_state) => {
+                Some(VirtualTimelineItem::ScanStateChanged {
+                    event_id: event_id.0.clone(),
+                    new_scan_state: BWIScanState::from(new_scan_state.clone()),
+                })
+            } // end BWI-specific
         }
     }
 
@@ -1273,6 +1303,13 @@ pub enum VirtualTimelineItem {
 
     /// The timeline start, that is, the *oldest* event in time for that room.
     TimelineStart,
+
+    // BWI-specific
+    ScanStateChanged {
+        event_id: String,
+        new_scan_state: BWIScanState,
+    },
+    // end BWI-specific
 }
 
 /// A [`TimelineItem`](super::TimelineItem) that doesn't correspond to an event.

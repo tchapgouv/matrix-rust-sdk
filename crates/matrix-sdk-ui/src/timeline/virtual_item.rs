@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::timeline::TimelineUniqueId;
+use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState;
 use ruma::MilliSecondsSinceUnixEpoch;
 
 /// A [`TimelineItem`](super::TimelineItem) that doesn't correspond to an event.
@@ -30,4 +32,9 @@ pub enum VirtualTimelineItem {
     /// The timeline start, that is, an indication that we've seen all the
     /// events for that timeline.
     TimelineStart,
+
+    // BWI-specific
+    /// Indicates that the scan state for a specific Item has changed
+    ScanStateChanged(TimelineUniqueId, BWIScanState),
+    // end BWI-specific
 }

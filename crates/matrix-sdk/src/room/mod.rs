@@ -173,10 +173,10 @@ pub mod reply;
 /// Contains all the functionality for modifying the privacy settings in a room.
 pub mod privacy_settings;
 
-pub mod access_rules;
-
 #[cfg(feature = "e2e-encryption")]
 pub(crate) mod shared_room_history;
+
+pub mod access_rules;
 
 /// A struct containing methods that are common for Joined, Invited and Left
 /// Rooms
@@ -4039,7 +4039,13 @@ mod tests {
     use super::ReportedContentScore;
     use crate::{
         config::RequestConfig,
-        test_utils::{client::mock_matrix_session, logged_in_client, mocks::MatrixMockServer},
+        room::AccessRule,
+        room::messages::{IncludeRelations, ListThreadsOptions, RelationsOptions},
+        test_utils::{
+            client::mock_matrix_session,
+            logged_in_client,
+            mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
+        },
         Client,
     };
 
@@ -4411,5 +4417,212 @@ mod tests {
         // And also the sender info from the /members endpoint
         assert!(ret.sender_info.is_some());
         assert_eq!(ret.sender_info.unwrap().event().user_id(), sender_id);
+    }
+
+    #[async_test]
+    async fn test_list_threads() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!a:b.c");
+        let sender_id = user_id!("@alice:b.c");
+        let f = EventFactory::new().room(room_id).sender(sender_id);
+
+        let eid1 = event_id!("$1");
+        let eid2 = event_id!("$2");
+        let batch1 = vec![f.text_msg("Thread root 1").event_id(eid1).into_raw_sync().cast()];
+        let batch2 = vec![f.text_msg("Thread root 2").event_id(eid2).into_raw_sync().cast()];
+
+        server
+            .mock_room_threads()
+            .ok(batch1.clone(), Some("prev_batch".to_owned()))
+            .mock_once()
+            .mount()
+            .await;
+        server
+            .mock_room_threads()
+            .match_from("prev_batch")
+            .ok(batch2, None)
+            .mock_once()
+            .mount()
+            .await;
+
+        let room = server.sync_joined_room(&client, room_id).await;
+        let result =
+            room.list_threads(ListThreadsOptions::default()).await.expect("Failed to list threads");
+        assert_eq!(result.chunk.len(), 1);
+        assert_eq!(result.chunk[0].event_id().unwrap(), eid1);
+        assert!(result.prev_batch_token.is_some());
+
+        let opts = ListThreadsOptions { from: result.prev_batch_token, ..Default::default() };
+        let result = room.list_threads(opts).await.expect("Failed to list threads");
+        assert_eq!(result.chunk.len(), 1);
+        assert_eq!(result.chunk[0].event_id().unwrap(), eid2);
+        assert!(result.prev_batch_token.is_none());
+    }
+
+    #[async_test]
+    async fn test_relations() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!a:b.c");
+        let sender_id = user_id!("@alice:b.c");
+        let f = EventFactory::new().room(room_id).sender(sender_id);
+
+        let target_event_id = owned_event_id!("$target");
+        let eid1 = event_id!("$1");
+        let eid2 = event_id!("$2");
+        let batch1 = vec![f.text_msg("Related event 1").event_id(eid1).into_raw_sync().cast()];
+        let batch2 = vec![f.text_msg("Related event 2").event_id(eid2).into_raw_sync().cast()];
+
+        server
+            .mock_room_relations()
+            .match_target_event(target_event_id.clone())
+            .ok(RoomRelationsResponseTemplate::default().events(batch1).next_batch("next_batch"))
+            .mock_once()
+            .mount()
+            .await;
+
+        server
+            .mock_room_relations()
+            .match_target_event(target_event_id.clone())
+            .match_from("next_batch")
+            .ok(RoomRelationsResponseTemplate::default().events(batch2))
+            .mock_once()
+            .mount()
+            .await;
+
+        let room = server.sync_joined_room(&client, room_id).await;
+
+        // Main endpoint: no relation type filtered out.
+        let mut opts = RelationsOptions {
+            include_relations: IncludeRelations::AllRelations,
+            ..Default::default()
+        };
+        let result = room
+            .relations(target_event_id.clone(), opts.clone())
+            .await
+            .expect("Failed to list relations the first time");
+        assert_eq!(result.chunk.len(), 1);
+        assert_eq!(result.chunk[0].event_id().unwrap(), eid1);
+        assert!(result.prev_batch_token.is_none());
+        assert!(result.next_batch_token.is_some());
+        assert!(result.recursion_depth.is_none());
+
+        opts.from = result.next_batch_token;
+        let result = room
+            .relations(target_event_id, opts)
+            .await
+            .expect("Failed to list relations the second time");
+        assert_eq!(result.chunk.len(), 1);
+        assert_eq!(result.chunk[0].event_id().unwrap(), eid2);
+        assert!(result.prev_batch_token.is_none());
+        assert!(result.next_batch_token.is_none());
+        assert!(result.recursion_depth.is_none());
+    }
+
+    #[async_test]
+    async fn test_relations_with_reltype() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        let room_id = room_id!("!a:b.c");
+        let sender_id = user_id!("@alice:b.c");
+        let f = EventFactory::new().room(room_id).sender(sender_id);
+
+        let target_event_id = owned_event_id!("$target");
+        let eid1 = event_id!("$1");
+        let eid2 = event_id!("$2");
+        let batch1 = vec![f.text_msg("In-thread event 1").event_id(eid1).into_raw_sync().cast()];
+        let batch2 = vec![f.text_msg("In-thread event 2").event_id(eid2).into_raw_sync().cast()];
+
+        server
+            .mock_room_relations()
+            .match_target_event(target_event_id.clone())
+            .match_subrequest(IncludeRelations::RelationsOfType(RelationType::Thread))
+            .ok(RoomRelationsResponseTemplate::default().events(batch1).next_batch("next_batch"))
+            .mock_once()
+            .mount()
+            .await;
+
+        server
+            .mock_room_relations()
+            .match_target_event(target_event_id.clone())
+            .match_from("next_batch")
+            .match_subrequest(IncludeRelations::RelationsOfType(RelationType::Thread))
+            .ok(RoomRelationsResponseTemplate::default().events(batch2))
+            .mock_once()
+            .mount()
+            .await;
+
+        let room = server.sync_joined_room(&client, room_id).await;
+
+        // Reltype-filtered endpoint, for threads \o/
+        let mut opts = RelationsOptions {
+            include_relations: IncludeRelations::RelationsOfType(RelationType::Thread),
+            ..Default::default()
+        };
+        let result = room
+            .relations(target_event_id.clone(), opts.clone())
+            .await
+            .expect("Failed to list relations the first time");
+        assert_eq!(result.chunk.len(), 1);
+        assert_eq!(result.chunk[0].event_id().unwrap(), eid1);
+        assert!(result.prev_batch_token.is_none());
+        assert!(result.next_batch_token.is_some());
+        assert!(result.recursion_depth.is_none());
+
+        opts.from = result.next_batch_token;
+        let result = room
+            .relations(target_event_id, opts)
+            .await
+            .expect("Failed to list relations the second time");
+        assert_eq!(result.chunk.len(), 1);
+        assert_eq!(result.chunk[0].event_id().unwrap(), eid2);
+        assert!(result.prev_batch_token.is_none());
+        assert!(result.next_batch_token.is_none());
+        assert!(result.recursion_depth.is_none());
+	}
+
+	#[async_test]
+    async fn test_own_room_access_rules() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room_id = room_id!("!a:b.c");
+        let sender_id = user_id!("@alice:b.c");
+        let user_id = user_id!("@example:localhost");
+
+        let f = EventFactory::new().room(room_id).sender(sender_id);
+        let joined_room_builder = JoinedRoomBuilder::new(room_id)
+            .add_state_bulk(vec![f.member(user_id).into_raw_sync().cast()]);
+        let room = server.sync_room(&client, joined_room_builder).await;
+
+        let set_access_rules_result = room.set_access_rules(AccessRule::Restricted).await;
+        println!("Hello");
+        assert!(set_access_rules_result.is_err(), "set_access_rules_result is an Err!");
+
+        // let get_access_rules_result = room.get_access_rules().await;
+
+        // assert!(!get_access_rules_result.is_err());
+
+        // // We'll receive the member info through the /members endpoint
+        // server
+        //     .mock_get_members()
+        //     .ok(vec![f.member(sender_id).into_raw_timeline().cast()])
+        //     .mock_once()
+        //     .mount()
+        //     .await;
+
+        // // We get the current user's member info
+        // let ret = room.own_membership_details().await;
+        // assert_matches!(ret, Ok((member, sender)));
+
+        // // We get the current user's member info
+        // assert_eq!(member.event().user_id(), user_id);
+
+        // // And also the sender info from the /members endpoint
+        // assert!(sender.is_some());
+        // assert_eq!(sender.unwrap().event().user_id(), sender_id);
     }
 }

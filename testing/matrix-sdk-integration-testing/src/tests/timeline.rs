@@ -83,7 +83,7 @@ async fn test_toggling_reaction() -> Result<()> {
     debug!("Creating room…");
     let user_id = alice.user_id().unwrap().to_owned();
     let room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
+        .create_room_federated(assign!(CreateRoomRequest::new(), {
             is_direct: true,
         }))
         .await?;
@@ -243,7 +243,7 @@ async fn test_stale_local_echo_time_abort_edit() {
 
     debug!("Creating room…");
     let room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
+        .create_room_federated(assign!(CreateRoomRequest::new(), {
             is_direct: true,
         }))
         .await
@@ -402,7 +402,7 @@ async fn test_enabling_backups_retries_decryption() {
             .to_raw_any()];
 
     let room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
+        .create_room_federated(assign!(CreateRoomRequest::new(), {
             is_direct: true,
             initial_state,
             preset: Some(RoomPreset::PrivateChat)
@@ -538,7 +538,7 @@ async fn test_room_keys_received_on_notification_client_trigger_redecryption() {
             .to_raw_any()];
 
     let alice_room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
+        .create_room_federated(assign!(CreateRoomRequest::new(), {
             is_direct: true,
             initial_state,
             preset: Some(RoomPreset::PrivateChat)
@@ -785,7 +785,7 @@ async fn test_new_users_first_messages_dont_warn_about_insecure_device_if_it_is_
     /// Create a room and ensure it is encrypted
     async fn create_encrypted_room(client: &Client) -> Room {
         let room = client
-        .create_room(assign!(CreateRoomRequest::new(), {
+        .create_room_federated(assign!(CreateRoomRequest::new(), {
             is_direct: true,
             initial_state: vec![
                 InitialStateEvent::new(RoomEncryptionEventContent::with_recommended_defaults()).to_raw_any()

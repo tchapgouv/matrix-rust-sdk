@@ -16,6 +16,8 @@ features = ["docsrs"]
 rustdoc-args = ["--cfg", "docsrs", "--generate-link-to-definition"]
 
 [features]
+client = []
+server = []
 default = ["e2e-encryption", "automatic-room-key-forwarding", "sqlite", "native-tls"]
 testing = [
     "matrix-sdk-sqlite?/testing",
@@ -88,10 +90,14 @@ js_int = "0.2.2"
 language-tags = { version = "0.3.2" }
 matrix-sdk-base.workspace = true
 matrix-sdk-common.workspace = true
+matrix-sdk-base-bwi = { workspace = true }
+matrix-sdk-bwi = { workspace = true, features = ["client"] }
+matrix-sdk-bwi-test = { workspace = true }
 matrix-sdk-ffi-macros = { workspace = true, optional = true }
 matrix-sdk-indexeddb = { workspace = true, optional = true }
 matrix-sdk-sqlite = { workspace = true, optional = true }
 matrix-sdk-test = { workspace = true, optional = true }
+matrix-sdk-tchap = { workspace = true }
 mime.workspace = true
 mime2ext = "0.1.53"
 oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "timing-resistant-secret-traits"] }
@@ -99,6 +105,8 @@ once_cell.workspace = true
 percent-encoding = "2.3.1"
 pin-project-lite.workspace = true
 rand = { workspace = true, optional = true }
+# BWI: use `rstest` for tests
+rstest = { workspace = true }
 ruma = { workspace = true, features = [
     "rand",
     "unstable-msc2448",
@@ -119,7 +127,7 @@ thiserror.workspace = true
 tokio-stream = { workspace = true, features = ["sync"] }
 tokio-util = "0.7.13"
 tower = { version = "0.5.2", features = ["util"], optional = true }
-tracing = { workspace = true, features = ["attributes"] }
+tracing = { workspace = true, features = ["attributes", "log"] }
 uniffi = { workspace = true, optional = true }
 url = { workspace = true, features = ["serde"] }
 urlencoding = "2.1.3"

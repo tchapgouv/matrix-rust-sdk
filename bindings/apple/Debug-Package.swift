@@ -13,7 +13,7 @@ let package = Package(
     ],
     products: [
         .library(name: "MatrixRustSDK",
-                 type: .dynamic,
+// bwi 6881 our local build does not work on device with dynamic binding
                  targets: ["MatrixRustSDK"]),
     ],
     targets: [
