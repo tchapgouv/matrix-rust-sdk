@@ -182,9 +182,9 @@ impl TimelineBuilder {
             unable_to_decrypt_hook,
             is_room_encrypted,
             settings,
-			// BWI-specific
+            // BWI-specific
             content_scanner.to_owned(),
-			// end BWI-specific
+            // end BWI-specific
         );
 
         let has_events = controller.init_focus(&focus, &room_event_cache).await?;

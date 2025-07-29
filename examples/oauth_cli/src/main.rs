@@ -142,7 +142,9 @@ impl OAuthCli {
         if let Err(error) = cli.register_and_login().await {
             let mut unsupported = false;
             if let Some(error) = error.downcast_ref::<OAuthError>() {
-                if let OAuthError::ClientRegistration(OAuthClientRegistrationError::NotSupported) = error {
+                if let OAuthError::ClientRegistration(OAuthClientRegistrationError::NotSupported) =
+                    error
+                {
                     unsupported = true;
                 }
             }

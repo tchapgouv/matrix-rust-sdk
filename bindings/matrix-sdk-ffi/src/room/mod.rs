@@ -6,8 +6,7 @@ use matrix_sdk::{
     crypto::LocalTrust,
     room::{
         access_rules::AccessRule, edit::EditedContent, power_levels::RoomPowerLevelChanges,
-        Room as SdkRoom, RoomMemberRole,
-        TryFromReportedContentScoreError,
+        Room as SdkRoom, RoomMemberRole, TryFromReportedContentScoreError,
     },
     ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType, EncryptionState,
     PredecessorRoom as SdkPredecessorRoom, RoomHero as SdkRoomHero, RoomMemberships, RoomState,
@@ -281,9 +280,9 @@ impl Room {
 
         let timeline = builder.build().await?;
 
-        // Tchap: BWI adaptation needed since Matrix Timeline Refactor: 
+        // Tchap: BWI adaptation needed since Matrix Timeline Refactor:
         //  - https://github.com/matrix-org/matrix-rust-sdk/pull/5069
-        //  - https://github.com/matrix-org/matrix-rust-sdk/pull/5058 
+        //  - https://github.com/matrix-org/matrix-rust-sdk/pull/5058
         // The BWI code was located in `crates/matrix-sdk-ui/src/room_list_service/room.rs` file that was deleted.
         //
         // BWI-specific: set up the hook for starting the content scanner

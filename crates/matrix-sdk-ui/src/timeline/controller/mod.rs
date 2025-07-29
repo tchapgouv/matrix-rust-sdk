@@ -144,7 +144,7 @@ pub(in crate::timeline) enum TimelineFocusKind<P: RoomDataProvider> {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct  TimelineController<P: RoomDataProvider = Room, D: Decryptor = Room> {
+pub(super) struct TimelineController<P: RoomDataProvider = Room, D: Decryptor = Room> {
     /// Inner mutable state.
     state: Arc<RwLock<TimelineState<P>>>,
 
@@ -159,11 +159,11 @@ pub(super) struct  TimelineController<P: RoomDataProvider = Room, D: Decryptor =
     /// Settings applied to this timeline.
     pub(super) settings: TimelineSettings,
 
-   /// Long-running task used to retry decryption of timeline items without
+    /// Long-running task used to retry decryption of timeline items without
     /// blocking main processing.
     decryption_retry_task: DecryptionRetryTask<P, D>,
 
-        // BWI-specific
+    // BWI-specific
     /// the used ContentScanner
     content_scanner: BWIContentScannerWrapper,
     // end BWI-specific
@@ -341,11 +341,16 @@ impl<P: RoomDataProvider, D: Decryptor> TimelineController<P, D> {
         let decryption_retry_task =
             DecryptionRetryTask::new(state.clone(), room_data_provider.clone());
 
-        Self { state, focus, room_data_provider, settings, 
-			// BWI-specific
-			content_scanner,
-			// end PWI-specific
-			decryption_retry_task }
+        Self {
+            state,
+            focus,
+            room_data_provider,
+            settings,
+            // BWI-specific
+            content_scanner,
+            // end PWI-specific
+            decryption_retry_task,
+        }
     }
 
     /// Initializes the configured focus with appropriate data.

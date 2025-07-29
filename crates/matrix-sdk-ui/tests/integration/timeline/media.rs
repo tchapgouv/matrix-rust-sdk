@@ -22,8 +22,8 @@ use futures_util::StreamExt;
 use matrix_sdk::bwi_extensions::client::BWIClientSetupExt;
 use matrix_sdk::test_utils::client::TEST_BEARER_TOKEN;
 use matrix_sdk_ui::timeline::Error::AttachmentSizeExceededLimit;
-use wiremock::matchers::{bearer_token, method, path};
 use wiremock::http::Method;
+use wiremock::matchers::{bearer_token, method, path};
 use wiremock::Mock;
 // end BWI-specific
 use matrix_sdk::{

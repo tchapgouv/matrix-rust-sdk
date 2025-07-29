@@ -1520,14 +1520,16 @@ impl QueueStorage {
                 })
             });
 
-        let reactions_and_medias =
-            store.load_dependent_queued_requests(&self.room_id).await?.into_iter().filter_map(
-                |dep| match dep.kind {
-                    DependentQueuedRequestKind::EditEvent { .. }
-                    | DependentQueuedRequestKind::RedactEvent => {
-                        // TODO: reflect local edits/redacts too?
-                        None
-                    }
+        let reactions_and_medias = store
+            .load_dependent_queued_requests(&self.room_id)
+            .await?
+            .into_iter()
+            .filter_map(|dep| match dep.kind {
+                DependentQueuedRequestKind::EditEvent { .. }
+                | DependentQueuedRequestKind::RedactEvent => {
+                    // TODO: reflect local edits/redacts too?
+                    None
+                }
 
                 DependentQueuedRequestKind::ReactEvent { key } => Some(LocalEcho {
                     transaction_id: dep.own_transaction_id.clone().into(),
@@ -1549,7 +1551,7 @@ impl QueueStorage {
                 DependentQueuedRequestKind::FinishUpload {
                     local_echo,
                     file_upload,
-                    thumbnail_info,
+                    thumbnail_info: _,
                 } => {
                     // Materialize as an event local echo.
                     Some(LocalEcho {
@@ -1560,10 +1562,10 @@ impl QueueStorage {
                             send_handle: SendHandle {
                                 room: room.clone(),
                                 transaction_id: dep.own_transaction_id.into(),
-                                media_handles: vec!(MediaHandles {
+                                media_handles: vec![MediaHandles {
                                     upload_thumbnail_txn: None, // thumbnail_info.map(|info| info.txn),
                                     upload_file_txn: file_upload,
-                                }),
+                                }],
                                 created_at: dep.created_at,
                             },
                             send_error: None,

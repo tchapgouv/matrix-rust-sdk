@@ -4039,8 +4039,8 @@ mod tests {
     use super::ReportedContentScore;
     use crate::{
         config::RequestConfig,
-        room::AccessRule,
         room::messages::{IncludeRelations, ListThreadsOptions, RelationsOptions},
+        room::AccessRule,
         test_utils::{
             client::mock_matrix_session,
             logged_in_client,
@@ -4583,9 +4583,9 @@ mod tests {
         assert!(result.prev_batch_token.is_none());
         assert!(result.next_batch_token.is_none());
         assert!(result.recursion_depth.is_none());
-	}
+    }
 
-	#[async_test]
+    #[async_test]
     async fn test_own_room_access_rules() {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;

@@ -10,7 +10,9 @@ use matrix_sdk::media::{MediaEventContent, MediaFormat, MediaRequestParameters};
 use matrix_sdk::ruma::events::room::message::{ImageMessageEventContent, MessageType};
 use matrix_sdk::ruma::push::ComparisonOperator::Le;
 use matrix_sdk::{config::SyncSettings, ruma::OwnedRoomId, Client, Room};
-use matrix_sdk_ui::timeline::{MsgLikeKind, RoomExt, TimelineItem, TimelineItemContent, TimelineItemKind};
+use matrix_sdk_ui::timeline::{
+    MsgLikeKind, RoomExt, TimelineItem, TimelineItemContent, TimelineItemKind,
+};
 use std::fs;
 use std::path::{absolute, Path};
 use std::sync::Arc;

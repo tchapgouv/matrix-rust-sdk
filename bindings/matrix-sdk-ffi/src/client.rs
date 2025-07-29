@@ -9,10 +9,10 @@ use std::{
 use crate::client::BWIScanState::Infected;
 use anyhow::{anyhow, Context as _};
 use futures_util::pin_mut;
-#[cfg(not(target_family = "wasm"))]
-use matrix_sdk::media::MediaFileHandle as SdkMediaFileHandle;
 use matrix_sdk::bwi_extensions::attachment::ClientAttachmentExt;
 use matrix_sdk::bwi_extensions::client::BWIClientSetupExt;
+#[cfg(not(target_family = "wasm"))]
+use matrix_sdk::media::MediaFileHandle as SdkMediaFileHandle;
 use matrix_sdk::{
     authentication::oauth::{
         AccountManagementActionFull, ClientId, OAuthAuthorizationData, OAuthSession,
@@ -1010,11 +1010,9 @@ impl Client {
 
     // BWI-specific
     pub async fn get_file_size_limit_for_file_upload(&self) -> Result<u64, ClientError> {
-        self.inner
-            .get_size_limit_for_file_upload()
-            .await
-            .map(|size| size.0)
-            .ok_or(ClientError::Generic { msg: "File size limit not synced".to_string(), details: None, })
+        self.inner.get_size_limit_for_file_upload().await.map(|size| size.0).ok_or(
+            ClientError::Generic { msg: "File size limit not synced".to_string(), details: None },
+        )
     }
     // end BWI-specific
 

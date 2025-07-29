@@ -35,7 +35,7 @@ use matrix_sdk_common::{
     stream::StreamExt,
 };
 use matrix_sdk_ui::timeline::{
-    self, Error, AttachmentSource, EventItemOrigin, Profile, TimelineDetails,
+    self, AttachmentSource, Error, EventItemOrigin, Profile, TimelineDetails,
     TimelineUniqueId as SdkTimelineUniqueId,
 };
 use mime::Mime;
@@ -381,13 +381,9 @@ impl Timeline {
     pub async fn get_file_size_limit_for_file_upload(
         &self,
     ) -> std::result::Result<u64, ClientError> {
-        self.inner
-            .room()
-            .client()
-            .get_size_limit_for_file_upload()
-            .await
-            .map(|size| size.0)
-            .ok_or(ClientError::Generic { msg: "File size limit not synced".to_string(), details: None, })
+        self.inner.room().client().get_size_limit_for_file_upload().await.map(|size| size.0).ok_or(
+            ClientError::Generic { msg: "File size limit not synced".to_string(), details: None },
+        )
     }
     // end BWI-specific
 

@@ -23,13 +23,13 @@ use homeserver_config::*;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::DecryptionSettings;
 use matrix_sdk_base::{store::StoreConfig, BaseClient};
-#[cfg(feature = "sqlite")]
-use matrix_sdk_sqlite::SqliteStoreConfig;
 use matrix_sdk_base_bwi::jwt_token::{
     BWIJWTTokenValidationError, BWIPublicKeyForJWTTokenValidation,
     BWIPublicKeyForJWTTokenValidationParseError, BWITokenValidator,
 };
 use matrix_sdk_bwi::content_scanner::BWIContentScanner;
+#[cfg(feature = "sqlite")]
+use matrix_sdk_sqlite::SqliteStoreConfig;
 use ruma::{
     api::{error::FromHttpResponseError, MatrixVersion},
     OwnedServerName, ServerName,
@@ -47,7 +47,6 @@ use crate::crypto::{CollectStrategy, TrustRequirement};
 use crate::encryption::EncryptionSettings;
 #[cfg(not(target_family = "wasm"))]
 use crate::http_client::HttpSettings;
-use crate::ClientBuildError::ServerIsNotVerified;
 use crate::{
     authentication::{oauth::OAuthCtx, AuthCtx},
     client::{

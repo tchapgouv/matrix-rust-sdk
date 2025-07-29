@@ -1650,15 +1650,14 @@ impl Client {
     /// let client = Client::new(homeserver).await.unwrap();
     /// assert!(client.create_room(request, false).await.is_ok());
     /// # };
-    /// ```  
+    /// ```
 
-    pub async fn create_room_federated(
-        &self,
-        mut request: create_room::v3::Request
-    ) -> Result<Room> {
-            self.create_room(request, true).await
-        }
+    pub async fn create_room_federated(&self, request: create_room::v3::Request) -> Result<Room> {
+        self.create_room(request, true).await
+    }
 
+    /// Create a room with the given parameters.
+    /// See documentation above "create_room_federated"
     pub async fn create_room(
         &self,
         mut request: create_room::v3::Request,

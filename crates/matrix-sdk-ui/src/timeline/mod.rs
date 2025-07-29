@@ -59,7 +59,7 @@ use ruma::{
 };
 use subscriber::TimelineWithDropHandle;
 use thiserror::Error;
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use self::{
     algorithms::rfind_event_by_id, controller::TimelineController, futures::SendAttachment,
