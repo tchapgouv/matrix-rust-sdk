@@ -15,7 +15,7 @@
 //! Types and traits for attachments.
 
 use crate::bwi_extensions::attachment::FileSize;
-use crate::Error::{AttachmentSizeExceededMaxSize, AttachmentSizeNotDefined};
+use crate::Error::AttachmentSizeNotDefined;
 use std::time::Duration;
 
 use ruma::{
@@ -295,30 +295,27 @@ impl AttachmentConfig {
         self
     }
 
-    // BWI-specific
-    /// TODO Technical Debt: needed as this class can not usefully initialized outside of this crate
-    pub fn set_info(&mut self, info: AttachmentInfo) {
-        self.info = Some(info);
-    }
+    // BWI-specific code disabled here and copied in the newly used AttachmentConfig impl in "crates/matrix-sdk-ui/src/timeline/mod.rs"
+    // // BWI-specific
+    // /// TODO Technical Debt: needed as this class can not usefully initialized outside of this crate
+    // pub fn set_info(&mut self, info: AttachmentInfo) {
+    //     self.info = Some(info);
+    // }
 
-    /// Assert, that the file does not exceed the maximal file size
-    pub fn assert_valid_file_size(
-        &self,
-        max_valid_file_size: FileSize,
-    ) -> Result<(), crate::Error> {
-        let file_size_is_allowed = self.get_attachment_size()? < max_valid_file_size;
-        if file_size_is_allowed {
-            Ok(())
-        } else {
-            Err(AttachmentSizeExceededMaxSize)
-        }
-    }
+    // /// Assert, that the file does not exceed the maximal file size
+    // pub fn assert_valid_file_size(
+    //     &self,
+    //     max_valid_file_size: FileSize,
+    // ) -> Result<(), crate::Error> {
+    //     let file_size_is_allowed = self.get_attachment_size()? < max_valid_file_size;
+    //     if file_size_is_allowed { Ok(()) } else { Err(AttachmentSizeExceededMaxSize) }
+    // }
 
-    /// Get the size of the attachment
-    pub fn get_attachment_size(&self) -> Result<FileSize, crate::Error> {
-        FileSize::try_from(self)
-    }
-    // end BWI-specific
+    // /// Get the size of the attachment
+    // pub fn get_attachment_size(&self) -> Result<FileSize, crate::Error> {
+    //     FileSize::try_from(self)
+    // }
+    // // end BWI-specific
 }
 
 /// Configuration for sending a gallery.

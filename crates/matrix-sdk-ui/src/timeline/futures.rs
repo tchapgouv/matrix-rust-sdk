@@ -4,7 +4,6 @@ use crate::timeline::Error::{AttachmentSizeExceededLimit, AttachmentSizeNotAvail
 use eyeball::SharedObservable;
 use matrix_sdk::TransmissionProgress;
 use matrix_sdk::bwi_extensions::attachment::ClientAttachmentExt;
-use matrix_sdk::{attachment::AttachmentConfig, TransmissionProgress};
 use matrix_sdk_base::boxed_into_future;
 use mime::Mime;
 use tracing::{Instrument as _, Span};

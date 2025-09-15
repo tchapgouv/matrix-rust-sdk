@@ -24,11 +24,13 @@ use eyeball_im::VectorDiff;
 #[cfg(feature = "unstable-msc4274")]
 use futures::SendGallery;
 use futures_core::Stream;
-use futures_util::{future, pin_mut, StreamExt};
+use futures_util::{StreamExt, future, pin_mut};
 use imbl::Vector;
 use matrix_sdk::{
+    Error::{self as MatrixSDKError, AttachmentSizeExceededMaxSize, AttachmentSizeNotDefined},
     Result,
     attachment::{AttachmentInfo, Thumbnail},
+    bwi_extensions::attachment::FileSize,
     deserialized_responses::TimelineEvent,
     event_cache::{EventCacheDropHandles, RoomEventCache},
     executor::JoinHandle,
@@ -189,6 +191,53 @@ pub struct AttachmentConfig {
     pub mentions: Option<Mentions>,
     pub in_reply_to: Option<OwnedEventId>,
 }
+
+impl AttachmentConfig {
+    /// Create a new attachment configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // BWI-specific
+    /// TODO Technical Debt: needed as this class can not usefully initialized outside of this crate
+    pub fn set_info(&mut self, info: AttachmentInfo) {
+        self.info = Some(info);
+    }
+
+    /// Assert, that the file does not exceed the maximal file size
+    pub fn assert_valid_file_size(
+        &self,
+        max_valid_file_size: FileSize,
+    ) -> Result<(), MatrixSDKError> {
+        let file_size_is_allowed = self.get_attachment_size()? < max_valid_file_size;
+        if file_size_is_allowed { Ok(()) } else { Err(AttachmentSizeExceededMaxSize) }
+    }
+
+    /// Get the size of the attachment
+    pub fn get_attachment_size(&self) -> Result<FileSize, MatrixSDKError> {
+        FileSize::try_from(self)
+    }
+    // end BWI-specific
+}
+
+// BWI-specific
+impl TryFrom<&AttachmentConfig> for FileSize {
+    type Error = MatrixSDKError;
+
+    fn try_from(value: &AttachmentConfig) -> Result<Self, Self::Error> {
+        match &value.info {
+            Some(AttachmentInfo::Image(info)) => FileSize::try_from(info),
+            Some(AttachmentInfo::Video(info)) => FileSize::try_from(info),
+            Some(AttachmentInfo::Audio(info)) => FileSize::try_from(info),
+            Some(AttachmentInfo::File(info)) => FileSize::try_from(info),
+            Some(AttachmentInfo::Voice { audio_info: info, waveform: _ }) => {
+                FileSize::try_from(info)
+            }
+            _ => Err(AttachmentSizeNotDefined),
+        }
+    }
+}
+// end BWI-specific
 
 impl Timeline {
     /// Returns the room for this timeline.

@@ -30,7 +30,7 @@ use matrix_sdk_common::{
     stream::StreamExt,
 };
 use matrix_sdk_ui::timeline::{
-    self, AttachmentConfig, AttachmentSource, EventItemOrigin,
+    self, AttachmentConfig, AttachmentSource, Error, EventItemOrigin,
     MediaUploadProgress as SdkMediaUploadProgress, Profile, TimelineDetails,
     TimelineUniqueId as SdkTimelineUniqueId,
 };
@@ -129,17 +129,18 @@ impl Timeline {
         };
 
         let handle = SendAttachmentJoinHandle::new(get_runtime_handle().spawn(async move {
-            self.inner
+            let request = self
+                .inner
                 .send_attachment(params.source, mime_type, attachment_config)
                 .use_send_queue()
-                .await
-                .map_err(|_| RoomError::FailedSendingAttachment)
+                .await;
             // BWI-specific
-            request.await.map_err(|e| match e {
+            request.map_err(|e| match e {
                 Error::AttachmentSizeExceededLimit => RoomError::AttachmentSizeExceededUploadLimit,
                 Error::AttachmentSizeNotAvailable => RoomError::FailedSendingAttachment,
                 _ => RoomError::FailedSendingAttachment,
             })?;
+            Ok(())
             // end BWI-specific
         }));
 
