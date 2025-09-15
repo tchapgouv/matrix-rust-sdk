@@ -6,6 +6,88 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features:
+
+- Add `LowPriority` and `NonLowPriority` variants to `RoomListEntriesDynamicFilterKind` for filtering 
+  rooms based on their low priority status. These filters allow clients to show only low priority rooms 
+  or exclude low priority rooms from the room list.
+  ([#5508](https://github.com/matrix-org/matrix-rust-sdk/pull/5508))
+- Add `room_version` and `privileged_creators_role` to `RoomInfo` ([#5449](https://github.com/matrix-org/matrix-rust-sdk/pull/5449)).
+- The [`unstable-hydra`] feature has been enabled, which enables room v12 changes in the SDK.
+  ([#5450](https://github.com/matrix-org/matrix-rust-sdk/pull/5450)).
+- Add experimental support for
+  [MSC4306](https://github.com/matrix-org/matrix-spec-proposals/pull/4306), with the
+  `Room::fetch_thread_subscription()` and `Room::set_thread_subscription()` methods.
+  ([#5442](https://github.com/matrix-org/matrix-rust-sdk/pull/5442))
+- [**breaking**] [`GalleryUploadParameters::reply`] and [`UploadParameters::reply`] have been both
+  replaced with a new optional `in_reply_to` field, that's a string which will be parsed into an
+  `OwnedEventId` when sending the event. The thread relationship will be automatically filled in,
+  based on the timeline focus.
+  ([5427](https://github.com/matrix-org/matrix-rust-sdk/pull/5427))
+- [**breaking**] [`Timeline::send_reply()`] now automatically fills in the thread relationship,
+  based on the timeline focus. As a result, it only takes an `OwnedEventId` parameter, instead of
+  the `Reply` type. The proper way to start a thread is now thus to create a threaded-focused
+  timeline, and then use `Timeline::send()`.
+  ([5427](https://github.com/matrix-org/matrix-rust-sdk/pull/5427))
+- Add `HomeserverLoginDetails::supports_sso_login` for legacy SSO support information.
+  This is primarily for Element X to give a dedicated error message in case
+  it connects a homeserver with only this method available.
+  ([#5222](https://github.com/matrix-org/matrix-rust-sdk/pull/5222))
+
+### Breaking changes:
+
+- The timeline will now always use the send queue to upload medias, so the
+  `UploadParameters::use_send_queue` bool has been removed. Make sure to listen to the send queue's
+  error updates, and to handle send queue restarts.
+  ([#5525](https://github.com/matrix-org/matrix-rust-sdk/pull/5525))
+- Support for the legacy media upload progress has been disabled. Media upload progress is
+  available through the send queue, and can be enabled thanks to
+  `Client::enable_send_queue_upload_progress()`.
+  ([#5525](https://github.com/matrix-org/matrix-rust-sdk/pull/5525))
+- `TimelineDiff` is now exported as a true `uniffi::Enum` instead of the weird `uniffi::Object` hybrid. This matches
+  both `RoomDirectorySearchEntryUpdate` and `RoomListEntriesUpdate` and can be used in the same way.
+  ([#5474](https://github.com/matrix-org/matrix-rust-sdk/pull/5474))
+- The `creator` field of `RoomInfo` has been renamed to `creators` and can now contain a list of
+  user IDs, to reflect that a room can now have several creators, as introduced in room version 12.
+  ([#5436](https://github.com/matrix-org/matrix-rust-sdk/pull/5436))
+- The `PowerLevel` type was introduced to represent power levels instead of `i64` to differentiate
+  the infinite power level of creators, as introduced in room version 12. It is used in
+  `suggested_role_for_power_level`, `suggested_power_level_for_role` and `RoomMember`.
+  ([#5436](https://github.com/matrix-org/matrix-rust-sdk/pull/5436))
+- `Client::get_url` now returns a `Vec<u8>` instead of a `String`. It also throws an error when the
+  response isn't status code 200 OK, instead of providing the error in the response body.
+  ([#5438](https://github.com/matrix-org/matrix-rust-sdk/pull/5438))
+- `RoomPreview::info()` doesn't return a result anymore. All unknown join rules are handled in the
+  `JoinRule::Custom` variant.
+  ([#5337](https://github.com/matrix-org/matrix-rust-sdk/pull/5337))
+- The `reason` argument of `Room::report_room` is now required, do to a clarification in the spec.
+  ([#5337](https://github.com/matrix-org/matrix-rust-sdk/pull/5337))
+- `PublicRoomJoinRule` has more variants, supporting all the known values from the spec.
+  ([#5337](https://github.com/matrix-org/matrix-rust-sdk/pull/5337))
+- The fields of `MediaPreviewConfig` are both optional, allowing to use the type for room account
+  data as well as global account data.
+  ([#5337](https://github.com/matrix-org/matrix-rust-sdk/pull/5337))
+- The `event_id` field of `PredecessorRoom` was removed, due to its removal in the Matrix
+  specification with MSC4291.
+  ([#5419](https://github.com/matrix-org/matrix-rust-sdk/pull/5419))
+- `Client::url_for_oidc` now allows requesting additional scopes for the OAuth2 authorization code grant.
+  ([#5395](https://github.com/matrix-org/matrix-rust-sdk/pull/5395))
+- `Client::url_for_oidc` now allows passing an optional existing device id from a previous login call.
+  ([#5394](https://github.com/matrix-org/matrix-rust-sdk/pull/5394))
+- `ClientBuilder::build_with_qr_code` has been removed. Instead, the Client should be built by passing
+  `QrCodeData::server_name` to `ClientBuilder::server_name_or_homeserver_url`, after which QR login can be performed by
+  calling `Client::login_with_qr_code`. ([#5388](https://github.com/matrix-org/matrix-rust-sdk/pull/5388))
+- The MSRV has been bumped to Rust 1.88.
+  ([#5431](https://github.com/matrix-org/matrix-rust-sdk/pull/5431))
+- `Room::send_call_notification` and `Room::send_call_notification_if_needed` have been removed, since the event type they send is outdated, and `Client` is not actually supposed to be able to join MatrixRTC sessions (yet). In practice, users of these methods probably already rely on another MatrixRTC implementation to participate in sessions, and such an implementation should be capable of sending notifications itself.
+- The `GalleryItemInfo` variants now take an `UploadSource` rather than a `String` path to enable uploading
+  from bytes directly.
+  ([#5529](https://github.com/matrix-org/matrix-rust-sdk/pull/5529))
+- Media and gallery uploads now use `UploadSource` to specify the thumbnail.
+  ([#5530](https://github.com/matrix-org/matrix-rust-sdk/pull/5530))
+
+## [0.13.0] - 2025-07-10
+
 ### Features
 
 - Add `NotificationRoomInfo::topic` to the `NotificationRoomInfo` struct, which
@@ -14,6 +96,9 @@ All notable changes to this project will be documented in this file.
 - Add `EmbeddedEventDetails::timestamp` and `EmbeddedEventDetails::event_or_transaction_id`
   which are already available in regular timeline items.
   ([#5331](https://github.com/matrix-org/matrix-rust-sdk/pull/5331))
+- `RoomListService::subscribe_to_rooms` becomes `async` and automatically calls
+  `matrix_sdk::latest_events::LatestEvents::listen_to_room`
+  ([#5369](https://github.com/matrix-org/matrix-rust-sdk/pull/5369))
 
 ### Refactor
 
@@ -67,7 +152,8 @@ Additions:
   we can automatically update the UI.
 - `Client::get_max_media_upload_size` to get the max size of a request sent to the homeserver so we can tweak our media
   uploads by compressing/transcoding the media.
-- Add `ClientBuilder::enable_share_history_on_invite` to enable experimental support for sharing encrypted room history on invite, per [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268).
+- Add `ClientBuilder::enable_share_history_on_invite` to enable experimental support for sharing encrypted room history
+  on invite, per [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268).
   ([#5141](https://github.com/matrix-org/matrix-rust-sdk/pull/5141))
 - Support for adding a Sentry layer to the FFI bindings has been added. Only `tracing` statements with
   the field `sentry=true` will be forwarded to Sentry, in addition to default Sentry filters.
@@ -160,7 +246,8 @@ Breaking changes:
 - The `dynamic_registrations_file` field of `OidcConfiguration` was removed.
   Clients are supposed to re-register with the homeserver for every login.
 
-- `RoomPreview::own_membership_details` is now `RoomPreview::member_with_sender_info`, takes any user id and returns an `Option<RoomMemberWithSenderInfo>`.
+- `RoomPreview::own_membership_details` is now `RoomPreview::member_with_sender_info`, takes any user id and returns an
+  `Option<RoomMemberWithSenderInfo>`.
 
 Additions:
 
@@ -175,9 +262,11 @@ Additions:
 - Add `Timeline::send_thread_reply` for clients that need to start threads
   themselves.
   ([4819](https://github.com/matrix-org/matrix-rust-sdk/pull/4819))
-- Add `ClientBuilder::session_pool_max_size`, `::session_cache_size` and `::session_journal_size_limit` to control the stores configuration, especially their memory consumption
+- Add `ClientBuilder::session_pool_max_size`, `::session_cache_size` and `::session_journal_size_limit` to control the
+  stores configuration, especially their memory consumption
   ([#4870](https://github.com/matrix-org/matrix-rust-sdk/pull/4870/))
 - Add `ClientBuilder::system_is_memory_constrained` to indicate that the system
   has less memory available than the current standard
   ([#4894](https://github.com/matrix-org/matrix-rust-sdk/pull/4894))
-- Add `Room::member_with_sender_info` to get both a room member's info and for the user who sent the `m.room.member` event the `RoomMember` is based on.
+- Add `Room::member_with_sender_info` to get both a room member's info and for the user who sent the `m.room.member`
+  event the `RoomMember` is based on.

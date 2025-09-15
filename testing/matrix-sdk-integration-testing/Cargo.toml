@@ -2,12 +2,22 @@
 name = "matrix-sdk-integration-testing"
 description = "Internal integration testing for matrix-sdk crate"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 license = "Apache-2.0"
 
 [package.metadata.release]
 release = false
+
+[features]
+default = []
+
+# Enable experimental support for encrypting state events; see
+# https://github.com/matrix-org/matrix-rust-sdk/issues/5397.
+experimental-encrypted-state-events = [
+    "matrix-sdk/experimental-encrypted-state-events",
+    "matrix-sdk-base/experimental-encrypted-state-events"
+]
 
 [dev-dependencies]
 anyhow.workspace = true
@@ -25,6 +35,7 @@ matrix-sdk = { workspace = true, default-features = true, features = ["testing",
 matrix-sdk-base = { workspace = true, default-features = true, features = ["testing", "qrcode"] }
 matrix-sdk-common.workspace = true
 matrix-sdk-test.workspace = true
+matrix-sdk-test-utils.workspace = true
 matrix-sdk-ui = { workspace = true, default-features = true }
 once_cell.workspace = true
 rand.workspace = true

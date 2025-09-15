@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use bitflags::bitflags;
-use ruma::events::{tag::Tags, AnyRoomAccountDataEvent, RoomAccountDataEventType};
+use ruma::events::{AnyRoomAccountDataEvent, RoomAccountDataEventType, tag::Tags};
 use serde::{Deserialize, Serialize};
 
 use super::Room;
@@ -82,16 +82,19 @@ mod tests {
 
     use super::{super::BaseRoomInfo, RoomNotableTags};
     use crate::{
+        BaseClient, RoomState, SessionMeta,
+        client::ThreadingSupport,
         response_processors as processors,
         store::{RoomLoadSettings, StoreConfig},
-        BaseClient, RoomState, SessionMeta,
     };
 
     #[async_test]
     async fn test_is_favourite() {
         // Given a room,
-        let client =
-            BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
+        let client = BaseClient::new(
+            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            ThreadingSupport::Disabled,
+        );
 
         client
             .activate(
@@ -129,7 +132,7 @@ mod tests {
             "type": "m.tag",
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         // When the new tag is handled and applied.
         let mut context = processors::Context::default();
@@ -161,7 +164,7 @@ mod tests {
             "type": "m.tag"
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         processors::account_data::for_room(&mut context, room_id, &[tag_raw], &client.state_store)
             .await;
@@ -186,8 +189,10 @@ mod tests {
     #[async_test]
     async fn test_is_low_priority() {
         // Given a room,
-        let client =
-            BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
+        let client = BaseClient::new(
+            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            ThreadingSupport::Disabled,
+        );
 
         client
             .activate(
@@ -225,7 +230,7 @@ mod tests {
             "type": "m.tag"
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         // When the new tag is handled and applied.
         let mut context = processors::Context::default();
@@ -257,7 +262,7 @@ mod tests {
             "type": "m.tag"
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         processors::account_data::for_room(&mut context, room_id, &[tag_raw], &client.state_store)
             .await;

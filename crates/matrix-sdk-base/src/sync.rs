@@ -24,14 +24,14 @@ pub use ruma::api::client::sync::sync_events::v3::{
     InvitedRoom as InvitedRoomUpdate, KnockedRoom as KnockedRoomUpdate,
 };
 use ruma::{
+    OwnedEventId, OwnedRoomId,
     api::client::sync::sync_events::UnreadNotificationsCount as RumaUnreadNotificationsCount,
     events::{
-        presence::PresenceEvent, AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent,
-        AnySyncEphemeralRoomEvent, AnySyncStateEvent,
+        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnySyncEphemeralRoomEvent,
+        AnySyncStateEvent, presence::PresenceEvent,
     },
     push::Action,
     serde::Raw,
-    OwnedEventId, OwnedRoomId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -90,12 +90,21 @@ impl RoomUpdates {
     /// Iterate over all room IDs, from [`RoomUpdates::left`],
     /// [`RoomUpdates::joined`], [`RoomUpdates::invited`] and
     /// [`RoomUpdates::knocked`].
-    pub(crate) fn iter_all_room_ids(&self) -> impl Iterator<Item = &OwnedRoomId> {
+    pub fn iter_all_room_ids(&self) -> impl Iterator<Item = &OwnedRoomId> {
         self.left
             .keys()
             .chain(self.joined.keys())
             .chain(self.invited.keys())
             .chain(self.knocked.keys())
+    }
+
+    /// Returns whether or not this update contains any changes to the list
+    /// of invited, joined, knocked or left rooms.
+    pub fn is_empty(&self) -> bool {
+        self.invited.is_empty()
+            && self.joined.is_empty()
+            && self.knocked.is_empty()
+            && self.left.is_empty()
     }
 }
 
@@ -158,6 +167,16 @@ mod tests {
         assert_matches!(iter.next(), Some(room_id) => assert_eq!(room_id, room_id_7));
         assert!(iter.next().is_none());
     }
+
+    #[test]
+    fn test_empty_room_updates() {
+        let room_updates = RoomUpdates::default();
+
+        let mut iter = room_updates.iter_all_room_ids();
+        assert!(iter.next().is_none());
+
+        assert!(room_updates.is_empty());
+    }
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -179,11 +198,17 @@ pub struct JoinedRoomUpdate {
     pub unread_notifications: UnreadNotificationsCount,
     /// The timeline of messages and state changes in the room.
     pub timeline: Timeline,
-    /// Updates to the state, between the time indicated by the `since`
-    /// parameter, and the start of the `timeline` (or all state up to the
-    /// start of the `timeline`, if `since` is not given, or `full_state` is
-    /// true).
-    pub state: Vec<Raw<AnySyncStateEvent>>,
+    /// Updates to the state.
+    ///
+    /// If `since` is missing or `full_state` is true, the start point of the
+    /// update is the beginning of the timeline. Otherwise, the start point
+    /// is the time specified in `since`.
+    ///
+    /// If `state_after` was used, the end point of the update is the end of the
+    /// `timeline`. Otherwise, the end point of these updates is the start of
+    /// the `timeline`, and to calculate room state we must scan the `timeline`
+    /// for state events as well as using this information in this property.
+    pub state: State,
     /// The private data that this user has attached to this room.
     pub account_data: Vec<Raw<AnyRoomAccountDataEvent>>,
     /// The ephemeral events in the room that aren't recorded in the timeline or
@@ -202,7 +227,7 @@ impl fmt::Debug for JoinedRoomUpdate {
         f.debug_struct("JoinedRoomUpdate")
             .field("unread_notifications", &self.unread_notifications)
             .field("timeline", &self.timeline)
-            .field("state", &DebugListOfRawEvents(&self.state))
+            .field("state", &self.state)
             .field("account_data", &DebugListOfRawEventsNoId(&self.account_data))
             .field("ephemeral", &self.ephemeral)
             .field("ambiguity_changes", &self.ambiguity_changes)
@@ -213,7 +238,7 @@ impl fmt::Debug for JoinedRoomUpdate {
 impl JoinedRoomUpdate {
     pub(crate) fn new(
         timeline: Timeline,
-        state: Vec<Raw<AnySyncStateEvent>>,
+        state: State,
         account_data: Vec<Raw<AnyRoomAccountDataEvent>>,
         ephemeral: Vec<Raw<AnySyncEphemeralRoomEvent>>,
         unread_notifications: UnreadNotificationsCount,
@@ -248,11 +273,17 @@ pub struct LeftRoomUpdate {
     /// The timeline of messages and state changes in the room up to the point
     /// when the user left.
     pub timeline: Timeline,
-    /// Updates to the state, between the time indicated by the `since`
-    /// parameter, and the start of the `timeline` (or all state up to the
-    /// start of the `timeline`, if `since` is not given, or `full_state` is
-    /// true).
-    pub state: Vec<Raw<AnySyncStateEvent>>,
+    /// Updates to the state.
+    ///
+    /// If `since` is missing or `full_state` is true, the start point of the
+    /// update is the beginning of the timeline. Otherwise, the start point
+    /// is the time specified in `since`.
+    ///
+    /// If `state_after` was used, the end point of the update is the end of the
+    /// `timeline`. Otherwise, the end point of these updates is the start of
+    /// the `timeline`, and to calculate room state we must scan the `timeline`
+    /// for state events as well as using this information in this property.
+    pub state: State,
     /// The private data that this user has attached to this room.
     pub account_data: Vec<Raw<AnyRoomAccountDataEvent>>,
     /// Collection of ambiguity changes that room member events trigger.
@@ -265,7 +296,7 @@ pub struct LeftRoomUpdate {
 impl LeftRoomUpdate {
     pub(crate) fn new(
         timeline: Timeline,
-        state: Vec<Raw<AnySyncStateEvent>>,
+        state: State,
         account_data: Vec<Raw<AnyRoomAccountDataEvent>>,
         ambiguity_changes: BTreeMap<OwnedEventId, AmbiguityChange>,
     ) -> Self {
@@ -278,7 +309,7 @@ impl fmt::Debug for LeftRoomUpdate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LeftRoomUpdate")
             .field("timeline", &self.timeline)
-            .field("state", &DebugListOfRawEvents(&self.state))
+            .field("state", &self.state)
             .field("account_data", &DebugListOfRawEventsNoId(&self.account_data))
             .field("ambiguity_changes", &self.ambiguity_changes)
             .finish()
@@ -303,6 +334,44 @@ pub struct Timeline {
 impl Timeline {
     pub(crate) fn new(limited: bool, prev_batch: Option<String>) -> Self {
         Self { limited, prev_batch, ..Default::default() }
+    }
+}
+
+/// State changes in the room.
+#[derive(Clone)]
+pub enum State {
+    /// The state changes between the previous sync and the start of the
+    /// timeline.
+    ///
+    /// To get the full list of state changes since the previous sync, the state
+    /// events in [`Timeline`] must be added to these events to update the local
+    /// state.
+    Before(Vec<Raw<AnySyncStateEvent>>),
+
+    /// The state changes between the previous sync and the end of the timeline.
+    ///
+    /// This contains the full list of state changes since the previous sync.
+    /// State events in [`Timeline`] must be ignored to update the local state.
+    After(Vec<Raw<AnySyncStateEvent>>),
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::Before(vec![])
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+impl fmt::Debug for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Before(events) => {
+                f.debug_tuple("Before").field(&DebugListOfRawEvents(events)).finish()
+            }
+            Self::After(events) => {
+                f.debug_tuple("After").field(&DebugListOfRawEvents(events)).finish()
+            }
+        }
     }
 }
 
@@ -339,7 +408,9 @@ impl fmt::Debug for Notification {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let event_debug = match &self.event {
             RawAnySyncOrStrippedTimelineEvent::Sync(ev) => DebugRawEvent(ev),
-            RawAnySyncOrStrippedTimelineEvent::Stripped(ev) => DebugRawEvent(ev.cast_ref()),
+            RawAnySyncOrStrippedTimelineEvent::Stripped(ev) => {
+                DebugRawEvent(ev.cast_ref_unchecked())
+            }
         };
 
         f.debug_struct("Notification")

@@ -20,10 +20,10 @@ use matrix_sdk::deserialized_responses::{
     ThreadSummaryStatus, TimelineEvent, TimelineEventKind, UnsignedEventLocation,
 };
 use ruma::{
-    events::AnySyncTimelineEvent, push::Action, serde::Raw, EventId, MilliSecondsSinceUnixEpoch,
-    OwnedEventId, OwnedTransactionId, OwnedUserId, UserId,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId, UserId,
+    events::AnySyncTimelineEvent, push::Action, serde::Raw,
 };
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument, trace, warn};
 
 use super::{
     super::{
@@ -33,13 +33,13 @@ use super::{
         event_item::RemoteEventOrigin,
         traits::RoomDataProvider,
     },
-    metadata::EventMeta,
     ObservableItems, ObservableItemsTransaction, TimelineMetadata, TimelineSettings,
+    metadata::EventMeta,
 };
 use crate::timeline::{
+    EmbeddedEvent, ThreadSummary, TimelineDetails, VirtualTimelineItem,
     controller::TimelineFocusKind,
     event_handler::{FailedToParseEvent, RemovedItem, TimelineAction},
-    EmbeddedEvent, ThreadSummary, TimelineDetails, VirtualTimelineItem,
 };
 
 pub(in crate::timeline) struct TimelineStateTransaction<'a, P: RoomDataProvider> {
@@ -398,8 +398,9 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         thread_root: Option<&EventId>,
         position: TimelineItemPosition,
     ) -> bool {
-        let room_version = room_data_provider.room_version();
-        if !(settings.event_filter)(event, &room_version) {
+        let rules = room_data_provider.room_version_rules();
+
+        if !(settings.event_filter)(event, &rules) {
             // The user filtered out the event.
             return false;
         }
@@ -683,7 +684,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         .await;
 
         // Handle the event to create or update a timeline item.
-        if let Some(timeline_action) = timeline_action {
+        let item_added = if let Some(timeline_action) = timeline_action {
             let sender_profile = room_data_provider.profile_from_user_id(&sender).await;
 
             let ctx = TimelineEventContext {
@@ -714,9 +715,25 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                 .handle_event(date_divider_adjuster, timeline_action)
                 .await
         } else {
-            // No item has been removed from the timeline.
+            // No item has been added to the timeline.
             false
+        };
+
+        let mut item_removed = false;
+
+        if !item_added {
+            trace!("No new item added");
+
+            if let TimelineItemPosition::UpdateAt { timeline_item_index } = position {
+                // If add was not called, that means the UTD event is one that
+                // wouldn't normally be visible. Remove it.
+                trace!("Removing UTD that was successfully retried");
+                self.items.remove(timeline_item_index);
+                item_removed = true;
+            }
         }
+
+        item_removed
     }
 
     /// Remove one timeline item by its `event_index`.
@@ -850,15 +867,14 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
             TimelineItemPosition::UpdateAt { .. } => {
                 if let Some(event) =
                     self.items.get_remote_event_by_event_id_mut(&event_meta.event_id)
+                    && event.visible != event_meta.visible
                 {
-                    if event.visible != event_meta.visible {
-                        event.visible = event_meta.visible;
+                    event.visible = event_meta.visible;
 
-                        if settings.track_read_receipts {
-                            // Since the event's visibility changed, we need to update the read
-                            // receipts of the previous visible event.
-                            self.maybe_update_read_receipts_of_prev_event(&event_meta.event_id);
-                        }
+                    if settings.track_read_receipts {
+                        // Since the event's visibility changed, we need to update the read
+                        // receipts of the previous visible event.
+                        self.maybe_update_read_receipts_of_prev_event(&event_meta.event_id);
                     }
                 }
             }

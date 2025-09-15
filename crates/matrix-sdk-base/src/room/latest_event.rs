@@ -16,12 +16,12 @@
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
 #[cfg(feature = "e2e-encryption")]
-use ruma::{events::AnySyncTimelineEvent, serde::Raw, OwnedRoomId};
+use ruma::{OwnedRoomId, events::AnySyncTimelineEvent, serde::Raw};
 
 use super::Room;
 #[cfg(feature = "e2e-encryption")]
 use super::RoomInfoNotableUpdateReasons;
-use crate::latest_event::LatestEvent;
+use crate::latest_event::{LatestEvent, LatestEventValue};
 
 impl Room {
     /// The size of the latest_encrypted_events RingBuffer
@@ -32,6 +32,11 @@ impl Room {
     /// sliding sync.
     pub fn latest_event(&self) -> Option<LatestEvent> {
         self.inner.read().latest_event.as_deref().cloned()
+    }
+
+    /// Return the [`LatestEventValue`] of this room.
+    pub fn new_latest_event(&self) -> LatestEventValue {
+        self.inner.read().new_latest_event.clone()
     }
 
     /// Return the most recent few encrypted events. When the keys come through
@@ -88,11 +93,12 @@ mod tests_with_e2e_encryption {
     use serde_json::json;
 
     use crate::{
+        BaseClient, Room, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomState,
+        SessionMeta, StateChanges,
+        client::ThreadingSupport,
         latest_event::LatestEvent,
         response_processors as processors,
         store::{MemoryStore, RoomLoadSettings, StoreConfig},
-        BaseClient, Room, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomState,
-        SessionMeta, StateChanges,
     };
 
     fn make_room_test_helper(room_type: RoomState) -> (Arc<MemoryStore>, Room) {
@@ -107,8 +113,10 @@ mod tests_with_e2e_encryption {
     #[async_test]
     async fn test_setting_the_latest_event_doesnt_cause_a_room_info_notable_update() {
         // Given a room,
-        let client =
-            BaseClient::new(StoreConfig::new("cross-process-store-locks-holder-name".to_owned()));
+        let client = BaseClient::new(
+            StoreConfig::new("cross-process-store-locks-holder-name".to_owned()),
+            ThreadingSupport::Disabled,
+        );
 
         client
             .activate(

@@ -32,7 +32,7 @@ use ruma::serde::Base64;
 use ruma::{
     api::{
         client::{authenticated_media, error::ErrorKind, media},
-        MatrixVersion,
+        OutgoingRequest,
     },
     assign,
     events::room::{MediaSource, ThumbnailInfo},
@@ -441,29 +441,19 @@ impl Media {
             {
                 return Ok(content);
             }
-        };
+        }
 
-        // Use the authenticated endpoints when the server supports Matrix 1.11 or the
-        // authenticated media stable feature.
-        const AUTHENTICATED_MEDIA_STABLE_FEATURE: &str = "org.matrix.msc3916.stable";
+        let request_config = self
+            .client
+            .request_config()
+            // Downloading a file should have no timeout as we don't know the network connectivity
+            // available for the user or the file size
+            .timeout(Some(Duration::MAX));
 
-        let (use_auth, request_config) =
-            if self.client.server_versions().await?.contains(&MatrixVersion::V1_11) {
-                (true, None)
-            } else if self
-                .client
-                .unstable_features()
-                .await?
-                .get(AUTHENTICATED_MEDIA_STABLE_FEATURE)
-                .is_some_and(|is_supported| *is_supported)
-            {
-                // We need to force the use of the stable endpoint with the Matrix version
-                // because Ruma does not handle stable features.
-                let request_config = self.client.request_config();
-                (true, Some(request_config.force_matrix_version(MatrixVersion::V1_11)))
-            } else {
-                (false, None)
-            };
+        // Use the authenticated endpoints when the server supports it.
+        let supported_versions = self.client.supported_versions().await?;
+        let use_auth =
+            authenticated_media::get_content::v1::Request::is_supported(&supported_versions);
 
         let content: Vec<u8> = match &request.source {
             MediaSource::Encrypted(file) => {

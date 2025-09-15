@@ -15,9 +15,9 @@ use fixup::FixupArgs;
 use kotlin::KotlinArgs;
 use release::ReleaseArgs;
 use swift::SwiftArgs;
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
-const NIGHTLY: &str = "nightly-2025-06-27";
+const NIGHTLY: &str = "nightly-2025-08-08";
 
 type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 

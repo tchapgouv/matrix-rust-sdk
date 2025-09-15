@@ -14,10 +14,10 @@
 
 use std::{fmt::Formatter, sync::Arc};
 
-use futures_util::{stream, StreamExt};
-use matrix_sdk::{config::RequestConfig, BoxFuture, Room, SendOutsideWasm, SyncOutsideWasm};
+use futures_util::{StreamExt, stream};
+use matrix_sdk::{BoxFuture, Room, SendOutsideWasm, SyncOutsideWasm, config::RequestConfig};
 use matrix_sdk_base::deserialized_responses::TimelineEvent;
-use ruma::{events::relation::RelationType, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId};
+use ruma::{EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, events::relation::RelationType};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -171,13 +171,12 @@ impl PinnedEventsRoom for Room {
         related_event_filters: Option<Vec<RelationType>>,
     ) -> BoxFuture<'a, Result<(TimelineEvent, Vec<TimelineEvent>), matrix_sdk::Error>> {
         Box::pin(async move {
-            if let Ok((cache, _handles)) = self.event_cache().await {
-                if let Some(ret) =
+            if let Ok((cache, _handles)) = self.event_cache().await
+                && let Some(ret) =
                     cache.find_event_with_relations(event_id, related_event_filters).await
-                {
-                    debug!("Loaded pinned event {event_id} and related events from cache");
-                    return Ok(ret);
-                }
+            {
+                debug!("Loaded pinned event {event_id} and related events from cache");
+                return Ok(ret);
             }
 
             debug!("Loading pinned event {event_id} from HS");

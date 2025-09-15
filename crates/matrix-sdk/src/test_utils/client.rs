@@ -14,10 +14,7 @@
 
 //! Augmented [`ClientBuilder`] that can set up an already logged-in user.
 
-use matrix_sdk_base::{
-    store::{RoomLoadSettings, StoreConfig},
-    SessionMeta,
-};
+use matrix_sdk_base::{store::RoomLoadSettings, SessionMeta};
 use ruma::{api::MatrixVersion, owned_device_id, owned_user_id, OwnedDeviceId, OwnedUserId};
 // BWI Specific
 use matrix_sdk_bwi::attachment::FILE_SIZE_LIMIT;
@@ -37,20 +34,24 @@ use crate::{
 pub struct MockClientBuilder {
     builder: ClientBuilder,
     auth_state: AuthState,
+    server_versions: ServerVersions,
 }
 
 impl MockClientBuilder {
     /// Create a new [`MockClientBuilder`] connected to the given homeserver,
     /// using Matrix V1.12, and which will not attempt any network retry (by
     /// default).
-    pub(crate) fn new(homeserver: String) -> Self {
+    ///
+    /// If no homeserver is provided, `http://localhost` is used as a homeserver.
+    pub fn new(homeserver: Option<&str>) -> Self {
+        let homeserver = homeserver.unwrap_or("http://localhost");
+
         let default_builder = Client::builder()
-            .homeserver_url(&homeserver)
-            .server_versions([MatrixVersion::V1_12])
-            .request_config(RequestConfig::new().disable_retry())
+            .homeserver_url(homeserver)
+            .request_config(RequestConfig::new().disable_retry());
             // BWI-specific
             .without_server_jwt_token_validation();
-        // end BWI-specific
+            // end BWI-specific 
 
         Self {
             builder: default_builder,
@@ -59,7 +60,20 @@ impl MockClientBuilder {
                 user_id: None,
                 device_id: None,
             },
+            server_versions: ServerVersions::Default,
         }
+    }
+
+    /// Don't cache server versions in the client.
+    pub fn no_server_versions(mut self) -> Self {
+        self.server_versions = ServerVersions::None;
+        self
+    }
+
+    /// Set the cached server versions in the client.
+    pub fn server_versions(mut self, versions: Vec<MatrixVersion>) -> Self {
+        self.server_versions = ServerVersions::Custom(versions);
+        self
     }
 
     /// Doesn't log-in a user.
@@ -97,29 +111,38 @@ impl MockClientBuilder {
         self
     }
 
-    /// Provides another [`StoreConfig`] for the underlying [`ClientBuilder`].
-    pub fn store_config(mut self, store_config: StoreConfig) -> Self {
-        self.builder = self.builder.store_config(store_config);
-        self
-    }
-
-    /// Use an SQLite store at the given path for the underlying
-    /// [`ClientBuilder`].
-    #[cfg(feature = "sqlite")]
-    pub fn sqlite_store(mut self, path: impl AsRef<std::path::Path>) -> Self {
-        self.builder = self.builder.sqlite_store(path, None);
-        self
-    }
-
-    /// Handle refreshing access tokens automatically.
-    pub fn handle_refresh_tokens(mut self) -> Self {
-        self.builder = self.builder.handle_refresh_tokens();
+    /// Apply changes to the underlying [`ClientBuilder`].
+    ///
+    /// ```
+    /// # tokio_test::block_on(async {
+    /// use matrix_sdk::test_utils::client::MockClientBuilder;
+    ///
+    /// MockClientBuilder::new(None)
+    ///     .on_builder(|builder| {
+    ///         // Here it's possible to modify the underlying `ClientBuilder`.
+    ///         builder
+    ///             .handle_refresh_tokens()
+    ///             .cross_process_store_locks_holder_name("hodor".to_owned())
+    ///     })
+    ///     .build()
+    ///     .await;
+    /// # anyhow::Ok(()) });
+    /// ```
+    pub fn on_builder<F: FnOnce(ClientBuilder) -> ClientBuilder>(mut self, f: F) -> Self {
+        self.builder = f(self.builder);
         self
     }
 
     /// Finish building the client into the final [`Client`] instance.
     pub async fn build(self) -> Client {
-        let client = self.builder.build().await.expect("building client failed");
+        let mut builder = self.builder;
+
+        if let Some(versions) = self.server_versions.into_vec() {
+            builder = builder.server_versions(versions);
+        }
+
+        let client = builder.build().await.expect("building client failed");
+
         self.auth_state.maybe_restore_client(&client).await;
 
         // BWI-specific
@@ -185,6 +208,29 @@ impl AuthState {
                     .await
                     .unwrap();
             }
+        }
+    }
+}
+
+/// The server versions cached during client creation.
+enum ServerVersions {
+    /// Cache the default server version.
+    Default,
+    /// Don't cache any server versions.
+    None,
+    /// Cache the given server versions.
+    Custom(Vec<MatrixVersion>),
+}
+
+impl ServerVersions {
+    /// Convert these `ServerVersions` to a list of matrix versions.
+    ///
+    /// Returns `None` if no server versions should be cached in the client.
+    fn into_vec(self) -> Option<Vec<MatrixVersion>> {
+        match self {
+            Self::Default => Some(vec![MatrixVersion::V1_12]),
+            Self::None => None,
+            Self::Custom(versions) => Some(versions),
         }
     }
 }

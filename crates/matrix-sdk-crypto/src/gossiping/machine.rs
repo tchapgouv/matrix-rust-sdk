@@ -1142,6 +1142,7 @@ mod tests {
             EncryptedEvent, EncryptedToDeviceEvent, RoomEncryptedEventContent,
         },
         verification::VerificationMachine,
+        DecryptionSettings, TrustRequirement,
     };
 
     fn alice_id() -> &'static UserId {
@@ -1363,6 +1364,8 @@ mod tests {
         EncryptedEvent {
             sender: sender.to_owned(),
             event_id: event_id!("$143273582443PhrSn:example.org").to_owned(),
+            #[cfg(feature = "experimental-encrypted-state-events")]
+            state_key: None,
             content,
             origin_server_ts: ruma::MilliSecondsSinceUnixEpoch::now(),
             unsigned: Default::default(),
@@ -1382,7 +1385,7 @@ mod tests {
             + std::fmt::Debug,
     {
         let content = extract_content(recipient, request);
-        let content: C = content.deserialize_as().unwrap_or_else(|_| {
+        let content: C = content.deserialize_as_unchecked().unwrap_or_else(|_| {
             panic!("We can always deserialize the to-device event content {content:?}")
         });
 
@@ -1756,7 +1759,13 @@ mod tests {
                 let res = tr
                     .account()
                     .await?
-                    .decrypt_to_device_event(&alice_machine.inner.store, &event)
+                    .decrypt_to_device_event(
+                        &alice_machine.inner.store,
+                        &event,
+                        &DecryptionSettings {
+                            sender_device_trust_requirement: TrustRequirement::Untrusted,
+                        },
+                    )
                     .await?;
                 Ok((tr, res))
             })
@@ -1837,7 +1846,13 @@ mod tests {
                 let res = tr
                     .account()
                     .await?
-                    .decrypt_to_device_event(&alice_machine.inner.store, &event)
+                    .decrypt_to_device_event(
+                        &alice_machine.inner.store,
+                        &event,
+                        &DecryptionSettings {
+                            sender_device_trust_requirement: TrustRequirement::Untrusted,
+                        },
+                    )
                     .await?;
                 Ok((tr, res))
             })
@@ -2051,14 +2066,20 @@ mod tests {
         let stream = bob_machine.store().secrets_stream();
         pin_mut!(stream);
 
+        let decryption_settings =
+            DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted };
+
         bob_machine
-            .receive_sync_changes(EncryptionSyncChanges {
-                to_device_events: vec![event],
-                changed_devices: &Default::default(),
-                one_time_keys_counts: &Default::default(),
-                unused_fallback_keys: None,
-                next_batch_token: None,
-            })
+            .receive_sync_changes(
+                EncryptionSyncChanges {
+                    to_device_events: vec![event],
+                    changed_devices: &Default::default(),
+                    one_time_keys_counts: &Default::default(),
+                    unused_fallback_keys: None,
+                    next_batch_token: None,
+                },
+                &decryption_settings,
+            )
             .await
             .unwrap();
 
@@ -2159,7 +2180,13 @@ mod tests {
                 let res = tr
                     .account()
                     .await?
-                    .decrypt_to_device_event(&alice_machine.inner.store, &event)
+                    .decrypt_to_device_event(
+                        &alice_machine.inner.store,
+                        &event,
+                        &DecryptionSettings {
+                            sender_device_trust_requirement: TrustRequirement::Untrusted,
+                        },
+                    )
                     .await?;
                 Ok((tr, res))
             })

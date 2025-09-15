@@ -21,7 +21,7 @@
 //!
 //! ```rust
 //! use matrix_sdk_ui::room_list_service::{
-//!     filters, RoomListDynamicEntriesController,
+//!     RoomListDynamicEntriesController, filters,
 //! };
 //!
 //! fn configure_room_list(
@@ -59,20 +59,23 @@ mod favourite;
 mod fuzzy_match_room_name;
 mod invite;
 mod joined;
+mod low_priority;
 mod non_left;
 mod none;
 mod normalized_match_room_name;
 mod not;
+mod space;
 mod unread;
 
 pub use all::new_filter as new_filter_all;
 pub use any::new_filter as new_filter_any;
-pub use category::{new_filter as new_filter_category, RoomCategory};
+pub use category::{RoomCategory, new_filter as new_filter_category};
 pub use deduplicate_versions::new_filter as new_filter_deduplicate_versions;
 pub use favourite::new_filter as new_filter_favourite;
 pub use fuzzy_match_room_name::new_filter as new_filter_fuzzy_match_room_name;
 pub use invite::new_filter as new_filter_invite;
 pub use joined::new_filter as new_filter_joined;
+pub use low_priority::new_filter as new_filter_low_priority;
 #[cfg(test)]
 use matrix_sdk::Client;
 use matrix_sdk::Room;
@@ -84,12 +87,13 @@ pub use normalized_match_room_name::new_filter as new_filter_normalized_match_ro
 pub use not::new_filter as new_filter_not;
 #[cfg(test)]
 use ruma::RoomId;
-use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
+pub use space::new_filter as new_filter_space;
+use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 pub use unread::new_filter as new_filter_unread;
 #[cfg(test)]
 use wiremock::{
-    matchers::{header, method, path},
     Mock, MockServer, ResponseTemplate,
+    matchers::{header, method, path},
 };
 
 /// A trait “alias” that represents a _filter_.

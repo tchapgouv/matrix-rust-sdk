@@ -24,7 +24,7 @@ use matrix_sdk_base::{
 };
 use oauth2::{DeviceCodeErrorResponseType, StandardDeviceAuthorizationResponse};
 use ruma::{
-    api::client::discovery::get_authorization_server_metadata::msc2965::AuthorizationServerMetadata,
+    api::client::discovery::get_authorization_server_metadata::v1::AuthorizationServerMetadata,
     OwnedDeviceId,
 };
 use tracing::trace;
@@ -189,7 +189,7 @@ impl<'a> IntoFuture for LoginWithQrCode<'a> {
                 }
 
                 return Err(e.into());
-            };
+            }
 
             // We only received an access token from the OAuth 2.0 authorization server, we
             // have no clue who we are, so we need to figure out our user ID
@@ -253,7 +253,7 @@ impl<'a> IntoFuture for LoginWithQrCode<'a> {
             // ourselves see us as verified and the recovery/backup states will
             // be known. If we did receive all the secrets in the secrets
             // bundle, then backups will be enabled after this step as well.
-            self.client.encryption().spawn_initialization_task(None);
+            self.client.encryption().spawn_initialization_task(None).await;
             self.client.encryption().wait_for_e2ee_initialization_tasks().await;
 
             trace!("successfully logged in and enabled E2EE.");

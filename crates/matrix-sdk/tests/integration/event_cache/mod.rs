@@ -22,20 +22,20 @@ use matrix_sdk_base::event_cache::{
     store::{EventCacheStore, MemoryStore},
     Gap,
 };
-use matrix_sdk_test::{
-    async_test, event_factory::EventFactory, GlobalAccountDataTestEvent, JoinedRoomBuilder, ALICE,
-    BOB,
-};
+use matrix_sdk_test::{async_test, event_factory::EventFactory, JoinedRoomBuilder, ALICE, BOB};
 use ruma::{
     event_id,
     events::{
         room::message::RoomMessageEventContentWithoutRelation, AnySyncMessageLikeEvent,
         AnySyncTimelineEvent, TimelineEventType,
     },
-    room_id, user_id, EventId, RoomVersionId,
+    room_id,
+    room_version_rules::RedactionRules,
+    user_id, EventId,
 };
-use serde_json::json;
 use tokio::{spawn, sync::broadcast, time::sleep};
+
+mod threads;
 
 macro_rules! assert_event_id {
     ($timeline_event:expr, $event_id:literal) => {
@@ -159,14 +159,7 @@ async fn test_ignored_unignored() {
     server
         .mock_sync()
         .ok_and_run(&client, |sync_builder| {
-            sync_builder.add_global_account_data_event(GlobalAccountDataTestEvent::Custom(json!({
-                "content": {
-                    "ignored_users": {
-                        dexter: {}
-                    }
-                },
-                "type": "m.ignored_user_list",
-            })));
+            sync_builder.add_global_account_data(f.ignored_user_list([dexter.to_owned()]));
         })
         .await;
 
@@ -1358,7 +1351,11 @@ async fn test_apply_redaction_when_redaction_comes_later() {
     let store_config = StoreConfig::new("hodlor".to_owned())
         .state_store(state_memory_store)
         .event_cache_store(event_cache_store);
-    let client = server.client_builder().store_config(store_config.clone()).build().await;
+    let client = server
+        .client_builder()
+        .on_builder(|builder| builder.store_config(store_config.clone()))
+        .build()
+        .await;
 
     let event_cache = client.event_cache();
 
@@ -1412,7 +1409,7 @@ async fn test_apply_redaction_when_redaction_comes_later() {
         assert_let!(
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(ev)) = ev
         );
-        assert_eq!(ev.redacts(&RoomVersionId::V1).unwrap(), event_id!("$1"));
+        assert_eq!(ev.redacts(&RedactionRules::V1).unwrap(), event_id!("$1"));
     }
 
     // Then, we have an update for the redacted event.
@@ -1433,7 +1430,11 @@ async fn test_apply_redaction_when_redaction_comes_later() {
     // already redacted.
     drop(client);
 
-    let client = server.client_builder().store_config(store_config).build().await;
+    let client = server
+        .client_builder()
+        .on_builder(|builder| builder.store_config(store_config))
+        .build()
+        .await;
     client.event_cache().subscribe().unwrap();
     let room = client.get_room(room_id).unwrap();
     let (cache, _drop_handles) = room.event_cache().await.unwrap();
@@ -1444,7 +1445,7 @@ async fn test_apply_redaction_when_redaction_comes_later() {
     assert_eq!(events.len(), 2);
 
     // The initial event (that's been redacted),
-    let ev = events[0].raw().cast_ref::<AnySyncMessageLikeEvent>().deserialize().unwrap();
+    let ev = events[0].raw().cast_ref_unchecked::<AnySyncMessageLikeEvent>().deserialize().unwrap();
     assert!(ev.is_redacted());
 
     // And the redacted event.
@@ -1642,7 +1643,7 @@ async fn test_apply_redaction_when_redacted_and_redaction_are_in_same_sync() {
         assert_let!(
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(ev)) = ev
         );
-        assert_eq!(ev.redacts(&RoomVersionId::V1).unwrap(), event_id!("$2"));
+        assert_eq!(ev.redacts(&RedactionRules::V1).unwrap(), event_id!("$2"));
     }
 
     // Then the redaction of the event happens separately.
@@ -2362,9 +2363,11 @@ async fn test_clear_all_rooms() {
     let server = MatrixMockServer::new().await;
     let client = server
         .client_builder()
-        .store_config(
-            StoreConfig::new("hodlor".to_owned()).event_cache_store(event_cache_store.clone()),
-        )
+        .on_builder(|builder| {
+            builder.store_config(
+                StoreConfig::new("hodlor".to_owned()).event_cache_store(event_cache_store.clone()),
+            )
+        })
         .build()
         .await;
 
@@ -2446,13 +2449,21 @@ async fn test_sync_while_back_paginate() {
     {
         // First, initialize the sync so the client is aware of the room, in the state
         // store.
-        let client = server.client_builder().store_config(store_config.clone()).build().await;
+        let client = server
+            .client_builder()
+            .on_builder(|builder| builder.store_config(store_config.clone()))
+            .build()
+            .await;
         server.sync_joined_room(&client, room_id).await;
     }
 
     // Then, use a new client that will restore the state from the state store, and
     // with an empty event cache store.
-    let client = server.client_builder().store_config(store_config).build().await;
+    let client = server
+        .client_builder()
+        .on_builder(|builder| builder.store_config(store_config))
+        .build()
+        .await;
     let room = client.get_room(room_id).unwrap();
 
     client.event_cache().subscribe().unwrap();
@@ -2554,9 +2565,11 @@ async fn test_relations_ordering() {
 
     let client = server
         .client_builder()
-        .store_config(
-            StoreConfig::new("hodlor".to_owned()).event_cache_store(event_cache_store.clone()),
-        )
+        .on_builder(|builder| {
+            builder.store_config(
+                StoreConfig::new("hodlor".to_owned()).event_cache_store(event_cache_store.clone()),
+            )
+        })
         .build()
         .await;
 

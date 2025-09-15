@@ -23,30 +23,30 @@ use matrix_sdk::{
     test_utils::mocks::MatrixMockServer,
 };
 use matrix_sdk_test::{
-    async_test, event_factory::EventFactory, JoinedRoomBuilder, RoomAccountDataTestEvent,
-    StateTestEvent, ALICE, BOB,
+    ALICE, BOB, JoinedRoomBuilder, RoomAccountDataTestEvent, StateTestEvent, async_test,
+    event_factory::EventFactory,
 };
 use matrix_sdk_ui::{
+    Timeline,
     timeline::{
         AnyOtherFullStateEventContent, Error, EventSendState, RedactError, RoomExt,
         TimelineBuilder, TimelineEventItemId, TimelineItemContent, VirtualTimelineItem,
     },
-    Timeline,
 };
 use ruma::{
-    event_id,
+    EventId, MilliSecondsSinceUnixEpoch, event_id,
     events::room::{
         encryption::RoomEncryptionEventContent,
         message::{RedactedRoomMessageEventContent, RoomMessageEventContent},
     },
-    owned_event_id, room_id, user_id, EventId, MilliSecondsSinceUnixEpoch,
+    owned_event_id, room_id, user_id,
 };
 use serde_json::json;
 use sliding_sync::assert_timeline_stream;
 use stream_assert::assert_pending;
 use wiremock::{
-    matchers::{header, method, path_regex},
     Mock, ResponseTemplate,
+    matchers::{header, method, path_regex},
 };
 
 mod decryption;
@@ -60,6 +60,7 @@ mod profiles;
 mod queue;
 mod reactions;
 mod read_receipts;
+mod redecryption;
 mod replies;
 mod subscribe;
 mod thread;
@@ -243,7 +244,7 @@ async fn test_redact_message() {
     assert_let!(VectorDiff::PushBack { value: second } = &timeline_updates[0]);
 
     let second = second.as_event().unwrap();
-    assert_matches!(second.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(second.send_state(), Some(EventSendState::NotSentYet { progress: None }));
 
     assert_let!(Some(timeline_updates) = timeline_stream.next().await);
     assert_eq!(timeline_updates.len(), 1);
@@ -297,7 +298,7 @@ async fn test_redact_local_sent_message() {
     assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
     let event = item.as_event().unwrap();
     assert!(event.is_local_echo());
-    assert_matches!(event.send_state(), Some(EventSendState::NotSentYet));
+    assert_matches!(event.send_state(), Some(EventSendState::NotSentYet { progress: None }));
 
     // As well as a date divider.
     assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[1]);

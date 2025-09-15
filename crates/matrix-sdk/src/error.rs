@@ -37,7 +37,7 @@ use ruma::{
         },
         error::{FromHttpResponseError, IntoHttpError},
     },
-    events::tag::InvalidUserTagName,
+    events::{room::power_levels::PowerLevelsError, tag::InvalidUserTagName},
     push::{InsertPushRuleError, RemovePushRuleError},
     IdParseError,
 };
@@ -416,6 +416,10 @@ pub enum Error {
     #[error(transparent)]
     ReplyError(#[from] ReplyError),
 
+    /// An error happened while attempting to change power levels.
+    #[error("power levels error: {0}")]
+    PowerLevels(#[from] PowerLevelsError),
+
     // BWI-specific
     /// The attachment could not be sent because it exceeded the maximal size allowed by the server.
     #[error("Attachment exceeded the maximal allowed size")]
@@ -719,6 +723,13 @@ pub enum NotificationSettingsError {
     /// Unable to save the push rules
     #[error("Unable to save push rules")]
     UnableToSavePushRules,
+}
+
+impl NotificationSettingsError {
+    /// Whether this error is the [`RuleNotFound`](Self::RuleNotFound) variant.
+    pub fn is_rule_not_found(&self) -> bool {
+        matches!(self, Self::RuleNotFound(_))
+    }
 }
 
 impl From<InsertPushRuleError> for NotificationSettingsError {

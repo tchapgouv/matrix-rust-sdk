@@ -2,9 +2,9 @@ use anyhow::Context as _;
 use assert_matches::assert_matches;
 use matrix_sdk_base::store::RoomLoadSettings;
 use matrix_sdk_test::async_test;
-use oauth2::{ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl};
+use oauth2::{ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, Scope};
 use ruma::{
-    api::client::discovery::get_authorization_server_metadata::msc2965::Prompt, device_id,
+    api::client::discovery::get_authorization_server_metadata::v1::Prompt, device_id,
     owned_device_id, user_id, DeviceId, ServerName,
 };
 use tokio::sync::broadcast::error::TryRecvError;
@@ -56,6 +56,7 @@ async fn check_authorization_url(
     device_id: Option<&DeviceId>,
     expected_prompt: Option<&str>,
     expected_login_hint: Option<&str>,
+    additional_scopes: Option<Vec<Scope>>,
 ) {
     tracing::debug!("authorization data URL = {}", authorization_data.url);
 
@@ -85,15 +86,45 @@ async fn check_authorization_url(
                 num_expected -= 1;
             }
             "scope" => {
-                let expected_start = "urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:";
-                assert!(val.starts_with(expected_start));
-                assert!(val.len() > expected_start.len());
+                let actual_scopes: Vec<String> = val.split(' ').map(String::from).collect();
+
+                assert!(actual_scopes.len() >= 2, "Expected at least two scopes");
+
+                assert!(
+                    actual_scopes
+                        .contains(&"urn:matrix:org.matrix.msc2967.client:api:*".to_owned()),
+                    "Expected Matrix API scope not found in scopes"
+                );
 
                 // Only check the device ID if we know it. If it's generated randomly we don't
                 // know it.
                 if let Some(device_id) = device_id {
-                    assert!(val.ends_with(device_id.as_str()));
-                    assert_eq!(val.len(), expected_start.len() + device_id.as_str().len());
+                    let device_id_scope =
+                        format!("urn:matrix:org.matrix.msc2967.client:device:{device_id}");
+                    assert!(
+                        actual_scopes.contains(&device_id_scope),
+                        "Expected device ID scope not found in scopes"
+                    )
+                } else {
+                    assert!(
+                        actual_scopes
+                            .iter()
+                            .any(|s| s.starts_with("urn:matrix:org.matrix.msc2967.client:device:")),
+                        "Expected device ID scope not found in scopes"
+                    );
+                }
+
+                if let Some(additional_scopes) = &additional_scopes {
+                    // Check if the additional scopes are present in the actual scopes.
+                    let expected_len = 2 + additional_scopes.len();
+                    assert_eq!(actual_scopes.len(), expected_len, "Expected {expected_len} scopes",);
+
+                    for scope in additional_scopes {
+                        assert!(
+                            actual_scopes.contains(scope),
+                            "Expected additional scope not found in scopes: {scope:?}",
+                        );
+                    }
                 }
 
                 num_expected -= 1;
@@ -146,7 +177,7 @@ async fn test_high_level_login() -> anyhow::Result<()> {
 
     // When getting the OIDC login URL.
     let authorization_data = oauth
-        .login(redirect_uri.clone(), None, Some(registration_data))
+        .login(redirect_uri.clone(), None, Some(registration_data), None)
         .prompt(vec![Prompt::Create])
         .build()
         .await
@@ -169,12 +200,15 @@ async fn test_high_level_login_cancellation() -> anyhow::Result<()> {
     // Given a client ready to complete login.
     let (oauth, server, mut redirect_uri, registration_data) = mock_environment().await.unwrap();
 
-    let authorization_data =
-        oauth.login(redirect_uri.clone(), None, Some(registration_data)).build().await.unwrap();
+    let authorization_data = oauth
+        .login(redirect_uri.clone(), None, Some(registration_data), None)
+        .build()
+        .await
+        .unwrap();
 
     assert_eq!(oauth.client_id().map(|id| id.as_str()), Some("test_client_id"));
 
-    check_authorization_url(&authorization_data, &oauth, &server.server().uri(), None, None, None)
+    check_authorization_url(&authorization_data, &oauth, &server.uri(), None, None, None, None)
         .await;
 
     // When completing login with a cancellation callback.
@@ -201,12 +235,15 @@ async fn test_high_level_login_invalid_state() -> anyhow::Result<()> {
     // Given a client ready to complete login.
     let (oauth, server, mut redirect_uri, registration_data) = mock_environment().await.unwrap();
 
-    let authorization_data =
-        oauth.login(redirect_uri.clone(), None, Some(registration_data)).build().await.unwrap();
+    let authorization_data = oauth
+        .login(redirect_uri.clone(), None, Some(registration_data), None)
+        .build()
+        .await
+        .unwrap();
 
     assert_eq!(oauth.client_id().map(|id| id.as_str()), Some("test_client_id"));
 
-    check_authorization_url(&authorization_data, &oauth, &server.server().uri(), None, None, None)
+    check_authorization_url(&authorization_data, &oauth, &server.uri(), None, None, None, None)
         .await;
 
     // When completing login with an old/tampered state.
@@ -228,10 +265,10 @@ async fn test_high_level_login_invalid_state() -> anyhow::Result<()> {
 #[async_test]
 async fn test_login_url() -> anyhow::Result<()> {
     let server = MatrixMockServer::new().await;
-    let server_uri = server.server().uri();
+    let server_uri = server.uri();
 
     let oauth_server = server.oauth();
-    oauth_server.mock_server_metadata().ok().expect(3).mount().await;
+    oauth_server.mock_server_metadata().ok().expect(4).mount().await;
 
     let client = server.client_builder().registered_with_oauth().build().await;
     let oauth = client.oauth();
@@ -241,15 +278,26 @@ async fn test_login_url() -> anyhow::Result<()> {
     let redirect_uri_str = REDIRECT_URI_STRING;
     let redirect_uri = Url::parse(redirect_uri_str)?;
 
+    let additional_scopes =
+        vec![Scope::new("urn:test:scope1".to_owned()), Scope::new("urn:test:scope2".to_owned())];
+
     // No extra parameters.
     let authorization_data =
-        oauth.login(redirect_uri.clone(), Some(device_id.clone()), None).build().await?;
-    check_authorization_url(&authorization_data, &oauth, &server_uri, Some(&device_id), None, None)
-        .await;
+        oauth.login(redirect_uri.clone(), Some(device_id.clone()), None, None).build().await?;
+    check_authorization_url(
+        &authorization_data,
+        &oauth,
+        &server_uri,
+        Some(&device_id),
+        None,
+        None,
+        None,
+    )
+    .await;
 
     // With prompt parameter.
     let authorization_data = oauth
-        .login(redirect_uri.clone(), Some(device_id.clone()), None)
+        .login(redirect_uri.clone(), Some(device_id.clone()), None, None)
         .prompt(vec![Prompt::Create])
         .build()
         .await?;
@@ -260,12 +308,13 @@ async fn test_login_url() -> anyhow::Result<()> {
         Some(&device_id),
         Some("create"),
         None,
+        None,
     )
     .await;
 
     // With user_id_hint parameter.
     let authorization_data = oauth
-        .login(redirect_uri.clone(), Some(device_id.clone()), None)
+        .login(redirect_uri.clone(), Some(device_id.clone()), None, None)
         .user_id_hint(user_id!("@joe:example.org"))
         .build()
         .await?;
@@ -276,6 +325,23 @@ async fn test_login_url() -> anyhow::Result<()> {
         Some(&device_id),
         None,
         Some("mxid:@joe:example.org"),
+        None,
+    )
+    .await;
+
+    // With additional scopes.
+    let authorization_data = oauth
+        .login(redirect_uri.clone(), Some(device_id.clone()), None, Some(additional_scopes.clone()))
+        .build()
+        .await?;
+    check_authorization_url(
+        &authorization_data,
+        &oauth,
+        &server_uri,
+        Some(&device_id),
+        None,
+        None,
+        Some(additional_scopes),
     )
     .await;
 
@@ -483,7 +549,7 @@ async fn test_finish_login() -> anyhow::Result<()> {
 
 #[async_test]
 async fn test_oauth_session() -> anyhow::Result<()> {
-    let client = MockClientBuilder::new("https://example.org".to_owned()).unlogged().build().await;
+    let client = MockClientBuilder::new(None).unlogged().build().await;
     let oauth = client.oauth();
 
     let tokens = mock_session_tokens_with_refresh();
@@ -509,7 +575,7 @@ async fn test_oauth_session() -> anyhow::Result<()> {
 #[async_test]
 async fn test_insecure_clients() -> anyhow::Result<()> {
     let server = MatrixMockServer::new().await;
-    let server_url = server.server().uri();
+    let server_url = server.uri();
 
     server.mock_well_known().ok().expect(1..).named("well_known").mount().await;
     server.mock_versions().ok().expect(1..).named("versions").mount().await;

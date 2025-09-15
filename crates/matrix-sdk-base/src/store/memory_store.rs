@@ -19,33 +19,35 @@ use std::{
 
 use async_trait::async_trait;
 use growable_bloom_filter::GrowableBloom;
-use matrix_sdk_common::ROOM_VERSION_FALLBACK;
+use matrix_sdk_common::{ROOM_VERSION_FALLBACK, ROOM_VERSION_RULES_FALLBACK};
 use ruma::{
-    canonical_json::{redact, RedactedBecause},
+    CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri,
+    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
+    canonical_json::{RedactedBecause, redact},
     events::{
+        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
+        AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
         presence::PresenceEvent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
         room::member::{MembershipState, StrippedRoomMemberEvent, SyncRoomMemberEvent},
-        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
-        AnySyncStateEvent, GlobalAccountDataEventType, RoomAccountDataEventType, StateEventType,
     },
     serde::Raw,
     time::Instant,
-    CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedMxcUri,
-    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
 };
 use tracing::{debug, instrument, warn};
 
 use super::{
-    send_queue::{ChildTransactionId, QueuedRequest, SentRequestKey},
-    traits::{ComposerDraft, ServerInfo},
     DependentQueuedRequest, DependentQueuedRequestKind, QueuedRequestKind, Result, RoomInfo,
     RoomLoadSettings, StateChanges, StateStore, StoreError,
+    send_queue::{ChildTransactionId, QueuedRequest, SentRequestKey},
+    traits::{ComposerDraft, ServerInfo},
 };
 use crate::{
-    deserialized_responses::{DisplayName, RawAnySyncOrStrippedState},
-    store::QueueWedgeError,
     MinimalRoomMemberEvent, RoomMemberships, StateStoreDataKey, StateStoreDataValue,
+    deserialized_responses::{DisplayName, RawAnySyncOrStrippedState},
+    store::{
+        QueueWedgeError, StoredThreadSubscription, traits::compare_thread_subscription_bump_stamps,
+    },
 };
 
 #[derive(Debug, Default)]
@@ -58,6 +60,7 @@ struct MemoryStoreInner {
     server_info: Option<ServerInfo>,
     filters: HashMap<String, String>,
     utd_hook_manager_data: Option<GrowableBloom>,
+    one_time_key_uploaded_error: bool,
     account_data: HashMap<GlobalAccountDataEventType, Raw<AnyGlobalAccountDataEvent>>,
     profiles: HashMap<OwnedRoomId, HashMap<OwnedUserId, MinimalRoomMemberEvent>>,
     display_names: HashMap<OwnedRoomId, HashMap<DisplayName, BTreeSet<OwnedUserId>>>,
@@ -75,7 +78,6 @@ struct MemoryStoreInner {
         OwnedRoomId,
         HashMap<(String, Option<String>), HashMap<OwnedUserId, (OwnedEventId, Receipt)>>,
     >,
-
     room_event_receipts: HashMap<
         OwnedRoomId,
         HashMap<(String, Option<String>), HashMap<OwnedEventId, HashMap<OwnedUserId, Receipt>>>,
@@ -84,6 +86,7 @@ struct MemoryStoreInner {
     send_queue_events: BTreeMap<OwnedRoomId, Vec<QueuedRequest>>,
     dependent_send_queue_events: BTreeMap<OwnedRoomId, Vec<DependentQueuedRequest>>,
     seen_knock_requests: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, OwnedUserId>>,
+    thread_subscriptions: BTreeMap<OwnedRoomId, BTreeMap<OwnedEventId, StoredThreadSubscription>>,
 }
 
 /// In-memory, non-persistent implementation of the `StateStore`.
@@ -146,6 +149,7 @@ impl StateStore for MemoryStore {
 
     async fn get_kv_data(&self, key: StateStoreDataKey<'_>) -> Result<Option<StateStoreDataValue>> {
         let inner = self.inner.read().unwrap();
+
         Ok(match key {
             StateStoreDataKey::SyncToken => {
                 inner.sync_token.clone().map(StateStoreDataValue::SyncToken)
@@ -167,6 +171,9 @@ impl StateStore for MemoryStore {
             StateStoreDataKey::UtdHookManagerData => {
                 inner.utd_hook_manager_data.clone().map(StateStoreDataValue::UtdHookManagerData)
             }
+            StateStoreDataKey::OneTimeKeyAlreadyUploaded => inner
+                .one_time_key_uploaded_error
+                .then_some(StateStoreDataValue::OneTimeKeyAlreadyUploaded),
             StateStoreDataKey::ComposerDraft(room_id, thread_root) => {
                 let key = (room_id.to_owned(), thread_root.map(ToOwned::to_owned));
                 inner.composer_drafts.get(&key).cloned().map(StateStoreDataValue::ComposerDraft)
@@ -217,6 +224,9 @@ impl StateStore for MemoryStore {
                         .expect("Session data not the hook manager data"),
                 );
             }
+            StateStoreDataKey::OneTimeKeyAlreadyUploaded => {
+                inner.one_time_key_uploaded_error = true;
+            }
             StateStoreDataKey::ComposerDraft(room_id, thread_root) => {
                 inner.composer_drafts.insert(
                     (room_id.to_owned(), thread_root.map(ToOwned::to_owned)),
@@ -256,6 +266,9 @@ impl StateStore for MemoryStore {
                 inner.recently_visited_rooms.remove(user_id);
             }
             StateStoreDataKey::UtdHookManagerData => inner.utd_hook_manager_data = None,
+            StateStoreDataKey::OneTimeKeyAlreadyUploaded => {
+                inner.one_time_key_uploaded_error = false
+            }
             StateStoreDataKey::ComposerDraft(room_id, thread_root) => {
                 let key = (room_id.to_owned(), thread_root.map(ToOwned::to_owned));
                 inner.composer_drafts.remove(&key);
@@ -333,15 +346,16 @@ impl StateStore for MemoryStore {
                     inner.stripped_room_state.remove(room);
 
                     if *event_type == StateEventType::RoomMember {
-                        let event = match raw_event.deserialize_as::<SyncRoomMemberEvent>() {
-                            Ok(ev) => ev,
-                            Err(e) => {
-                                let event_id: Option<String> =
-                                    raw_event.get_field("event_id").ok().flatten();
-                                debug!(event_id, "Failed to deserialize member event: {e}");
-                                continue;
-                            }
-                        };
+                        let event =
+                            match raw_event.deserialize_as_unchecked::<SyncRoomMemberEvent>() {
+                                Ok(ev) => ev,
+                                Err(e) => {
+                                    let event_id: Option<String> =
+                                        raw_event.get_field("event_id").ok().flatten();
+                                    debug!(event_id, "Failed to deserialize member event: {e}");
+                                    continue;
+                                }
+                            };
 
                         inner.stripped_members.remove(room);
 
@@ -375,18 +389,19 @@ impl StateStore for MemoryStore {
                         .insert(state_key.to_owned(), raw_event.clone());
 
                     if *event_type == StateEventType::RoomMember {
-                        let event = match raw_event.deserialize_as::<StrippedRoomMemberEvent>() {
-                            Ok(ev) => ev,
-                            Err(e) => {
-                                let event_id: Option<String> =
-                                    raw_event.get_field("event_id").ok().flatten();
-                                debug!(
-                                    event_id,
-                                    "Failed to deserialize stripped member event: {e}"
-                                );
-                                continue;
-                            }
-                        };
+                        let event =
+                            match raw_event.deserialize_as_unchecked::<StrippedRoomMemberEvent>() {
+                                Ok(ev) => ev,
+                                Err(e) => {
+                                    let event_id: Option<String> =
+                                        raw_event.get_field("event_id").ok().flatten();
+                                    debug!(
+                                        event_id,
+                                        "Failed to deserialize stripped member event: {e}"
+                                    );
+                                    continue;
+                                }
+                            };
 
                         inner
                             .stripped_members
@@ -413,14 +428,12 @@ impl StateStore for MemoryStore {
                             .insert(user_id.clone(), (event_id.clone(), receipt.clone()))
                         {
                             // Remove the old receipt from the room event receipts
-                            if let Some(receipt_map) = inner.room_event_receipts.get_mut(room) {
-                                if let Some(event_map) =
+                            if let Some(receipt_map) = inner.room_event_receipts.get_mut(room)
+                                && let Some(event_map) =
                                     receipt_map.get_mut(&(receipt_type.to_string(), thread.clone()))
-                                {
-                                    if let Some(user_map) = event_map.get_mut(&old_event) {
-                                        user_map.remove(user_id);
-                                    }
-                                }
+                                && let Some(user_map) = event_map.get_mut(&old_event)
+                            {
+                                user_map.remove(user_id);
                             }
                         }
 
@@ -439,35 +452,35 @@ impl StateStore for MemoryStore {
             }
         }
 
-        let make_room_version = |room_info: &HashMap<OwnedRoomId, RoomInfo>, room_id| {
-            room_info.get(room_id).map(|info| info.room_version_or_default()).unwrap_or_else(|| {
+        let make_redaction_rules = |room_info: &HashMap<OwnedRoomId, RoomInfo>, room_id| {
+            room_info.get(room_id).map(|info| info.room_version_rules_or_default()).unwrap_or_else(|| {
                 warn!(
                     ?room_id,
-                    "Unable to find the room version, assuming {ROOM_VERSION_FALLBACK}"
+                    "Unable to get the room version rules, defaulting to rules for room version {ROOM_VERSION_FALLBACK}"
                 );
-                ROOM_VERSION_FALLBACK
-            })
+                ROOM_VERSION_RULES_FALLBACK
+            }).redaction
         };
 
         let inner = &mut *inner;
         for (room_id, redactions) in &changes.redactions {
-            let mut room_version = None;
+            let mut redaction_rules = None;
 
             if let Some(room) = inner.room_state.get_mut(room_id) {
                 for ref_room_mu in room.values_mut() {
                     for raw_evt in ref_room_mu.values_mut() {
-                        if let Ok(Some(event_id)) = raw_evt.get_field::<OwnedEventId>("event_id") {
-                            if let Some(redaction) = redactions.get(&event_id) {
-                                let redacted = redact(
-                                    raw_evt.deserialize_as::<CanonicalJsonObject>()?,
-                                    room_version.get_or_insert_with(|| {
-                                        make_room_version(&inner.room_info, room_id)
-                                    }),
-                                    Some(RedactedBecause::from_raw_event(redaction)?),
-                                )
-                                .map_err(StoreError::Redaction)?;
-                                *raw_evt = Raw::new(&redacted)?.cast();
-                            }
+                        if let Ok(Some(event_id)) = raw_evt.get_field::<OwnedEventId>("event_id")
+                            && let Some(redaction) = redactions.get(&event_id)
+                        {
+                            let redacted = redact(
+                                raw_evt.deserialize_as::<CanonicalJsonObject>()?,
+                                redaction_rules.get_or_insert_with(|| {
+                                    make_redaction_rules(&inner.room_info, room_id)
+                                }),
+                                Some(RedactedBecause::from_raw_event(redaction)?),
+                            )
+                            .map_err(StoreError::Redaction)?;
+                            *raw_evt = Raw::new(&redacted)?.cast_unchecked();
                         }
                     }
                 }
@@ -754,6 +767,7 @@ impl StateStore for MemoryStore {
         inner.room_event_receipts.remove(room_id);
         inner.send_queue_events.remove(room_id);
         inner.dependent_send_queue_events.remove(room_id);
+        inner.thread_subscriptions.remove(room_id);
 
         Ok(())
     }
@@ -938,10 +952,6 @@ impl StateStore for MemoryStore {
         }
     }
 
-    /// List all the dependent send queue events.
-    ///
-    /// This returns absolutely all the dependent send queue events, whether
-    /// they have an event id or not.
     async fn load_dependent_queued_requests(
         &self,
         room: &RoomId,
@@ -954,6 +964,64 @@ impl StateStore for MemoryStore {
             .get(room)
             .cloned()
             .unwrap_or_default())
+    }
+
+    async fn upsert_thread_subscription(
+        &self,
+        room: &RoomId,
+        thread_id: &EventId,
+        mut new: StoredThreadSubscription,
+    ) -> Result<(), Self::Error> {
+        let mut inner = self.inner.write().unwrap();
+        let room_subs = inner.thread_subscriptions.entry(room.to_owned()).or_default();
+
+        if let Some(previous) = room_subs.get(thread_id) {
+            // Nothing to do.
+            if *previous == new {
+                return Ok(());
+            }
+            if !compare_thread_subscription_bump_stamps(previous.bump_stamp, &mut new.bump_stamp) {
+                return Ok(());
+            }
+        }
+
+        room_subs.insert(thread_id.to_owned(), new);
+
+        Ok(())
+    }
+
+    async fn load_thread_subscription(
+        &self,
+        room: &RoomId,
+        thread_id: &EventId,
+    ) -> Result<Option<StoredThreadSubscription>, Self::Error> {
+        let inner = self.inner.read().unwrap();
+        Ok(inner
+            .thread_subscriptions
+            .get(room)
+            .and_then(|subscriptions| subscriptions.get(thread_id))
+            .copied())
+    }
+
+    async fn remove_thread_subscription(
+        &self,
+        room: &RoomId,
+        thread_id: &EventId,
+    ) -> Result<(), Self::Error> {
+        let mut inner = self.inner.write().unwrap();
+
+        let Some(room_subs) = inner.thread_subscriptions.get_mut(room) else {
+            return Ok(());
+        };
+
+        room_subs.remove(thread_id);
+
+        if room_subs.is_empty() {
+            // If there are no more subscriptions for this room, remove the room entry.
+            inner.thread_subscriptions.remove(room);
+        }
+
+        Ok(())
     }
 }
 

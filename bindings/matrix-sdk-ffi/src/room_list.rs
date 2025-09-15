@@ -16,8 +16,9 @@ use matrix_sdk_ui::{
     room_list_service::filters::{
         new_filter_all, new_filter_any, new_filter_category, new_filter_deduplicate_versions,
         new_filter_favourite, new_filter_fuzzy_match_room_name, new_filter_invite,
-        new_filter_joined, new_filter_non_left, new_filter_none,
-        new_filter_normalized_match_room_name, new_filter_unread, BoxedFilterFn, RoomCategory,
+        new_filter_joined, new_filter_low_priority, new_filter_non_left, new_filter_none,
+        new_filter_normalized_match_room_name, new_filter_not, new_filter_space, new_filter_unread,
+        BoxedFilterFn, RoomCategory,
     },
     unable_to_decrypt_hook::UtdHookManager,
 };
@@ -121,7 +122,7 @@ impl RoomListService {
         })))
     }
 
-    fn subscribe_to_rooms(&self, room_ids: Vec<String>) -> Result<(), RoomListError> {
+    async fn subscribe_to_rooms(&self, room_ids: Vec<String>) -> Result<(), RoomListError> {
         let room_ids = room_ids
             .into_iter()
             .map(|room_id| {
@@ -129,7 +130,9 @@ impl RoomListService {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        self.inner.subscribe_to_rooms(&room_ids.iter().map(AsRef::as_ref).collect::<Vec<_>>());
+        self.inner
+            .subscribe_to_rooms(&room_ids.iter().map(AsRef::as_ref).collect::<Vec<_>>())
+            .await;
 
         Ok(())
     }
@@ -452,10 +455,15 @@ impl RoomListDynamicEntriesController {
 pub enum RoomListEntriesDynamicFilterKind {
     All { filters: Vec<RoomListEntriesDynamicFilterKind> },
     Any { filters: Vec<RoomListEntriesDynamicFilterKind> },
+    NonSpace,
     NonLeft,
+    // Not { filter: RoomListEntriesDynamicFilterKind } - requires recursive enum
+    // support in uniffi https://github.com/mozilla/uniffi-rs/issues/396
     Joined,
     Unread,
     Favourite,
+    LowPriority,
+    NonLowPriority,
     Invite,
     Category { expect: RoomListFilterCategory },
     None,
@@ -491,9 +499,12 @@ impl From<RoomListEntriesDynamicFilterKind> for BoxedFilterFn {
                 filters.into_iter().map(|filter| BoxedFilterFn::from(filter)).collect(),
             )),
             Kind::NonLeft => Box::new(new_filter_non_left()),
+            Kind::NonSpace => Box::new(new_filter_not(Box::new(new_filter_space()))),
             Kind::Joined => Box::new(new_filter_joined()),
             Kind::Unread => Box::new(new_filter_unread()),
             Kind::Favourite => Box::new(new_filter_favourite()),
+            Kind::LowPriority => Box::new(new_filter_low_priority()),
+            Kind::NonLowPriority => Box::new(new_filter_not(Box::new(new_filter_low_priority()))),
             Kind::Invite => Box::new(new_filter_invite()),
             Kind::Category { expect } => Box::new(new_filter_category(expect.into())),
             Kind::None => Box::new(new_filter_none()),

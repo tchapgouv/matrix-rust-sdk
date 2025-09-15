@@ -24,8 +24,22 @@ use matrix_sdk_common::deserialized_responses::{
     TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason,
 };
 use ruma::{
+    EventId, Int, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId,
+    OwnedRoomId, OwnedTransactionId, OwnedUserId, OwnedVoipId, RoomId, RoomVersionId,
+    TransactionId, UInt, UserId, VoipVersionId,
     events::{
+        AnyGlobalAccountDataEvent, AnyStateEvent, AnySyncMessageLikeEvent, AnySyncStateEvent,
+        AnySyncTimelineEvent, AnyTimelineEvent, BundledMessageLikeRelations, False, Mentions,
+        RedactedMessageLikeEventContent, RedactedStateEventContent, StateEventContent,
+        StaticEventContent,
         beacon::BeaconEventContent,
+        call::{
+            SessionDescription,
+            invite::CallInviteEventContent,
+            notify::{ApplicationType, CallNotifyEventContent, NotifyType},
+        },
+        direct::{DirectEventContent, OwnedDirectUserIdentifier},
+        ignored_user_list::IgnoredUserListEventContent,
         member_hints::MemberHintsEventContent,
         poll::{
             unstable_end::UnstablePollEndEventContent,
@@ -35,10 +49,12 @@ use ruma::{
                 UnstablePollAnswer, UnstablePollStartContentBlock, UnstablePollStartEventContent,
             },
         },
+        push_rules::PushRulesEventContent,
         reaction::ReactionEventContent,
         receipt::{Receipt, ReceiptEventContent, ReceiptThread, ReceiptType},
         relation::{Annotation, BundledThread, InReplyTo, Replacement, Thread},
         room::{
+            ImageInfo,
             avatar::{self, RoomAvatarEventContent},
             canonical_alias::RoomCanonicalAliasEventContent,
             create::{PreviousRoom, RoomCreateEventContent},
@@ -55,18 +71,16 @@ use ruma::{
             server_acl::RoomServerAclEventContent,
             tombstone::RoomTombstoneEventContent,
             topic::RoomTopicEventContent,
-            ImageInfo,
         },
+        space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
         sticker::StickerEventContent,
         typing::TypingEventContent,
-        AnyMessageLikeEvent, AnyStateEvent, AnySyncStateEvent, AnySyncTimelineEvent,
-        AnyTimelineEvent, BundledMessageLikeRelations, EventContent,
-        RedactedMessageLikeEventContent, RedactedStateEventContent, StateEventContent,
     },
+    push::Ruleset,
+    room::RoomType,
+    room_version_rules::AuthorizationRules,
     serde::Raw,
-    server_name, EventId, Int, MilliSecondsSinceUnixEpoch, MxcUri, OwnedEventId, OwnedMxcUri,
-    OwnedRoomAliasId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, RoomVersionId,
-    TransactionId, UInt, UserId,
+    server_name,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -105,7 +119,7 @@ struct RedactedBecause {
 }
 
 #[derive(Debug, Serialize)]
-struct Unsigned<C: EventContent> {
+struct Unsigned<C: StaticEventContent> {
     #[serde(skip_serializing_if = "Option::is_none")]
     prev_content: Option<C>,
 
@@ -123,7 +137,7 @@ struct Unsigned<C: EventContent> {
 }
 
 // rustc can't derive Default because C isn't marked as `Default` 🤔 oh well.
-impl<C: EventContent> Default for Unsigned<C> {
+impl<C: StaticEventContent> Default for Unsigned<C> {
     fn default() -> Self {
         Self {
             prev_content: None,
@@ -136,11 +150,14 @@ impl<C: EventContent> Default for Unsigned<C> {
 }
 
 #[derive(Debug)]
-pub struct EventBuilder<C: EventContent> {
+pub struct EventBuilder<C: StaticEventContent<IsPrefix = False>> {
     sender: Option<OwnedUserId>,
     /// Whether the event is an ephemeral one. As such, it doesn't require a
     /// room id or a sender.
     is_ephemeral: bool,
+    /// Whether the event is global account data. As such, it doesn't require a
+    /// room id.
+    is_global: bool,
     room: Option<OwnedRoomId>,
     event_id: Option<OwnedEventId>,
     /// Whether the event should *not* have an event id. False by default.
@@ -152,10 +169,7 @@ pub struct EventBuilder<C: EventContent> {
     state_key: Option<String>,
 }
 
-impl<E: EventContent> EventBuilder<E>
-where
-    E::EventType: Serialize,
-{
+impl<E: StaticEventContent<IsPrefix = False>> EventBuilder<E> {
     pub fn room(mut self, room_id: &RoomId) -> Self {
         self.room = Some(room_id.to_owned());
         self
@@ -199,7 +213,7 @@ where
     /// this event.
     pub fn with_bundled_thread_summary(
         mut self,
-        latest_event: Raw<AnyMessageLikeEvent>,
+        latest_event: Raw<AnySyncMessageLikeEvent>,
         count: usize,
         current_user_participated: bool,
     ) -> Self {
@@ -235,7 +249,12 @@ where
         self.state_key = Some(state_key.into());
         self
     }
+}
 
+impl<E> EventBuilder<E>
+where
+    E: StaticEventContent<IsPrefix = False> + Serialize,
+{
     #[inline(always)]
     fn construct_json(self, requires_room: bool) -> serde_json::Value {
         // Use the `sender` preferably, or resort to the `redacted_because` sender if
@@ -244,20 +263,8 @@ where
             .sender
             .or_else(|| Some(self.unsigned.as_ref()?.redacted_because.as_ref()?.sender.clone()));
 
-        if sender.is_none() {
-            assert!(
-                self.is_ephemeral,
-                "the sender must be known when building the JSON for a non read-receipt event"
-            );
-        } else {
-            assert!(
-                !self.is_ephemeral,
-                "event builder set is_ephemeral, but also has a sender field"
-            );
-        }
-
         let mut json = json!({
-            "type": self.content.event_type(),
+            "type": E::TYPE,
             "content": self.content,
             "origin_server_ts": self.server_ts,
         });
@@ -265,7 +272,14 @@ where
         let map = json.as_object_mut().unwrap();
 
         if let Some(sender) = sender {
-            map.insert("sender".to_owned(), json!(sender));
+            if !self.is_ephemeral && !self.is_global {
+                map.insert("sender".to_owned(), json!(sender));
+            }
+        } else {
+            assert!(
+                self.is_ephemeral || self.is_global,
+                "the sender must be known when building the JSON for a non read-receipt or global event"
+            );
         }
 
         let event_id = self
@@ -278,7 +292,7 @@ where
             map.insert("event_id".to_owned(), json!(event_id));
         }
 
-        if requires_room && !self.is_ephemeral {
+        if requires_room && !self.is_ephemeral && !self.is_global {
             let room_id = self.room.expect("TimelineEvent requires a room id");
             map.insert("room_id".to_owned(), json!(room_id));
         }
@@ -304,15 +318,19 @@ where
     /// The generic argument `T` allows you to automatically cast the [`Raw`]
     /// event into any desired type.
     pub fn into_raw<T>(self) -> Raw<T> {
-        Raw::new(&self.construct_json(true)).unwrap().cast()
+        Raw::new(&self.construct_json(true)).unwrap().cast_unchecked()
     }
 
     pub fn into_raw_timeline(self) -> Raw<AnyTimelineEvent> {
         self.into_raw()
     }
 
+    pub fn into_any_sync_message_like_event(self) -> AnySyncMessageLikeEvent {
+        self.into_raw().deserialize().expect("expected message like event")
+    }
+
     pub fn into_raw_sync(self) -> Raw<AnySyncTimelineEvent> {
-        Raw::new(&self.construct_json(false)).unwrap().cast()
+        Raw::new(&self.construct_json(false)).unwrap().cast_unchecked()
     }
 
     pub fn into_event(self) -> TimelineEvent {
@@ -358,6 +376,12 @@ impl EventBuilder<RoomMessageEventContent> {
     pub fn in_thread_reply(mut self, root: &EventId, replied_to: &EventId) -> Self {
         self.content.relates_to =
             Some(Relation::Thread(Thread::reply(root.to_owned(), replied_to.to_owned())));
+        self
+    }
+
+    /// Adds the given mentions to the current event.
+    pub fn mentions(mut self, mentions: Mentions) -> Self {
+        self.content.mentions = Some(mentions);
         self
     }
 
@@ -412,7 +436,7 @@ impl EventBuilder<UnstablePollStartEventContent> {
             content.relates_to = Some(RelationWithoutReplacement::Reply {
                 in_reply_to: InReplyTo::new(event_id.to_owned()),
             });
-        };
+        }
         self
     }
 
@@ -423,21 +447,27 @@ impl EventBuilder<UnstablePollStartEventContent> {
 
         if let UnstablePollStartEventContent::New(content) = &mut self.content {
             content.relates_to = Some(RelationWithoutReplacement::Thread(thread));
-        };
+        }
         self
     }
 }
 
 impl EventBuilder<RoomCreateEventContent> {
     /// Define the predecessor fields.
-    pub fn predecessor(mut self, room_id: &RoomId, event_id: &EventId) -> Self {
-        self.content.predecessor = Some(PreviousRoom::new(room_id.to_owned(), event_id.to_owned()));
+    pub fn predecessor(mut self, room_id: &RoomId) -> Self {
+        self.content.predecessor = Some(PreviousRoom::new(room_id.to_owned()));
         self
     }
 
     /// Erase the predecessor if any.
     pub fn no_predecessor(mut self) -> Self {
         self.content.predecessor = None;
+        self
+    }
+
+    /// Sets the `m.room.create` `type` field to `m.space`.
+    pub fn with_space_type(mut self) -> Self {
+        self.content.room_type = Some(RoomType::Space);
         self
     }
 }
@@ -451,48 +481,56 @@ impl EventBuilder<StickerEventContent> {
     }
 }
 
-impl<E: EventContent> From<EventBuilder<E>> for Raw<AnySyncTimelineEvent>
+impl<E: StaticEventContent<IsPrefix = False>> From<EventBuilder<E>> for Raw<AnySyncTimelineEvent>
 where
-    E::EventType: Serialize,
+    E: Serialize,
 {
     fn from(val: EventBuilder<E>) -> Self {
         val.into_raw_sync()
     }
 }
 
-impl<E: EventContent> From<EventBuilder<E>> for Raw<AnyTimelineEvent>
+impl<E: StaticEventContent<IsPrefix = False>> From<EventBuilder<E>> for Raw<AnyTimelineEvent>
 where
-    E::EventType: Serialize,
+    E: Serialize,
 {
     fn from(val: EventBuilder<E>) -> Self {
         val.into_raw_timeline()
     }
 }
 
-impl<E: EventContent> From<EventBuilder<E>> for TimelineEvent
+impl<E: StaticEventContent<IsPrefix = False>> From<EventBuilder<E>>
+    for Raw<AnyGlobalAccountDataEvent>
 where
-    E::EventType: Serialize,
+    E: Serialize,
+{
+    fn from(val: EventBuilder<E>) -> Self {
+        val.into_raw()
+    }
+}
+
+impl<E: StaticEventContent<IsPrefix = False>> From<EventBuilder<E>> for TimelineEvent
+where
+    E: Serialize,
 {
     fn from(val: EventBuilder<E>) -> Self {
         val.into_event()
     }
 }
 
-impl<E: StateEventContent> From<EventBuilder<E>> for Raw<AnySyncStateEvent>
-where
-    E::EventType: Serialize,
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for Raw<AnySyncStateEvent>
 {
     fn from(val: EventBuilder<E>) -> Self {
-        Raw::new(&val.construct_json(false)).unwrap().cast()
+        Raw::new(&val.construct_json(false)).unwrap().cast_unchecked()
     }
 }
 
-impl<E: StateEventContent> From<EventBuilder<E>> for Raw<AnyStateEvent>
-where
-    E::EventType: Serialize,
+impl<E: StaticEventContent<IsPrefix = False> + StateEventContent> From<EventBuilder<E>>
+    for Raw<AnyStateEvent>
 {
     fn from(val: EventBuilder<E>) -> Self {
-        Raw::new(&val.construct_json(true)).unwrap().cast()
+        Raw::new(&val.construct_json(true)).unwrap().cast_unchecked()
     }
 }
 
@@ -528,10 +566,11 @@ impl EventFactory {
     }
 
     /// Create an event from any event content.
-    pub fn event<E: EventContent>(&self, content: E) -> EventBuilder<E> {
+    pub fn event<E: StaticEventContent<IsPrefix = False>>(&self, content: E) -> EventBuilder<E> {
         EventBuilder {
             sender: self.sender.clone(),
             is_ephemeral: false,
+            is_global: false,
             room: self.room.clone(),
             server_ts: self.next_server_ts(),
             event_id: None,
@@ -567,8 +606,8 @@ impl EventFactory {
     /// use matrix_sdk_test::event_factory::EventFactory;
     /// use ruma::{
     ///     events::{
-    ///         room::member::{MembershipState, RoomMemberEventContent},
     ///         SyncStateEvent,
+    ///         room::member::{MembershipState, RoomMemberEventContent},
     ///     },
     ///     room_id,
     ///     serde::Raw,
@@ -639,7 +678,7 @@ impl EventFactory {
     ///
     /// use matrix_sdk_test::event_factory::EventFactory;
     /// use ruma::{
-    ///     events::{member_hints::MemberHintsEventContent, SyncStateEvent},
+    ///     events::{SyncStateEvent, member_hints::MemberHintsEventContent},
     ///     owned_user_id, room_id,
     ///     serde::Raw,
     ///     user_id,
@@ -698,7 +737,7 @@ impl EventFactory {
 
     /// Create a redacted event, with extra information in the unsigned section
     /// about the redaction itself.
-    pub fn redacted<T: RedactedMessageLikeEventContent>(
+    pub fn redacted<T: StaticEventContent<IsPrefix = False> + RedactedMessageLikeEventContent>(
         &self,
         redacter: &UserId,
         content: T,
@@ -719,7 +758,7 @@ impl EventFactory {
 
     /// Create a redacted state event, with extra information in the unsigned
     /// section about the redaction itself.
-    pub fn redacted_state<T: RedactedStateEventContent>(
+    pub fn redacted_state<T: StaticEventContent<IsPrefix = False> + RedactedStateEventContent>(
         &self,
         redacter: &UserId,
         state_key: impl Into<String>,
@@ -873,7 +912,7 @@ impl EventFactory {
         &self,
         map: &mut BTreeMap<OwnedUserId, Int>,
     ) -> EventBuilder<RoomPowerLevelsEventContent> {
-        let mut event = RoomPowerLevelsEventContent::new();
+        let mut event = RoomPowerLevelsEventContent::new(&AuthorizationRules::V1);
         event.users.append(map);
         self.event(event)
     }
@@ -905,10 +944,11 @@ impl EventFactory {
     /// ```
     /// use matrix_sdk_test::event_factory::EventFactory;
     /// use ruma::{
-    ///     events::{beacon::BeaconEventContent, MessageLikeEvent},
+    ///     MilliSecondsSinceUnixEpoch,
+    ///     events::{MessageLikeEvent, beacon::BeaconEventContent},
     ///     owned_event_id, room_id,
     ///     serde::Raw,
-    ///     user_id, MilliSecondsSinceUnixEpoch,
+    ///     user_id,
     /// };
     ///
     /// let factory = EventFactory::new().room(room_id!("!test:localhost"));
@@ -946,11 +986,89 @@ impl EventFactory {
         self.event(StickerEventContent::new(body.into(), info, url))
     }
 
+    /// Create a new `m.call.invite` event.
+    pub fn call_invite(
+        &self,
+        call_id: OwnedVoipId,
+        lifetime: UInt,
+        offer: SessionDescription,
+        version: VoipVersionId,
+    ) -> EventBuilder<CallInviteEventContent> {
+        self.event(CallInviteEventContent::new(call_id, lifetime, offer, version))
+    }
+
+    /// Create a new `m.call.notify` event.
+    pub fn call_notify(
+        &self,
+        call_id: String,
+        application: ApplicationType,
+        notify_type: NotifyType,
+        mentions: Mentions,
+    ) -> EventBuilder<CallNotifyEventContent> {
+        self.event(CallNotifyEventContent::new(call_id, application, notify_type, mentions))
+    }
+
+    /// Create a new `m.direct` global account data event.
+    pub fn direct(&self) -> EventBuilder<DirectEventContent> {
+        let mut builder = self.event(DirectEventContent::default());
+        builder.is_global = true;
+        builder
+    }
+
+    /// Create a new `m.ignored_user_list` global account data event.
+    pub fn ignored_user_list(
+        &self,
+        users: impl IntoIterator<Item = OwnedUserId>,
+    ) -> EventBuilder<IgnoredUserListEventContent> {
+        let mut builder = self.event(IgnoredUserListEventContent::users(users));
+        builder.is_global = true;
+        builder
+    }
+
+    /// Create a new `m.push_rules` global account data event.
+    pub fn push_rules(&self, rules: Ruleset) -> EventBuilder<PushRulesEventContent> {
+        let mut builder = self.event(PushRulesEventContent::new(rules));
+        builder.is_global = true;
+        builder
+    }
+
+    /// Create a new `m.space.child` state event.
+    pub fn space_child(
+        &self,
+        parent: OwnedRoomId,
+        child: OwnedRoomId,
+    ) -> EventBuilder<SpaceChildEventContent> {
+        let mut event = self.event(SpaceChildEventContent::new(vec![]));
+        event.room = Some(parent);
+        event.state_key = Some(child.to_string());
+        event
+    }
+
+    /// Create a new `m.space.parent` state event.
+    pub fn space_parent(
+        &self,
+        parent: OwnedRoomId,
+        child: OwnedRoomId,
+    ) -> EventBuilder<SpaceParentEventContent> {
+        let mut event = self.event(SpaceParentEventContent::new(vec![]));
+        event.state_key = Some(parent.to_string());
+        event.room = Some(child);
+        event
+    }
+
     /// Set the next server timestamp.
     ///
     /// Timestamps will continue to increase by 1 (millisecond) from that value.
     pub fn set_next_ts(&self, value: u64) {
         self.next_ts.store(value, SeqCst);
+    }
+}
+
+impl EventBuilder<DirectEventContent> {
+    /// Add a user/room pair to the `m.direct` event.
+    pub fn add_user(mut self, user_id: OwnedDirectUserIdentifier, room_id: &RoomId) -> Self {
+        self.content.0.entry(user_id).or_default().push(room_id.to_owned());
+        self
     }
 }
 

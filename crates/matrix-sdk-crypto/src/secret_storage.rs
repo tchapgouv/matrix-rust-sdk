@@ -36,7 +36,7 @@ use ruma::{
             },
             secret::SecretEncryptedData,
         },
-        EventContent, GlobalAccountDataEventType,
+        GlobalAccountDataEventContent, GlobalAccountDataEventType,
     },
     serde::Base64,
     UInt,
@@ -582,6 +582,12 @@ impl SecretStorageKey {
     /// [`SecretStorageKey::key_id()`] method.
     pub fn event_type(&self) -> GlobalAccountDataEventType {
         self.event_content().event_type()
+    }
+}
+
+impl Default for SecretStorageKey {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -15,27 +15,23 @@
 use std::{collections::HashMap, fmt::Write as _, fs, panic, sync::Arc};
 
 use anyhow::{Context, Result};
-use as_variant::as_variant;
 use eyeball_im::VectorDiff;
 use futures_util::pin_mut;
 use matrix_sdk::{
     attachment::{
-        AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
-        BaseVideoInfo, Thumbnail,
+        AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo, Thumbnail,
     },
     deserialized_responses::{ShieldState as SdkShieldState, ShieldStateCode},
     event_cache::RoomPaginationStatus,
-    room::{
-        edit::EditedContent as SdkEditedContent,
-        reply::{EnforceThread, Reply},
-    },
+    room::edit::EditedContent as SdkEditedContent,
 };
 use matrix_sdk_common::{
     executor::{AbortHandle, JoinHandle},
     stream::StreamExt,
 };
 use matrix_sdk_ui::timeline::{
-    self, AttachmentSource, Error, EventItemOrigin, Profile, TimelineDetails,
+    self, AttachmentConfig, AttachmentSource, EventItemOrigin,
+    MediaUploadProgress as SdkMediaUploadProgress, Profile, TimelineDetails,
     TimelineUniqueId as SdkTimelineUniqueId,
 };
 use mime::Mime;
@@ -51,10 +47,8 @@ use ruma::{
                 UnstablePollStartContentBlock,
             },
         },
-        receipt::ReceiptThread,
         room::message::{
-            LocationMessageEventContent, MessageType, ReplyWithinThread,
-            RoomMessageEventContentWithoutRelation,
+            LocationMessageEventContent, MessageType, RoomMessageEventContentWithoutRelation,
         },
         AnyMessageLikeEventContent,
     },
@@ -67,10 +61,8 @@ use uuid::Uuid;
 use self::content::TimelineItemContent;
 pub use self::msg_like::MessageContent;
 use crate::{
-    client::ProgressWatcher,
     error::{ClientError, RoomError},
     event::EventOrTransactionId,
-    helpers::unwrap_or_clone_arc,
     ruma::{
         AssetType, AudioInfo, FileInfo, FormattedBody, ImageInfo, Mentions, PollKind,
         ThumbnailInfo, VideoInfo,
@@ -108,43 +100,40 @@ impl Timeline {
         params: UploadParameters,
         attachment_info: AttachmentInfo,
         mime_type: Option<String>,
-        progress_watcher: Option<Box<dyn ProgressWatcher>>,
         thumbnail: Option<Thumbnail>,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
         let mime_str = mime_type.as_ref().ok_or(RoomError::InvalidAttachmentMimeType)?;
+
         let mime_type =
             mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
+
+        let in_reply_to_event_id = params
+            .in_reply_to
+            .map(EventId::parse)
+            .transpose()
+            .map_err(|_| RoomError::InvalidRepliedToEventId)?;
 
         let formatted_caption = formatted_body_from(
             params.caption.as_deref(),
             params.formatted_caption.map(Into::into),
         );
 
-        let attachment_config = AttachmentConfig::new()
-            .thumbnail(thumbnail)
-            .info(attachment_info)
-            .caption(params.caption)
-            .formatted_caption(formatted_caption)
-            .mentions(params.mentions.map(Into::into))
-            .reply(params.reply_params.map(|p| p.try_into()).transpose()?);
+        let attachment_config = AttachmentConfig {
+            info: Some(attachment_info),
+            thumbnail,
+            caption: params.caption,
+            formatted_caption,
+            mentions: params.mentions.map(Into::into),
+            in_reply_to: in_reply_to_event_id,
+            ..Default::default()
+        };
 
         let handle = SendAttachmentJoinHandle::new(get_runtime_handle().spawn(async move {
-            let mut request =
-                self.inner.send_attachment(params.source, mime_type, attachment_config);
-
-            if params.use_send_queue {
-                request = request.use_send_queue();
-            }
-
-            if let Some(progress_watcher) = progress_watcher {
-                let mut subscriber = request.subscribe_to_send_progress();
-                get_runtime_handle().spawn(async move {
-                    while let Some(progress) = subscriber.next().await {
-                        progress_watcher.transmission_progress(progress.into());
-                    }
-                });
-            }
-
+            self.inner
+                .send_attachment(params.source, mime_type, attachment_config)
+                .use_send_queue()
+                .await
+                .map_err(|_| RoomError::FailedSendingAttachment)
             // BWI-specific
             request.await.map_err(|e| match e {
                 Error::AttachmentSizeExceededLimit => RoomError::AttachmentSizeExceededUploadLimit,
@@ -152,8 +141,6 @@ impl Timeline {
                 _ => RoomError::FailedSendingAttachment,
             })?;
             // end BWI-specific
-
-            Ok(())
         }));
 
         Ok(handle)
@@ -161,15 +148,19 @@ impl Timeline {
 }
 
 fn build_thumbnail_info(
-    thumbnail_path: Option<String>,
+    thumbnail_source: Option<UploadSource>,
     thumbnail_info: Option<ThumbnailInfo>,
 ) -> Result<Option<Thumbnail>, RoomError> {
-    match (thumbnail_path, thumbnail_info) {
+    match (thumbnail_source, thumbnail_info) {
         (None, None) => Ok(None),
 
-        (Some(thumbnail_path), Some(thumbnail_info)) => {
-            let thumbnail_data =
-                fs::read(thumbnail_path).map_err(|_| RoomError::InvalidThumbnailData)?;
+        (Some(thumbnail_source), Some(thumbnail_info)) => {
+            let thumbnail_data = match thumbnail_source {
+                UploadSource::File { filename } => {
+                    fs::read(filename).map_err(|_| RoomError::InvalidThumbnailData)?
+                }
+                UploadSource::Data { bytes, .. } => bytes,
+            };
 
             let height = thumbnail_info
                 .height
@@ -199,7 +190,7 @@ fn build_thumbnail_info(
         }
 
         _ => {
-            warn!("Ignoring thumbnail because either the thumbnail path or info isn't defined");
+            warn!("Ignoring thumbnail because either the thumbnail source or info isn't defined");
             Ok(None)
         }
     }
@@ -215,16 +206,12 @@ pub struct UploadParameters {
     formatted_caption: Option<FormattedBody>,
     /// Optional intentional mentions to be sent with the media.
     mentions: Option<Mentions>,
-    /// Optional parameters for sending the media as (threaded) reply.
-    reply_params: Option<ReplyParameters>,
-    /// Should the media be sent with the send queue, or synchronously?
-    ///
-    /// Watching progress only works with the synchronous method, at the moment.
-    use_send_queue: bool,
+    /// Optional Event ID to reply to.
+    in_reply_to: Option<String>,
 }
 
 /// A source for uploading a file
-#[derive(uniffi::Enum)]
+#[derive(Clone, uniffi::Enum)]
 pub enum UploadSource {
     /// Upload source is a file on disk
     File {
@@ -249,34 +236,47 @@ impl From<UploadSource> for AttachmentSource {
     }
 }
 
-#[derive(uniffi::Record)]
-pub struct ReplyParameters {
-    /// The ID of the event to reply to.
-    event_id: String,
-    /// Whether to enforce a thread relation.
-    enforce_thread: bool,
-    /// If enforcing a threaded relation, whether the message is a reply on a
-    /// thread.
-    reply_within_thread: bool,
+/// This type represents the progress of a media (consisting of a file and
+/// possibly a thumbnail) being uploaded.
+#[derive(Clone, Copy, uniffi::Record)]
+pub struct MediaUploadProgress {
+    /// The index of the media within the transaction. A file and its
+    /// thumbnail share the same index. Will always be 0 for non-gallery
+    /// media uploads.
+    pub index: u64,
+
+    /// The current combined upload progress for both the file and,
+    /// if it exists, its thumbnail.
+    pub progress: AbstractProgress,
 }
 
-impl TryInto<Reply> for ReplyParameters {
-    type Error = RoomError;
+impl From<SdkMediaUploadProgress> for MediaUploadProgress {
+    fn from(value: SdkMediaUploadProgress) -> Self {
+        Self { index: value.index, progress: value.progress.into() }
+    }
+}
 
-    fn try_into(self) -> Result<Reply, Self::Error> {
-        let event_id =
-            EventId::parse(&self.event_id).map_err(|_| RoomError::InvalidRepliedToEventId)?;
-        let enforce_thread = if self.enforce_thread {
-            EnforceThread::Threaded(if self.reply_within_thread {
-                ReplyWithinThread::Yes
-            } else {
-                ReplyWithinThread::No
-            })
-        } else {
-            EnforceThread::MaybeThreaded
-        };
+/// Progress of an operation in abstract units.
+///
+/// Contrary to [`TransmissionProgress`], this allows tracking the progress
+/// of sending or receiving a payload in estimated pseudo units representing a
+/// percentage. This is helpful in cases where the exact progress in bytes isn't
+/// known, for instance, because encryption (which changes the size) happens on
+/// the fly.
+#[derive(Clone, Copy, uniffi::Record)]
+pub struct AbstractProgress {
+    /// How many units were already transferred.
+    pub current: u64,
+    /// How many units there are in total.
+    pub total: u64,
+}
 
-        Ok(Reply { event_id, enforce_thread })
+impl From<matrix_sdk::send_queue::AbstractProgress> for AbstractProgress {
+    fn from(value: matrix_sdk::send_queue::AbstractProgress) -> Self {
+        Self {
+            current: value.current.try_into().unwrap_or(u64::MAX),
+            total: value.total.try_into().unwrap_or(u64::MAX),
+        }
     }
 }
 
@@ -291,17 +291,14 @@ impl Timeline {
         // handled by the caller. See #3535 for details.
 
         // First, pass all the items as a reset update.
-        listener.on_update(vec![Arc::new(TimelineDiff::new(VectorDiff::Reset {
-            values: timeline_items,
-        }))]);
+        listener.on_update(vec![TimelineDiff::new(VectorDiff::Reset { values: timeline_items })]);
 
         Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
             pin_mut!(timeline_stream);
 
             // Then forward new items.
             while let Some(diffs) = timeline_stream.next().await {
-                listener
-                    .on_update(diffs.into_iter().map(|d| Arc::new(TimelineDiff::new(d))).collect());
+                listener.on_update(diffs.into_iter().map(TimelineDiff::new).collect());
             }
         })))
     }
@@ -360,9 +357,7 @@ impl Timeline {
         event_id: String,
     ) -> Result<(), ClientError> {
         let event_id = EventId::parse(event_id)?;
-        self.inner
-            .send_single_receipt(receipt_type.into(), ReceiptThread::Unthreaded, event_id)
-            .await?;
+        self.inner.send_single_receipt(receipt_type.into(), event_id).await?;
         Ok(())
     }
 
@@ -408,53 +403,38 @@ impl Timeline {
     pub fn send_image(
         self: Arc<Self>,
         params: UploadParameters,
-        thumbnail_path: Option<String>,
+        thumbnail_source: Option<UploadSource>,
         image_info: ImageInfo,
-        progress_watcher: Option<Box<dyn ProgressWatcher>>,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
         let attachment_info = AttachmentInfo::Image(
             BaseImageInfo::try_from(&image_info).map_err(|_| RoomError::InvalidAttachmentData)?,
         );
-        let thumbnail = build_thumbnail_info(thumbnail_path, image_info.thumbnail_info)?;
-        self.send_attachment(
-            params,
-            attachment_info,
-            image_info.mimetype,
-            progress_watcher,
-            thumbnail,
-        )
+        let thumbnail = build_thumbnail_info(thumbnail_source, image_info.thumbnail_info)?;
+        self.send_attachment(params, attachment_info, image_info.mimetype, thumbnail)
     }
 
     pub fn send_video(
         self: Arc<Self>,
         params: UploadParameters,
-        thumbnail_path: Option<String>,
+        thumbnail_source: Option<UploadSource>,
         video_info: VideoInfo,
-        progress_watcher: Option<Box<dyn ProgressWatcher>>,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
         let attachment_info = AttachmentInfo::Video(
             BaseVideoInfo::try_from(&video_info).map_err(|_| RoomError::InvalidAttachmentData)?,
         );
-        let thumbnail = build_thumbnail_info(thumbnail_path, video_info.thumbnail_info)?;
-        self.send_attachment(
-            params,
-            attachment_info,
-            video_info.mimetype,
-            progress_watcher,
-            thumbnail,
-        )
+        let thumbnail = build_thumbnail_info(thumbnail_source, video_info.thumbnail_info)?;
+        self.send_attachment(params, attachment_info, video_info.mimetype, thumbnail)
     }
 
     pub fn send_audio(
         self: Arc<Self>,
         params: UploadParameters,
         audio_info: AudioInfo,
-        progress_watcher: Option<Box<dyn ProgressWatcher>>,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
         let attachment_info = AttachmentInfo::Audio(
             BaseAudioInfo::try_from(&audio_info).map_err(|_| RoomError::InvalidAttachmentData)?,
         );
-        self.send_attachment(params, attachment_info, audio_info.mimetype, progress_watcher, None)
+        self.send_attachment(params, attachment_info, audio_info.mimetype, None)
     }
 
     pub fn send_voice_message(
@@ -462,26 +442,24 @@ impl Timeline {
         params: UploadParameters,
         audio_info: AudioInfo,
         waveform: Vec<u16>,
-        progress_watcher: Option<Box<dyn ProgressWatcher>>,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
         let attachment_info = AttachmentInfo::Voice {
             audio_info: BaseAudioInfo::try_from(&audio_info)
                 .map_err(|_| RoomError::InvalidAttachmentData)?,
             waveform: Some(waveform),
         };
-        self.send_attachment(params, attachment_info, audio_info.mimetype, progress_watcher, None)
+        self.send_attachment(params, attachment_info, audio_info.mimetype, None)
     }
 
     pub fn send_file(
         self: Arc<Self>,
         params: UploadParameters,
         file_info: FileInfo,
-        progress_watcher: Option<Box<dyn ProgressWatcher>>,
     ) -> Result<Arc<SendAttachmentJoinHandle>, RoomError> {
         let attachment_info = AttachmentInfo::File(
             BaseFileInfo::try_from(&file_info).map_err(|_| RoomError::InvalidAttachmentData)?,
         );
-        self.send_attachment(params, attachment_info, file_info.mimetype, progress_watcher, None)
+        self.send_attachment(params, attachment_info, file_info.mimetype, None)
     }
 
     pub async fn create_poll(
@@ -551,9 +529,10 @@ impl Timeline {
     pub async fn send_reply(
         &self,
         msg: Arc<RoomMessageEventContentWithoutRelation>,
-        reply_params: ReplyParameters,
+        event_id: String,
     ) -> Result<(), ClientError> {
-        self.inner.send_reply((*msg).clone(), reply_params.try_into()?).await?;
+        let event_id = EventId::parse(&event_id).map_err(|_| RoomError::InvalidRepliedToEventId)?;
+        self.inner.send_reply((*msg).clone(), event_id).await?;
         Ok(())
     }
 
@@ -607,7 +586,7 @@ impl Timeline {
         description: Option<String>,
         zoom_level: Option<u8>,
         asset_type: Option<AssetType>,
-        reply_params: Option<ReplyParameters>,
+        replied_to_event_id: Option<String>,
     ) -> Result<(), ClientError> {
         let mut location_event_message_content =
             LocationMessageEventContent::new(body, geo_uri.clone());
@@ -626,8 +605,8 @@ impl Timeline {
             MessageType::Location(location_event_message_content),
         );
 
-        if let Some(reply_params) = reply_params {
-            self.send_reply(Arc::new(room_message_event_content), reply_params).await
+        if let Some(replied_to_event_id) = replied_to_event_id {
+            self.send_reply(Arc::new(room_message_event_content), replied_to_event_id).await
         } else {
             self.send(Arc::new(room_message_event_content)).await?;
             Ok(())
@@ -840,7 +819,7 @@ pub enum FocusEventError {
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait TimelineListener: SyncOutsideWasm + SendOutsideWasm {
-    fn on_update(&self, diff: Vec<Arc<TimelineDiff>>);
+    fn on_update(&self, diff: Vec<TimelineDiff>);
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
@@ -848,7 +827,7 @@ pub trait PaginationStatusListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_update(&self, status: RoomPaginationStatus);
 }
 
-#[derive(Clone, uniffi::Object)]
+#[derive(Clone, uniffi::Enum)]
 pub enum TimelineDiff {
     Append { values: Vec<Arc<TimelineItem>> },
     Clear,
@@ -856,10 +835,10 @@ pub enum TimelineDiff {
     PushBack { value: Arc<TimelineItem> },
     PopFront,
     PopBack,
-    Insert { index: usize, value: Arc<TimelineItem> },
-    Set { index: usize, value: Arc<TimelineItem> },
-    Remove { index: usize },
-    Truncate { length: usize },
+    Insert { index: u32, value: Arc<TimelineItem> },
+    Set { index: u32, value: Arc<TimelineItem> },
+    Remove { index: u32 },
+    Truncate { length: u32 },
     Reset { values: Vec<Arc<TimelineItem>> },
 }
 
@@ -870,14 +849,18 @@ impl TimelineDiff {
                 Self::Append { values: values.into_iter().map(TimelineItem::from_arc).collect() }
             }
             VectorDiff::Clear => Self::Clear,
-            VectorDiff::Insert { index, value } => {
-                Self::Insert { index, value: TimelineItem::from_arc(value) }
+            VectorDiff::Insert { index, value } => Self::Insert {
+                index: u32::try_from(index).unwrap(),
+                value: TimelineItem::from_arc(value),
+            },
+            VectorDiff::Set { index, value } => Self::Set {
+                index: u32::try_from(index).unwrap(),
+                value: TimelineItem::from_arc(value),
+            },
+            VectorDiff::Truncate { length } => {
+                Self::Truncate { length: u32::try_from(length).unwrap() }
             }
-            VectorDiff::Set { index, value } => {
-                Self::Set { index, value: TimelineItem::from_arc(value) }
-            }
-            VectorDiff::Truncate { length } => Self::Truncate { length },
-            VectorDiff::Remove { index } => Self::Remove { index },
+            VectorDiff::Remove { index } => Self::Remove { index: u32::try_from(index).unwrap() },
             VectorDiff::PushBack { value } => {
                 Self::PushBack { value: TimelineItem::from_arc(value) }
             }
@@ -891,94 +874,6 @@ impl TimelineDiff {
             }
         }
     }
-}
-
-#[matrix_sdk_ffi_macros::export]
-impl TimelineDiff {
-    pub fn change(&self) -> TimelineChange {
-        match self {
-            Self::Append { .. } => TimelineChange::Append,
-            Self::Insert { .. } => TimelineChange::Insert,
-            Self::Set { .. } => TimelineChange::Set,
-            Self::Remove { .. } => TimelineChange::Remove,
-            Self::PushBack { .. } => TimelineChange::PushBack,
-            Self::PushFront { .. } => TimelineChange::PushFront,
-            Self::PopBack => TimelineChange::PopBack,
-            Self::PopFront => TimelineChange::PopFront,
-            Self::Clear => TimelineChange::Clear,
-            Self::Truncate { .. } => TimelineChange::Truncate,
-            Self::Reset { .. } => TimelineChange::Reset,
-        }
-    }
-
-    pub fn append(self: Arc<Self>) -> Option<Vec<Arc<TimelineItem>>> {
-        let this = unwrap_or_clone_arc(self);
-        as_variant!(this, Self::Append { values } => values)
-    }
-
-    pub fn insert(self: Arc<Self>) -> Option<InsertData> {
-        let this = unwrap_or_clone_arc(self);
-        as_variant!(this, Self::Insert { index, value } => {
-            InsertData { index: index.try_into().unwrap(), item: value }
-        })
-    }
-
-    pub fn set(self: Arc<Self>) -> Option<SetData> {
-        let this = unwrap_or_clone_arc(self);
-        as_variant!(this, Self::Set { index, value } => {
-            SetData { index: index.try_into().unwrap(), item: value }
-        })
-    }
-
-    pub fn remove(&self) -> Option<u32> {
-        as_variant!(self, Self::Remove { index } => (*index).try_into().unwrap())
-    }
-
-    pub fn push_back(self: Arc<Self>) -> Option<Arc<TimelineItem>> {
-        let this = unwrap_or_clone_arc(self);
-        as_variant!(this, Self::PushBack { value } => value)
-    }
-
-    pub fn push_front(self: Arc<Self>) -> Option<Arc<TimelineItem>> {
-        let this = unwrap_or_clone_arc(self);
-        as_variant!(this, Self::PushFront { value } => value)
-    }
-
-    pub fn reset(self: Arc<Self>) -> Option<Vec<Arc<TimelineItem>>> {
-        let this = unwrap_or_clone_arc(self);
-        as_variant!(this, Self::Reset { values } => values)
-    }
-
-    pub fn truncate(&self) -> Option<u32> {
-        as_variant!(self, Self::Truncate { length } => (*length).try_into().unwrap())
-    }
-}
-
-#[derive(uniffi::Record)]
-pub struct InsertData {
-    pub index: u32,
-    pub item: Arc<TimelineItem>,
-}
-
-#[derive(uniffi::Record)]
-pub struct SetData {
-    pub index: u32,
-    pub item: Arc<TimelineItem>,
-}
-
-#[derive(Clone, Copy, uniffi::Enum)]
-pub enum TimelineChange {
-    Append,
-    Clear,
-    Insert,
-    Set,
-    Remove,
-    PushBack,
-    PushFront,
-    PopBack,
-    PopFront,
-    Truncate,
-    Reset,
 }
 
 #[derive(Clone, uniffi::Record)]
@@ -1047,7 +942,11 @@ impl TimelineItem {
 #[derive(Clone, uniffi::Enum)]
 pub enum EventSendState {
     /// The local event has not been sent yet.
-    NotSentYet,
+    NotSentYet {
+        /// The progress of the sending operation, if the event involves a media
+        /// upload.
+        progress: Option<MediaUploadProgress>,
+    },
 
     /// The local event has been sent to the server, but unsuccessfully: The
     /// sending has failed.
@@ -1072,7 +971,9 @@ impl From<&matrix_sdk_ui::timeline::EventSendState> for EventSendState {
         use matrix_sdk_ui::timeline::EventSendState::*;
 
         match value {
-            NotSentYet => Self::NotSentYet,
+            NotSentYet { progress } => {
+                Self::NotSentYet { progress: progress.clone().map(|p| p.into()) }
+            }
             SendingFailed { error, is_recoverable } => {
                 let as_queue_wedge_error: matrix_sdk::QueueWedgeError = (&**error).into();
                 Self::SendingFailed {
@@ -1430,6 +1331,7 @@ mod galleries {
     use matrix_sdk_common::executor::{AbortHandle, JoinHandle};
     use matrix_sdk_ui::timeline::GalleryConfig;
     use mime::Mime;
+    use ruma::EventId;
     use tokio::sync::Mutex;
     use tracing::error;
 
@@ -1437,7 +1339,7 @@ mod galleries {
         error::RoomError,
         ruma::{AudioInfo, FileInfo, FormattedBody, ImageInfo, Mentions, VideoInfo},
         runtime::get_runtime_handle,
-        timeline::{build_thumbnail_info, ReplyParameters, Timeline},
+        timeline::{build_thumbnail_info, Timeline, UploadSource},
     };
 
     #[derive(uniffi::Record)]
@@ -1448,37 +1350,37 @@ mod galleries {
         formatted_caption: Option<FormattedBody>,
         /// Optional intentional mentions to be sent with the gallery.
         mentions: Option<Mentions>,
-        /// Optional parameters for sending the media as (threaded) reply.
-        reply_params: Option<ReplyParameters>,
+        /// Optional Event ID to reply to.
+        in_reply_to: Option<String>,
     }
 
     #[derive(uniffi::Enum)]
     pub enum GalleryItemInfo {
         Audio {
             audio_info: AudioInfo,
-            filename: String,
+            source: UploadSource,
             caption: Option<String>,
             formatted_caption: Option<FormattedBody>,
         },
         File {
             file_info: FileInfo,
-            filename: String,
+            source: UploadSource,
             caption: Option<String>,
             formatted_caption: Option<FormattedBody>,
         },
         Image {
             image_info: ImageInfo,
-            filename: String,
+            source: UploadSource,
             caption: Option<String>,
             formatted_caption: Option<FormattedBody>,
-            thumbnail_path: Option<String>,
+            thumbnail_source: Option<UploadSource>,
         },
         Video {
             video_info: VideoInfo,
-            filename: String,
+            source: UploadSource,
             caption: Option<String>,
             formatted_caption: Option<FormattedBody>,
-            thumbnail_path: Option<String>,
+            thumbnail_source: Option<UploadSource>,
         },
     }
 
@@ -1492,12 +1394,12 @@ mod galleries {
             }
         }
 
-        fn filename(&self) -> &String {
+        fn source(&self) -> &UploadSource {
             match self {
-                GalleryItemInfo::Audio { filename, .. } => filename,
-                GalleryItemInfo::File { filename, .. } => filename,
-                GalleryItemInfo::Image { filename, .. } => filename,
-                GalleryItemInfo::Video { filename, .. } => filename,
+                GalleryItemInfo::File { source, .. } => source,
+                GalleryItemInfo::Audio { source, .. } => source,
+                GalleryItemInfo::Image { source, .. } => source,
+                GalleryItemInfo::Video { source, .. } => source,
             }
         }
 
@@ -1543,11 +1445,17 @@ mod galleries {
         fn thumbnail(&self) -> Result<Option<Thumbnail>, RoomError> {
             match self {
                 GalleryItemInfo::Audio { .. } | GalleryItemInfo::File { .. } => Ok(None),
-                GalleryItemInfo::Image { image_info, thumbnail_path, .. } => {
-                    build_thumbnail_info(thumbnail_path.clone(), image_info.thumbnail_info.clone())
+                GalleryItemInfo::Image { image_info, thumbnail_source, .. } => {
+                    build_thumbnail_info(
+                        thumbnail_source.as_ref().cloned(),
+                        image_info.thumbnail_info.clone(),
+                    )
                 }
-                GalleryItemInfo::Video { video_info, thumbnail_path, .. } => {
-                    build_thumbnail_info(thumbnail_path.clone(), video_info.thumbnail_info.clone())
+                GalleryItemInfo::Video { video_info, thumbnail_source, .. } => {
+                    build_thumbnail_info(
+                        thumbnail_source.as_ref().cloned(),
+                        video_info.thumbnail_info.clone(),
+                    )
                 }
             }
         }
@@ -1563,7 +1471,7 @@ mod galleries {
             let mime_type =
                 mime_str.parse::<Mime>().map_err(|_| RoomError::InvalidAttachmentMimeType)?;
             Ok(matrix_sdk_ui::timeline::GalleryItemInfo {
-                source: self.filename().into(),
+                source: self.source().clone().into(),
                 content_type: mime_type,
                 attachment_info: self.attachment_info()?,
                 caption: self.caption().clone(),
@@ -1634,11 +1542,18 @@ mod galleries {
                 params.formatted_caption.map(Into::into),
             );
 
+            let in_reply_to = params
+                .in_reply_to
+                .as_ref()
+                .map(EventId::parse)
+                .transpose()
+                .map_err(|_| RoomError::InvalidRepliedToEventId)?;
+
             let mut gallery_config = GalleryConfig::new()
                 .caption(params.caption)
                 .formatted_caption(formatted_caption)
                 .mentions(params.mentions.map(Into::into))
-                .reply(params.reply_params.map(|p| p.try_into()).transpose()?);
+                .in_reply_to(in_reply_to);
 
             for item_info in item_infos {
                 gallery_config = gallery_config.add_item(item_info.try_into()?);

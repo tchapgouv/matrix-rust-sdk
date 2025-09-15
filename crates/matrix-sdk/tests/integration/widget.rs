@@ -26,6 +26,7 @@ use matrix_sdk::{
     },
     Client,
 };
+use matrix_sdk_base::crypto::CollectStrategy;
 use matrix_sdk_common::{
     deserialized_responses::EncryptionInfo, executor::spawn, locks::Mutex, timeout::timeout,
 };
@@ -619,13 +620,18 @@ async fn test_accept_encrypted_to_device_in_e2ee_room() {
         "call_id": "",
     }))
     .unwrap()
-    .cast();
+    .cast_unchecked();
 
     let event_synced_future =
         mock_server.mock_capture_put_to_device_then_sync_back(bob.user_id().unwrap(), &alice).await;
 
     bob.encryption()
-        .encrypt_and_send_raw_to_device(vec![&bob_alice_device], "my.custom.to.device", content_raw)
+        .encrypt_and_send_raw_to_device(
+            vec![&bob_alice_device],
+            "my.custom.to.device",
+            content_raw,
+            CollectStrategy::AllDevices,
+        )
         .await
         .unwrap();
 

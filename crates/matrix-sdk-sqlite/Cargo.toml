@@ -1,6 +1,6 @@
 [package]
 name = "matrix-sdk-sqlite"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 repository = "https://github.com/matrix-org/matrix-rust-sdk"
 description = "Sqlite storage backend for matrix-sdk"
@@ -18,6 +18,10 @@ bundled = ["rusqlite/bundled"]
 crypto-store = ["dep:matrix-sdk-crypto"]
 event-cache = ["dep:matrix-sdk-base"]
 state-store = ["dep:matrix-sdk-base"]
+
+experimental-encrypted-state-events = [
+    "matrix-sdk-crypto?/experimental-encrypted-state-events"
+]
 
 [dependencies]
 as_variant.workspace = true
@@ -46,6 +50,7 @@ matrix-sdk-base = { workspace = true, features = ["testing"] }
 matrix-sdk-common.workspace = true
 matrix-sdk-crypto = { workspace = true, features = ["testing"] }
 matrix-sdk-test.workspace = true
+matrix-sdk-test-utils.workspace = true
 once_cell.workspace = true
 similar-asserts.workspace = true
 tempfile.workspace = true

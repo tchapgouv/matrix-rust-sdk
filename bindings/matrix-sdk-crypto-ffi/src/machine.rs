@@ -18,7 +18,8 @@ use matrix_sdk_crypto::{
     olm::ExportedRoomKey,
     store::types::{BackupDecryptionKey, Changes},
     types::requests::ToDeviceRequest,
-    DecryptionSettings, LocalTrust, OlmMachine as InnerMachine, UserIdentity as SdkUserIdentity,
+    CollectStrategy, DecryptionSettings, LocalTrust, OlmMachine as InnerMachine,
+    UserIdentity as SdkUserIdentity,
 };
 use ruma::{
     api::{
@@ -38,7 +39,7 @@ use ruma::{
     },
     events::{
         key::verification::VerificationMethod, room::message::MessageType, AnyMessageLikeEvent,
-        AnySyncMessageLikeEvent, MessageLikeEvent,
+        AnySyncMessageLikeEvent, AnyTimelineEvent, MessageLikeEvent,
     },
     serde::Raw,
     to_device::DeviceIdOrAllDevices,
@@ -526,6 +527,7 @@ impl OlmMachine {
         key_counts: HashMap<String, i32>,
         unused_fallback_keys: Option<Vec<String>>,
         next_batch_token: String,
+        decryption_settings: &DecryptionSettings,
     ) -> Result<SyncChangesResult, CryptoStoreError> {
         let to_device: ToDevice = serde_json::from_str(&events)?;
         let device_changes: RumaDeviceLists = device_changes.into();
@@ -544,15 +546,17 @@ impl OlmMachine {
         let unused_fallback_keys: Option<Vec<OneTimeKeyAlgorithm>> =
             unused_fallback_keys.map(|u| u.into_iter().map(OneTimeKeyAlgorithm::from).collect());
 
-        let (to_device_events, room_key_infos) = self.runtime.block_on(
-            self.inner.receive_sync_changes(matrix_sdk_crypto::EncryptionSyncChanges {
-                to_device_events: to_device.events,
-                changed_devices: &device_changes,
-                one_time_keys_counts: &key_counts,
-                unused_fallback_keys: unused_fallback_keys.as_deref(),
-                next_batch_token: Some(next_batch_token),
-            }),
-        )?;
+        let (to_device_events, room_key_infos) =
+            self.runtime.block_on(self.inner.receive_sync_changes(
+                matrix_sdk_crypto::EncryptionSyncChanges {
+                    to_device_events: to_device.events,
+                    changed_devices: &device_changes,
+                    one_time_keys_counts: &key_counts,
+                    unused_fallback_keys: unused_fallback_keys.as_deref(),
+                    next_batch_token: Some(next_batch_token),
+                },
+                decryption_settings,
+            ))?;
 
         let to_device_events = to_device_events
             .into_iter()
@@ -829,6 +833,7 @@ impl OlmMachine {
         device_id: String,
         event_type: String,
         content: String,
+        share_strategy: CollectStrategy,
     ) -> Result<Option<Request>, CryptoStoreError> {
         let user_id = parse_user_id(&user_id)?;
         let device_id = device_id.as_str().into();
@@ -837,8 +842,11 @@ impl OlmMachine {
         let device = self.runtime.block_on(self.inner.get_device(&user_id, device_id, None))?;
 
         if let Some(device) = device {
-            let encrypted_content =
-                self.runtime.block_on(device.encrypt_event_raw(&event_type, &content))?;
+            let encrypted_content = self.runtime.block_on(device.encrypt_event_raw(
+                &event_type,
+                &content,
+                share_strategy,
+            ))?;
 
             let request = ToDeviceRequest::new(
                 user_id.as_ref(),
@@ -894,7 +902,7 @@ impl OlmMachine {
         ))?;
 
         if handle_verification_events {
-            if let Ok(e) = decrypted.event.deserialize() {
+            if let Ok(AnyTimelineEvent::MessageLike(e)) = decrypted.event.deserialize() {
                 match &e {
                     AnyMessageLikeEvent::RoomMessage(MessageLikeEvent::Original(
                         original_event,

@@ -34,6 +34,7 @@ use matrix_sdk_base::{
     sync::{JoinedRoomUpdate, LeftRoomUpdate, Timeline},
 };
 use ruma::{
+    api::Direction,
     events::{relation::RelationType, AnyRoomAccountDataEvent, AnySyncEphemeralRoomEvent},
     serde::Raw,
     EventId, OwnedEventId, OwnedRoomId,
@@ -48,9 +49,16 @@ use super::{
     AutoShrinkChannelPayload, EventsOrigin, Result, RoomEventCacheGenericUpdate,
     RoomEventCacheUpdate, RoomPagination, RoomPaginationStatus,
 };
-use crate::{client::WeakClient, room::WeakRoom};
+use crate::{
+    client::WeakClient,
+    event_cache::EventCacheError,
+    room::{IncludeRelations, RelationsOptions, WeakRoom},
+};
 
 pub(super) mod events;
+mod threads;
+
+pub use threads::ThreadEventCacheUpdate;
 
 /// A subset of an event cache, for a room.
 ///
@@ -208,6 +216,98 @@ impl RoomEventCache {
         (events, subscriber)
     }
 
+    /// Subscribe to thread for a given root event, and get a (maybe empty)
+    /// initially known list of events for that thread.
+    pub async fn subscribe_to_thread(
+        &self,
+        thread_root: OwnedEventId,
+    ) -> (Vec<Event>, Receiver<ThreadEventCacheUpdate>) {
+        let mut state = self.inner.state.write().await;
+        state.subscribe_to_thread(thread_root)
+    }
+
+    /// Paginate backwards in a thread, given its root event ID.
+    ///
+    /// Returns whether we've hit the start of the thread, in which case the
+    /// root event will be prepended to the thread.
+    #[instrument(skip(self), fields(room_id = %self.inner.room_id))]
+    pub async fn paginate_thread_backwards(
+        &self,
+        thread_root: OwnedEventId,
+        num_events: u16,
+    ) -> Result<bool> {
+        let room = self.inner.weak_room.get().ok_or(EventCacheError::ClientDropped)?;
+
+        // Take the lock only for a short time here.
+        let mut outcome =
+            self.inner.state.write().await.load_more_thread_events_backwards(thread_root.clone());
+
+        loop {
+            match outcome {
+                LoadMoreEventsBackwardsOutcome::Gap { prev_token } => {
+                    // Start a threaded pagination from this gap.
+                    let options = RelationsOptions {
+                        from: prev_token.clone(),
+                        dir: Direction::Backward,
+                        limit: Some(num_events.into()),
+                        include_relations: IncludeRelations::AllRelations,
+                        recurse: true,
+                    };
+
+                    let mut result = room
+                        .relations(thread_root.clone(), options)
+                        .await
+                        .map_err(|err| EventCacheError::BackpaginationError(Box::new(err)))?;
+
+                    let reached_start = result.next_batch_token.is_none();
+                    trace!(num_events = result.chunk.len(), %reached_start, "received a /relations response");
+
+                    // Because the state lock is taken again in `load_or_fetch_event`, we need
+                    // to do this *before* we take the state lock again.
+                    if reached_start {
+                        // Prepend the thread root event to the results.
+                        let root_event = room
+                            .load_or_fetch_event(&thread_root, None)
+                            .await
+                            .map_err(|err| EventCacheError::BackpaginationError(Box::new(err)))?;
+
+                        // Note: the events are still in the reversed order at this point, so
+                        // pushing will eventually make it so that the root event is the first.
+                        result.chunk.push(root_event);
+                    }
+
+                    let mut state = self.inner.state.write().await;
+
+                    if let Some(outcome) = state.finish_thread_network_pagination(
+                        thread_root.clone(),
+                        prev_token,
+                        result.next_batch_token,
+                        result.chunk,
+                    ) {
+                        return Ok(outcome.reached_start);
+                    }
+
+                    // fallthrough: restart the pagination.
+                    outcome = state.load_more_thread_events_backwards(thread_root.clone());
+                }
+
+                LoadMoreEventsBackwardsOutcome::StartOfTimeline => {
+                    // We're done!
+                    return Ok(true);
+                }
+
+                LoadMoreEventsBackwardsOutcome::Events { .. } => {
+                    // TODO: implement :)
+                    unimplemented!("loading from disk for threads is not implemented yet");
+                }
+
+                LoadMoreEventsBackwardsOutcome::WaitForInitialPrevToken => {
+                    unreachable!("unused for threads")
+                }
+            }
+        }
+    }
+
     /// Return a [`RoomPagination`] API object useful for running
     /// back-pagination queries in the current room.
     pub fn pagination(&self) -> RoomPagination {
@@ -219,11 +319,11 @@ impl RoomEventCache {
     ///
     /// **Warning**! It looks into the loaded events from the in-memory linked
     /// chunk **only**. It doesn't look inside the storage.
-    pub async fn rfind_event_in_memory_by<P>(&self, predicate: P) -> Option<Event>
+    pub async fn rfind_map_event_in_memory_by<O, P>(&self, predicate: P) -> Option<O>
     where
-        P: FnMut(&Event) -> bool,
+        P: FnMut(&Event) -> Option<O>,
     {
-        self.inner.state.read().await.rfind_event_in_memory_by(predicate)
+        self.inner.state.read().await.rfind_map_event_in_memory_by(predicate)
     }
 
     /// Try to find an event by ID in this room.
@@ -283,6 +383,12 @@ impl RoomEventCache {
             origin: EventsOrigin::Cache,
         });
 
+        // Notify observers about the generic update.
+        let _ = self
+            .inner
+            .generic_update_sender
+            .send(RoomEventCacheGenericUpdate { room_id: self.inner.room_id.clone() });
+
         Ok(())
     }
 
@@ -325,7 +431,7 @@ pub(super) struct RoomEventCacheInner {
     /// more details.
     auto_shrink_sender: mpsc::Sender<AutoShrinkChannelPayload>,
 
-    /// A clone of [`EventCacheInner::room_event_cache_generic_update_sender`].
+    /// A clone of [`EventCacheInner::generic_update_sender`].
     ///
     /// Whilst `EventCacheInner` handles the generic updates from the sync, or
     /// the storage, it doesn't handle the update from pagination. Having a
@@ -445,8 +551,6 @@ impl RoomEventCacheInner {
             self.pagination_batch_token_notifier.notify_one();
         }
 
-        let mut update_has_been_sent = false;
-
         // The order matters here: first send the timeline event diffs, then only the
         // related events (read receipts, etc.).
         if !timeline_event_diffs.is_empty() {
@@ -454,25 +558,20 @@ impl RoomEventCacheInner {
                 diffs: timeline_event_diffs,
                 origin: EventsOrigin::Sync,
             });
-            update_has_been_sent = true;
+
+            let _ = self
+                .generic_update_sender
+                .send(RoomEventCacheGenericUpdate { room_id: self.room_id.clone() });
         }
 
         if !ephemeral_events.is_empty() {
             let _ = self
                 .sender
                 .send(RoomEventCacheUpdate::AddEphemeralEvents { events: ephemeral_events });
-            update_has_been_sent = true;
         }
 
         if !ambiguity_changes.is_empty() {
             let _ = self.sender.send(RoomEventCacheUpdate::UpdateMembers { ambiguity_changes });
-            update_has_been_sent = true;
-        }
-
-        if update_has_been_sent {
-            let _ = self.generic_update_sender.send(RoomEventCacheGenericUpdate::TimelineUpdated {
-                room_id: self.room_id.clone(),
-            });
         }
 
         Ok(())
@@ -503,7 +602,7 @@ pub(super) enum LoadMoreEventsBackwardsOutcome {
 // Use a private module to hide `events` to this parent module.
 mod private {
     use std::{
-        collections::{HashMap, HashSet},
+        collections::{BTreeMap, HashMap, HashSet},
         sync::{atomic::AtomicUsize, Arc},
     };
 
@@ -518,7 +617,8 @@ mod private {
         },
         linked_chunk::{
             lazy_loader::{self},
-            ChunkContent, ChunkIdentifierGenerator, ChunkMetadata, LinkedChunkId, Position, Update,
+            ChunkContent, ChunkIdentifierGenerator, ChunkMetadata, LinkedChunkId,
+            OwnedLinkedChunkId, Position, Update,
         },
         serde_helpers::extract_thread_root,
         sync::Timeline,
@@ -526,12 +626,14 @@ mod private {
     use matrix_sdk_common::executor::spawn;
     use ruma::{
         events::{
-            relation::RelationType, room::redaction::SyncRoomRedactionEvent, AnySyncTimelineEvent,
-            MessageLikeEventType,
+            relation::RelationType, room::redaction::SyncRoomRedactionEvent,
+            AnySyncMessageLikeEvent, AnySyncTimelineEvent, MessageLikeEventType,
         },
+        room_version_rules::RoomVersionRules,
         serde::Raw,
-        EventId, OwnedEventId, OwnedRoomId, RoomVersionId,
+        EventId, OwnedEventId, OwnedRoomId,
     };
+    use tokio::sync::broadcast::{Receiver, Sender};
     use tracing::{debug, error, instrument, trace, warn};
 
     use super::{
@@ -540,7 +642,9 @@ mod private {
         sort_positions_descending, EventLocation, LoadMoreEventsBackwardsOutcome,
     };
     use crate::event_cache::{
-        deduplicator::filter_duplicate_events, BackPaginationOutcome, RoomPaginationStatus,
+        deduplicator::filter_duplicate_events, room::threads::ThreadEventCache,
+        BackPaginationOutcome, RoomEventCacheLinkedChunkUpdate, RoomPaginationStatus,
+        ThreadEventCacheUpdate,
     };
 
     /// State for a single room's event cache.
@@ -551,8 +655,11 @@ mod private {
         /// The room this state relates to.
         room: OwnedRoomId,
 
-        /// The room version for this room.
-        room_version: RoomVersionId,
+        /// The rules for the version of this room.
+        room_version_rules: RoomVersionRules,
+
+        /// Whether thread support has been enabled for the event cache.
+        enabled_thread_support: bool,
 
         /// Reference to the underlying backing store.
         store: EventCacheStoreLock,
@@ -561,6 +668,11 @@ mod private {
         /// linked chunk for this room.
         room_linked_chunk: EventLinkedChunk,
 
+        /// Threads present in this room.
+        ///
+        /// Keyed by the thread root event ID.
+        threads: HashMap<OwnedEventId, ThreadEventCache>,
+
         /// Have we ever waited for a previous-batch-token to come from sync, in
         /// the context of pagination? We do this at most once per room,
         /// the first time we try to run backward pagination. We reset
@@ -568,6 +680,10 @@ mod private {
         pub waited_for_initial_prev_token: bool,
 
         pagination_status: SharedObservable<RoomPaginationStatus>,
+
+        /// See doc comment of
+        /// [`super::super::EventCacheInner::linked_chunk_update_sender`].
+        linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
 
         /// An atomic count of the current number of subscriber of the
         /// [`super::RoomEventCache`].
@@ -586,7 +702,9 @@ mod private {
         /// [`LinkedChunk`]: matrix_sdk_common::linked_chunk::LinkedChunk
         pub async fn new(
             room_id: OwnedRoomId,
-            room_version: RoomVersionId,
+            room_version_rules: RoomVersionRules,
+            enabled_thread_support: bool,
+            linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
             store: EventCacheStoreLock,
             pagination_status: SharedObservable<RoomPaginationStatus>,
         ) -> Result<Self, EventCacheError> {
@@ -606,7 +724,7 @@ mod private {
                             "error when loading a linked chunk's metadata from the store: {err}"
                         );
 
-                        // Clear storage for this room.
+                        // Try to clear storage for this room.
                         store_lock
                             .handle_linked_chunk_updates(linked_chunk_id, vec![Update::Clear])
                             .await?;
@@ -616,29 +734,51 @@ mod private {
                     }
                 };
 
-            let linked_chunk = store_lock
+            let linked_chunk = match store_lock
                 .load_last_chunk(linked_chunk_id)
                 .await
                 .map_err(EventCacheError::from)
                 .and_then(|(last_chunk, chunk_identifier_generator)| {
                     lazy_loader::from_last_chunk(last_chunk, chunk_identifier_generator)
                         .map_err(EventCacheError::from)
-                })
-                .expect("fully loading the linked chunk just worked, so loading it partially should also work");
+                }) {
+                Ok(linked_chunk) => linked_chunk,
+                Err(err) => {
+                    error!(
+                        "error when loading a linked chunk's latest chunk from the store: {err}"
+                    );
+
+                    // Try to clear storage for this room.
+                    store_lock
+                        .handle_linked_chunk_updates(linked_chunk_id, vec![Update::Clear])
+                        .await?;
+
+                    None
+                }
+            };
 
             let room_linked_chunk = EventLinkedChunk::with_initial_linked_chunk(
                 linked_chunk,
                 full_linked_chunk_metadata,
             );
 
+            // The threads mapping is intentionally empty at start, since we're going to
+            // reload threads lazily, as soon as we need to (based on external
+            // subscribers) or when we get new information about those (from
+            // sync).
+            let threads = HashMap::new();
+
             Ok(Self {
                 room: room_id,
-                room_version,
+                room_version_rules,
+                enabled_thread_support,
                 store,
                 room_linked_chunk,
+                threads,
                 waited_for_initial_prev_token: false,
                 subscriber_count: Default::default(),
                 pagination_status,
+                linked_chunk_update_sender,
             })
         }
 
@@ -855,7 +995,7 @@ mod private {
 
                 // Return the error.
                 return Err(err.into());
-            };
+            }
 
             // ⚠️ Let's not propagate the updates to the store! We already have these data
             // in the store! Let's drain them.
@@ -979,7 +1119,7 @@ mod private {
                 let unsigned = val.get_mut("unsigned")?;
                 let unsigned_obj = unsigned.as_object_mut()?;
                 if unsigned_obj.remove("m.relations").is_some() {
-                    *event = Raw::new(&val).ok()?.cast();
+                    *event = Raw::new(&val).ok()?.cast_unchecked();
                 }
                 None
             };
@@ -1108,19 +1248,26 @@ mod private {
 
             let store = self.store.clone();
             let room_id = self.room.clone();
+            let cloned_updates = updates.clone();
 
             spawn(async move {
                 let store = store.lock().await?;
 
-                trace!(?updates, "sending linked chunk updates to the store");
+                trace!(updates = ?cloned_updates, "sending linked chunk updates to the store");
                 let linked_chunk_id = LinkedChunkId::Room(&room_id);
-                store.handle_linked_chunk_updates(linked_chunk_id, updates).await?;
+                store.handle_linked_chunk_updates(linked_chunk_id, cloned_updates).await?;
                 trace!("linked chunk updates applied");
 
                 super::Result::Ok(())
             })
             .await
             .expect("joining failed")?;
+
+            // Forward that the store got updated to observers.
+            let _ = self.linked_chunk_update_sender.send(RoomEventCacheLinkedChunkUpdate {
+                linked_chunk_id: OwnedLinkedChunkId::Room(self.room.clone()),
+                updates,
+            });
 
             Ok(())
         }
@@ -1146,6 +1293,15 @@ mod private {
         async fn reset_internal(&mut self) -> Result<(), EventCacheError> {
             self.room_linked_chunk.reset();
 
+            // No need to update the thread summaries: the room events are
+            // gone because of the
+            // reset of `room_linked_chunk`.
+            //
+            // Clear the threads.
+            for thread in self.threads.values_mut() {
+                thread.clear();
+            }
+
             self.propagate_changes().await?;
 
             // Reset the pagination state too: pretend we never waited for the initial
@@ -1168,13 +1324,11 @@ mod private {
         /// **Warning**! It looks into the loaded events from the in-memory
         /// linked chunk **only**. It doesn't look inside the storage,
         /// contrary to [`Self::find_event`].
-        pub fn rfind_event_in_memory_by<P>(&self, mut predicate: P) -> Option<Event>
+        pub fn rfind_map_event_in_memory_by<O, P>(&self, mut predicate: P) -> Option<O>
         where
-            P: FnMut(&Event) -> bool,
+            P: FnMut(&Event) -> Option<O>,
         {
-            self.room_linked_chunk
-                .revents()
-                .find_map(|(_position, event)| predicate(event).then(|| event.clone()))
+            self.room_linked_chunk.revents().find_map(|(_position, event)| predicate(event))
         }
 
         /// Find a single event in this room.
@@ -1300,15 +1454,26 @@ mod private {
         async fn post_process_new_events(
             &mut self,
             events: Vec<Event>,
-            is_live_sync: bool,
+            is_sync: bool,
         ) -> Result<(), EventCacheError> {
             // Update the store before doing the post-processing.
             self.propagate_changes().await?;
 
+            let mut new_events_by_thread: BTreeMap<_, Vec<_>> = BTreeMap::new();
+
             for event in events {
                 self.maybe_apply_new_redaction(&event).await?;
 
-                self.analyze_thread_root(&event, is_live_sync).await?;
+                if self.enabled_thread_support {
+                    if let Some(thread_root) = extract_thread_root(event.raw()) {
+                        new_events_by_thread.entry(thread_root).or_default().push(event.clone());
+                    } else if let Some(event_id) = event.event_id() {
+                        // If we spot the root of a thread, add it to its linked chunk.
+                        if self.threads.contains_key(&event_id) {
+                            new_events_by_thread.entry(event_id).or_default().push(event.clone());
+                        }
+                    }
+                }
 
                 // Save a bundled thread event, if there was one.
                 if let Some(bundled_thread) = event.bundled_latest_thread_event {
@@ -1316,76 +1481,90 @@ mod private {
                 }
             }
 
+            self.update_threads(new_events_by_thread, is_sync).await?;
+
             Ok(())
         }
 
-        /// If the event is a threaded reply, ensure the related thread's root
-        /// event (i.e. first thread event) has a thread summary.
+        fn get_or_reload_thread(&mut self, root_event_id: OwnedEventId) -> &mut ThreadEventCache {
+            // TODO: when there's persistent storage, try to lazily reload from disk, if
+            // missing from memory.
+            self.threads.entry(root_event_id.clone()).or_insert_with(|| {
+                ThreadEventCache::new(
+                    self.room.clone(),
+                    root_event_id,
+                    self.linked_chunk_update_sender.clone(),
+                )
+            })
+        }
+
         #[instrument(skip_all)]
-        async fn analyze_thread_root(
+        async fn update_threads(
             &mut self,
-            event: &Event,
-            is_live_sync: bool,
+            new_events_by_thread: BTreeMap<OwnedEventId, Vec<Event>>,
+            is_sync: bool,
         ) -> Result<(), EventCacheError> {
-            let Some(thread_root) = extract_thread_root(event.raw()) else {
-                // No thread root, carry on.
-                return Ok(());
-            };
+            for (thread_root, new_events) in new_events_by_thread {
+                let thread_cache = self.get_or_reload_thread(thread_root.clone());
 
-            // Add a thread summary to the event which has the thread root, if we knew about
-            // it.
-            let Some((location, mut target_event)) = self.find_event(&thread_root).await? else {
-                trace!("thread root event is missing from the linked chunk");
-                return Ok(());
-            };
+                // If we're not in sync mode, we're receiving events from a room pagination: as
+                // we don't know where they should be put in a thread linked
+                // chunk, we don't try to be smart and include them. That's for
+                // the best.
+                if is_sync {
+                    thread_cache.add_live_events(new_events);
+                }
 
-            // Read the latest number of thread replies from the store.
-            //
-            // Implementation note: since this is based on the `m.relates_to` field, and
-            // that field can only be present on room messages, we don't have to
-            // worry about filtering out aggregation events (like
-            // reactions/edits/etc.). Pretty neat, huh?
-            let num_replies = {
-                let store_guard = &*self.store.lock().await?;
-                let related_thread_events = store_guard
-                    .find_event_relations(&self.room, &thread_root, Some(&[RelationType::Thread]))
-                    .await?;
-                related_thread_events.len().try_into().unwrap_or(u32::MAX)
-            };
+                // Add a thread summary to the (room) event which has the thread root, if we
+                // knew about it.
 
-            let prev_summary = target_event.thread_summary.summary();
-            let mut latest_reply =
-                prev_summary.as_ref().and_then(|summary| summary.latest_reply.clone());
+                let last_event_id = thread_cache.latest_event_id();
 
-            // If we're live-syncing, then the latest event is always the event we're
-            // currently processing. We're processing the sync events from oldest to newest,
-            // so a a single sync response containing multiple thread events
-            // will correctly override the latest event to the most recent one.
-            //
-            // If we're back-paginating, then we shouldn't update the latest event
-            // information if it's set. If it's not set, then we should update
-            // it to the last event in the batch. TODO(bnjbvr): the code is
-            // wrong here in this particular case, because a single pagination
-            // batch may include multiple events in the same thread, and they're
-            // processed from oldest to newest; so the first in-thread event seen in that
-            // batch will be marked as the latest reply, which is incorrect.
-            // This will be fixed Later™ by using a proper linked chunk per
-            // thread.
+                let Some((location, mut target_event)) = self.find_event(&thread_root).await?
+                else {
+                    trace!(%thread_root, "thread root event is missing from the linked chunk");
+                    continue;
+                };
 
-            if is_live_sync || latest_reply.is_none() {
-                latest_reply = event.event_id();
+                let prev_summary = target_event.thread_summary.summary();
+                let mut latest_reply =
+                    prev_summary.as_ref().and_then(|summary| summary.latest_reply.clone());
+
+                // Recompute the thread summary, if needs be.
+
+                // Read the latest number of thread replies from the store.
+                //
+                // Implementation note: since this is based on the `m.relates_to` field, and
+                // that field can only be present on room messages, we don't have to
+                // worry about filtering out aggregation events (like
+                // reactions/edits/etc.). Pretty neat, huh?
+                let num_replies = {
+                    let store_guard = &*self.store.lock().await?;
+                    let related_thread_events = store_guard
+                        .find_event_relations(
+                            &self.room,
+                            &thread_root,
+                            Some(&[RelationType::Thread]),
+                        )
+                        .await?;
+                    related_thread_events.len().try_into().unwrap_or(u32::MAX)
+                };
+
+                if let Some(last_event_id) = last_event_id {
+                    latest_reply = Some(last_event_id);
+                }
+
+                let new_summary = ThreadSummary { num_replies, latest_reply };
+
+                if prev_summary == Some(&new_summary) {
+                    trace!(%thread_root, "thread summary is already up-to-date");
+                    continue;
+                }
+
+                // Trigger an update to observers.
+                target_event.thread_summary = ThreadSummaryStatus::Some(new_summary);
+                self.replace_event_at(location, target_event).await?;
             }
-
-            let new_summary = ThreadSummary { num_replies, latest_reply };
-
-            if prev_summary == Some(&new_summary) {
-                trace!("thread summary is already up-to-date");
-                return Ok(());
-            }
-
-            // Cause an update to observers.
-            target_event.thread_summary = ThreadSummaryStatus::Some(new_summary);
-            self.replace_event_at(location, target_event).await?;
 
             Ok(())
         }
@@ -1438,14 +1617,14 @@ mod private {
 
             // It is a `m.room.redaction`! We can deserialize it entirely.
 
-            let Ok(AnySyncTimelineEvent::MessageLike(
-                ruma::events::AnySyncMessageLikeEvent::RoomRedaction(redaction),
-            )) = raw_event.deserialize()
+            let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(
+                redaction,
+            ))) = raw_event.deserialize()
             else {
                 return Ok(());
             };
 
-            let Some(event_id) = redaction.redacts(&self.room_version) else {
+            let Some(event_id) = redaction.redacts(&self.room_version_rules.redaction) else {
                 warn!("missing target event id from the redaction event");
                 return Ok(());
             };
@@ -1474,14 +1653,14 @@ mod private {
 
             if let Some(redacted_event) = apply_redaction(
                 target_event.raw(),
-                event.raw().cast_ref::<SyncRoomRedactionEvent>(),
-                &self.room_version,
+                event.raw().cast_ref_unchecked::<SyncRoomRedactionEvent>(),
+                &self.room_version_rules.redaction,
             ) {
                 // It's safe to cast `redacted_event` here:
                 // - either the event was an `AnyTimelineEvent` cast to `AnySyncTimelineEvent`
                 //   when calling .raw(), so it's still one under the hood.
                 // - or it wasn't, and it's a plain `AnySyncTimelineEvent` in this case.
-                target_event.replace_raw(redacted_event.cast());
+                target_event.replace_raw(redacted_event.cast_unchecked());
 
                 self.replace_event_at(location, target_event).await?;
             }
@@ -1560,6 +1739,40 @@ mod private {
                 || all_duplicates
             {
                 prev_batch = None;
+            }
+
+            if prev_batch.is_some() {
+                // Sad time: there's a gap, somewhere, in the timeline, and there's at least one
+                // non-duplicated event. We don't know which threads might have gappy, so we
+                // must invalidate them all :(
+                // TODO(bnjbvr): figure out a better catchup mechanism for threads.
+                let mut summaries_to_update = Vec::new();
+
+                for (thread_root, thread) in self.threads.iter_mut() {
+                    // Empty the thread's linked chunk.
+                    thread.clear();
+
+                    summaries_to_update.push(thread_root.clone());
+                }
+
+                // Now, update the summaries to indicate that we're not sure what the latest
+                // thread event is. The thread count can remain as is, as it might still be
+                // valid, and there's no good value to reset it to, anyways.
+                for thread_root in summaries_to_update {
+                    let Some((location, mut target_event)) = self.find_event(&thread_root).await?
+                    else {
+                        trace!(%thread_root, "thread root event is unknown, when updating thread summary after a gappy sync");
+                        continue;
+                    };
+
+                    if let Some(mut prev_summary) = target_event.thread_summary.summary().cloned() {
+                        prev_summary.latest_reply = None;
+
+                        target_event.thread_summary = ThreadSummaryStatus::Some(prev_summary);
+
+                        self.replace_event_at(location, target_event).await?;
+                    }
+                }
             }
 
             if all_duplicates {
@@ -1676,7 +1889,7 @@ mod private {
                 // The gap can be ditched too, as it won't be useful to backpaginate any
                 // further.
                 new_token = None;
-            };
+            }
 
             // `/messages` has been called with `dir=b` (backwards), so the events are in
             // the inverted order; reorder them.
@@ -1695,6 +1908,35 @@ mod private {
             let event_diffs = self.room_linked_chunk.updates_as_vector_diffs();
 
             Ok(Some((BackPaginationOutcome { events, reached_start }, event_diffs)))
+        }
+
+        /// Subscribe to thread for a given root event, and get a (maybe empty)
+        /// initially known list of events for that thread.
+        pub fn subscribe_to_thread(
+            &mut self,
+            root: OwnedEventId,
+        ) -> (Vec<Event>, Receiver<ThreadEventCacheUpdate>) {
+            self.get_or_reload_thread(root).subscribe()
+        }
+
+        /// Back paginate in the given thread.
+        ///
+        /// Will always start from the end, unless we previously paginated.
+        pub fn finish_thread_network_pagination(
+            &mut self,
+            root: OwnedEventId,
+            prev_token: Option<String>,
+            new_token: Option<String>,
+            events: Vec<Event>,
+        ) -> Option<BackPaginationOutcome> {
+            self.get_or_reload_thread(root).finish_network_pagination(prev_token, new_token, events)
+        }
+
+        pub fn load_more_thread_events_backwards(
+            &mut self,
+            root: OwnedEventId,
+        ) -> LoadMoreEventsBackwardsOutcome {
+            self.get_or_reload_thread(root).load_more_events_backwards()
         }
     }
 }
@@ -2010,10 +2252,13 @@ mod timed_tests {
 
         let event_cache_store = Arc::new(MemoryStore::new());
 
-        let client = MockClientBuilder::new("http://localhost".to_owned())
-            .store_config(
-                StoreConfig::new("hodlor".to_owned()).event_cache_store(event_cache_store.clone()),
-            )
+        let client = MockClientBuilder::new(None)
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new("hodlor".to_owned())
+                        .event_cache_store(event_cache_store.clone()),
+                )
+            })
             .build()
             .await;
 
@@ -2044,7 +2289,7 @@ mod timed_tests {
         // Just checking the generic update is correct.
         assert_matches!(
             generic_stream.recv().await,
-            Ok(RoomEventCacheGenericUpdate::TimelineUpdated { room_id: expected_room_id }) => {
+            Ok(RoomEventCacheGenericUpdate { room_id: expected_room_id }) => {
                 assert_eq!(expected_room_id, room_id);
             }
         );
@@ -2084,10 +2329,13 @@ mod timed_tests {
 
         let event_cache_store = Arc::new(MemoryStore::new());
 
-        let client = MockClientBuilder::new("http://localhost".to_owned())
-            .store_config(
-                StoreConfig::new("hodlor".to_owned()).event_cache_store(event_cache_store.clone()),
-            )
+        let client = MockClientBuilder::new(None)
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new("hodlor".to_owned())
+                        .event_cache_store(event_cache_store.clone()),
+                )
+            })
             .build()
             .await;
 
@@ -2120,7 +2368,7 @@ mod timed_tests {
         // Just checking the generic update is correct.
         assert_matches!(
             generic_stream.recv().await,
-            Ok(RoomEventCacheGenericUpdate::TimelineUpdated { room_id: expected_room_id }) => {
+            Ok(RoomEventCacheGenericUpdate { room_id: expected_room_id }) => {
                 assert_eq!(expected_room_id, room_id);
             }
         );
@@ -2223,10 +2471,13 @@ mod timed_tests {
             .await
             .unwrap();
 
-        let client = MockClientBuilder::new("http://localhost".to_owned())
-            .store_config(
-                StoreConfig::new("hodlor".to_owned()).event_cache_store(event_cache_store.clone()),
-            )
+        let client = MockClientBuilder::new(None)
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new("hodlor".to_owned())
+                        .event_cache_store(event_cache_store.clone()),
+                )
+            })
             .build()
             .await;
 
@@ -2241,6 +2492,7 @@ mod timed_tests {
         let (room_event_cache, _drop_handles) = room.event_cache().await.unwrap();
 
         let (items, mut stream) = room_event_cache.subscribe().await;
+        let mut generic_stream = event_cache.subscribe_to_room_generic_updates();
 
         // The rooms knows about all cached events.
         {
@@ -2282,6 +2534,12 @@ mod timed_tests {
         );
         assert_eq!(diffs.len(), 1);
         assert_let!(VectorDiff::Clear = &diffs[0]);
+
+        // … same with a generic update.
+        assert_let_timeout!(
+            Ok(RoomEventCacheGenericUpdate { room_id: received_room_id }) = generic_stream.recv()
+        );
+        assert_eq!(received_room_id, room_id);
 
         // Events individually are not forgotten by the event cache, after clearing a
         // room.
@@ -2361,10 +2619,13 @@ mod timed_tests {
             .await
             .unwrap();
 
-        let client = MockClientBuilder::new("http://localhost".to_owned())
-            .store_config(
-                StoreConfig::new("hodlor".to_owned()).event_cache_store(event_cache_store.clone()),
-            )
+        let client = MockClientBuilder::new(None)
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new("hodlor".to_owned())
+                        .event_cache_store(event_cache_store.clone()),
+                )
+            })
             .build()
             .await;
 
@@ -2385,7 +2646,7 @@ mod timed_tests {
         // triggered.
         assert_matches!(
             generic_stream.recv().await,
-            Ok(RoomEventCacheGenericUpdate::TimelineUpdated { room_id: expected_room_id }) => {
+            Ok(RoomEventCacheGenericUpdate { room_id: expected_room_id }) => {
                 assert_eq!(room_id, expected_room_id);
             }
         );
@@ -2418,7 +2679,7 @@ mod timed_tests {
         // A generic update is triggered too.
         assert_matches!(
             generic_stream.recv().await,
-            Ok(RoomEventCacheGenericUpdate::TimelineUpdated { room_id: expected_room_id }) => {
+            Ok(RoomEventCacheGenericUpdate { room_id: expected_room_id }) => {
                 assert_eq!(expected_room_id, room_id);
             }
         );
@@ -2482,10 +2743,13 @@ mod timed_tests {
             .await
             .unwrap();
 
-        let client = MockClientBuilder::new("http://localhost".to_owned())
-            .store_config(
-                StoreConfig::new("holder".to_owned()).event_cache_store(event_cache_store.clone()),
-            )
+        let client = MockClientBuilder::new(None)
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new("holder".to_owned())
+                        .event_cache_store(event_cache_store.clone()),
+                )
+            })
             .build()
             .await;
 
@@ -2516,7 +2780,7 @@ mod timed_tests {
     async fn test_no_useless_gaps() {
         let room_id = room_id!("!galette:saucisse.bzh");
 
-        let client = MockClientBuilder::new("http://localhost".to_owned()).build().await;
+        let client = MockClientBuilder::new(None).build().await;
 
         let event_cache = client.event_cache();
         event_cache.subscribe().unwrap();
@@ -2546,7 +2810,7 @@ mod timed_tests {
         // Just checking the generic update is correct.
         assert_matches!(
             generic_stream.recv().await,
-            Ok(RoomEventCacheGenericUpdate::TimelineUpdated { room_id: expected_room_id }) => {
+            Ok(RoomEventCacheGenericUpdate { room_id: expected_room_id }) => {
                 assert_eq!(expected_room_id, room_id);
             }
         );
@@ -2607,7 +2871,7 @@ mod timed_tests {
         // Just checking the generic update is correct.
         assert_matches!(
             generic_stream.recv().await,
-            Ok(RoomEventCacheGenericUpdate::TimelineUpdated { room_id: expected_room_id }) => {
+            Ok(RoomEventCacheGenericUpdate { room_id: expected_room_id }) => {
                 assert_eq!(expected_room_id, room_id);
             }
         );
@@ -2638,7 +2902,7 @@ mod timed_tests {
     async fn test_shrink_to_last_chunk() {
         let room_id = room_id!("!galette:saucisse.bzh");
 
-        let client = MockClientBuilder::new("http://localhost".to_owned()).build().await;
+        let client = MockClientBuilder::new(None).build().await;
 
         let f = EventFactory::new().room(room_id);
 
@@ -2693,6 +2957,8 @@ mod timed_tests {
         assert_eq!(events[0].event_id().as_deref(), Some(evid2));
         assert!(stream.is_empty());
 
+        let mut generic_stream = event_cache.subscribe_to_room_generic_updates();
+
         // Force loading the full linked chunk by back-paginating.
         let outcome = room_event_cache.pagination().run_backwards_once(20).await.unwrap();
         assert_eq!(outcome.events.len(), 1);
@@ -2709,6 +2975,12 @@ mod timed_tests {
         });
 
         assert!(stream.is_empty());
+
+        // Same for the generic update.
+        assert_let_timeout!(
+            Ok(RoomEventCacheGenericUpdate { room_id: received_room_id }) = generic_stream.recv()
+        );
+        assert_eq!(received_room_id, room_id);
 
         // Shrink the linked chunk to the last chunk.
         let diffs = room_event_cache
@@ -2730,6 +3002,9 @@ mod timed_tests {
 
         assert!(stream.is_empty());
 
+        // No generic update is sent in this case.
+        assert!(generic_stream.is_empty());
+
         // When reading the events, we do get only the last one.
         let events = room_event_cache.events().await;
         assert_eq!(events.len(), 1);
@@ -2747,7 +3022,7 @@ mod timed_tests {
     async fn test_room_ordering() {
         let room_id = room_id!("!galette:saucisse.bzh");
 
-        let client = MockClientBuilder::new("http://localhost".to_owned()).build().await;
+        let client = MockClientBuilder::new(None).build().await;
 
         let f = EventFactory::new().room(room_id).sender(*ALICE);
 
@@ -2882,7 +3157,7 @@ mod timed_tests {
     async fn test_auto_shrink_after_all_subscribers_are_gone() {
         let room_id = room_id!("!galette:saucisse.bzh");
 
-        let client = MockClientBuilder::new("http://localhost".to_owned()).build().await;
+        let client = MockClientBuilder::new(None).build().await;
 
         let f = EventFactory::new().room(room_id);
 
@@ -2990,10 +3265,10 @@ mod timed_tests {
     }
 
     #[async_test]
-    async fn test_rfind_event_in_memory_by() {
+    async fn test_rfind_map_event_in_memory_by() {
         let user_id = user_id!("@mnt_io:matrix.org");
         let room_id = room_id!("!raclette:patate.ch");
-        let client = MockClientBuilder::new("http://localhost".to_owned()).build().await;
+        let client = MockClientBuilder::new(None).build().await;
 
         let event_factory = EventFactory::new().room(room_id);
 
@@ -3053,12 +3328,12 @@ mod timed_tests {
         // Look for an event from `BOB`: it must be `event_0`.
         assert_matches!(
             room_event_cache
-                .rfind_event_in_memory_by(|event| {
-                    event.raw().get_field::<OwnedUserId>("sender").unwrap().as_deref() == Some(*BOB)
+                .rfind_map_event_in_memory_by(|event| {
+                    (event.raw().get_field::<OwnedUserId>("sender").unwrap().as_deref() == Some(*BOB)).then(|| event.event_id())
                 })
                 .await,
-            Some(event) => {
-                assert_eq!(event.event_id().as_deref(), Some(event_id_0));
+            Some(event_id) => {
+                assert_eq!(event_id.as_deref(), Some(event_id_0));
             }
         );
 
@@ -3066,24 +3341,26 @@ mod timed_tests {
         // because events are looked for in reverse order.
         assert_matches!(
             room_event_cache
-                .rfind_event_in_memory_by(|event| {
-                    event.raw().get_field::<OwnedUserId>("sender").unwrap().as_deref() == Some(*ALICE)
+                .rfind_map_event_in_memory_by(|event| {
+                    (event.raw().get_field::<OwnedUserId>("sender").unwrap().as_deref() == Some(*ALICE)).then(|| event.event_id())
                 })
                 .await,
-            Some(event) => {
-                assert_eq!(event.event_id().as_deref(), Some(event_id_2));
+            Some(event_id) => {
+                assert_eq!(event_id.as_deref(), Some(event_id_2));
             }
         );
 
         // Look for an event that is inside the storage, but not loaded.
         assert!(room_event_cache
-            .rfind_event_in_memory_by(|event| {
-                event.raw().get_field::<OwnedUserId>("sender").unwrap().as_deref() == Some(user_id)
+            .rfind_map_event_in_memory_by(|event| {
+                (event.raw().get_field::<OwnedUserId>("sender").unwrap().as_deref()
+                    == Some(user_id))
+                .then(|| event.event_id())
             })
             .await
             .is_none());
 
         // Look for an event that doesn't exist.
-        assert!(room_event_cache.rfind_event_in_memory_by(|_| false).await.is_none());
+        assert!(room_event_cache.rfind_map_event_in_memory_by(|_| None::<()>).await.is_none());
     }
 }

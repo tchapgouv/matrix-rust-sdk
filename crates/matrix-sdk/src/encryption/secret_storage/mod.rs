@@ -153,7 +153,8 @@ pub enum DecryptionError {
 
 /// A high-level API to manage secret storage.
 ///
-/// To get this, use [`Client::encryption()::secret_storage()`].
+/// To get this, use
+/// [`client.encryption().secret_storage()`](super::Encryption::secret_storage).
 #[derive(Debug)]
 pub struct SecretStorage {
     pub(super) client: Client,
@@ -192,8 +193,7 @@ impl SecretStorage {
         let maybe_default_key_id = self.fetch_default_key_id().await?;
 
         if let Some(default_key_id) = maybe_default_key_id {
-            let default_key_id =
-                default_key_id.deserialize_as::<SecretStorageDefaultKeyEventContent>()?;
+            let default_key_id = default_key_id.deserialize()?;
 
             let event_type =
                 GlobalAccountDataEventType::SecretStorageKey(default_key_id.key_id.to_owned());
@@ -273,7 +273,7 @@ impl SecretStorage {
         if let Some(content) = self.fetch_default_key_id().await? {
             // Since we can't delete account data events, we're going to treat
             // deserialization failures as secret storage being disabled.
-            Ok(content.deserialize_as::<SecretStorageDefaultKeyEventContent>().is_ok())
+            Ok(content.deserialize().is_ok())
         } else {
             // No account data event found, must be disabled.
             Ok(false)
@@ -284,12 +284,9 @@ impl SecretStorage {
     pub async fn fetch_default_key_id(
         &self,
     ) -> crate::Result<Option<Raw<SecretStorageDefaultKeyEventContent>>> {
-        let maybe_default_key_id = self
-            .client
+        self.client
             .account()
-            .fetch_account_data(GlobalAccountDataEventType::SecretStorageDefaultKey)
-            .await?;
-
-        Ok(maybe_default_key_id.map(|event| event.cast()))
+            .fetch_account_data_static::<SecretStorageDefaultKeyEventContent>()
+            .await
     }
 }

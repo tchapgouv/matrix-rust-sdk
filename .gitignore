@@ -5,6 +5,7 @@ master.zip
 emsdk-*
 .idea/
 .env
+.envrc
 .build
 .swiftpm
 /Package.swift

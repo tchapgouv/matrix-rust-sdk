@@ -44,11 +44,12 @@ use matrix_sdk_common::ring_buffer::RingBuffer;
 pub use members::{RoomMember, RoomMembersUpdate, RoomMemberships};
 pub(crate) use room_info::SyncInfo;
 pub use room_info::{
-    apply_redaction, BaseRoomInfo, RoomInfo, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons,
+    BaseRoomInfo, InviteAcceptanceDetails, RoomInfo, RoomInfoNotableUpdate,
+    RoomInfoNotableUpdateReasons, apply_redaction,
 };
-#[cfg(feature = "e2e-encryption")]
-use ruma::{events::AnySyncTimelineEvent, serde::Raw};
 use ruma::{
+    EventId, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedUserId, RoomId,
+    RoomVersionId, UserId,
     events::{
         direct::OwnedDirectUserIdentifier,
         receipt::{Receipt, ReceiptThread, ReceiptType},
@@ -57,12 +58,13 @@ use ruma::{
             guest_access::GuestAccess,
             history_visibility::HistoryVisibility,
             join_rules::JoinRule,
-            power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent},
+            power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent, RoomPowerLevelsSource},
         },
     },
     room::RoomType,
-    EventId, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedUserId, RoomId, UserId,
 };
+#[cfg(feature = "e2e-encryption")]
+use ruma::{events::AnySyncTimelineEvent, serde::Raw};
 use serde::{Deserialize, Serialize};
 pub use state::{RoomState, RoomStateFilter};
 pub(crate) use tags::RoomNotableTags;
@@ -71,12 +73,12 @@ pub use tombstone::{PredecessorRoom, SuccessorRoom};
 use tracing::{info, instrument, warn};
 
 use crate::{
+    Error, MinimalStateEvent,
     deserialized_responses::MemberEvent,
     notification_settings::RoomNotificationMode,
     read_receipts::RoomReadReceipts,
     store::{DynStateStore, Result as StoreResult, StateStoreExt},
     sync::UnreadNotificationsCount,
-    Error, MinimalStateEvent,
 };
 
 /// The underlying room data structure collecting state for joined, left and
@@ -154,9 +156,9 @@ impl Room {
         &self.room_id
     }
 
-    /// Get a copy of the room creator.
-    pub fn creator(&self) -> Option<OwnedUserId> {
-        self.inner.read().creator().map(ToOwned::to_owned)
+    /// Get a copy of the room creators.
+    pub fn creators(&self) -> Option<Vec<OwnedUserId>> {
+        self.inner.read().creators()
     }
 
     /// Get our own user id.
@@ -361,13 +363,32 @@ impl Room {
 
     /// Get the current power levels of this room.
     pub async fn power_levels(&self) -> Result<RoomPowerLevels, Error> {
-        Ok(self
+        let power_levels_content = self
             .store
             .get_state_event_static::<RoomPowerLevelsEventContent>(self.room_id())
             .await?
             .ok_or(Error::InsufficientData)?
-            .deserialize()?
-            .power_levels())
+            .deserialize()?;
+        let creators = self.creators().ok_or(Error::InsufficientData)?;
+        let rules = self.inner.read().room_version_rules_or_default();
+
+        Ok(power_levels_content.power_levels(&rules.authorization, creators))
+    }
+
+    /// Get the current power levels of this room, or a sensible default if they
+    /// are not known.
+    pub async fn power_levels_or_default(&self) -> RoomPowerLevels {
+        if let Ok(power_levels) = self.power_levels().await {
+            return power_levels;
+        }
+
+        // As a fallback, create the default power levels of a room.
+        let rules = self.inner.read().room_version_rules_or_default();
+        RoomPowerLevels::new(
+            RoomPowerLevelsSource::None,
+            &rules.authorization,
+            self.creators().into_iter().flatten(),
+        )
     }
 
     /// Get the `m.room.name` of this room.
@@ -450,6 +471,11 @@ impl Room {
         self.inner.read().base_info.is_marked_unread
     }
 
+    /// Returns the [`RoomVersionId`] of the room, if known.
+    pub fn version(&self) -> Option<RoomVersionId> {
+        self.inner.read().room_version().cloned()
+    }
+
     /// Returns the recency stamp of the room.
     ///
     /// Please read `RoomInfo::recency_stamp` to learn more.
@@ -457,9 +483,20 @@ impl Room {
         self.inner.read().recency_stamp
     }
 
+    /// Returns the details about an invite to this room if the invite has been
+    /// accepted by this specific client.
+    ///
+    /// # Returns
+    /// - `Some` if an invite has been accepted by this specific client.
+    /// - `None` if we didn't join this room using an invite or the invite
+    ///   wasn't accepted by this client.
+    pub fn invite_acceptance_details(&self) -> Option<InviteAcceptanceDetails> {
+        self.inner.read().invite_acceptance_details.clone()
+    }
+
     /// Get a `Stream` of loaded pinned events for this room.
     /// If no pinned events are found a single empty `Vec` will be returned.
-    pub fn pinned_event_ids_stream(&self) -> impl Stream<Item = Vec<OwnedEventId>> {
+    pub fn pinned_event_ids_stream(&self) -> impl Stream<Item = Vec<OwnedEventId>> + use<> {
         self.inner
             .subscribe()
             .map(|i| i.base_info.pinned_events.map(|c| c.pinned).unwrap_or_default())

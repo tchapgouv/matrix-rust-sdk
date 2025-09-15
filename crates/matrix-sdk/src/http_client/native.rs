@@ -76,15 +76,19 @@ impl HttpClient {
             async {
                 let num_attempt = retry_count.fetch_add(1, Ordering::SeqCst);
                 debug!(num_attempt, "Sending request");
+                let before = ruma::time::Instant::now();
 
                 let response =
                     send_request(&self.inner, &request, config.timeout, send_progress).await?;
+
+                let request_duration = ruma::time::Instant::now().saturating_duration_since(before);
 
                 let status_code = response.status();
                 let response_size = ByteSize(response.body().len().try_into().unwrap_or(u64::MAX));
                 tracing::Span::current()
                     .record("status", status_code.as_u16())
-                    .record("response_size", response_size.display().si_short().to_string());
+                    .record("response_size", response_size.display().si_short().to_string())
+                    .record("request_duration", tracing::field::debug(request_duration));
 
                 // Record interesting headers. If you add more headers, ensure they're not
                 // confidential.
@@ -145,7 +149,8 @@ pub(crate) struct HttpSettings {
     pub(crate) disable_ssl_verification: bool,
     pub(crate) proxy: Option<String>,
     pub(crate) user_agent: Option<String>,
-    pub(crate) timeout: Duration,
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) read_timeout: Option<Duration>,
     pub(crate) additional_root_certificates: Vec<Certificate>,
     pub(crate) disable_built_in_root_certificates: bool,
 }
@@ -157,7 +162,8 @@ impl Default for HttpSettings {
             disable_ssl_verification: false,
             proxy: None,
             user_agent: None,
-            timeout: DEFAULT_REQUEST_TIMEOUT,
+            timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            read_timeout: None,
             additional_root_certificates: Default::default(),
             disable_built_in_root_certificates: false,
         }
@@ -171,10 +177,17 @@ impl HttpSettings {
         let user_agent = self.user_agent.clone().unwrap_or_else(|| "matrix-rust-sdk".to_owned());
         let mut http_client = reqwest::Client::builder()
             .user_agent(user_agent)
-            .timeout(self.timeout)
             // As recommended by BCP 195.
             // See: https://datatracker.ietf.org/doc/bcp195/
             .min_tls_version(tls::Version::TLS_1_2);
+
+        if let Some(timeout) = self.timeout {
+            http_client = http_client.timeout(timeout);
+        }
+
+        if let Some(read_timeout) = self.read_timeout {
+            http_client = http_client.read_timeout(read_timeout);
+        }
 
         if self.disable_ssl_verification {
             warn!("SSL verification disabled in the HTTP client!");
@@ -209,7 +222,7 @@ impl HttpSettings {
 pub(super) async fn send_request(
     client: &reqwest::Client,
     request: &http::Request<Bytes>,
-    timeout: Duration,
+    timeout: Option<Duration>,
     send_progress: SharedObservable<TransmissionProgress>,
 ) -> Result<http::Response<Bytes>, HttpError> {
     use std::convert::Infallible;
@@ -247,7 +260,7 @@ pub(super) async fn send_request(
             reqwest::Request::try_from(request)?
         };
 
-        *request.timeout_mut() = Some(timeout);
+        *request.timeout_mut() = timeout;
         request
     };
 

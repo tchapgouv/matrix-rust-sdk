@@ -89,7 +89,7 @@ impl Status {
                 let status_message = status_message.clone();
 
                 async move {
-                    // Clear the status message in 4 seconds.
+                    // Clear the status message after the standard duration.
                     sleep(MESSAGE_DURATION).await;
                     status_message.lock().take();
                 }
@@ -129,6 +129,8 @@ impl StatefulWidget for &mut Status {
             match global_mode {
                 GlobalMode::Help => "Press q to exit the help screen",
                 GlobalMode::Settings { .. } => "Press ESC to exit the settings screen",
+                GlobalMode::CreateRoom { .. } => "Press ESC to exit the create room screen",
+                GlobalMode::Searching { .. } => "Press ESC to exit the search screen",
                 GlobalMode::Default => "Press F1 to show the help screen",
                 GlobalMode::Exiting { .. } => "",
             }

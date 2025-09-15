@@ -14,19 +14,22 @@
 
 use std::sync::Arc;
 
-use matrix_sdk::{executor::spawn, Room};
+use matrix_sdk::{Room, executor::spawn};
 use matrix_sdk_base::{SendOutsideWasm, SyncOutsideWasm};
-use ruma::{events::AnySyncTimelineEvent, RoomVersionId};
-use tracing::{info_span, Instrument, Span};
+use ruma::{events::AnySyncTimelineEvent, room_version_rules::RoomVersionRules};
+use tracing::{Instrument, Span, info_span};
 
 use super::{
-    controller::{TimelineController, TimelineSettings},
     DateDividerMode, Error, Timeline, TimelineDropHandle, TimelineFocus,
+    controller::{TimelineController, TimelineSettings},
 };
 use crate::{
     timeline::{
         controller::spawn_crypto_tasks,
-        tasks::{pinned_events_task, room_event_cache_updates_task, room_send_queue_update_task},
+        tasks::{
+            pinned_events_task, room_event_cache_updates_task, room_send_queue_update_task,
+            thread_updates_task,
+        },
     },
     unable_to_decrypt_hook::UtdHookManager,
 };
@@ -129,7 +132,7 @@ impl TimelineBuilder {
     ///   they couldn't be decrypted when the appropriate room key arrives).
     pub fn event_filter<F>(mut self, filter: F) -> Self
     where
-        F: Fn(&AnySyncTimelineEvent, &RoomVersionId) -> bool
+        F: Fn(&AnySyncTimelineEvent, &RoomVersionRules) -> bool
             + SendOutsideWasm
             + SyncOutsideWasm
             + 'static,
@@ -214,6 +217,35 @@ impl TimelineBuilder {
             .instrument(span)
         });
 
+        let thread_update_join_handle = if let Some(root) = controller.thread_root() {
+            Some({
+                let span = info_span!(
+                    parent: Span::none(),
+                    "thread_live_update_handler",
+                    room_id = ?room.room_id(),
+                    focus = focus.debug_string(),
+                    prefix = internal_id_prefix
+                );
+                span.follows_from(Span::current());
+
+                // Note: must be done here *before* spawning the task, to avoid race conditions
+                // with event cache updates happening in the background.
+                let (_events, receiver) = room_event_cache.subscribe_to_thread(root.clone()).await;
+
+                spawn(
+                    thread_updates_task(
+                        receiver,
+                        room_event_cache.clone(),
+                        controller.clone(),
+                        root,
+                    )
+                    .instrument(span),
+                )
+            })
+        } else {
+            None
+        };
+
         let local_echo_listener_handle = {
             let timeline_controller = controller.clone();
             let (local_echoes, send_queue_stream) = room.send_queue().subscribe().await?;
@@ -245,6 +277,7 @@ impl TimelineBuilder {
             drop_handle: Arc::new(TimelineDropHandle {
                 _crypto_drop_handles: crypto_drop_handles,
                 room_update_join_handle,
+                thread_update_join_handle,
                 pinned_events_join_handle,
                 local_echo_listener_handle,
                 _event_cache_drop_handle: event_cache_drop,

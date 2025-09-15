@@ -2,27 +2,27 @@ use std::{ops::Not, sync::Arc};
 
 use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
-use futures_util::{pin_mut, FutureExt, StreamExt};
+use futures_util::{FutureExt, StreamExt, pin_mut};
 use matrix_sdk::{
+    Client, RoomDisplayName,
     config::RequestConfig,
     test_utils::{
         logged_in_client_with_server,
         mocks::{MatrixMockServer, RoomMessagesResponseTemplate},
         set_client_session, test_client_builder,
     },
-    Client, RoomDisplayName,
 };
 use matrix_sdk_base::sync::UnreadNotificationsCount;
 use matrix_sdk_test::{
-    async_test, event_factory::EventFactory, mocks::mock_encryption_state, ALICE,
+    ALICE, async_test, event_factory::EventFactory, mocks::mock_encryption_state,
 };
 use matrix_sdk_ui::{
+    RoomListService,
     room_list_service::{
+        ALL_ROOMS_LIST_NAME as ALL_ROOMS, Error, RoomListLoadingState, State, SyncIndicator,
         filters::{new_filter_fuzzy_match_room_name, new_filter_non_left, new_filter_none},
-        Error, RoomListLoadingState, State, SyncIndicator, ALL_ROOMS_LIST_NAME as ALL_ROOMS,
     },
     timeline::{RoomExt as _, TimelineItemKind, VirtualTimelineItem},
-    RoomListService,
 };
 use ruma::{
     api::client::room::create_room::v3::Request as CreateRoomRequest,
@@ -36,8 +36,8 @@ use stream_assert::{assert_next_matches, assert_pending};
 use tempfile::TempDir;
 use tokio::{spawn, sync::Barrier, task::yield_now, time::sleep};
 use wiremock::{
-    matchers::{header, method, path},
     Mock, MockServer, ResponseTemplate,
+    matchers::{header, method, path},
 };
 
 use crate::timeline::sliding_sync::{assert_timeline_stream, timeline_event};
@@ -369,10 +369,10 @@ async fn test_sync_all_states() -> Result<(), Error> {
                         ["m.room.create", ""],
                         ["m.room.history_visibility", ""],
                         ["io.element.functional_members", ""],
+                        ["m.space.parent", "*"],
+                        ["m.space.child", "*"],
                     ],
-                    "filters": {
-                        "not_room_types": ["m.space"],
-                    },
+                    "filters": {},
                     "timeline_limit": 1,
                 },
             },
@@ -2247,7 +2247,7 @@ async fn test_room_subscription() -> Result<(), Error> {
 
     // Subscribe.
 
-    room_list.subscribe_to_rooms(&[room_id_1]);
+    room_list.subscribe_to_rooms(&[room_id_1]).await;
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -2275,6 +2275,8 @@ async fn test_room_subscription() -> Result<(), Error> {
                         ["m.room.create", ""],
                         ["m.room.history_visibility", ""],
                         ["io.element.functional_members", ""],
+                        ["m.space.parent", "*"],
+                        ["m.space.child", "*"],
                         ["m.room.pinned_events", ""],
                     ],
                     "timeline_limit": 20,
@@ -2290,7 +2292,7 @@ async fn test_room_subscription() -> Result<(), Error> {
 
     // Subscribe to another room.
 
-    room_list.subscribe_to_rooms(&[room_id_2]);
+    room_list.subscribe_to_rooms(&[room_id_2]).await;
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]
@@ -2318,6 +2320,8 @@ async fn test_room_subscription() -> Result<(), Error> {
                         ["m.room.create", ""],
                         ["m.room.history_visibility", ""],
                         ["io.element.functional_members", ""],
+                        ["m.space.parent", "*"],
+                        ["m.space.child", "*"],
                         ["m.room.pinned_events", ""],
                     ],
                     "timeline_limit": 20,
@@ -2333,7 +2337,7 @@ async fn test_room_subscription() -> Result<(), Error> {
 
     // Subscribe to an already subscribed room. Nothing happens.
 
-    room_list.subscribe_to_rooms(&[room_id_1]);
+    room_list.subscribe_to_rooms(&[room_id_1]).await;
 
     sync_then_assert_request_and_fake_response! {
         [server, room_list, sync]

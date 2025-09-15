@@ -15,11 +15,12 @@
 // limitations under the License.
 
 use std::{
-    collections::{btree_map, BTreeMap},
+    collections::{btree_map, BTreeMap, BTreeSet},
     fmt::{self, Debug},
     future::{ready, Future},
     pin::Pin,
     sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak},
+    time::Duration,
 };
 
 use caches::ClientCaches;
@@ -34,7 +35,7 @@ use matrix_sdk_base::{
     store::{DynStateStore, RoomLoadSettings, ServerInfo, WellKnownResponse},
     sync::{Notification, RoomUpdates},
     BaseClient, RoomInfoNotableUpdate, RoomState, RoomStateFilter, SendOutsideWasm, SessionMeta,
-    StateStoreDataKey, StateStoreDataValue, SyncOutsideWasm,
+    StateStoreDataKey, StateStoreDataValue, SyncOutsideWasm, ThreadingSupport,
 };
 use matrix_sdk_base_bwi::room_alias::BWIRoomAlias;
 use matrix_sdk_bwi::content_scanner::BWIContentScanner;
@@ -51,26 +52,29 @@ use ruma::{
         client::{
             account::whoami,
             alias::{create_alias, delete_alias, get_alias},
+            authenticated_media,
             device::{delete_devices, get_devices, update_device},
             directory::{get_public_rooms, get_public_rooms_filtered},
             discovery::{
-                discover_homeserver,
-                discover_homeserver::RtcFocusInfo,
-                get_capabilities::{self, Capabilities},
+                discover_homeserver::{self, RtcFocusInfo},
+                get_capabilities::{self, v3::Capabilities},
                 get_supported_versions,
             },
             error::ErrorKind,
             filter::{create_filter::v3::Request as FilterUploadRequest, FilterDefinition},
             knock::knock_room,
+            media,
             membership::{join_room_by_id, join_room_by_id_or_alias},
             room::create_room,
             session::login::v3::DiscoveryInfo,
             sync::sync_events,
+            threads::get_thread_subscriptions_changes,
             uiaa,
             user_directory::search_users,
         },
         error::FromHttpResponseError,
-        MatrixVersion, OutgoingRequest,
+        federation::discovery::get_server_version,
+        FeatureFlag, MatrixVersion, OutgoingRequest, SupportedVersions,
     },
     assign,
     push::Ruleset,
@@ -89,7 +93,7 @@ use crate::{
         matrix::MatrixAuth, oauth::OAuth, AuthCtx, AuthData, ReloadSessionCallback,
         SaveSessionCallback,
     },
-    config::RequestConfig,
+    config::{RequestConfig, SyncToken},
     deduplicating_handler::DeduplicatingHandler,
     error::HttpResult,
     event_cache::EventCache,
@@ -118,8 +122,12 @@ use crate::{
 mod builder;
 pub(crate) mod caches;
 pub(crate) mod futures;
+#[cfg(feature = "experimental-search")]
+pub(crate) mod search;
 
 pub use self::builder::{sanitize_server_name, ClientBuildError, ClientBuilder};
+#[cfg(feature = "experimental-search")]
+use crate::client::search::SearchIndex;
 
 #[cfg(not(target_family = "wasm"))]
 type NotificationHandlerFut = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -156,6 +164,16 @@ pub enum SessionChange {
     },
     /// The session's tokens have been refreshed.
     TokensRefreshed,
+}
+
+/// Information about the server vendor obtained from the federation API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ServerVendorInfo {
+    /// The server name.
+    pub server_name: String,
+    /// The server version.
+    pub version: String,
 }
 
 /// An async/await enabled Matrix client.
@@ -360,6 +378,10 @@ pub(crate) struct ClientInner {
     ///
     /// [`LatestEvent`]: crate::latest_event::LatestEvent
     latest_events: OnceCell<LatestEvents>,
+
+    #[cfg(feature = "experimental-search")]
+    /// Handler for [`RoomIndex`]'s of each room
+    search_index: SearchIndex,
 }
 
 impl ClientInner {
@@ -387,6 +409,7 @@ impl ClientInner {
         #[cfg(feature = "e2e-encryption")] encryption_settings: EncryptionSettings,
         #[cfg(feature = "e2e-encryption")] enable_share_history_on_invite: bool,
         cross_process_store_locks_holder_name: String,
+        #[cfg(feature = "experimental-search")] search_index_handler: SearchIndex,
     ) -> Arc<Self> {
         let caches = ClientCaches {
             server_info: server_info.into(),
@@ -423,13 +446,15 @@ impl ClientInner {
             #[cfg(feature = "e2e-encryption")]
             enable_share_history_on_invite,
             server_max_upload_size: Mutex::new(OnceCell::new()),
+            #[cfg(feature = "experimental-search")]
+            search_index: search_index_handler,
         };
 
         #[allow(clippy::let_and_return)]
         let client = Arc::new(client);
 
         #[cfg(feature = "e2e-encryption")]
-        client.e2ee.initialize_room_key_tasks(&client);
+        client.e2ee.initialize_tasks(&client);
 
         let _ = client
             .event_cache
@@ -542,6 +567,38 @@ impl Client {
         Ok(res.capabilities)
     }
 
+    /// Get the server vendor information from the federation API.
+    ///
+    /// This method calls the `/_matrix/federation/v1/version` endpoint to get
+    /// both the server's software name and version.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use matrix_sdk::Client;
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://example.com")?;
+    /// let client = Client::new(homeserver).await?;
+    ///
+    /// let server_info = client.server_vendor_info().await?;
+    /// println!(
+    ///     "Server: {}, Version: {}",
+    ///     server_info.server_name, server_info.version
+    /// );
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn server_vendor_info(&self) -> HttpResult<ServerVendorInfo> {
+        let res = self.send(get_server_version::v1::Request::new()).await?;
+
+        // Extract server info, using defaults if fields are missing.
+        let server = res.server.unwrap_or_default();
+        let server_name_str = server.name.unwrap_or_else(|| "unknown".to_owned());
+        let version = server.version.unwrap_or_else(|| "unknown".to_owned());
+
+        Ok(ServerVendorInfo { server_name: server_name_str, version })
+    }
+
     /// Get a copy of the default request config.
     ///
     /// The default request config is what's used when sending requests if no
@@ -601,8 +658,7 @@ impl Client {
     }
 
     /// Returns a receiver that gets events for each room info update. To watch
-    /// for new events, use `receiver.resubscribe()`. Each event contains the
-    /// room and a boolean whether this event should trigger a room list update.
+    /// for new events, use `receiver.resubscribe()`.
     pub fn room_info_notable_update_receiver(&self) -> broadcast::Receiver<RoomInfoNotableUpdate> {
         self.base_client().room_info_notable_update_receiver()
     }
@@ -1186,28 +1242,25 @@ impl Client {
 
     /// Returns the joined rooms this client knows about.
     pub fn joined_rooms(&self) -> Vec<Room> {
-        self.base_client()
-            .rooms_filtered(RoomStateFilter::JOINED)
-            .into_iter()
-            .map(|room| Room::new(self.clone(), room))
-            .collect()
+        self.rooms_filtered(RoomStateFilter::JOINED)
     }
 
     /// Returns the invited rooms this client knows about.
     pub fn invited_rooms(&self) -> Vec<Room> {
-        self.base_client()
-            .rooms_filtered(RoomStateFilter::INVITED)
-            .into_iter()
-            .map(|room| Room::new(self.clone(), room))
-            .collect()
+        self.rooms_filtered(RoomStateFilter::INVITED)
     }
 
     /// Returns the left rooms this client knows about.
     pub fn left_rooms(&self) -> Vec<Room> {
+        self.rooms_filtered(RoomStateFilter::LEFT)
+    }
+
+    /// Returns the joined space rooms this client knows about.
+    pub fn joined_space_rooms(&self) -> Vec<Room> {
         self.base_client()
-            .rooms_filtered(RoomStateFilter::LEFT)
+            .rooms_filtered(RoomStateFilter::JOINED)
             .into_iter()
-            .map(|room| Room::new(self.clone(), room))
+            .flat_map(|room| room.is_space().then_some(Room::new(self.clone(), room)))
             .collect()
     }
 
@@ -1502,7 +1555,16 @@ impl Client {
             false
         };
 
-        let base_room = self.base_client().room_joined(room_id).await?;
+        let base_room = self
+            .base_client()
+            .room_joined(
+                room_id,
+                pre_join_room_info
+                    .as_ref()
+                    .and_then(|info| info.inviter.as_ref())
+                    .map(|i| i.user_id().to_owned()),
+            )
+            .await?;
         let room = Room::new(self.clone(), base_room);
 
         if mark_as_dm {
@@ -1878,7 +1940,7 @@ impl Client {
                 config,
                 homeserver,
                 access_token.as_deref(),
-                &self.server_versions().await?,
+                &self.supported_versions().await?,
                 send_progress,
             )
             .await
@@ -1905,7 +1967,10 @@ impl Client {
                 request_config,
                 self.homeserver().to_string(),
                 None,
-                &[MatrixVersion::V1_0],
+                &SupportedVersions {
+                    versions: [MatrixVersion::V1_0].into(),
+                    features: Default::default(),
+                },
                 Default::default(),
             )
             .await?;
@@ -1932,7 +1997,10 @@ impl Client {
                 Some(RequestConfig::short_retry()),
                 server_url_string,
                 None,
-                &[MatrixVersion::V1_0],
+                &SupportedVersions {
+                    versions: [MatrixVersion::V1_0].into(),
+                    features: Default::default(),
+                },
                 Default::default(),
             )
             .await;
@@ -2013,18 +2081,49 @@ impl Client {
         let server_info = self.load_or_fetch_server_info().await?;
 
         // Fill both unstable features and server versions at once.
-        let mut versions = server_info.known_versions();
-        if versions.is_empty() {
-            versions.push(MatrixVersion::V1_0);
+        let mut supported = server_info.supported_versions();
+        if supported.versions.is_empty() {
+            supported.versions = [MatrixVersion::V1_0].into();
         }
 
-        guarded_server_info.server_versions = CachedValue::Cached(versions.into());
-        guarded_server_info.unstable_features = CachedValue::Cached(server_info.unstable_features);
+        guarded_server_info.supported_versions = CachedValue::Cached(supported);
         guarded_server_info.well_known = CachedValue::Cached(server_info.well_known);
 
         // SAFETY: all fields were set above, so (assuming the caller doesn't attempt to
         // fetch an optional property), the function will always return some.
         Ok(map(&guarded_server_info).unwrap_cached_value())
+    }
+
+    /// Get the Matrix versions and features supported by the homeserver by
+    /// fetching them from the server or the cache.
+    ///
+    /// This is equivalent to calling both [`Client::server_versions()`] and
+    /// [`Client::unstable_features()`]. To always fetch the result from the
+    /// homeserver, you can call [`Client::fetch_server_versions()`] instead,
+    /// and then `.as_supported_versions()` on the response.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ruma::api::{FeatureFlag, MatrixVersion};
+    /// # use matrix_sdk::{Client, config::SyncSettings};
+    /// # use url::Url;
+    /// # async {
+    /// # let homeserver = Url::parse("http://localhost:8080")?;
+    /// # let mut client = Client::new(homeserver).await?;
+    ///
+    /// let supported = client.supported_versions().await?;
+    /// let supports_1_1 = supported.versions.contains(&MatrixVersion::V1_1);
+    /// println!("The homeserver supports Matrix 1.1: {supports_1_1:?}");
+    ///
+    /// let msc_x_feature = FeatureFlag::from("msc_x");
+    /// let supports_msc_x = supported.features.contains(&msc_x_feature);
+    /// println!("The homeserver supports msc X: {supports_msc_x:?}");
+    /// # anyhow::Ok(()) };
+    /// ```
+    pub async fn supported_versions(&self) -> HttpResult<SupportedVersions> {
+        self.get_or_load_and_cache_server_info(|server_info| server_info.supported_versions.clone())
+            .await
     }
 
     /// Get the Matrix versions supported by the homeserver by fetching them
@@ -2045,9 +2144,11 @@ impl Client {
     /// println!("The homeserver supports Matrix 1.1: {supports_1_1:?}");
     /// # anyhow::Ok(()) };
     /// ```
-    pub async fn server_versions(&self) -> HttpResult<Box<[MatrixVersion]>> {
-        self.get_or_load_and_cache_server_info(|server_info| server_info.server_versions.clone())
-            .await
+    pub async fn server_versions(&self) -> HttpResult<BTreeSet<MatrixVersion>> {
+        self.get_or_load_and_cache_server_info(|server_info| {
+            server_info.supported_versions.as_ref().map(|supported| supported.versions.clone())
+        })
+        .await
     }
 
     /// Get the unstable features supported by the homeserver by fetching them
@@ -2056,20 +2157,24 @@ impl Client {
     /// # Examples
     ///
     /// ```no_run
+    /// use matrix_sdk::ruma::api::FeatureFlag;
     /// # use matrix_sdk::{Client, config::SyncSettings};
     /// # use url::Url;
     /// # async {
     /// # let homeserver = Url::parse("http://localhost:8080")?;
     /// # let mut client = Client::new(homeserver).await?;
+    ///
+    /// let msc_x_feature = FeatureFlag::from("msc_x");
     /// let unstable_features = client.unstable_features().await?;
-    /// let supports_msc_x =
-    ///     unstable_features.get("msc_x").copied().unwrap_or(false);
+    /// let supports_msc_x = unstable_features.contains(&msc_x_feature);
     /// println!("The homeserver supports msc X: {supports_msc_x:?}");
     /// # anyhow::Ok(()) };
     /// ```
-    pub async fn unstable_features(&self) -> HttpResult<BTreeMap<String, bool>> {
-        self.get_or_load_and_cache_server_info(|server_info| server_info.unstable_features.clone())
-            .await
+    pub async fn unstable_features(&self) -> HttpResult<BTreeSet<FeatureFlag>> {
+        self.get_or_load_and_cache_server_info(|server_info| {
+            server_info.supported_versions.as_ref().map(|supported| supported.features.clone())
+        })
+        .await
     }
 
     /// Get information about the homeserver's advertised RTC foci by fetching
@@ -2108,8 +2213,7 @@ impl Client {
     pub async fn reset_server_info(&self) -> Result<()> {
         // Empty the in-memory caches.
         let mut guard = self.inner.caches.server_info.write().await;
-        guard.server_versions = CachedValue::NotSet;
-        guard.unstable_features = CachedValue::NotSet;
+        guard.supported_versions = CachedValue::NotSet;
 
         // Empty the store cache.
         Ok(self.state_store().remove_kv_data(StateStoreDataKey::ServerInfo).await?)
@@ -2130,7 +2234,7 @@ impl Client {
     /// # anyhow::Ok(()) };
     /// ```
     pub async fn can_homeserver_push_encrypted_event_to_device(&self) -> HttpResult<bool> {
-        Ok(self.unstable_features().await?.get("org.matrix.msc4028").copied().unwrap_or(false))
+        Ok(self.unstable_features().await?.contains(&FeatureFlag::from("org.matrix.msc4028")))
     }
 
     /// Get information of all our own devices.
@@ -2340,16 +2444,24 @@ impl Client {
             error!(error = ?e, "Error while sending outgoing E2EE requests");
         }
 
+        let token = match sync_settings.token {
+            SyncToken::Specific(token) => Some(token),
+            SyncToken::NoToken => None,
+            SyncToken::ReusePrevious => self.sync_token().await,
+        };
+
         let request = assign!(sync_events::v3::Request::new(), {
             filter: sync_settings.filter.map(|f| *f),
-            since: sync_settings.token,
+            since: token,
             full_state: sync_settings.full_state,
             set_presence: sync_settings.set_presence,
             timeout: sync_settings.timeout,
+            use_state_after: true,
         });
         let mut request_config = self.request_config();
         if let Some(timeout) = sync_settings.timeout {
-            request_config.timeout += timeout;
+            let base_timeout = request_config.timeout.unwrap_or(Duration::from_secs(30));
+            request_config.timeout = Some(base_timeout + timeout);
         }
 
         let response = self.send(request).with_request_config(request_config).await?;
@@ -2567,30 +2679,21 @@ impl Client {
     #[instrument(skip(self, callback))]
     pub async fn sync_with_result_callback<C>(
         &self,
-        mut sync_settings: crate::config::SyncSettings,
+        sync_settings: crate::config::SyncSettings,
         callback: impl Fn(Result<SyncResponse, Error>) -> C,
     ) -> Result<(), Error>
     where
         C: Future<Output = Result<LoopCtrl, Error>>,
     {
-        let mut last_sync_time: Option<Instant> = None;
+        let mut sync_stream = Box::pin(self.sync_stream(sync_settings).await);
 
-        if sync_settings.token.is_none() {
-            sync_settings.token = self.sync_token().await;
-        }
-
-        loop {
-            trace!("Syncing");
-            let result = self.sync_loop_helper(&mut sync_settings).await;
-
+        while let Some(result) = sync_stream.next().await {
             trace!("Running callback");
             if callback(result).await? == LoopCtrl::Break {
                 trace!("Callback told us to stop");
                 break;
             }
             trace!("Done running callback");
-
-            Client::delay_sync(&mut last_sync_time).await
         }
 
         Ok(())
@@ -2643,21 +2746,34 @@ impl Client {
         &self,
         mut sync_settings: crate::config::SyncSettings,
     ) -> impl Stream<Item = Result<SyncResponse>> + '_ {
+        let mut is_first_sync = true;
+        let mut timeout = None;
         let mut last_sync_time: Option<Instant> = None;
-
-        if sync_settings.token.is_none() {
-            sync_settings.token = self.sync_token().await;
-        }
 
         let parent_span = Span::current();
 
-        async_stream::stream! {
+        async_stream::stream!({
             loop {
-                yield self.sync_loop_helper(&mut sync_settings).instrument(parent_span.clone()).await;
+                trace!("Syncing");
+
+                if sync_settings.ignore_timeout_on_first_sync {
+                    if is_first_sync {
+                        timeout = sync_settings.timeout.take();
+                    } else if sync_settings.timeout.is_none() && timeout.is_some() {
+                        sync_settings.timeout = timeout.take();
+                    }
+
+                    is_first_sync = false;
+                }
+
+                yield self
+                    .sync_loop_helper(&mut sync_settings)
+                    .instrument(parent_span.clone())
+                    .await;
 
                 Client::delay_sync(&mut last_sync_time).await
             }
-        }
+        })
     }
 
     /// Get the current, if any, sync token of the client.
@@ -2740,6 +2856,8 @@ impl Client {
                 #[cfg(feature = "e2e-encryption")]
                 self.inner.enable_share_history_on_invite,
                 cross_process_store_locks_holder_name,
+                #[cfg(feature = "experimental-search")]
+                self.inner.search_index.clone(),
             )
             .await,
         };
@@ -2758,7 +2876,11 @@ impl Client {
         self.inner
             .latest_events
             .get_or_init(|| async {
-                LatestEvents::new(self.event_cache().clone(), SendQueue::new(self.clone()))
+                LatestEvents::new(
+                    WeakClient::from_client(self),
+                    self.event_cache().clone(),
+                    SendQueue::new(self.clone()),
+                )
             })
             .await
     }
@@ -2815,12 +2937,22 @@ impl Client {
             return Ok(data.to_owned());
         }
 
-        let response = self
-            .send(ruma::api::client::authenticated_media::get_media_config::v1::Request::default())
-            .await?;
+        // Use the authenticated endpoint when the server supports it.
+        let supported_versions = self.supported_versions().await?;
+        let use_auth =
+            authenticated_media::get_media_config::v1::Request::is_supported(&supported_versions);
 
-        match max_upload_size_lock.set(response.upload_size) {
-            Ok(_) => Ok(response.upload_size),
+        let upload_size = if use_auth {
+            self.send(authenticated_media::get_media_config::v1::Request::default())
+                .await?
+                .upload_size
+        } else {
+            #[allow(deprecated)]
+            self.send(media::get_media_config::v3::Request::default()).await?.upload_size
+        };
+
+        match max_upload_size_lock.set(upload_size) {
+            Ok(_) => Ok(upload_size),
             Err(error) => {
                 Err(Error::Media(MediaError::FetchMaxUploadSizeFailed(error.to_string())))
             }
@@ -2831,6 +2963,43 @@ impl Client {
     #[cfg(feature = "e2e-encryption")]
     pub fn decryption_settings(&self) -> &DecryptionSettings {
         &self.base_client().decryption_settings
+    }
+
+    #[cfg(feature = "experimental-search")]
+    pub(crate) fn search_index(&self) -> &SearchIndex {
+        &self.inner.search_index
+    }
+
+    /// Whether the client is configured to take thread subscriptions (MSC4306
+    /// and MSC4308) into account.
+    ///
+    /// This may cause filtering out of thread subscriptions, and loading the
+    /// thread subscriptions via the sliding sync extension, when the room
+    /// list service is being used.
+    pub fn enabled_thread_subscriptions(&self) -> bool {
+        match self.base_client().threading_support {
+            ThreadingSupport::Enabled { with_subscriptions } => with_subscriptions,
+            ThreadingSupport::Disabled => false,
+        }
+    }
+
+    /// Fetch thread subscriptions changes between `from` and up to `to`.
+    ///
+    /// The `limit` optional parameter can be used to limit the number of
+    /// entries in a response. It can also be overridden by the server, if
+    /// it's deemed too large.
+    pub async fn fetch_thread_subscriptions(
+        &self,
+        from: Option<String>,
+        to: Option<String>,
+        limit: Option<UInt>,
+    ) -> Result<get_thread_subscriptions_changes::unstable::Response> {
+        let request = assign!(get_thread_subscriptions_changes::unstable::Request::new(), {
+            from,
+            to,
+            limit,
+        });
+        Ok(self.send(request).await?)
     }
 }
 
@@ -2850,7 +3019,7 @@ impl Client {
 
 /// A weak reference to the inner client, useful when trying to get a handle
 /// on the owning client.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct WeakClient {
     client: Weak<ClientInner>,
 }
@@ -2881,11 +3050,9 @@ impl WeakClient {
 
 #[derive(Clone)]
 struct ClientServerInfo {
-    /// The Matrix versions the server supports (known ones only).
-    server_versions: CachedValue<Box<[MatrixVersion]>>,
-
-    /// The unstable features and their on/off state on the server.
-    unstable_features: CachedValue<BTreeMap<String, bool>>,
+    /// The Matrix versions and unstable features the server supports (known
+    /// ones only).
+    supported_versions: CachedValue<SupportedVersions>,
 
     /// The server's well-known file, if any.
     well_known: CachedValue<Option<WellKnownResponse>>,
@@ -2914,6 +3081,27 @@ impl<Value> CachedValue<Value> {
             CachedValue::NotSet => panic!("Tried to unwrap a cached value that wasn't set"),
         }
     }
+
+    /// Converts from `&CachedValue<Value>` to `CachedValue<&Value>`.
+    fn as_ref(&self) -> CachedValue<&Value> {
+        match self {
+            Self::Cached(value) => CachedValue::Cached(value),
+            Self::NotSet => CachedValue::NotSet,
+        }
+    }
+
+    /// Maps a `CachedValue<Value>` to `CachedValue<Other>` by applying a
+    /// function to a contained value (if `Cached`) or returns `NotSet` (if
+    /// `NotSet`).
+    fn map<Other, F>(self, f: F) -> CachedValue<Other>
+    where
+        F: FnOnce(Value) -> Other,
+    {
+        match self {
+            Self::Cached(value) => CachedValue::Cached(f(value)),
+            Self::NotSet => CachedValue::NotSet,
+        }
+    }
 }
 
 /// Information about the state of a room before we joined it.
@@ -2931,14 +3119,14 @@ pub(crate) mod tests {
     use assert_matches::assert_matches;
     use assert_matches2::assert_let;
     use eyeball::SharedObservable;
-    use futures_util::{pin_mut, FutureExt};
+    use futures_util::{pin_mut, FutureExt, StreamExt};
     use js_int::{uint, UInt};
     use matrix_sdk_base::{
         store::{MemoryStore, StoreConfig},
         RoomState,
     };
     use matrix_sdk_test::{
-        async_test, test_json, GlobalAccountDataTestEvent, JoinedRoomBuilder, StateTestEvent,
+        async_test, event_factory::EventFactory, JoinedRoomBuilder, StateTestEvent,
         SyncResponseBuilder, DEFAULT_TEST_ROOM_ID,
     };
     #[cfg(target_family = "wasm")]
@@ -2950,14 +3138,14 @@ pub(crate) mod tests {
                 discovery::discover_homeserver::RtcFocusInfo,
                 room::create_room::v3::Request as CreateRoomRequest,
             },
-            MatrixVersion,
+            FeatureFlag, MatrixVersion,
         },
         assign,
         events::{
             ignored_user_list::IgnoredUserListEventContent,
             media_preview_config::{InviteAvatars, MediaPreviewConfigEventContent, MediaPreviews},
         },
-        owned_room_id, room_alias_id, room_id, RoomId, ServerName, UserId,
+        owned_room_id, owned_user_id, room_alias_id, room_id, RoomId, ServerName, UserId,
     };
     use serde_json::json;
     use stream_assert::{assert_next_matches, assert_pending};
@@ -2966,10 +3154,6 @@ pub(crate) mod tests {
         time::{sleep, timeout},
     };
     use url::Url;
-    use wiremock::{
-        matchers::{body_json, header, method, path, query_param_is_missing},
-        Mock, MockServer, ResponseTemplate,
-    };
 
     use super::Client;
     use crate::{
@@ -2977,27 +3161,24 @@ pub(crate) mod tests {
         config::{RequestConfig, SyncSettings},
         futures::SendRequest,
         media::MediaError,
-        test_utils::{
-            logged_in_client, mocks::MatrixMockServer, no_retry_test_client, set_client_session,
-            test_client_builder, test_client_builder_with_server,
-        },
+        test_utils::{client::MockClientBuilder, mocks::MatrixMockServer},
         Error, TransmissionProgress,
     };
 
     #[async_test]
     async fn test_account_data() {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
 
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/r0/sync".to_owned()))
-            .and(header("authorization", "Bearer 1234"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::SYNC))
-            .mount(&server)
+        let f = EventFactory::new();
+        server
+            .mock_sync()
+            .ok_and_run(&client, |builder| {
+                builder.add_global_account_data(
+                    f.ignored_user_list([owned_user_id!("@someone:example.org")]),
+                );
+            })
             .await;
-
-        let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
-        let _response = client.sync_once(sync_settings).await.unwrap();
 
         let content = client
             .account()
@@ -3014,32 +3195,28 @@ pub(crate) mod tests {
     #[async_test]
     async fn test_successful_discovery() {
         // Imagine this is `matrix.org`.
-        let server = MockServer::start().await;
+        let server = MatrixMockServer::new().await;
+        let server_url = server.uri();
 
         // Imagine this is `matrix-client.matrix.org`.
-        let homeserver = MockServer::start().await;
+        let homeserver = MatrixMockServer::new().await;
+        let homeserver_url = homeserver.uri();
 
         // Imagine Alice has the user ID `@alice:matrix.org`.
-        let server_url = server.uri();
         let domain = server_url.strip_prefix("http://").unwrap();
         let alice = UserId::parse("@alice:".to_owned() + domain).unwrap();
 
         // The `.well-known` is on the server (e.g. `matrix.org`).
-        Mock::given(method("GET"))
-            .and(path("/.well-known/matrix/client"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(
-                test_json::WELL_KNOWN.to_string().replace("HOMESERVER_URL", &homeserver.uri()),
-                "application/json",
-            ))
-            .mount(&server)
+        server
+            .mock_well_known()
+            .ok_with_homeserver_url(&homeserver_url)
+            .mock_once()
+            .named("well-known")
+            .mount()
             .await;
 
         // The `/versions` is on the homeserver (e.g. `matrix-client.matrix.org`).
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/versions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
-            .mount(&homeserver)
-            .await;
+        homeserver.mock_versions().ok().mock_once().named("versions").mount().await;
 
         let client = Client::builder()
             .insecure_server_name_no_tls(alice.server_name())
@@ -3050,22 +3227,19 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(client.server().unwrap(), &Url::parse(&server.uri()).unwrap());
-        assert_eq!(client.homeserver(), Url::parse(&homeserver.uri()).unwrap());
+        assert_eq!(client.server().unwrap(), &Url::parse(&server_url).unwrap());
+        assert_eq!(client.homeserver(), Url::parse(&homeserver_url).unwrap());
+        client.server_versions().await.unwrap();
     }
 
     #[async_test]
     async fn test_discovery_broken_server() {
-        let server = MockServer::start().await;
+        let server = MatrixMockServer::new().await;
         let server_url = server.uri();
         let domain = server_url.strip_prefix("http://").unwrap();
         let alice = UserId::parse("@alice:".to_owned() + domain).unwrap();
 
-        Mock::given(method("GET"))
-            .and(path("/.well-known/matrix/client"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
+        server.mock_well_known().error404().mock_once().named("well-known").mount().await;
 
         assert!(
             Client::builder()
@@ -3079,20 +3253,19 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_room_creation() {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
 
-        let response = SyncResponseBuilder::default()
-            .add_joined_room(
-                JoinedRoomBuilder::default()
-                    .add_state_event(StateTestEvent::Member)
-                    .add_state_event(StateTestEvent::PowerLevels),
-            )
-            .build_sync_response();
-
-        client.inner.base_client.receive_sync_response(response).await.unwrap();
-
-        assert_eq!(client.homeserver(), Url::parse(&server.uri()).unwrap());
+        server
+            .mock_sync()
+            .ok_and_run(&client, |builder| {
+                builder.add_joined_room(
+                    JoinedRoomBuilder::default()
+                        .add_state_event(StateTestEvent::Member)
+                        .add_state_event(StateTestEvent::PowerLevels),
+                );
+            })
+            .await;
 
         let room = client.get_room(&DEFAULT_TEST_ROOM_ID).unwrap();
         assert_eq!(room.state(), RoomState::Joined);
@@ -3100,21 +3273,16 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_retry_limit_http_requests() {
-        let server = MockServer::start().await;
-        let client = test_client_builder(Some(server.uri()))
-            .request_config(RequestConfig::new().retry_limit(3))
+        let server = MatrixMockServer::new().await;
+        let client = server
+            .client_builder()
+            .on_builder(|builder| builder.request_config(RequestConfig::new().retry_limit(3)))
             .build()
-            .await
-            .unwrap();
+            .await;
 
         assert!(client.request_config().retry_limit.unwrap() == 3);
 
-        Mock::given(method("POST"))
-            .and(path("/_matrix/client/r0/login"))
-            .respond_with(ResponseTemplate::new(501))
-            .expect(3)
-            .mount(&server)
-            .await;
+        server.mock_login().error500().expect(3).mount().await;
 
         client.matrix_auth().login_username("example", "wordpass").send().await.unwrap_err();
     }
@@ -3123,58 +3291,49 @@ pub(crate) mod tests {
     async fn test_retry_timeout_http_requests() {
         // Keep this timeout small so that the test doesn't take long
         let retry_timeout = Duration::from_secs(5);
-        let server = MockServer::start().await;
-        let client = test_client_builder(Some(server.uri()))
-            .request_config(RequestConfig::new().max_retry_time(retry_timeout))
+        let server = MatrixMockServer::new().await;
+        let client = server
+            .client_builder()
+            .on_builder(|builder| {
+                builder.request_config(RequestConfig::new().max_retry_time(retry_timeout))
+            })
             .build()
-            .await
-            .unwrap();
+            .await;
 
         assert!(client.request_config().max_retry_time.unwrap() == retry_timeout);
 
-        Mock::given(method("POST"))
-            .and(path("/_matrix/client/r0/login"))
-            .respond_with(ResponseTemplate::new(501))
-            .expect(2..)
-            .mount(&server)
-            .await;
+        server.mock_login().error500().expect(2..).mount().await;
 
         client.matrix_auth().login_username("example", "wordpass").send().await.unwrap_err();
     }
 
     #[async_test]
     async fn test_short_retry_initial_http_requests() {
-        let server = MockServer::start().await;
-        let client = test_client_builder(Some(server.uri())).build().await.unwrap();
-
-        Mock::given(method("POST"))
-            .and(path("/_matrix/client/r0/login"))
-            .respond_with(ResponseTemplate::new(501))
-            .expect(3..)
-            .mount(&server)
+        let server = MatrixMockServer::new().await;
+        let client = server
+            .client_builder()
+            .on_builder(|builder| builder.request_config(RequestConfig::short_retry()))
+            .build()
             .await;
+
+        server.mock_login().error500().expect(3..).mount().await;
 
         client.matrix_auth().login_username("example", "wordpass").send().await.unwrap_err();
     }
 
     #[async_test]
     async fn test_no_retry_http_requests() {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
 
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/r0/devices"))
-            .respond_with(ResponseTemplate::new(501))
-            .expect(1)
-            .mount(&server)
-            .await;
+        server.mock_devices().error500().mock_once().mount().await;
 
         client.devices().await.unwrap_err();
     }
 
     #[async_test]
     async fn test_set_homeserver() {
-        let client = no_retry_test_client(Some("http://localhost".to_owned())).await;
+        let client = MockClientBuilder::new(None).build().await;
         assert_eq!(client.homeserver().as_ref(), "http://localhost/");
 
         let homeserver = Url::parse("http://example.com/").unwrap();
@@ -3184,18 +3343,10 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_search_user_request() {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
 
-        Mock::given(method("POST"))
-            .and(path("_matrix/client/r0/user_directory/search"))
-            .and(body_json(&*test_json::search_users::SEARCH_USERS_REQUEST))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(&*test_json::search_users::SEARCH_USERS_RESPONSE),
-            )
-            .mount(&server)
-            .await;
+        server.mock_user_directory().ok().mock_once().mount().await;
 
         let response = client.search_users("test", 50).await.unwrap();
         assert_eq!(response.results.len(), 1);
@@ -3208,34 +3359,22 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_request_unstable_features() {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().no_server_versions().build().await;
 
-        Mock::given(method("GET"))
-            .and(path("_matrix/client/versions"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(&*test_json::api_responses::VERSIONS),
-            )
-            .mount(&server)
-            .await;
+        server.mock_versions().ok_with_unstable_features().mock_once().mount().await;
 
         let unstable_features = client.unstable_features().await.unwrap();
-        assert_eq!(unstable_features.get("org.matrix.e2e_cross_signing"), Some(&true));
-        assert_eq!(unstable_features.get("you.shall.pass"), None);
+        assert!(unstable_features.contains(&FeatureFlag::from("org.matrix.e2e_cross_signing")));
+        assert!(!unstable_features.contains(&FeatureFlag::from("you.shall.pass")));
     }
 
     #[async_test]
     async fn test_can_homeserver_push_encrypted_event_to_device() {
-        let server = MockServer::start().await;
-        let client = logged_in_client(Some(server.uri())).await;
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().no_server_versions().build().await;
 
-        Mock::given(method("GET"))
-            .and(path("_matrix/client/versions"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(&*test_json::api_responses::VERSIONS),
-            )
-            .mount(&server)
-            .await;
+        server.mock_versions().ok_with_unstable_features().mock_once().mount().await;
 
         let msc4028_enabled = client.can_homeserver_push_encrypted_event_to_device().await.unwrap();
         assert!(msc4028_enabled);
@@ -3244,13 +3383,13 @@ pub(crate) mod tests {
     #[async_test]
     async fn test_recently_visited_rooms() {
         // Tracking recently visited rooms requires authentication
-        let client = no_retry_test_client(Some("http://localhost".to_owned())).await;
+        let client = MockClientBuilder::new(None).unlogged().build().await;
         assert_matches!(
             client.account().track_recently_visited_room(owned_room_id!("!alpha:localhost")).await,
             Err(Error::AuthenticationRequired)
         );
 
-        let client = logged_in_client(None).await;
+        let client = MockClientBuilder::new(None).build().await;
         let account = client.account();
 
         // We should start off with an empty list
@@ -3307,7 +3446,7 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_client_no_cycle_with_event_cache() {
-        let client = logged_in_client(None).await;
+        let client = MockClientBuilder::new(None).build().await;
 
         // Wait for the init tasks to die.
         sleep(Duration::from_secs(1)).await;
@@ -3347,29 +3486,26 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_server_info_caching() {
-        let server = MockServer::start().await;
+        let server = MatrixMockServer::new().await;
         let server_url = server.uri();
         let domain = server_url.strip_prefix("http://").unwrap();
         let server_name = <&ServerName>::try_from(domain).unwrap();
         let rtc_foci = vec![RtcFocusInfo::livekit("https://livekit.example.com".to_owned())];
 
-        let well_known_mock = Mock::given(method("GET"))
-            .and(path("/.well-known/matrix/client"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(
-                test_json::WELL_KNOWN.to_string().replace("HOMESERVER_URL", server_url.as_ref()),
-                "application/json",
-            ))
+        let well_known_mock = server
+            .mock_well_known()
+            .ok()
             .named("well known mock")
             .expect(2) // One for ClientBuilder discovery, one for the ServerInfo cache.
-            .mount_as_scoped(&server)
+            .mount_as_scoped()
             .await;
 
-        let versions_mock = Mock::given(method("GET"))
-            .and(path("/_matrix/client/versions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
+        let versions_mock = server
+            .mock_versions()
+            .ok_with_unstable_features()
             .named("first versions mock")
             .expect(1)
-            .mount_as_scoped(&server)
+            .mount_as_scoped()
             .await;
 
         let memory_store = Arc::new(MemoryStore::new());
@@ -3386,7 +3522,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert_eq!(client.server_versions().await.unwrap().len(), 1);
+        assert!(client.server_versions().await.unwrap().contains(&MatrixVersion::V1_0));
 
         // These subsequent calls hit the in-memory cache.
         assert!(client.server_versions().await.unwrap().contains(&MatrixVersion::V1_0));
@@ -3394,56 +3530,46 @@ pub(crate) mod tests {
 
         drop(client);
 
-        let client = Client::builder()
-            .homeserver_url(server.uri()) // Configure this client directly so as to not hit the discovery endpoint.
-            .store_config(
-                StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
-                    .state_store(memory_store.clone()),
-            )
+        let client = server
+            .client_builder()
+            .no_server_versions()
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
+                        .state_store(memory_store.clone()),
+                )
+            })
             // BWI-specific
             .without_server_jwt_token_validation()
             // end BWI-specific
             .build()
-            .await
-            .unwrap();
+            .await;
 
-        // This call to the new client hits the on-disk cache.
-        assert_eq!(
-            client.unstable_features().await.unwrap().get("org.matrix.e2e_cross_signing"),
-            Some(&true)
-        );
+        // These calls to the new client hit the on-disk cache.
+        assert!(client
+            .unstable_features()
+            .await
+            .unwrap()
+            .contains(&FeatureFlag::from("org.matrix.e2e_cross_signing")));
+        let supported = client.supported_versions().await.unwrap();
+        assert!(supported.versions.contains(&MatrixVersion::V1_0));
+        assert!(supported.features.contains(&FeatureFlag::from("org.matrix.e2e_cross_signing")));
 
         // Then this call hits the in-memory cache.
         assert_eq!(client.rtc_foci().await.unwrap(), rtc_foci);
 
         drop(versions_mock);
         drop(well_known_mock);
-        server.verify().await;
 
         // Now, reset the cache, and observe the endpoints being called again once.
         client.reset_server_info().await.unwrap();
 
-        Mock::given(method("GET"))
-            .and(path("/.well-known/matrix/client"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(
-                test_json::WELL_KNOWN.to_string().replace("HOMESERVER_URL", server_url.as_ref()),
-                "application/json",
-            ))
-            .named("second well known mock")
-            .expect(1)
-            .mount(&server)
-            .await;
+        server.mock_well_known().ok().named("second well known mock").expect(1).mount().await;
 
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/versions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
-            .expect(1)
-            .named("second versions mock")
-            .mount(&server)
-            .await;
+        server.mock_versions().ok().expect(1).named("second versions mock").mount().await;
 
         // Hits network again.
-        assert_eq!(client.server_versions().await.unwrap().len(), 1);
+        assert!(client.server_versions().await.unwrap().contains(&MatrixVersion::V1_0));
         // Hits in-memory cache again.
         assert!(client.server_versions().await.unwrap().contains(&MatrixVersion::V1_0));
         assert_eq!(client.rtc_foci().await.unwrap(), rtc_foci);
@@ -3451,29 +3577,31 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_server_info_without_a_well_known() {
-        let server = MockServer::start().await;
+        let server = MatrixMockServer::new().await;
         let rtc_foci: Vec<RtcFocusInfo> = vec![];
 
-        let versions_mock = Mock::given(method("GET"))
-            .and(path("/_matrix/client/versions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
+        let versions_mock = server
+            .mock_versions()
+            .ok_with_unstable_features()
             .named("first versions mock")
             .expect(1)
-            .mount_as_scoped(&server)
+            .mount_as_scoped()
             .await;
 
         let memory_store = Arc::new(MemoryStore::new());
-        let client = Client::builder()
-            .homeserver_url(server.uri()) // Configure this client directly so as to not hit the discovery endpoint.
-            .store_config(
-                StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
-                    .state_store(memory_store.clone()),
-            )
+        let client = server
+            .client_builder()
+            .no_server_versions()
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
+                        .state_store(memory_store.clone()),
+                )
+            })
             .build()
-            .await
-            .unwrap();
+            .await;
 
-        assert_eq!(client.server_versions().await.unwrap().len(), 1);
+        assert!(client.server_versions().await.unwrap().contains(&MatrixVersion::V1_0));
 
         // These subsequent calls hit the in-memory cache.
         assert!(client.server_versions().await.unwrap().contains(&MatrixVersion::V1_0));
@@ -3481,41 +3609,37 @@ pub(crate) mod tests {
 
         drop(client);
 
-        let client = Client::builder()
-            .homeserver_url(server.uri()) // Configure this client directly so as to not hit the discovery endpoint.
-            .store_config(
-                StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
-                    .state_store(memory_store.clone()),
-            )
+        let client = server
+            .client_builder()
+            .no_server_versions()
+            .on_builder(|builder| {
+                builder.store_config(
+                    StoreConfig::new("cross-process-store-locks-holder-name".to_owned())
+                        .state_store(memory_store.clone()),
+                )
+            })
             .build()
-            .await
-            .unwrap();
+            .await;
 
         // This call to the new client hits the on-disk cache.
-        assert_eq!(
-            client.unstable_features().await.unwrap().get("org.matrix.e2e_cross_signing"),
-            Some(&true)
-        );
+        assert!(client
+            .unstable_features()
+            .await
+            .unwrap()
+            .contains(&FeatureFlag::from("org.matrix.e2e_cross_signing")));
 
         // Then this call hits the in-memory cache.
         assert_eq!(client.rtc_foci().await.unwrap(), rtc_foci);
 
         drop(versions_mock);
-        server.verify().await;
 
         // Now, reset the cache, and observe the endpoints being called again once.
         client.reset_server_info().await.unwrap();
 
-        Mock::given(method("GET"))
-            .and(path("/_matrix/client/versions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
-            .expect(1)
-            .named("second versions mock")
-            .mount(&server)
-            .await;
+        server.mock_versions().ok().expect(1).named("second versions mock").mount().await;
 
         // Hits network again.
-        assert_eq!(client.server_versions().await.unwrap().len(), 1);
+        assert!(client.server_versions().await.unwrap().contains(&MatrixVersion::V1_0));
         // Hits in-memory cache again.
         assert!(client.server_versions().await.unwrap().contains(&MatrixVersion::V1_0));
         assert_eq!(client.rtc_foci().await.unwrap(), rtc_foci);
@@ -3523,15 +3647,11 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_no_network_doesnt_cause_infinite_retries() {
-        let server = MockServer::start().await;
-        // Note: not `no_retry_test_client` or `logged_in_client` which uses the former,
-        // since we want infinite retries for transient errors.
-        let client = test_client_builder(Some(server.uri().clone()))
-            .request_config(RequestConfig::new())
+        // We want infinite retries for transient errors.
+        let client = MockClientBuilder::new(None)
+            .on_builder(|builder| builder.request_config(RequestConfig::new()))
             .build()
-            .await
-            .unwrap();
-        set_client_session(&client).await;
+            .await;
 
         // We don't define a mock server on purpose here, so that the error is really a
         // network error.
@@ -3540,27 +3660,17 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_await_room_remote_echo_returns_the_room_if_it_was_already_synced() {
-        let (client_builder, server) = test_client_builder_with_server().await;
-        let client = client_builder.request_config(RequestConfig::new()).build().await.unwrap();
-        set_client_session(&client).await;
-
-        let builder = Mock::given(method("GET"))
-            .and(path("/_matrix/client/r0/sync"))
-            .and(header("authorization", "Bearer 1234"))
-            .and(query_param_is_missing("since"));
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
 
         let room_id = room_id!("!room:example.org");
-        let joined_room_builder = JoinedRoomBuilder::new(room_id);
-        let mut sync_response_builder = SyncResponseBuilder::new();
-        sync_response_builder.add_joined_room(joined_room_builder);
-        let response_body = sync_response_builder.build_json_sync_response();
 
-        builder
-            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
-            .mount(&server)
+        server
+            .mock_sync()
+            .ok_and_run(&client, |builder| {
+                builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+            })
             .await;
-
-        client.sync_once(SyncSettings::default()).await.unwrap();
 
         let room = client.await_room_remote_echo(room_id).now_or_never().unwrap();
         assert_eq!(room.room_id(), room_id);
@@ -3568,25 +3678,10 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_await_room_remote_echo_returns_the_room_when_it_is_ready() {
-        let (client_builder, server) = test_client_builder_with_server().await;
-        let client = client_builder.request_config(RequestConfig::new()).build().await.unwrap();
-        set_client_session(&client).await;
-
-        let builder = Mock::given(method("GET"))
-            .and(path("/_matrix/client/r0/sync"))
-            .and(header("authorization", "Bearer 1234"))
-            .and(query_param_is_missing("since"));
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
 
         let room_id = room_id!("!room:example.org");
-        let joined_room_builder = JoinedRoomBuilder::new(room_id);
-        let mut sync_response_builder = SyncResponseBuilder::new();
-        sync_response_builder.add_joined_room(joined_room_builder);
-        let response_body = sync_response_builder.build_json_sync_response();
-
-        builder
-            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
-            .mount(&server)
-            .await;
 
         let client = Arc::new(client);
 
@@ -3596,7 +3691,13 @@ pub(crate) mod tests {
             let client = client.clone();
             async move {
                 sleep(Duration::from_millis(100)).await;
-                client.sync_once(SyncSettings::default()).await.unwrap();
+
+                server
+                    .mock_sync()
+                    .ok_and_run(&client, |builder| {
+                        builder.add_joined_room(JoinedRoomBuilder::new(room_id));
+                    })
+                    .await;
             }
         });
 
@@ -3607,9 +3708,7 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_await_room_remote_echo_will_timeout_if_no_room_is_found() {
-        let (client_builder, _) = test_client_builder_with_server().await;
-        let client = client_builder.request_config(RequestConfig::new()).build().await.unwrap();
-        set_client_session(&client).await;
+        let client = MockClientBuilder::new(None).build().await;
 
         let room_id = room_id!("!room:example.org");
         // Room is not present so the client won't be able to find it. The call will
@@ -3619,18 +3718,10 @@ pub(crate) mod tests {
 
     #[async_test]
     async fn test_await_room_remote_echo_will_timeout_if_room_is_found_but_not_synced() {
-        let (client_builder, server) = test_client_builder_with_server().await;
-        let client = client_builder.request_config(RequestConfig::new()).build().await.unwrap();
-        set_client_session(&client).await;
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
 
-        Mock::given(method("POST"))
-            .and(path("_matrix/client/r0/createRoom"))
-            .and(header("authorization", "Bearer 1234"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "room_id": "!room:example.org"})),
-            )
-            .mount(&server)
-            .await;
+        server.mock_create_room().ok().mount().await;
 
         // Create a room in the internal store
         let room = client
@@ -3800,13 +3891,13 @@ pub(crate) mod tests {
         server
             .mock_sync()
             .ok_and_run(&client, |builder| {
-                builder.add_global_account_data_event(GlobalAccountDataTestEvent::Custom(json!({
-                "content": {
-                    "media_previews": "private",
-                    "invite_avatars": "off"
-                },
-                "type": "m.media_preview_config"
-                  })));
+                builder.add_custom_global_account_data(json!({
+                    "content": {
+                        "media_previews": "private",
+                        "invite_avatars": "off"
+                    },
+                    "type": "m.media_preview_config"
+                }));
             })
             .await;
 
@@ -3814,29 +3905,29 @@ pub(crate) mod tests {
             client.account().observe_media_preview_config().await.unwrap();
 
         let initial_value: MediaPreviewConfigEventContent = initial_value.unwrap();
-        assert_eq!(initial_value.invite_avatars, InviteAvatars::Off);
-        assert_eq!(initial_value.media_previews, MediaPreviews::Private);
+        assert_eq!(initial_value.invite_avatars, Some(InviteAvatars::Off));
+        assert_eq!(initial_value.media_previews, Some(MediaPreviews::Private));
         pin_mut!(stream);
         assert_pending!(stream);
 
         server
             .mock_sync()
             .ok_and_run(&client, |builder| {
-                builder.add_global_account_data_event(GlobalAccountDataTestEvent::Custom(json!({
-                "content": {
-                    "media_previews": "off",
-                    "invite_avatars": "on"
-                },
-                "type": "m.media_preview_config"
-                  })));
+                builder.add_custom_global_account_data(json!({
+                    "content": {
+                        "media_previews": "off",
+                        "invite_avatars": "on"
+                    },
+                    "type": "m.media_preview_config"
+                }));
             })
             .await;
 
         assert_next_matches!(
             stream,
             MediaPreviewConfigEventContent {
-                media_previews: MediaPreviews::Off,
-                invite_avatars: InviteAvatars::On,
+                media_previews: Some(MediaPreviews::Off),
+                invite_avatars: Some(InviteAvatars::On),
                 ..
             }
         );
@@ -3851,13 +3942,13 @@ pub(crate) mod tests {
         server
             .mock_sync()
             .ok_and_run(&client, |builder| {
-                builder.add_global_account_data_event(GlobalAccountDataTestEvent::Custom(json!({
-                "content": {
-                    "media_previews": "private",
-                    "invite_avatars": "off"
-                },
-                "type": "io.element.msc4278.media_preview_config"
-                  })));
+                builder.add_custom_global_account_data(json!({
+                    "content": {
+                        "media_previews": "private",
+                        "invite_avatars": "off"
+                    },
+                    "type": "io.element.msc4278.media_preview_config"
+                }));
             })
             .await;
 
@@ -3865,29 +3956,29 @@ pub(crate) mod tests {
             client.account().observe_media_preview_config().await.unwrap();
 
         let initial_value: MediaPreviewConfigEventContent = initial_value.unwrap();
-        assert_eq!(initial_value.invite_avatars, InviteAvatars::Off);
-        assert_eq!(initial_value.media_previews, MediaPreviews::Private);
+        assert_eq!(initial_value.invite_avatars, Some(InviteAvatars::Off));
+        assert_eq!(initial_value.media_previews, Some(MediaPreviews::Private));
         pin_mut!(stream);
         assert_pending!(stream);
 
         server
             .mock_sync()
             .ok_and_run(&client, |builder| {
-                builder.add_global_account_data_event(GlobalAccountDataTestEvent::Custom(json!({
-                "content": {
-                    "media_previews": "off",
-                    "invite_avatars": "on"
-                },
-                "type": "io.element.msc4278.media_preview_config"
-                  })));
+                builder.add_custom_global_account_data(json!({
+                    "content": {
+                        "media_previews": "off",
+                        "invite_avatars": "on"
+                    },
+                    "type": "io.element.msc4278.media_preview_config"
+                }));
             })
             .await;
 
         assert_next_matches!(
             stream,
             MediaPreviewConfigEventContent {
-                media_previews: MediaPreviews::Off,
-                invite_avatars: InviteAvatars::On,
+                media_previews: Some(MediaPreviews::Off),
+                invite_avatars: Some(InviteAvatars::On),
                 ..
             }
         );
@@ -3905,13 +3996,64 @@ pub(crate) mod tests {
     }
 
     #[async_test]
-    async fn test_load_or_fetch_max_upload_size() {
+    async fn test_load_or_fetch_max_upload_size_with_auth_matrix_version() {
+        // The default Matrix version we use is 1.11 or higher, so authenticated media
+        // is supported.
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
 
         assert!(!client.inner.server_max_upload_size.lock().await.initialized());
 
         server.mock_authenticated_media_config().ok(uint!(2)).mock_once().mount().await;
+        client.load_or_fetch_max_upload_size().await.unwrap();
+
+        assert_eq!(*client.inner.server_max_upload_size.lock().await.get().unwrap(), uint!(2));
+    }
+
+    #[async_test]
+    async fn test_load_or_fetch_max_upload_size_with_auth_stable_feature() {
+        // The server must advertise support for the stable feature for authenticated
+        // media support, so we mock the `GET /versions` response.
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().no_server_versions().build().await;
+
+        server
+            .mock_versions()
+            .ok_custom(
+                &["v1.7", "v1.8", "v1.9", "v1.10"],
+                &[("org.matrix.msc3916.stable", true)].into(),
+            )
+            .named("versions")
+            .expect(1)
+            .mount()
+            .await;
+
+        assert!(!client.inner.server_max_upload_size.lock().await.initialized());
+
+        server.mock_authenticated_media_config().ok(uint!(2)).mock_once().mount().await;
+        client.load_or_fetch_max_upload_size().await.unwrap();
+
+        assert_eq!(*client.inner.server_max_upload_size.lock().await.get().unwrap(), uint!(2));
+    }
+
+    #[async_test]
+    async fn test_load_or_fetch_max_upload_size_no_auth() {
+        // The server must not support Matrix 1.11 or higher for unauthenticated
+        // media requests, so we mock the `GET /versions` response.
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().no_server_versions().build().await;
+
+        server
+            .mock_versions()
+            .ok_custom(&["v1.1"], &Default::default())
+            .named("versions")
+            .expect(1)
+            .mount()
+            .await;
+
+        assert!(!client.inner.server_max_upload_size.lock().await.initialized());
+
+        server.mock_media_config().ok(uint!(2)).mock_once().mount().await;
         client.load_or_fetch_max_upload_size().await.unwrap();
 
         assert_eq!(*client.inner.server_max_upload_size.lock().await.get().unwrap(), uint!(2));
@@ -3941,5 +4083,64 @@ pub(crate) mod tests {
         assert_let!(Some(Error::Media(MediaError::MediaTooLargeToUpload { max, current })) = error);
         assert_eq!(max, uint!(1));
         assert_eq!(current, UInt::new_wrapping(data.len() as u64));
+    }
+
+    #[async_test]
+    async fn test_dont_ignore_timeout_on_first_sync() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server
+            .mock_sync()
+            .timeout(Some(Duration::from_secs(30)))
+            .ok(|_| {})
+            .mock_once()
+            .named("sync_with_timeout")
+            .mount()
+            .await;
+
+        // Call the endpoint once to check the timeout.
+        let mut stream = Box::pin(client.sync_stream(SyncSettings::new()).await);
+
+        timeout(Duration::from_secs(1), async {
+            stream.next().await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[async_test]
+    async fn test_ignore_timeout_on_first_sync() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server
+            .mock_sync()
+            .timeout(None)
+            .ok(|_| {})
+            .mock_once()
+            .named("sync_no_timeout")
+            .mount()
+            .await;
+        server
+            .mock_sync()
+            .timeout(Some(Duration::from_secs(30)))
+            .ok(|_| {})
+            .mock_once()
+            .named("sync_with_timeout")
+            .mount()
+            .await;
+
+        // Call each version of the endpoint once to check the timeouts.
+        let mut stream = Box::pin(
+            client.sync_stream(SyncSettings::new().ignore_timeout_on_first_sync(true)).await,
+        );
+
+        timeout(Duration::from_secs(1), async {
+            stream.next().await.unwrap().unwrap();
+            stream.next().await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
     }
 }

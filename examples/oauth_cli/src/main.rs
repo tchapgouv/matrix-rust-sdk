@@ -193,8 +193,10 @@ impl OAuthCli {
             // the redirect when the custom URI scheme is opened.
             let (redirect_uri, server_handle) = LocalServerBuilder::new().spawn().await?;
 
-            let OAuthAuthorizationData { url, .. } =
-                oauth.login(redirect_uri, None, Some(client_metadata().into())).build().await?;
+            let OAuthAuthorizationData { url, .. } = oauth
+                .login(redirect_uri, None, Some(client_metadata().into()), None)
+                .build()
+                .await?;
 
             let query_string =
                 use_auth_url(&url, server_handle).await.map(|query| query.0).unwrap_or_default();
@@ -311,7 +313,7 @@ impl OAuthCli {
                     println!("Error: no command\n");
                     help()
                 }
-            };
+            }
         }
 
         Ok(())
@@ -380,12 +382,10 @@ impl OAuthCli {
 
     /// Get the account management URL.
     async fn account(&self, action: Option<AccountManagementActionFull>) {
-        let mut url_builder = match self.client.oauth().fetch_account_management_url().await {
-            Ok(Some(url_builder)) => url_builder,
-            _ => {
-                println!("\nThis homeserver does not provide the URL to manage your account");
-                return;
-            }
+        let Ok(Some(mut url_builder)) = self.client.oauth().fetch_account_management_url().await
+        else {
+            println!("\nThis homeserver does not provide the URL to manage your account");
+            return;
         };
 
         if let Some(action) = action {

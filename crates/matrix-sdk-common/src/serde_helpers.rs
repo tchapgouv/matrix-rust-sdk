@@ -16,9 +16,12 @@
 //! to access some fields.
 
 use ruma::{
-    events::{relation::BundledThread, AnyMessageLikeEvent, AnySyncTimelineEvent},
-    serde::Raw,
     OwnedEventId,
+    events::{
+        AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
+        relation::BundledThread,
+    },
+    serde::Raw,
 };
 use serde::Deserialize;
 
@@ -43,6 +46,22 @@ struct RelatesTo {
 struct SimplifiedContent {
     #[serde(rename = "m.relates_to")]
     relates_to: Option<RelatesTo>,
+}
+
+/// Try to extract the thread root from an event's content, if provided.
+///
+/// The thread root is the field located at `m.relates_to`.`event_id`,
+/// if the field at `m.relates_to`.`rel_type` is `m.thread`.
+///
+/// Returns `None` if we couldn't find a thread root, or if there was an issue
+/// during deserialization.
+pub fn extract_thread_root_from_content(
+    content: Raw<AnyMessageLikeEventContent>,
+) -> Option<OwnedEventId> {
+    let relates_to = content.deserialize_as_unchecked::<SimplifiedContent>().ok()?.relates_to?;
+    match relates_to.rel_type {
+        RelationsType::Thread => relates_to.event_id,
+    }
 }
 
 /// Try to extract the thread root from a timeline event, if provided.
@@ -76,7 +95,7 @@ struct Unsigned {
 /// Try to extract a bundled thread summary of a timeline event, if available.
 pub fn extract_bundled_thread_summary(
     event: &Raw<AnySyncTimelineEvent>,
-) -> (ThreadSummaryStatus, Option<Raw<AnyMessageLikeEvent>>) {
+) -> (ThreadSummaryStatus, Option<Raw<AnySyncMessageLikeEvent>>) {
     match event.get_field::<Unsigned>("unsigned") {
         Ok(Some(Unsigned { relations: Some(Relations { thread: Some(bundled_thread) }) })) => {
             // Take the count from the bundled thread summary, if available. If it can't be
@@ -130,7 +149,7 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         let observed_thread_root = extract_thread_root(&event);
         assert_eq!(observed_thread_root.as_deref(), Some(thread_root));
@@ -144,7 +163,7 @@ mod tests {
             "origin_server_ts": 42,
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         let observed_thread_root = extract_thread_root(&event);
         assert_matches!(observed_thread_root, None);
@@ -160,7 +179,7 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         let observed_thread_root = extract_thread_root(&event);
         assert_matches!(observed_thread_root, None);
@@ -180,7 +199,7 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         let observed_thread_root = extract_thread_root(&event);
         assert_matches!(observed_thread_root, None);
@@ -216,7 +235,7 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         assert_matches!(
             extract_bundled_thread_summary(&event),
@@ -231,7 +250,7 @@ mod tests {
             "origin_server_ts": 42,
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         assert_matches!(extract_bundled_thread_summary(&event), (ThreadSummaryStatus::None, None));
 
@@ -260,7 +279,7 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         assert_matches!(extract_bundled_thread_summary(&event), (ThreadSummaryStatus::None, None));
 
@@ -280,7 +299,7 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
 
         assert_matches!(
             extract_bundled_thread_summary(&event),

@@ -6,25 +6,136 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- `Client::fetch_thread_subscriptions` implements support for the companion endpoint of the
+  experimental MSC4308, allowing to fetch thread subscriptions for a given range, as specified by
+  the MSC.
+  ([#5590](https://github.com/matrix-org/matrix-rust-sdk/pull/5590))
+- Add a `Client::joined_space_rooms` method that allows retrieving the list of joined spaces.
+- `Room::enable_encryption` and `Room::enable_encryption_with_state_event_encryption` will poll
+  the encryption state for up to 3 seconds, rather than checking once after a single sync has
+  completed.
+  ([#5559](https://github.com/matrix-org/matrix-rust-sdk/pull/5559))
+- Add `Room::enable_encryption_with_state` to enable E2E encryption with encrypted state event
+  support, gated behind the `experimental-encrypted-state-events` feature.
+  ([#5557](https://github.com/matrix-org/matrix-rust-sdk/pull/5557))
+- Add `ignore_timeout_on_first_sync` to the `SyncSettings`, which should allow to have a quicker
+  first response when using one of the `sync`, `sync_with_callback`, `sync_with_result_callback`
+  or `sync_stream` methods on `Client`, if the response is empty.
+  ([#5481](https://github.com/matrix-org/matrix-rust-sdk/pull/5481))
+- The methods to use the `/v3/sync` endpoint set the `use_state_after` field,
+  which means that, if the server supports it, the response will contain the
+  state changes between the last sync and the end of the timeline.
+  ([#5488](https://github.com/matrix-org/matrix-rust-sdk/pull/5488))
+- Add experimental support for
+  [MSC4306](https://github.com/matrix-org/matrix-spec-proposals/pull/4306), with the
+  `Room::fetch_thread_subscription()`, `Room::subscribe_thread()` and `Room::unsubscribe_thread()`
+  methods.
+  ([#5439](https://github.com/matrix-org/matrix-rust-sdk/pull/5439))
+- [**breaking**] `RoomMemberRole` has a new `Creator` variant, that
+  differentiates room creators with infinite power levels, as introduced in room
+  version 12.
+  ([#5436](https://github.com/matrix-org/matrix-rust-sdk/pull/5436))
+- Add `Account::fetch_account_data_static` to fetch account data from the server
+  with a statically-known type, with a signature similar to
+  `Account::account_data`.
+  ([#5424](https://github.com/matrix-org/matrix-rust-sdk/pull/5424))
+- Add support to accept historic room key bundles that arrive out of order, i.e.
+  the bundle arrives after the invite has already been accepted.
+  ([#5322](https://github.com/matrix-org/matrix-rust-sdk/pull/5322))
+
+- [**breaking**] `OAuth::login` now allows requesting additional scopes for the authorization code grant.
+  ([#5395](https://github.com/matrix-org/matrix-rust-sdk/pull/5395))
+
+### Refactor
+
+- [**breaking**] `SyncSettings` token is now `SyncToken` enum type which has default behaviour of `SyncToken::ReusePrevious` token. This breaks `Client::sync_once`.
+  For old behaviour, set the token to `SyncToken::NoToken` with the usual `SyncSettings::token` setter.
+- [**breaking**] Change the upload_encrypted_file and make it clone the client instead of owning it. The lifetime of the `UploadEncryptedFile` request returned by `Client::upload_encrypted_file()` only depends on the request lifetime now.
+- [**breaking**] Add an `IsPrefix = False` bound to the `account_data()` and
+  `fetch_account_data_static()` methods of `Account`. These methods only worked
+  for events where the full event type is statically-known, and this is now
+  enforced at compile-time. `account_data_raw()` and `fetch_account_data()`
+  respectively can be used instead for event types with a variable suffix.
+  ([#5444](https://github.com/matrix-org/matrix-rust-sdk/pull/5444))
+- [**breaking**] `RoomMemberRole::suggested_role_for_power_level()` and
+  `RoomMemberRole::suggested_power_level()` now use `UserPowerLevel` to represent
+  power levels instead of `i64` to differentiate the infinite power level of
+  creators, as introduced in room version 12.
+  ([#5436](https://github.com/matrix-org/matrix-rust-sdk/pull/5436))
+- [**breaking**] The `reason` argument of `Room::report_room()` is now required,
+  due to a clarification in the spec.
+  ([#5337](https://github.com/matrix-org/matrix-rust-sdk/pull/5337))
+- [**breaking**] The `join_rule` field of `RoomPreview` is now a
+  `JoinRuleSummary`. It has the same variants as `SpaceRoomJoinRule` but
+  contains as summary of the allow rules for the restricted variants.
+  ([#5337](https://github.com/matrix-org/matrix-rust-sdk/pull/5337))
+- [**breaking**] The MSRV has been bumped to Rust 1.88.
+  ([#5431](https://github.com/matrix-org/matrix-rust-sdk/pull/5431))
+- [**breaking**] `Room::send_call_notification` and `Room::send_call_notification_if_needed` have been removed, since the event type they send is outdated, and `Client` is not actually supposed to be able to join MatrixRTC sessions (yet). In practice, users of these methods probably already rely on another MatrixRTC implementation to participate in sessions, and such an implementation should be capable of sending notifications itself.
+
+### Bugfix
+
+- The event handlers APIs now properly support events whose type is not fully
+  statically-known. Before, those events would never trigger an event handler.
+  ([#5444](https://github.com/matrix-org/matrix-rust-sdk/pull/5444))
+- All HTTP requests now have a default `read_timeout` of 60s, which means they'll disconnect if the connection stalls.
+ `RequestConfig::timeout` is now optional and can be disabled on a per-request basis. This will be done for
+ the requests used to download media, so they don't get cancelled after the default 30s timeout for no good reason.
+ ([#5437](https://github.com/matrix-org/matrix-rust-sdk/pull/5437))
+
+## [0.13.0] - 2025-07-10
+
+### Security Fixes
+
+- Fix SQL injection vulnerability in `EventCache`
+  ([d0c0100](https://github.com/matrix-org/matrix-rust-sdk/commit/d0c01006e4808db5eb96ad5c496416f284d8bd3c), Moderate, [CVE-2025-53549](https://www.cve.org/CVERecord?id=CVE-2025-53549), [GHSA-275g-g844-73jh](https://github.com/matrix-org/matrix-rust-sdk/security/advisories/GHSA-275g-g844-73jh))
+
 ### Bug fixes
 
+- `Room.leave()` will now attempt to leave all reachable predecessors too.
+  ([#5381](https://github.com/matrix-org/matrix-rust-sdk/pull/5381))
 - When joining a room via `Client::join_room_by_id()`, if the client has `enable_share_history_on_invite` enabled,
   we will correctly check for received room key bundles. Previously this was only done when calling `Room::join`.
   ([#5043](https://github.com/matrix-org/matrix-rust-sdk/pull/5043))
 
 ### Features
 
+- Add `Client::supported_versions()`, which returns the results of both `Client::server_versions()` and
+  `Client::unstable_features()` with a single call.
+  ([#5357](https://github.com/matrix-org/matrix-rust-sdk/pull/5357))
+- `WidgetDriver::send_to_device` Now supports sending encrypted to-device messages.
+  ([#5252](https://github.com/matrix-org/matrix-rust-sdk/pull/5252))
 - `Client::add_event_handler`: Set `Option<EncryptionInfo>` in `EventHandlerData` for to-device messages.
   If the to-device message was encrypted, the `EncryptionInfo` will be set. If it is `None` the message was sent in clear.
   ([#5099](https://github.com/matrix-org/matrix-rust-sdk/pull/5099))
 - `EventCache::subscribe_to_room_generic_updates` is added to subscribe to _all_
   room updates without having to subscribe to all rooms individually
   ([#5247](https://github.com/matrix-org/matrix-rust-sdk/pull/5247))
-- [**breaking**]: The element call widget URL configuration struct uses the new `header` url parameter
+- [**breaking**] The element call widget URL configuration struct uses the new `header` url parameter
   instead of the now deprecated `hideHeader` parameter. This is only compatible with EC v0.13.0 or newer.
+- [**breaking**] `RoomEventCacheGenericUpdate` gains a new `Clear` variant, and sees
+  its `TimelineUpdated` variant being renamed to `UpdateTimeline`.
+  ([#5363](https://github.com/matrix-org/matrix-rust-sdk/pull/5363/))
+- [**breaking**]: The element call widget URL configuration struct uses the new `header` url parameter
+  instead of the now deprecated `hideHeader` parameter. This is only compatible
+  with EC v0.13.0 or newer.
+- [**breaking**]: The experimental `Encryption::encrypt_and_send_raw_to_device`
+  function now takes a `share_strategy` parameter, and will not send to devices
+  that do not satisfy the given share strategy.
+  ([#5457](https://github.com/matrix-org/matrix-rust-sdk/pull/5457/))
 
 ### Refactor
 
+- [**breaking**]: `Client::unstable_features()` returns a `BTreeSet<FeatureFlag>`, containing only
+  the features whose value was set to true in the response to the `/versions` endpoint.
+  ([#5357](https://github.com/matrix-org/matrix-rust-sdk/pull/5357))
+- [**breaking**]: The family of `Room::can_user_*` methods has been removed. The
+  same functionality can be accessed using the `RoomPowerLevels::user_can_*`
+  family of methods. The `RoomPowerLevels` object can be accessed using the
+  `Room::power_levels()` method.
+  ([#5250](https://github.com/matrix-org/matrix-rust-sdk/pull/5250/))
 - `ClientServerCapabilities` has been renamed to `ClientServerInfo`. Alongside this,
   `Client::reset_server_info` is now `Client::reset_server_info` and `Client::fetch_server_capabilities`
   is now `Client::fetch_server_versions`, returning the server versions response directly.

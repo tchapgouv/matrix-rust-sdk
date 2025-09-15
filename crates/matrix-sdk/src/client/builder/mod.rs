@@ -15,14 +15,18 @@
 
 mod homeserver_config;
 
+#[cfg(feature = "experimental-search")]
+use std::collections::HashMap;
 #[cfg(feature = "sqlite")]
 use std::path::Path;
-use std::{fmt, sync::Arc};
+#[cfg(any(feature = "experimental-search", feature = "sqlite"))]
+use std::path::PathBuf;
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use homeserver_config::*;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::DecryptionSettings;
-use matrix_sdk_base::{store::StoreConfig, BaseClient};
+use matrix_sdk_base::{store::StoreConfig, BaseClient, ThreadingSupport};
 use matrix_sdk_base_bwi::jwt_token::{
     BWIJWTTokenValidationError, BWIPublicKeyForJWTTokenValidation,
     BWIPublicKeyForJWTTokenValidationParseError, BWITokenValidator,
@@ -31,7 +35,7 @@ use matrix_sdk_bwi::content_scanner::BWIContentScanner;
 #[cfg(feature = "sqlite")]
 use matrix_sdk_sqlite::SqliteStoreConfig;
 use ruma::{
-    api::{error::FromHttpResponseError, MatrixVersion},
+    api::{error::FromHttpResponseError, MatrixVersion, SupportedVersions},
     OwnedServerName, ServerName,
 };
 use thiserror::Error;
@@ -41,6 +45,10 @@ use tracing::{debug, field::debug, instrument, Span};
 use url::Url;
 
 use super::{Client, ClientInner};
+#[cfg(feature = "experimental-search")]
+use crate::client::search::SearchIndex;
+#[cfg(feature = "experimental-search")]
+use crate::client::search::SearchIndexStoreKind;
 #[cfg(feature = "e2e-encryption")]
 use crate::crypto::{CollectStrategy, TrustRequirement};
 #[cfg(feature = "e2e-encryption")]
@@ -112,7 +120,7 @@ pub struct ClientBuilder {
     store_config: BuilderStoreConfig,
     request_config: RequestConfig,
     respect_login_well_known: bool,
-    server_versions: Option<Box<[MatrixVersion]>>,
+    server_versions: Option<BTreeSet<MatrixVersion>>,
     handle_refresh_tokens: bool,
     base_client: Option<BaseClient>,
     #[cfg(feature = "e2e-encryption")]
@@ -124,6 +132,9 @@ pub struct ClientBuilder {
     #[cfg(feature = "e2e-encryption")]
     enable_share_history_on_invite: bool,
     cross_process_store_locks_holder_name: String,
+    threading_support: ThreadingSupport,
+    #[cfg(feature = "experimental-search")]
+    search_index_store_kind: SearchIndexStoreKind,
 }
 
 impl ClientBuilder {
@@ -158,6 +169,9 @@ impl ClientBuilder {
             enable_share_history_on_invite: false,
             cross_process_store_locks_holder_name:
                 Self::DEFAULT_CROSS_PROCESS_STORE_LOCKS_HOLDER_NAME.to_owned(),
+            threading_support: ThreadingSupport::Disabled,
+            #[cfg(feature = "experimental-search")]
+            search_index_store_kind: SearchIndexStoreKind::InMemory,
         }
     }
 
@@ -533,6 +547,21 @@ impl ClientBuilder {
         self
     }
 
+    /// Whether the threads feature is enabled throuoghout the SDK.
+    /// This will affect how timelines are setup, how read receipts are sent
+    /// and how room unreads are computed.
+    pub fn with_threading_support(mut self, threading_support: ThreadingSupport) -> Self {
+        self.threading_support = threading_support;
+        self
+    }
+
+    /// The base directory in which each room's index directory will be stored.
+    #[cfg(feature = "experimental-search")]
+    pub fn search_index_store(mut self, kind: SearchIndexStoreKind) -> Self {
+        self.search_index_store_kind = kind;
+        self
+    }
+
     /// Create a [`Client`] with the options set on this builder.
     ///
     /// # Errors
@@ -569,6 +598,7 @@ impl ClientBuilder {
             let mut client = BaseClient::new(
                 build_store_config(self.store_config, &self.cross_process_store_locks_holder_name)
                     .await?,
+                self.threading_support,
             );
 
             #[cfg(feature = "e2e-encryption")]
@@ -600,7 +630,9 @@ impl ClientBuilder {
                 None => None,
             };
 
-            let version = self.sliding_sync_version_builder.build(supported_versions.as_ref())?;
+            let version = self.sliding_sync_version_builder.build(
+                supported_versions.map(|response| response.as_supported_versions()).as_ref(),
+            )?;
 
             tracing::info!(?version, "selected sliding sync version");
 
@@ -624,11 +656,12 @@ impl ClientBuilder {
         let send_queue = Arc::new(SendQueueData::new(true));
 
         let server_info = ClientServerInfo {
-            server_versions: match self.server_versions {
-                Some(versions) => Cached(versions),
+            supported_versions: match self.server_versions {
+                Some(versions) => {
+                    Cached(SupportedVersions { versions, features: Default::default() })
+                }
                 None => NotSet,
             },
-            unstable_features: NotSet,
             well_known: Cached(well_known.map(Into::into)),
         };
 
@@ -637,6 +670,10 @@ impl ClientBuilder {
 
         let event_cache = OnceCell::new();
         let latest_events = OnceCell::new();
+
+        #[cfg(feature = "experimental-search")]
+        let search_index =
+            SearchIndex::new(Arc::new(Mutex::new(HashMap::new())), self.search_index_store_kind);
 
         let inner = ClientInner::new(
             auth_ctx,
@@ -656,6 +693,8 @@ impl ClientBuilder {
             #[cfg(feature = "e2e-encryption")]
             self.enable_share_history_on_invite,
             self.cross_process_store_locks_holder_name,
+            #[cfg(feature = "experimental-search")]
+            search_index,
         )
         .await;
 
@@ -821,7 +860,7 @@ enum BuilderStoreConfig {
     #[cfg(feature = "sqlite")]
     Sqlite {
         config: SqliteStoreConfig,
-        cache_path: Option<std::path::PathBuf>,
+        cache_path: Option<PathBuf>,
     },
     #[cfg(feature = "indexeddb")]
     IndexedDb {

@@ -22,7 +22,12 @@ use matrix_sdk::{
     send_queue::SendHandle,
 };
 use ruma::{
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
+    TransactionId,
     events::{
+        AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncStateEvent,
+        AnySyncTimelineEvent, FullStateEventContent, MessageLikeEventContent, MessageLikeEventType,
+        StateEventType, SyncStateEvent,
         poll::unstable_start::{
             NewUnstablePollStartEventContentWithoutRelation, UnstablePollStartEventContent,
         },
@@ -31,20 +36,18 @@ use ruma::{
         room::message::{
             Relation, RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
         },
-        AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncStateEvent,
-        AnySyncTimelineEvent, EventContent, FullStateEventContent, MessageLikeEventType,
-        StateEventType, SyncStateEvent,
     },
     serde::Raw,
-    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
-    TransactionId,
 };
 use tracing::{debug, error, field::debug, instrument, trace, warn};
 
 use super::{
+    EmbeddedEvent, EncryptedMessage, EventTimelineItem, InReplyToDetails, MsgLikeContent,
+    MsgLikeKind, OtherState, ReactionStatus, Sticker, ThreadSummary, TimelineDetails, TimelineItem,
+    TimelineItemContent,
     controller::{
-        find_item_and_apply_aggregation, Aggregation, AggregationKind, ObservableItemsTransaction,
-        PendingEditKind, TimelineMetadata, TimelineStateTransaction,
+        Aggregation, AggregationKind, ObservableItemsTransaction, PendingEditKind,
+        TimelineMetadata, TimelineStateTransaction, find_item_and_apply_aggregation,
     },
     date_dividers::DateDividerAdjuster,
     event_item::{
@@ -53,9 +56,6 @@ use super::{
         TimelineEventItemId,
     },
     traits::RoomDataProvider,
-    EmbeddedEvent, EncryptedMessage, EventTimelineItem, InReplyToDetails, MsgLikeContent,
-    MsgLikeKind, OtherState, ReactionStatus, Sticker, ThreadSummary, TimelineDetails, TimelineItem,
-    TimelineItemContent,
 };
 use crate::timeline::controller::aggregations::PendingEdit;
 
@@ -190,7 +190,7 @@ impl TimelineAction {
         thread_root: Option<OwnedEventId>,
         thread_summary: Option<ThreadSummary>,
     ) -> Option<Self> {
-        let room_version = room_data_provider.room_version();
+        let redaction_rules = room_data_provider.room_version_rules().redaction;
 
         let redacted_message_or_none = |event_type: MessageLikeEventType| {
             (event_type != MessageLikeEventType::Reaction)
@@ -199,7 +199,7 @@ impl TimelineAction {
 
         Some(match event {
             AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomRedaction(ev)) => {
-                if let Some(redacts) = ev.redacts(&room_version).map(ToOwned::to_owned) {
+                if let Some(redacts) = ev.redacts(&redaction_rules).map(ToOwned::to_owned) {
                     Self::HandleAggregation {
                         related_event: redacts,
                         kind: HandleAggregationKind::Redaction,
@@ -498,7 +498,14 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
     /// Handle an event.
     ///
-    /// Returns the number of timeline updates that were made.
+    /// Returns if an item was added to the timeline due to the new timeline
+    /// action. Items might not be added to the timeline for various reasons,
+    /// some common ones are if the item:
+    ///     - Contains an unsupported event type.
+    ///     - Is an edit or a redaction.
+    ///     - Contains a local echo turning into a remote echo.
+    ///     - Contains a message that is already in the timeline but was now
+    ///       decrypted.
     ///
     /// `raw_event` is only needed to determine the cause of any UTDs,
     /// so if we know this is not a UTD it can be None.
@@ -507,7 +514,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         mut self,
         date_divider_adjuster: &mut DateDividerAdjuster,
         timeline_action: TimelineAction,
-    ) -> RemovedItem {
+    ) -> bool {
         let span = tracing::Span::current();
 
         date_divider_adjuster.mark_used();
@@ -526,7 +533,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
                 }
                 trace!("Handling remote event");
             }
-        };
+        }
 
         let mut added_item = false;
 
@@ -566,25 +573,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             },
         }
 
-        let mut removed_item = false;
-
-        if !added_item {
-            trace!("No new item added");
-
-            if let Flow::Remote {
-                position: TimelineItemPosition::UpdateAt { timeline_item_index },
-                ..
-            } = self.ctx.flow
-            {
-                // If add was not called, that means the UTD event is one that
-                // wouldn't normally be visible. Remove it.
-                trace!("Removing UTD that was successfully retried");
-                self.items.remove(timeline_item_index);
-                removed_item = true;
-            }
-        }
-
-        removed_item
+        added_item
     }
 
     #[instrument(skip(self, edit_kind))]
@@ -610,7 +599,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             self.items,
             &target,
             aggregation,
-            &self.meta.room_version,
+            &self.meta.room_version_rules,
         ) {
             // Update all events that replied to this message with the edited content.
             Self::maybe_update_responses(self.meta, self.items, &edited_event_id, &new_item);
@@ -653,7 +642,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             self.items,
             &target,
             aggregation,
-            &self.meta.room_version,
+            &self.meta.room_version_rules,
         );
     }
 
@@ -673,7 +662,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             self.items,
             &target,
             aggregation,
-            &self.meta.room_version,
+            &self.meta.room_version_rules,
         );
     }
 
@@ -689,7 +678,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             self.items,
             &target,
             aggregation,
-            &self.meta.room_version,
+            &self.meta.room_version_rules,
         );
     }
 
@@ -720,7 +709,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             self.items,
             &target,
             aggregation,
-            &self.meta.room_version,
+            &self.meta.room_version_rules,
         ) {
             // Look for any timeline event that's a reply to the redacted event, and redact
             // the replied-to event there as well.
@@ -766,7 +755,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
         let kind: EventTimelineItemKind = match &self.ctx.flow {
             Flow::Local { txn_id, send_handle } => LocalEventTimelineItem {
-                send_state: EventSendState::NotSentYet,
+                send_state: EventSendState::NotSentYet { progress: None },
                 transaction_id: txn_id.to_owned(),
                 send_handle: send_handle.clone(),
             }
@@ -820,7 +809,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             &self.ctx.flow.timeline_item_id(),
             &mut cowed,
             self.items,
-            &self.meta.room_version,
+            &self.meta.room_version_rules,
         ) {
             warn!("discarding aggregations: {err}");
         }

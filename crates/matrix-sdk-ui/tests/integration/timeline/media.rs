@@ -27,13 +27,15 @@ use wiremock::matchers::{bearer_token, method, path};
 use wiremock::Mock;
 // end BWI-specific
 use matrix_sdk::{
-    assert_let_timeout,
-    attachment::{AttachmentConfig, AttachmentInfo, BaseFileInfo},
-    test_utils::mocks::MatrixMockServer,
+    assert_let_timeout, send_queue::AbstractProgress, test_utils::mocks::MatrixMockServer,
 };
 use matrix_sdk_test::{async_test, event_factory::EventFactory, JoinedRoomBuilder, ALICE};
-
-use matrix_sdk_ui::timeline::{AttachmentSource, EventSendState, RoomExt};
+use matrix_sdk_test::{
+    ALICE, JoinedRoomBuilder, TestResult, async_test, event_factory::EventFactory,
+};
+use matrix_sdk_ui::timeline::{
+    AttachmentConfig, AttachmentSource, EventSendState, MediaUploadProgress, RoomExt, TimelineFocus,
+};
 #[cfg(feature = "unstable-msc4274")]
 use matrix_sdk_ui::timeline::{GalleryConfig, GalleryItemInfo};
 #[cfg(feature = "unstable-msc4274")]
@@ -42,23 +44,20 @@ use ruma::events::room::message::GalleryItemType;
 use ruma::owned_mxc_uri;
 use ruma::{
     event_id,
-    events::room::{
-        message::{MessageType, ReplyWithinThread},
-        MediaSource,
-    },
-    room_id, uint, UInt,
+    events::room::{MediaSource, message::MessageType},
+    room_id,
 };
 use serde_json::json;
 use stream_assert::assert_pending;
 use tempfile::TempDir;
 use wiremock::ResponseTemplate;
 
-fn create_temporary_file(filename: &str) -> (TempDir, PathBuf) {
-    let tmp_dir = TempDir::new().unwrap();
+fn create_temporary_file(filename: &str) -> anyhow::Result<(TempDir, PathBuf)> {
+    let tmp_dir = TempDir::new()?;
     let file_path = tmp_dir.path().join(filename);
-    let mut file = File::create(&file_path).unwrap();
-    file.write_all(b"hello world").unwrap();
-    (tmp_dir, file_path)
+    let mut file = File::create(&file_path)?;
+    file.write_all(b"hello world")?;
+    Ok((tmp_dir, file_path))
 }
 
 fn get_filename_and_caption(msg: &MessageType) -> (&str, Option<&str>) {
@@ -72,7 +71,7 @@ fn get_filename_and_caption(msg: &MessageType) -> (&str, Option<&str>) {
 }
 
 #[async_test]
-async fn test_send_attachment_from_file() {
+async fn test_send_attachment_from_file() -> TestResult {
     let mock = MatrixMockServer::new().await;
     let client = mock.client_builder().build().await;
 
@@ -92,7 +91,7 @@ async fn test_send_attachment_from_file() {
 
     let room_id = room_id!("!a98sd12bjh:example.org");
     let room = mock.sync_joined_room(&client, room_id).await;
-    let timeline = room.timeline().await.unwrap();
+    let timeline = room.timeline().await?;
 
     let (items, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
@@ -117,7 +116,7 @@ async fn test_send_attachment_from_file() {
     assert_pending!(timeline_stream);
 
     // Store a file in a temporary directory.
-    let (_tmp_dir, file_path) = create_temporary_file("test.bin");
+    let (_tmp_dir, file_path) = create_temporary_file("test.bin")?;
 
     // Set up mocks for the file upload.
     mock.mock_upload()
@@ -132,17 +131,22 @@ async fn test_send_attachment_from_file() {
 
     mock.mock_room_send().ok(event_id!("$media")).mock_once().mount().await;
 
-    // Queue sending of an attachment.
+    // Queue sending of an attachment in the thread.
+    let thread_timeline = room
+        .timeline_builder()
+        .with_focus(TimelineFocus::Thread { root_event_id: event_id.to_owned() })
+        .build()
+        .await?;
     // BWI-specific // Workaround for bad design
     let info = BaseFileInfo { size: Some(UInt::new(8u64).unwrap()) };
-    let mut config = AttachmentConfig::new().caption(Some("caption".to_owned()));
+    let config = AttachmentConfig { caption: Some("caption".to_owned()), ..Default::default() };
     config.set_info(AttachmentInfo::File(info));
     // end BWI-specific
-    timeline.send_attachment(&file_path, mime::TEXT_PLAIN, config).use_send_queue().await.unwrap();
+    thread_timeline.send_attachment(&file_path, mime::TEXT_PLAIN, config).use_send_queue().await?;
 
     {
         assert_let_timeout!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next());
-        assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
+        assert_matches!(item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
         assert_let!(Some(msg) = item.content().as_message());
 
         // Body is the caption, because there's both a caption and filename.
@@ -159,6 +163,30 @@ async fn test_send_attachment_from_file() {
         assert!(aggregated.is_threaded());
     }
 
+    // The media upload finishes.
+    let (final_index, final_progress) = {
+        assert_let_timeout!(
+            Duration::from_secs(3),
+            Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next()
+        );
+        assert_let!(Some(msg) = item.content().as_message());
+        assert_let!(
+            Some(EventSendState::NotSentYet {
+                progress: Some(MediaUploadProgress { index, progress })
+            }) = item.send_state()
+        );
+        assert_eq!(*index, 0);
+        assert_eq!(progress.current, progress.total);
+        assert_eq!(get_filename_and_caption(msg.msgtype()), ("test.bin", Some("caption")));
+
+        // The URI still refers to the local cache.
+        assert_let!(MessageType::File(file) = msg.msgtype());
+        assert_let!(MediaSource::Plain(uri) = &file.source);
+        assert!(uri.to_string().contains("localhost"));
+
+        (*index, *progress)
+    };
+
     // Eventually, the media is updated with the final MXC IDs…
     {
         assert_let_timeout!(
@@ -166,7 +194,14 @@ async fn test_send_attachment_from_file() {
             Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next()
         );
         assert_let!(Some(msg) = item.content().as_message());
-        assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
+        assert_let!(
+            Some(EventSendState::NotSentYet {
+                progress: Some(MediaUploadProgress { index, progress })
+            }) = item.send_state()
+        );
+        assert_eq!(*index, final_index);
+        assert_eq!(progress.current, final_progress.current);
+        assert_eq!(progress.total, final_progress.total);
         assert_eq!(get_filename_and_caption(msg.msgtype()), ("test.bin", Some("caption")));
 
         // The URI now refers to the final MXC URI.
@@ -187,19 +222,21 @@ async fn test_send_attachment_from_file() {
 
     // That's all, folks!
     assert_pending!(timeline_stream);
+    Ok(())
 }
 
 #[async_test]
-async fn test_send_attachment_from_bytes() {
+async fn test_send_attachment_from_bytes() -> TestResult {
     let mock = MatrixMockServer::new().await;
     let client = mock.client_builder().build().await;
+    client.send_queue().enable_upload_progress(true);
 
     mock.mock_authenticated_media_config().ok_default().mount().await;
     mock.mock_room_state_encryption().plain().mount().await;
 
     let room_id = room_id!("!a98sd12bjh:example.org");
     let room = mock.sync_joined_room(&client, room_id).await;
-    let timeline = room.timeline().await.unwrap();
+    let timeline = room.timeline().await?;
 
     let (items, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
@@ -223,8 +260,9 @@ async fn test_send_attachment_from_bytes() {
 
     // The data of the file.
     let filename = "test.bin";
-    let source =
-        AttachmentSource::Data { bytes: b"hello world".to_vec(), filename: filename.to_owned() };
+    let bytes = b"hello world".to_vec();
+    let size = bytes.len();
+    let source = AttachmentSource::Data { bytes, filename: filename.to_owned() };
 
     // Set up mocks for the file upload.
     mock.mock_upload()
@@ -240,16 +278,15 @@ async fn test_send_attachment_from_bytes() {
     mock.mock_room_send().ok(event_id!("$media")).mock_once().mount().await;
 
     // Queue sending of an attachment.
+    let config = AttachmentConfig { caption: Some("caption".to_owned()), ..Default::default() };
     // BWI-specific
-    let config = AttachmentConfig::new()
-        .caption(Some("caption".to_owned()))
-        .info(AttachmentInfo::File(BaseFileInfo { size: Some(uint!(42)), ..Default::default() }));
+    config.info(AttachmentInfo::File(BaseFileInfo { size: Some(uint!(42)), ..Default::default() }));
     // end BWI-specific
-    timeline.send_attachment(source, mime::TEXT_PLAIN, config).use_send_queue().await.unwrap();
+    timeline.send_attachment(source, mime::TEXT_PLAIN, config).use_send_queue().await?;
 
     {
         assert_let_timeout!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next());
-        assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
+        assert_matches!(item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
         assert_let!(Some(msg) = item.content().as_message());
 
         // Body is the caption, because there's both a caption and filename.
@@ -262,20 +299,49 @@ async fn test_send_attachment_from_bytes() {
         assert!(uri.to_string().contains("localhost"));
     }
 
-    // Eventually, the media is updated with the final MXC IDs…
+    // The media upload progress is being reported and eventually the upload
+    // finishes.
     {
-        assert_let_timeout!(
-            Duration::from_secs(3),
-            Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next()
-        );
-        assert_let!(Some(msg) = item.content().as_message());
-        assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
-        assert_eq!(get_filename_and_caption(msg.msgtype()), (filename, Some("caption")));
+        let mut prev_progress: Option<AbstractProgress> = None;
 
-        // The URI now refers to the final MXC URI.
-        assert_let!(MessageType::File(file) = msg.msgtype());
-        assert_let!(MediaSource::Plain(uri) = &file.source);
-        assert_eq!(uri.to_string(), "mxc://sdk.rs/media");
+        loop {
+            assert_let_timeout!(
+                Duration::from_secs(3),
+                Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next()
+            );
+
+            // The caption is still correct.
+            assert_let!(Some(msg) = item.content().as_message());
+            assert_eq!(get_filename_and_caption(msg.msgtype()), (filename, Some("caption")));
+
+            assert_let!(Some(EventSendState::NotSentYet { progress }) = item.send_state());
+
+            assert_let!(Some(MediaUploadProgress { index, progress }) = progress);
+
+            // We're only uploading a single file.
+            assert_eq!(*index, 0);
+
+            // The progress is reported in units of the unencrypted file size.
+            assert!(progress.current <= progress.total);
+            assert_eq!(progress.total, size);
+
+            // The progress only increases.
+            if let Some(prev_progress) = prev_progress {
+                assert!(progress.current >= prev_progress.current);
+            }
+            prev_progress = Some(*progress);
+
+            assert_let!(MessageType::File(file) = msg.msgtype());
+            assert_let!(MediaSource::Plain(uri) = &file.source);
+
+            // Check if the upload finished and the URI now refers to the final MXC URI.
+            if progress.current == progress.total && *uri == "mxc://sdk.rs/media" {
+                break;
+            }
+
+            // Otherwise, the URI still refers to the local cache.
+            assert!(uri.to_string().contains("localhost"));
+        }
     }
 
     // And eventually the event itself is sent.
@@ -290,11 +356,12 @@ async fn test_send_attachment_from_bytes() {
 
     // That's all, folks!
     assert_pending!(timeline_stream);
+    Ok(())
 }
 
 #[cfg(feature = "unstable-msc4274")]
 #[async_test]
-async fn test_send_gallery_from_bytes() {
+async fn test_send_gallery_from_bytes() -> TestResult {
     let mock = MatrixMockServer::new().await;
     let client = mock.client_builder().build().await;
 
@@ -303,7 +370,7 @@ async fn test_send_gallery_from_bytes() {
 
     let room_id = room_id!("!a98sd12bjh:example.org");
     let room = mock.sync_joined_room(&client, room_id).await;
-    let timeline = room.timeline().await.unwrap();
+    let timeline = room.timeline().await?;
 
     let (items, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
@@ -359,11 +426,11 @@ async fn test_send_gallery_from_bytes() {
             formatted_caption: None,
             thumbnail: None,
         });
-    timeline.send_gallery(gallery).await.unwrap();
+    timeline.send_gallery(gallery).await?;
 
     {
         assert_let_timeout!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next());
-        assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
+        assert_matches!(item.send_state(), Some(EventSendState::NotSentYet { progress: None }));
         assert_let!(Some(msg) = item.content().as_message());
 
         // Body matches gallery caption.
@@ -383,6 +450,42 @@ async fn test_send_gallery_from_bytes() {
         assert!(uri.to_string().contains("localhost"));
     }
 
+    // The media upload finishes.
+    let (final_index, final_progress) = {
+        assert_let_timeout!(
+            Duration::from_secs(3),
+            Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next()
+        );
+        assert_let!(
+            Some(EventSendState::NotSentYet {
+                progress: Some(MediaUploadProgress { index, progress })
+            }) = item.send_state()
+        );
+        assert_let!(Some(msg) = item.content().as_message());
+
+        // The upload has finished.
+        assert_eq!(*index, 0);
+        assert_eq!(progress.current, progress.total);
+
+        // Body matches gallery caption.
+        assert_eq!(msg.body(), "caption");
+
+        // Message is gallery of expected length
+        assert_let!(MessageType::Gallery(content) = msg.msgtype());
+        assert_eq!(1, content.itemtypes.len());
+        assert_let!(GalleryItemType::File(file) = content.itemtypes.first().unwrap());
+
+        // Item has filename and caption
+        assert_eq!(filename, file.filename());
+        assert_eq!(Some("item caption"), file.caption());
+
+        // The URI still refers to the local cache.
+        assert_let!(MediaSource::Plain(uri) = &file.source);
+        assert!(uri.to_string().contains("localhost"));
+
+        (*index, progress.clone())
+    };
+
     // Eventually, the media is updated with the final MXC IDs…
     {
         assert_let_timeout!(
@@ -390,7 +493,14 @@ async fn test_send_gallery_from_bytes() {
             Some(VectorDiff::Set { index: 1, value: item }) = timeline_stream.next()
         );
         assert_let!(Some(msg) = item.content().as_message());
-        assert_matches!(item.send_state(), Some(EventSendState::NotSentYet));
+        assert_let!(
+            Some(EventSendState::NotSentYet {
+                progress: Some(MediaUploadProgress { index, progress })
+            }) = item.send_state()
+        );
+        assert_eq!(*index, final_index);
+        assert_eq!(progress.current, final_progress.current);
+        assert_eq!(progress.total, final_progress.total);
 
         // Message is gallery of expected length
         assert_let!(MessageType::Gallery(content) = msg.msgtype());
@@ -418,10 +528,11 @@ async fn test_send_gallery_from_bytes() {
 
     // That's all, folks!
     assert_pending!(timeline_stream);
+    Ok(())
 }
 
 #[async_test]
-async fn test_react_to_local_media() {
+async fn test_react_to_local_media() -> TestResult {
     let mock = MatrixMockServer::new().await;
     let client = mock.client_builder().build().await;
 
@@ -444,7 +555,7 @@ async fn test_react_to_local_media() {
 
     let room_id = room_id!("!a98sd12bjh:example.org");
     let room = mock.sync_joined_room(&client, room_id).await;
-    let timeline = room.timeline().await.unwrap();
+    let timeline = room.timeline().await?;
 
     let (items, mut timeline_stream) =
         timeline.subscribe_filter_map(|item| item.as_event().cloned()).await;
@@ -453,16 +564,16 @@ async fn test_react_to_local_media() {
     assert_pending!(timeline_stream);
 
     // Store a file in a temporary directory.
-    let (_tmp_dir, file_path) = create_temporary_file("test.bin");
+    let (_tmp_dir, file_path) = create_temporary_file("test.bin")?;
 
     // Queue sending of an attachment (no captions).
+    let config = AttachmentConfig::default();
     // BWI-specific // Workaround for bad design
     let kb_as_bytes = UInt::new(1024).unwrap();
     let info = BaseFileInfo { size: Some(kb_as_bytes) };
-    let mut config = AttachmentConfig::new();
     config.set_info(AttachmentInfo::File(info));
-    timeline.send_attachment(&file_path, mime::TEXT_PLAIN, config).use_send_queue().await.unwrap();
     // end BWI-specific
+    timeline.send_attachment(&file_path, mime::TEXT_PLAIN, config).use_send_queue().await?;
 
     let item_id = {
         assert_let_timeout!(Some(VectorDiff::PushBack { value: item }) = timeline_stream.next());
@@ -476,7 +587,7 @@ async fn test_react_to_local_media() {
     };
 
     // Add a reaction to the file media event.
-    timeline.toggle_reaction(&item_id, "🤪").await.unwrap();
+    timeline.toggle_reaction(&item_id, "🤪").await?;
 
     assert_let_timeout!(Some(VectorDiff::Set { index: 0, value: item }) = timeline_stream.next());
     assert_let!(Some(msg) = item.content().as_message());
@@ -489,6 +600,7 @@ async fn test_react_to_local_media() {
 
     // That's all, folks!
     assert_pending!(timeline_stream);
+    Ok(())
 }
 
 // BWI-specific

@@ -18,12 +18,12 @@ use assert_matches::assert_matches;
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use futures_util::{
-    future::{join, join3},
     FutureExt, StreamExt as _,
+    future::{join, join3},
 };
 use matrix_sdk::{
     assert_let_timeout,
-    config::SyncSettings,
+    config::{SyncSettings, SyncToken},
     event_cache::RoomPaginationStatus,
     test_utils::{
         logged_in_client_with_server,
@@ -31,24 +31,25 @@ use matrix_sdk::{
     },
 };
 use matrix_sdk_test::{
-    async_test, event_factory::EventFactory, mocks::mock_encryption_state, JoinedRoomBuilder,
-    StateTestEvent, SyncResponseBuilder, ALICE, BOB,
+    ALICE, BOB, JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder, async_test,
+    event_factory::EventFactory, mocks::mock_encryption_state,
 };
 use matrix_sdk_ui::timeline::{AnyOtherFullStateEventContent, RoomExt, TimelineItemContent};
 use once_cell::sync::Lazy;
 use ruma::{
-    events::{room::message::MessageType, FullStateEventContent},
-    room_id, EventId,
+    EventId,
+    events::{FullStateEventContent, room::message::MessageType},
+    room_id,
 };
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use stream_assert::{assert_next_eq, assert_pending};
 use tokio::{
     spawn,
     time::{sleep, timeout},
 };
 use wiremock::{
-    matchers::{header, method, path_regex, query_param, query_param_is_missing},
     Mock, ResponseTemplate,
+    matchers::{header, method, path_regex, query_param, query_param_is_missing},
 };
 
 use crate::{mock_sync, timeline::sliding_sync::assert_timeline_stream};
@@ -411,7 +412,8 @@ async fn test_wait_for_token() {
     let room_id = room_id!("!a98sd12bjh:example.org");
     let (client, server) = logged_in_client_with_server().await;
 
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let sync_settings =
+        SyncSettings::new().timeout(Duration::from_millis(3000)).token(SyncToken::NoToken);
 
     let f = EventFactory::new();
     let mut sync_builder = SyncResponseBuilder::new();
@@ -534,7 +536,8 @@ async fn test_dedup_pagination() {
 async fn test_timeline_reset_while_paginating() {
     let room_id = room_id!("!a98sd12bjh:example.org");
     let (client, server) = logged_in_client_with_server().await;
-    let sync_settings = SyncSettings::new().timeout(Duration::from_millis(3000));
+    let sync_settings =
+        SyncSettings::new().timeout(Duration::from_millis(3000)).token(SyncToken::NoToken);
 
     let f = EventFactory::new();
     let mut sync_builder = SyncResponseBuilder::new();

@@ -1,37 +1,55 @@
 <h1 align="center">Matrix Rust SDK</h1>
+
 <div align="center">
-    <i>Your all-in-one toolkit for creating Matrix clients with Rust, from simple bots to full-featured apps.</i>
-    <br/><br/>
-    <img src="contrib/logo.svg">
-    <br>
-    <hr>
-    <a href="https://github.com/matrix-org/matrix-rust-sdk/releases">
-        <img src="https://img.shields.io/github/v/release/matrix-org/matrix-rust-sdk?style=flat&labelColor=1C2E27&color=66845F&logo=GitHub&logoColor=white"></a>
-    <a href="https://crates.io/crates/matrix-sdk/">
-        <img src="https://img.shields.io/crates/v/matrix-sdk?style=flat&labelColor=1C2E27&color=66845F&logo=Rust&logoColor=white"></a>
-    <a href="https://codecov.io/gh/matrix-org/matrix-rust-sdk">
-        <img src="https://img.shields.io/codecov/c/gh/matrix-org/matrix-rust-sdk?style=flat&labelColor=1C2E27&color=66845F&logo=Codecov&logoColor=white"></a>
-    <br>
-    <a href="https://docs.rs/matrix-sdk/">
-        <img src="https://img.shields.io/docsrs/matrix-sdk?style=flat&labelColor=1C2E27&color=66845F&logo=Rust&logoColor=white"></a>
-    <a href="https://github.com/matrix-org/matrix-rust-sdk/actions/workflows/ci.yml">
-        <img src="https://img.shields.io/github/actions/workflow/status/matrix-org/matrix-rust-sdk/ci.yml?style=flat&labelColor=1C2E27&color=66845F&logo=GitHub%20Actions&logoColor=white"></a>
-    <br>
-    <br>
+  <em>Your all-in-one toolkit for creating Matrix clients with Rust, from simple bots to full-featured apps.</em>
+  <br />
+  <img src="contrib/logo.svg">
+  <hr />
+  <a href="https://github.com/matrix-org/matrix-rust-sdk/releases">
+    <img src="https://img.shields.io/github/v/release/matrix-org/matrix-rust-sdk?style=flat&labelColor=1C2E27&color=66845F&logo=GitHub&logoColor=white"></a>
+  <a href="https://crates.io/crates/matrix-sdk/">
+    <img src="https://img.shields.io/crates/v/matrix-sdk?style=flat&labelColor=1C2E27&color=66845F&logo=Rust&logoColor=white"></a>
+  <a href="https://codecov.io/gh/matrix-org/matrix-rust-sdk">
+    <img src="https://img.shields.io/codecov/c/gh/matrix-org/matrix-rust-sdk?style=flat&labelColor=1C2E27&color=66845F&logo=Codecov&logoColor=white"></a>
+  <br />
+  <a href="https://docs.rs/matrix-sdk/">
+    <img src="https://img.shields.io/docsrs/matrix-sdk?style=flat&labelColor=1C2E27&color=66845F&logo=Rust&logoColor=white"></a>
+  <a href="https://github.com/matrix-org/matrix-rust-sdk/actions/workflows/ci.yml">
+    <img src="https://img.shields.io/github/actions/workflow/status/matrix-org/matrix-rust-sdk/ci.yml?style=flat&labelColor=1C2E27&color=66845F&logo=GitHub%20Actions&logoColor=white"></a>
 </div>
 
+<div align="center">
 
-The Matrix Rust SDK is a collection of libraries that make it easier to build
-[Matrix] clients in [Rust]. It takes care of the low-level details like encryption,
+The Matrix Rust SDK is a collection of libraries that make it easier to build [Matrix] clients in [Rust].
+<br />
+<br />
+
+<picture>
+  <source srcset="contrib/element-logo-light.png" media="(prefers-color-scheme: dark)">
+  <source srcset="contrib/element-logo-dark.png" media="(prefers-color-scheme: light)">
+  <img src="contrib/element-logo-fallback.png" alt="Element logo">
+</picture>
+
+<br />
+<br />
+
+Development of the SDK is proudly sponsored and maintained by [Element](https://element.io). Element uses the SDK in their next-generation mobile apps Element X on [iOS](https://github.com/element-hq/element-x-ios) and [Android](https://github.com/element-hq/element-x-android) and has plans to introduce it to the web and desktop clients as well.
+
+The SDK is also the basis for multiple Matrix projects and we welcome contributions from all.
+
+</div>
+
+## Purpose
+
+The SDK takes care of the low-level details like encryption,
 syncing, and room state, so you can focus on your app's logic and UI. Whether
 you're writing a small bot, a desktop client, or something in between, the SDK
 is designed to be flexible, async-friendly, and ready to use out of the box.
 
-## Repository
+## Project structure
 
-https://gitlab.opencode.de/bwi/bundesmessenger/clients/bundesmessenger-matrix-rust-sdk.git
-
-The Matrix Rust SDK is made up of several crates that build on top of each other. Here are the key ones:
+The Matrix Rust SDK is made up of several crates that build on top of each
+other. The following crates are expected to be usable as direct dependencies:
 
 - [matrix-sdk-ui](https://docs.rs/matrix-sdk-ui/latest/matrix_sdk_ui/) – A high-level client library that makes it easy to build
   full-featured UI clients with minimal setup. Check out our reference client,
@@ -44,7 +62,10 @@ The Matrix Rust SDK is made up of several crates that build on top of each other
   See the [crypto tutorial](https://docs.rs/matrix-sdk-crypto/latest/matrix_sdk_crypto/tutorial/index.html)
   for a step-by-step introduction.
 
-## Struktur
+All other crates are effectively internal-only and only structured as crates
+for organizational purposes and to improve compilation times. Direct usage of them is discouraged.
+
+## Status
 
 The library is considered production ready and backs multiple client
 implementations such as Element X
@@ -53,12 +74,7 @@ implementations such as Element X
 [Fractal](https://gitlab.gnome.org/World/fractal) and [iamb](https://github.com/ulyssa/iamb). Client developers should feel
 confident to build upon it.
 
-Development of the SDK has been primarily sponsored by Element though accepts
-contributions from all.
-
-* **matirx-sdk-base-bwi** - Alle Bundesmessenger-Erweiterungen, welche keine Abhängigkeiten zu den bestehenden
-  matirx-sdk crates haben.
-* **matirx-sdk-bwi** - Alle Bundesmessenger-Erweiterungen, welche Abhängigkeiten zu der matirx-sdk crate haben.
+## Bindings
 
 The higher-level crates of the Matrix Rust SDK can be embedded in other
 environments such as Swift, Kotlin, JavaScript, and Node.js. Check out the
@@ -68,49 +84,6 @@ into your language of choice.
 
 [Matrix Rust SDK](https://github.com/matrix-org/matrix-rust-sdk)
 
-## Für Entwickler
 
-### Commit-Hooks
-
-Durch das erstmalige ausführen von `cargo test` werden die Git-Hooks automatisch initialisiert.
-Ob die Initialisierung erfolgreich war, kann mit `less .git/hooks/pre-commit` überprüft werden.
-
-Wenn der Output `.git/hooks/pre-commit: No such file or directory` lautet, so muss zuerst ein _.git/hooks_-Verzeichnis
-mittels `mkdir .git/hooks` erzeugt werden.
-Anschließend können mittels `rusty-hook init` die hooks initialisiert werden.
-
-### Für Android
-
-Das Rust-SDK wird mittels eines *.aar Archives in den Android Messenger X eingebunden.
-Zur Erstellung dieses Archives wird folgender Befehl im root dieses Projektes ausgeführt:
-
-```./android-scripts/build.sh -p . -t $TARGET_ARCHITECTURE $PROFILE```
-
-Dabei ist `$TARGET_ARCHITECTURE` die Zielarchitektur (z.B. `aarch64-linux-android`, `i686-linux-android` oder
-`armv7-linux-androideabi`).
-`$PROFILE` kann dabei durch `-r` ersetzt werden, wenn es sich um einen Build für ein Release handeln soll.
-
-Das entstandene *.aar Archiv kann dann von der Android-App verwendet werden.
-Genauere Informationen dazu können dem _BundesMessenger X Android_ Projekt entnommen werden.
-
-### Für iOS
-
-Das Rust-SDK wird mittels eines GitSubmoduls eingebunden.
-Anschießend wird ein Swift-Package erzeugt, welches von XCode angesprochen werden kann.
-Um ein Swift-Package zu erzeugen, steht folgender Befehlt zu Verfügung:
-
-```xtask swift build-framework -t $TARGET_ARCHITECTURE --profile $PROFILE```
-
-Dabei ist `$TARGET_ARCHITECTURE` die Zielarchitektur (z.B. `aarch64-apple-ios`, `aarch64-apple-ios-sim` oder
-`x86_64-apple-ios`).
-Für `$PROFILE` stehen dabei `bwibuild` (schneller Build) und `bwidbg` (Build für Debugging) zu Verfügung.
-Anschließend kann das Rust-SDK über die generierte Package.swift lokal eingebunden werden.
-
-## Rechtliches
-
-Die Lizenz des BundesMessenger - Matrix Rust SDK ist die [Apache License Version 2.0](./LICENSE).
-
-### Copyright
-
-- [BWI GmbH](https://messenger.bwi.de/copyright)
-- [Matrix](https://matrix.org/)
+[Matrix]: https://matrix.org/
+[Rust]: https://www.rust-lang.org/

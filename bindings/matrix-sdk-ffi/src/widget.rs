@@ -197,6 +197,15 @@ pub fn get_element_call_required_permissions(
         .chain(read_send.clone())
         .collect(),
         send: vec![
+            // To notify other users that a call has started.
+            WidgetEventFilter::MessageLikeWithType {
+                event_type: "org.matrix.msc4075.rtc.notification".to_owned(),
+            },
+            // Also for call notifications, except this is the deprecated fallback type which
+            // Element Call still sends.
+            WidgetEventFilter::MessageLikeWithType {
+                event_type: MessageLikeEventType::CallNotify.to_string(),
+            },
             // To send the call participation state event (main MatrixRTC event).
             // This is required for legacy state events (using only one event for all devices with
             // a membership array). TODO: remove once legacy call member events are
@@ -211,12 +220,23 @@ pub fn get_element_call_required_permissions(
                 event_type: StateEventType::CallMember.to_string(),
                 state_key: format!("{own_user_id}_{own_device_id}"),
             },
+            // Same as above for [MSC3779] and [MSC4143](https://github.com/matrix-org/matrix-spec-proposals/pull/4143),
+            // with application suffix
+            WidgetEventFilter::StateWithTypeAndStateKey {
+                event_type: StateEventType::CallMember.to_string(),
+                state_key: format!("{own_user_id}_{own_device_id}_m.call"),
+            },
             // The same as above but with an underscore.
             // To work around the issue that state events starting with `@` have to be Matrix id's
             // but we use mxId+deviceId.
             WidgetEventFilter::StateWithTypeAndStateKey {
                 event_type: StateEventType::CallMember.to_string(),
                 state_key: format!("_{own_user_id}_{own_device_id}"),
+            },
+            // Same as above for [MSC4143], with application suffix
+            WidgetEventFilter::StateWithTypeAndStateKey {
+                event_type: StateEventType::CallMember.to_string(),
+                state_key: format!("_{own_user_id}_{own_device_id}_m.call"),
             },
         ]
         .into_iter()
@@ -498,7 +518,13 @@ mod tests {
             "org.matrix.msc2762.send.state_event:org.matrix.msc3401.call.member#@my_user:my_domain.org_ABCDEFGHI",
         );
         cap_assert(
+            "org.matrix.msc2762.send.state_event:org.matrix.msc3401.call.member#@my_user:my_domain.org_ABCDEFGHI_m.call",
+        );
+        cap_assert(
             "org.matrix.msc2762.send.state_event:org.matrix.msc3401.call.member#_@my_user:my_domain.org_ABCDEFGHI",
+        );
+        cap_assert(
+            "org.matrix.msc2762.send.state_event:org.matrix.msc3401.call.member#_@my_user:my_domain.org_ABCDEFGHI_m.call",
         );
         cap_assert("org.matrix.msc2762.send.event:org.matrix.rageshake_request");
         cap_assert("org.matrix.msc2762.send.event:io.element.call.encryption_keys");

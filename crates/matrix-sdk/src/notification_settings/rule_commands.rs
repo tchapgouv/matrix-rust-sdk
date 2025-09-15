@@ -87,6 +87,9 @@ impl RuleCommands {
         Ok(())
     }
 
+    /// Enable or disable the given rule.
+    ///
+    /// Will return an error if the rule does not exist.
     fn set_enabled_internal(
         &mut self,
         kind: RuleKind,
@@ -133,22 +136,32 @@ impl RuleCommands {
         )?;
 
         // For compatibility purpose, we still need to add commands for
-        // `ContainsUserName` and `ContainsDisplayName` (deprecated rules).
+        // `ContainsUserName` and `ContainsDisplayName` (removed rules).
         #[allow(deprecated)]
         {
             // `ContainsUserName`
-            self.set_enabled_internal(
+            if let Err(err) = self.set_enabled_internal(
                 RuleKind::Content,
                 PredefinedContentRuleId::ContainsUserName.as_str(),
                 enabled,
-            )?;
+            ) {
+                // This rule has been removed from the spec, so it's fine if it wasn't found.
+                if !err.is_rule_not_found() {
+                    return Err(err);
+                }
+            }
 
             // `ContainsDisplayName`
-            self.set_enabled_internal(
+            if let Err(err) = self.set_enabled_internal(
                 RuleKind::Override,
                 PredefinedOverrideRuleId::ContainsDisplayName.as_str(),
                 enabled,
-            )?;
+            ) {
+                // This rule has been removed from the spec, so it's fine if it wasn't found.
+                if !err.is_rule_not_found() {
+                    return Err(err);
+                }
+            }
         }
 
         Ok(())
@@ -164,14 +177,19 @@ impl RuleCommands {
             enabled,
         )?;
 
-        // For compatibility purpose, we still need to set `RoomNotif` (deprecated
+        // For compatibility purpose, we still need to set `RoomNotif` (removed
         // rule).
         #[allow(deprecated)]
-        self.set_enabled_internal(
+        if let Err(err) = self.set_enabled_internal(
             RuleKind::Override,
             PredefinedOverrideRuleId::RoomNotif.as_str(),
             enabled,
-        )?;
+        ) {
+            // This rule has been removed from the spec, so it's fine if it wasn't found.
+            if !err.is_rule_not_found() {
+                return Err(err);
+            }
+        }
 
         Ok(())
     }

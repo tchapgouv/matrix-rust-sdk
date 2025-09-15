@@ -43,18 +43,18 @@ mod tests {
     use assign::assign;
     use matrix_sdk_test::{ALICE, BOB, CAROL};
     use ruma::{
-        device_id, event_id,
+        DeviceId, EventId, MilliSecondsSinceUnixEpoch, OwnedUserId, UserId, device_id, event_id,
         events::{
+            AnySyncStateEvent, StateUnsigned, SyncStateEvent,
             call::member::{
                 ActiveFocus, ActiveLivekitFocus, Application, CallApplicationContent,
                 CallMemberEventContent, CallMemberStateKey, Focus, LegacyMembershipData,
                 LegacyMembershipDataInit, LivekitFocus, OriginalSyncCallMemberEvent,
             },
-            AnySyncStateEvent, StateUnsigned, SyncStateEvent,
         },
         room_id,
         time::SystemTime,
-        user_id, DeviceId, EventId, MilliSecondsSinceUnixEpoch, OwnedUserId, UserId,
+        user_id,
     };
     use similar_asserts::assert_eq;
 
@@ -133,17 +133,23 @@ mod tests {
             "https://lk.org".to_owned(),
         ))];
         let focus_active = ActiveFocus::Livekit(ActiveLivekitFocus::new());
+
         let (content, state_key) = match init_data {
-            Some(InitData { device_id, minutes_ago }) => (
-                CallMemberEventContent::new(
-                    application,
-                    device_id.to_owned(),
-                    focus_active,
-                    foci_preferred,
-                    Some(timestamp(minutes_ago)),
-                ),
-                CallMemberStateKey::new(user_id.to_owned(), Some(device_id.to_owned()), false),
-            ),
+            Some(InitData { device_id, minutes_ago }) => {
+                let member_id = format!("{device_id}_m.call");
+                (
+                    CallMemberEventContent::new(
+                        application,
+                        device_id.to_owned(),
+                        focus_active,
+                        foci_preferred,
+                        Some(timestamp(minutes_ago)),
+                        None,
+                    ),
+                    CallMemberStateKey::new(user_id.to_owned(), Some(member_id), false),
+                )
+            }
+
             None => (
                 CallMemberEventContent::new_empty(None),
                 CallMemberStateKey::new(user_id.to_owned(), None, false),

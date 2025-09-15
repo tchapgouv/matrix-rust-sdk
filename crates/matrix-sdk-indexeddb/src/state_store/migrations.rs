@@ -46,7 +46,7 @@ use super::{
 };
 use crate::IndexeddbStateStoreError;
 
-const CURRENT_DB_VERSION: u32 = 12;
+const CURRENT_DB_VERSION: u32 = 14;
 const CURRENT_META_DB_VERSION: u32 = 2;
 
 /// Sometimes Migrations can't proceed without having to drop existing
@@ -236,6 +236,12 @@ pub async fn upgrade_inner_db(
             }
             if old_version < 12 {
                 db = migrate_to_v12(db).await?;
+            }
+            if old_version < 13 {
+                db = migrate_to_v13(db).await?;
+            }
+            if old_version < 14 {
+                db = migrate_to_v14(db).await?;
             }
         }
 
@@ -793,6 +799,28 @@ async fn migrate_to_v12(db: IdbDatabase) -> Result<IdbDatabase> {
     Ok(IdbDatabase::open_u32(&name, 12)?.await?)
 }
 
+/// Add the thread subscriptions table.
+async fn migrate_to_v13(db: IdbDatabase) -> Result<IdbDatabase> {
+    let migration = OngoingMigration {
+        drop_stores: [].into(),
+        create_stores: [keys::THREAD_SUBSCRIPTIONS].into_iter().collect(),
+        data: Default::default(),
+    };
+    apply_migration(db, 13, migration).await
+}
+
+/// Empty the thread subscriptions table, because the serialized format has
+/// changed (from storing only the subscription to storing the
+/// `StoredThreadSubscription`).
+async fn migrate_to_v14(db: IdbDatabase) -> Result<IdbDatabase> {
+    let migration = OngoingMigration {
+        drop_stores: [keys::THREAD_SUBSCRIPTIONS].into_iter().collect(),
+        create_stores: [keys::THREAD_SUBSCRIPTIONS].into_iter().collect(),
+        data: Default::default(),
+    };
+    apply_migration(db, 14, migration).await
+}
+
 #[cfg(all(test, target_family = "wasm"))]
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
@@ -815,9 +843,9 @@ mod tests {
             },
             AnySyncStateEvent, StateEventType,
         },
-        room_id,
+        owned_user_id, room_id,
         serde::Raw,
-        server_name, user_id, EventId, MilliSecondsSinceUnixEpoch, RoomId, UserId,
+        server_name, user_id, EventId, MilliSecondsSinceUnixEpoch, OwnedUserId, RoomId, UserId,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -1234,12 +1262,13 @@ mod tests {
 
         let room_id = room_id!("!room:localhost");
         let member_event =
-            Raw::new(&*test_json::MEMBER_INVITE).unwrap().cast::<SyncRoomMemberEvent>();
+            Raw::new(&*test_json::MEMBER_INVITE).unwrap().cast_unchecked::<SyncRoomMemberEvent>();
         let user_id = user_id!("@invited:localhost");
 
         let stripped_room_id = room_id!("!stripped_room:localhost");
-        let stripped_member_event =
-            Raw::new(&*test_json::MEMBER_STRIPPED).unwrap().cast::<StrippedRoomMemberEvent>();
+        let stripped_member_event = Raw::new(&*test_json::MEMBER_STRIPPED)
+            .unwrap()
+            .cast_unchecked::<StrippedRoomMemberEvent>();
         let stripped_user_id = user_id!("@example:localhost");
 
         // Populate DB with old table.
@@ -1308,15 +1337,16 @@ mod tests {
 
         let room_id = room_id!("!room:localhost");
         let invite_member_event =
-            Raw::new(&*test_json::MEMBER_INVITE).unwrap().cast::<SyncRoomMemberEvent>();
+            Raw::new(&*test_json::MEMBER_INVITE).unwrap().cast_unchecked::<SyncRoomMemberEvent>();
         let invite_user_id = user_id!("@invited:localhost");
         let ban_member_event =
-            Raw::new(&*test_json::MEMBER_BAN).unwrap().cast::<SyncRoomMemberEvent>();
+            Raw::new(&*test_json::MEMBER_BAN).unwrap().cast_unchecked::<SyncRoomMemberEvent>();
         let ban_user_id = user_id!("@banned:localhost");
 
         let stripped_room_id = room_id!("!stripped_room:localhost");
-        let stripped_member_event =
-            Raw::new(&*test_json::MEMBER_STRIPPED).unwrap().cast::<StrippedRoomMemberEvent>();
+        let stripped_member_event = Raw::new(&*test_json::MEMBER_STRIPPED)
+            .unwrap()
+            .cast_unchecked::<StrippedRoomMemberEvent>();
         let stripped_user_id = user_id!("@example:localhost");
 
         // Populate DB with old table.
@@ -1492,10 +1522,11 @@ mod tests {
         room_state_store: &IdbObjectStore<'_>,
         room_id: &RoomId,
         name: Option<&str>,
-        create_creator: Option<&UserId>,
+        create_creator: Option<OwnedUserId>,
         create_sender: Option<&UserId>,
     ) -> Result<()> {
-        let room_info_json = room_info_v1_json(room_id, RoomState::Joined, name, create_creator);
+        let room_info_json =
+            room_info_v1_json(room_id, RoomState::Joined, name, create_creator.as_deref());
 
         room_infos_store.put_key_val(
             &encode_key(None, keys::ROOM_INFOS, room_id),
@@ -1508,7 +1539,7 @@ mod tests {
         };
 
         let create_content = match create_creator {
-            Some(creator) => RoomCreateEventContent::new_v1(creator.to_owned()),
+            Some(creator) => RoomCreateEventContent::new_v1(creator),
             None => RoomCreateEventContent::new_v11(),
         };
 
@@ -1516,7 +1547,7 @@ mod tests {
         let create_event = json!({
             "content": create_content,
             "event_id": event_id,
-            "sender": create_sender.to_owned(),
+            "sender": create_sender,
             "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
             "state_key": "",
             "type": "m.room.create",
@@ -1538,17 +1569,17 @@ mod tests {
         // Room A: with name, creator and sender.
         let room_a_id = room_id!("!room_a:dummy.local");
         let room_a_name = "Room A";
-        let room_a_creator = user_id!("@creator:dummy.local");
+        let room_a_creator = owned_user_id!("@creator:dummy.local");
         // Use a different sender to check that sender is used over creator in
         // migration.
-        let room_a_create_sender = user_id!("@sender:dummy.local");
+        let room_a_create_sender = owned_user_id!("@sender:dummy.local");
 
         // Room B: without name, creator and sender.
         let room_b_id = room_id!("!room_b:dummy.local");
 
         // Room C: only with sender.
         let room_c_id = room_id!("!room_c:dummy.local");
-        let room_c_create_sender = user_id!("@creator:dummy.local");
+        let room_c_create_sender = owned_user_id!("@creator:dummy.local");
 
         // Create and populate db.
         {
@@ -1567,7 +1598,7 @@ mod tests {
                 room_a_id,
                 Some(room_a_name),
                 Some(room_a_creator),
-                Some(room_a_create_sender),
+                Some(&room_a_create_sender),
             )?;
             add_room_v7(&room_infos_store, &room_state_store, room_b_id, None, None, None)?;
             add_room_v7(
@@ -1576,7 +1607,7 @@ mod tests {
                 room_c_id,
                 None,
                 None,
-                Some(room_c_create_sender),
+                Some(&room_c_create_sender),
             )?;
 
             tx.await.into_result()?;
@@ -1592,15 +1623,15 @@ mod tests {
 
         let room_a = room_infos.iter().find(|r| r.room_id() == room_a_id).unwrap();
         assert_eq!(room_a.name(), Some(room_a_name));
-        assert_eq!(room_a.creator(), Some(room_a_create_sender));
+        assert_eq!(room_a.creators(), Some(vec![room_a_create_sender]));
 
         let room_b = room_infos.iter().find(|r| r.room_id() == room_b_id).unwrap();
         assert_eq!(room_b.name(), None);
-        assert_eq!(room_b.creator(), None);
+        assert_eq!(room_b.creators(), None);
 
         let room_c = room_infos.iter().find(|r| r.room_id() == room_c_id).unwrap();
         assert_eq!(room_c.name(), None);
-        assert_eq!(room_c.creator(), Some(room_c_create_sender));
+        assert_eq!(room_c.creators(), Some(vec![room_c_create_sender]));
 
         Ok(())
     }

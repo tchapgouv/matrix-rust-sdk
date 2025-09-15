@@ -18,7 +18,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use as_variant::as_variant;
-use matrix_sdk_base::deserialized_responses::{EncryptionInfo, RawAnySyncOrStrippedState};
+use matrix_sdk_base::{
+    crypto::CollectStrategy,
+    deserialized_responses::{EncryptionInfo, RawAnySyncOrStrippedState},
+    sync::State,
+};
 use ruma::{
     api::client::{
         account::request_openid_token::v3::{Request as OpenIdRequest, Response as OpenIdResponse},
@@ -92,7 +96,7 @@ impl MatrixDriver {
         Ok(messages
             .chunk
             .into_iter()
-            .map(|ev| ev.into_raw().cast())
+            .map(|ev| ev.into_raw().cast_unchecked())
             .filter(|ev| match &state_key {
                 Some(state_key) => {
                     ev.get_field::<String>("state_key").is_ok_and(|key| match state_key {
@@ -216,7 +220,7 @@ impl MatrixDriver {
         let room_id = self.room.room_id().to_owned();
 
         let handle = self.room.add_event_handler(move |raw: Raw<AnySyncTimelineEvent>| {
-            let _ = tx.send(attach_room_id(raw.cast_ref(), &room_id));
+            let _ = tx.send(attach_room_id(&raw, &room_id));
             async {}
         });
         let drop_guard = self.room.client().event_handler_drop_guard(handle);
@@ -267,7 +271,7 @@ impl MatrixDriver {
                             "Received to-device event in clear for a widget in an e2e room, dropping."
                         );
                         return;
-                    };
+                    }
 
                     // There are no per-room specific decryption settings (trust requirements), so we can just send it to the
                     // widget.
@@ -494,6 +498,7 @@ impl MatrixDriver {
                     recipient_devices.iter().collect(),
                     &event_type.to_string(),
                     Raw::from_json_string(content.to_owned())?,
+                    CollectStrategy::AllDevices,
                 )
                 .await?;
 
@@ -530,9 +535,13 @@ impl StateUpdateReceiver {
         loop {
             match self.room_updates.recv().await? {
                 RoomUpdate::Joined { room, updates } => {
-                    if !updates.state.is_empty() {
-                        return Ok(updates
-                            .state
+                    let state_events = match updates.state {
+                        State::Before(events) => events,
+                        State::After(events) => events,
+                    };
+
+                    if !state_events.is_empty() {
+                        return Ok(state_events
                             .into_iter()
                             .map(|ev| attach_room_id_state(&ev, room.room_id()))
                             .collect());
@@ -548,13 +557,14 @@ impl StateUpdateReceiver {
 }
 
 fn attach_room_id(raw_ev: &Raw<AnySyncTimelineEvent>, room_id: &RoomId) -> Raw<AnyTimelineEvent> {
-    let mut ev_obj = raw_ev.deserialize_as::<BTreeMap<String, Box<RawJsonValue>>>().unwrap();
+    let mut ev_obj =
+        raw_ev.deserialize_as_unchecked::<BTreeMap<String, Box<RawJsonValue>>>().unwrap();
     ev_obj.insert("room_id".to_owned(), serde_json::value::to_raw_value(room_id).unwrap());
-    Raw::new(&ev_obj).unwrap().cast()
+    Raw::new(&ev_obj).unwrap().cast_unchecked()
 }
 
 fn attach_room_id_state(raw_ev: &Raw<AnySyncStateEvent>, room_id: &RoomId) -> Raw<AnyStateEvent> {
-    attach_room_id(raw_ev.cast_ref(), room_id).cast()
+    attach_room_id(raw_ev.cast_ref(), room_id).cast_unchecked()
 }
 
 #[cfg(test)]
@@ -578,7 +588,7 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
         let room_id = room_id!("!my_id:example.org");
         let new = attach_room_id(&raw, room_id);
 
@@ -606,7 +616,7 @@ mod tests {
             }
         }))
         .unwrap()
-        .cast();
+        .cast_unchecked();
         let room_id = room_id!("!my_id:example.org");
         let new = attach_room_id(&raw, room_id);
 

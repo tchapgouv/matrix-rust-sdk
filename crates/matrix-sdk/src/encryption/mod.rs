@@ -32,16 +32,22 @@ use futures_util::{
     future::try_join,
     stream::{self, StreamExt},
 };
-use matrix_sdk_base::crypto::{
-    store::types::{RoomKeyBundleInfo, RoomKeyInfo},
-    types::requests::{
-        OutgoingRequest, OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest,
+#[cfg(feature = "experimental-send-custom-to-device")]
+use matrix_sdk_base::crypto::CollectStrategy;
+use matrix_sdk_base::{
+    crypto::{
+        store::types::{RoomKeyBundleInfo, RoomKeyInfo},
+        types::requests::{
+            OutgoingRequest, OutgoingVerificationRequest, RoomMessageRequest, ToDeviceRequest,
+        },
+        CrossSigningBootstrapRequests, OlmMachine,
     },
-    CrossSigningBootstrapRequests, OlmMachine,
+    StateStoreDataKey, StateStoreDataValue,
 };
 use matrix_sdk_common::{executor::spawn, locks::Mutex as StdMutex};
 use ruma::{
     api::client::{
+        error::ErrorBody,
         keys::{
             get_keys, upload_keys, upload_signatures::v3::Request as UploadSignaturesRequest,
             upload_signing_keys::v3::Request as UploadSigningKeysRequest,
@@ -62,6 +68,7 @@ use ruma::{
 #[cfg(feature = "experimental-send-custom-to-device")]
 use ruma::{events::AnyToDeviceEventContent, serde::Raw, to_device::DeviceIdOrAllDevices};
 use serde::Deserialize;
+use tasks::BundleReceiverTask;
 use tokio::sync::{Mutex, RwLockReadGuard};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tracing::{debug, error, instrument, trace, warn};
@@ -82,7 +89,7 @@ use crate::{
     client::{ClientInner, WeakClient},
     error::HttpResult,
     store_locks::CrossProcessStoreLockGuard,
-    Client, Error, HttpError, Result, Room, TransmissionProgress,
+    Client, Error, HttpError, Result, Room, RumaApiError, TransmissionProgress,
 };
 
 pub mod backups;
@@ -134,7 +141,7 @@ impl EncryptionData {
         }
     }
 
-    pub fn initialize_room_key_tasks(&self, client: &Arc<ClientInner>) {
+    pub fn initialize_tasks(&self, client: &Arc<ClientInner>) {
         let weak_client = WeakClient::from_inner(client);
 
         let mut tasks = self.tasks.lock();
@@ -348,8 +355,9 @@ pub struct OAuthCrossSigningResetInfo {
 
 impl OAuthCrossSigningResetInfo {
     fn from_auth_info(auth_info: &UiaaInfo) -> Result<Self> {
-        let parameters =
-            serde_json::from_str::<OAuthCrossSigningResetUiaaParameters>(auth_info.params.get())?;
+        let parameters = serde_json::from_str::<OAuthCrossSigningResetUiaaParameters>(
+            auth_info.params.as_ref().map(|value| value.get()).unwrap_or_default(),
+        )?;
 
         Ok(OAuthCrossSigningResetInfo { approval_url: parameters.reset.url })
     }
@@ -618,7 +626,45 @@ impl Client {
                 self.keys_query(r.request_id(), request.device_keys.clone()).await?;
             }
             AnyOutgoingRequest::KeysUpload(request) => {
-                self.keys_upload(r.request_id(), request).await?;
+                let response = self.keys_upload(r.request_id(), request).await;
+
+                if let Err(e) = &response {
+                    match e.as_ruma_api_error() {
+                        Some(RumaApiError::ClientApi(e)) if e.status_code == 400 => {
+                            if let ErrorBody::Standard { message, .. } = &e.body {
+                                // This is one of the nastiest errors we can have. The server
+                                // telling us that we already have a one-time key uploaded means
+                                // that we forgot about some of our one-time keys. This will lead to
+                                // UTDs.
+                                {
+                                    let already_reported = self
+                                        .state_store()
+                                        .get_kv_data(StateStoreDataKey::OneTimeKeyAlreadyUploaded)
+                                        .await?
+                                        .is_some();
+
+                                    if message.starts_with("One time key") && !already_reported {
+                                        tracing::error!(
+                                            sentry = true,
+                                            error_message = message,
+                                            "Duplicate one-time keys have been uploaded"
+                                        );
+
+                                        self.state_store()
+                                            .set_kv_data(
+                                                StateStoreDataKey::OneTimeKeyAlreadyUploaded,
+                                                StateStoreDataValue::OneTimeKeyAlreadyUploaded,
+                                            )
+                                            .await?;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    response?;
+                }
             }
             AnyOutgoingRequest::ToDeviceRequest(request) => {
                 let response = self.send_to_device(request).await?;
@@ -1685,10 +1731,20 @@ impl Encryption {
     ///   there is a proposal (MSC3967) to remove this requirement, which would
     ///   allow for the initial upload of cross-signing keys without
     ///   authentication, rendering this parameter obsolete.
-    pub(crate) fn spawn_initialization_task(&self, auth_data: Option<AuthData>) {
+    pub(crate) async fn spawn_initialization_task(&self, auth_data: Option<AuthData>) {
+        // It's fine to be async here as we're only getting the lock protecting the
+        // `OlmMachine`. Since the lock shouldn't be that contested right after logging
+        // in we won't delay the login or restoration of the Client.
+        let bundle_receiver_task = if self.client.inner.enable_share_history_on_invite {
+            Some(BundleReceiverTask::new(&self.client).await)
+        } else {
+            None
+        };
+
         let mut tasks = self.client.inner.e2ee.tasks.lock();
 
         let this = self.clone();
+
         tasks.setup_e2ee = Some(spawn(async move {
             // Update the current state first, so we don't have to wait for the result of
             // network requests
@@ -1707,6 +1763,8 @@ impl Encryption {
                 error!("Couldn't setup and resume recovery {e:?}");
             }
         }));
+
+        tasks.receive_historic_room_key_bundles = bundle_receiver_task;
     }
 
     /// Waits for end-to-end encryption initialization tasks to finish, if any
@@ -1794,6 +1852,7 @@ impl Encryption {
         recipient_devices: Vec<&Device>,
         event_type: &str,
         content: Raw<AnyToDeviceEventContent>,
+        share_strategy: CollectStrategy,
     ) -> Result<Vec<(OwnedUserId, OwnedDeviceId)>> {
         let users = recipient_devices.iter().map(|device| device.user_id());
 
@@ -1812,6 +1871,7 @@ impl Encryption {
                 &content
                     .deserialize_as::<serde_json::Value>()
                     .expect("Deserialize as Value will always work"),
+                share_strategy,
             )
             .await?;
 
@@ -1869,7 +1929,7 @@ mod tests {
     };
 
     use matrix_sdk_test::{
-        async_test, test_json, GlobalAccountDataTestEvent, JoinedRoomBuilder, StateTestEvent,
+        async_test, event_factory::EventFactory, test_json, JoinedRoomBuilder, StateTestEvent,
         SyncResponseBuilder, DEFAULT_TEST_ROOM_ID,
     };
     use ruma::{
@@ -1953,11 +2013,14 @@ mod tests {
         let user_id = user_id!("@invited:localhost");
 
         // When we receive a sync response saying "invited" is invited to a DM
+        let f = EventFactory::new();
         let response = SyncResponseBuilder::default()
             .add_joined_room(
                 JoinedRoomBuilder::default().add_state_event(StateTestEvent::MemberAdditional),
             )
-            .add_global_account_data_event(GlobalAccountDataTestEvent::Direct)
+            .add_global_account_data(
+                f.direct().add_user(user_id.to_owned().into(), *DEFAULT_TEST_ROOM_ID),
+            )
             .build_sync_response();
         client.base_client().receive_sync_response(response).await.unwrap();
 
@@ -1974,11 +2037,14 @@ mod tests {
         let user_id = user_id!("@invited:localhost");
 
         // When we receive a sync response saying "invited" is invited to a DM
+        let f = EventFactory::new();
         let response = SyncResponseBuilder::default()
             .add_joined_room(
                 JoinedRoomBuilder::default().add_state_event(StateTestEvent::MemberInvite),
             )
-            .add_global_account_data_event(GlobalAccountDataTestEvent::Direct)
+            .add_global_account_data(
+                f.direct().add_user(user_id.to_owned().into(), *DEFAULT_TEST_ROOM_ID),
+            )
             .build_sync_response();
         client.base_client().receive_sync_response(response).await.unwrap();
 
@@ -2000,11 +2066,14 @@ mod tests {
         let user_id = user_id!("@invited:localhost");
 
         // When we receive a sync response saying "invited" is invited to a DM
+        let f = EventFactory::new();
         let response = SyncResponseBuilder::default()
             .add_joined_room(
                 JoinedRoomBuilder::default().add_state_event(StateTestEvent::MemberLeave),
             )
-            .add_global_account_data_event(GlobalAccountDataTestEvent::Direct)
+            .add_global_account_data(
+                f.direct().add_user(user_id.to_owned().into(), *DEFAULT_TEST_ROOM_ID),
+            )
             .build_sync_response();
         client.base_client().receive_sync_response(response).await.unwrap();
 
