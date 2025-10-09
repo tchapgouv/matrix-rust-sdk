@@ -114,6 +114,7 @@ matrix-sdk-indexeddb = { workspace = true, optional = true }
 matrix-sdk-search = { workspace = true, optional = true }
 matrix-sdk-sqlite = { workspace = true, optional = true }
 matrix-sdk-test = { workspace = true, optional = true }
+
 mime.workspace = true
 mime2ext = "0.1.54"
 oauth2.workspace = true
