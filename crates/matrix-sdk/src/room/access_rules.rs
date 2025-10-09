@@ -1,6 +1,9 @@
 //! Types for the [`im.vector.room.access_rules`] event.
 
-use ruma::events::{macros::EventContent, EmptyStateKey};
+use ruma::{
+    api::client::room::Visibility,
+    events::{macros::EventContent, EmptyStateKey},
+};
 use serde::{Deserialize, Serialize};
 
 /// The rule used for Tchap external users wishing to join this room.
@@ -23,11 +26,9 @@ pub enum AccessRule {
 }
 
 impl AccessRule {}
-
 /// The content of an `im.vector.room.access_rules` event.
 ///
 /// Describes how external users are allowed to join the room.
-#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
 #[derive(Clone, Debug, Serialize, Deserialize, EventContent)]
 //#[cfg_attr(not(ruma_unstable_exhaustive_types), non_exhaustive)]
 #[ruma_event(type = "im.vector.room.access_rules", kind = State, state_key_type = EmptyStateKey)]
@@ -35,12 +36,21 @@ pub struct RoomAccessRulesEventContent {
     /// The type of rules used for external users wishing to join this room.
     #[serde(rename = "rule")] // The key name awaited by Synapse. Mandatory!
     pub access_rule: AccessRule,
+    /// Allow to specify if a room should be unencrypted.
+    /// By default Tchap servers will force encryption when creating a private room or a DM,
+    /// except if this attribute is explicitly set to false.
+    pub encrypted: Option<bool>,
+    /// This reflects if the room is visible in the public room directory.
+    /// We need this in a room state event, otherwise we have to manually regularly pull
+    /// the public dir endpoint, which is inefficient, not real time and error prone.
+    /// If no attribute is specified the room is considered private by default.
+    pub visibility: Option<Visibility>,
 }
 
 impl RoomAccessRulesEventContent {
     /// Creates a new `RoomAccessRulesEventContent` with the given rule.
     pub fn new(access_rule: AccessRule) -> Self {
-        Self { access_rule }
+        Self { access_rule, encrypted: None, visibility: None }
     }
 }
 
@@ -62,7 +72,11 @@ mod tests {
         let event: RoomAccessRulesEventContent = serde_json::from_str(json).unwrap();
         assert_matches!(
             event,
-            RoomAccessRulesEventContent { access_rule: AccessRule::Unrestricted }
+            RoomAccessRulesEventContent {
+                access_rule: AccessRule::Unrestricted,
+                encrypted: None,
+                visibility: None
+            }
         );
     }
 
@@ -72,7 +86,11 @@ mod tests {
         let access_rules: RoomAccessRulesEventContent = serde_json::from_str(json).unwrap();
         assert_matches!(
             access_rules,
-            RoomAccessRulesEventContent { access_rule: AccessRule::Restricted }
+            RoomAccessRulesEventContent {
+                access_rule: AccessRule::Restricted,
+                encrypted: None,
+                visibility: None
+            }
         );
     }
 
@@ -82,7 +100,11 @@ mod tests {
         let access_rules: RoomAccessRulesEventContent = serde_json::from_str(json).unwrap();
         assert_matches!(
             access_rules,
-            RoomAccessRulesEventContent { access_rule: AccessRule::Direct }
+            RoomAccessRulesEventContent {
+                access_rule: AccessRule::Direct,
+                encrypted: None,
+                visibility: None
+            }
         );
     }
 

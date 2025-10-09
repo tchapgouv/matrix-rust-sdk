@@ -2076,7 +2076,7 @@ impl From<PowerLevels> for RoomPowerLevelsEventContent {
 #[derive(uniffi::Record)]
 pub struct CreateRoomParameters {
     #[uniffi(default = None)]
-    pub access_rules_override: Option<AccessRule>,
+    pub access_rule_override: Option<AccessRule>,
     pub name: Option<String>,
     #[uniffi(default = None)]
     pub topic: Option<String>,
@@ -2126,10 +2126,22 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
 
         let mut initial_state: Vec<Raw<AnyInitialStateEvent>> = vec![];
 
-        if let Some(access_rules_override) = value.access_rules_override {
-            let content = RoomAccessRulesEventContent::new(access_rules_override);
-            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+        // Tchap-specific : access_rules
+        let access_rule = if let Some(access_rule_override) = value.access_rule_override {
+            access_rule_override
+        } else {
+            AccessRule::Restricted
+        };
+
+        let mut content = RoomAccessRulesEventContent::new(access_rule);
+        if !value.is_encrypted {
+            content.encrypted = Some(value.is_encrypted);
         }
+        if value.visibility != RoomVisibility::Private {
+            content.visibility = Some(value.visibility);
+        }
+        initial_state.push(InitialStateEvent::new(content).to_raw_any());
+        // end Tchap-specific
 
         if value.is_encrypted {
             let content =

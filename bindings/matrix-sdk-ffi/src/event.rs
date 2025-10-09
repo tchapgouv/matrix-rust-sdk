@@ -17,6 +17,7 @@ use ruma::{
 };
 
 use crate::{
+    client::RoomVisibility,
     room_member::MembershipState,
     ruma::{MessageType, NotifyType},
     utils::Timestamp,
@@ -96,7 +97,7 @@ pub enum StateEventContent {
     RoomTopic { topic: String },
     SpaceChild,
     SpaceParent,
-    RoomAccessRule { rule: String },
+    RoomAccessRules { rule: String, encrypted: Option<bool>, visibility: Option<RoomVisibility> },
 }
 
 impl TryFrom<AnySyncStateEvent> for StateEventContent {
