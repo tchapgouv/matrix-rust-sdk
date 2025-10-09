@@ -141,6 +141,10 @@ matrix-sdk-test-utils = { path = "testing/matrix-sdk-test-utils", version = "0.1
 matrix-sdk-ui = { path = "crates/matrix-sdk-ui", version = "0.18.0", default-features = false }
 matrix-sdk-search = { path = "crates/matrix-sdk-search", version = "0.18.0" }
 
+# Tchap-specific
+matrix-sdk-tchap = { path = "crates/matrix-sdk-tchap", version = "0.1.0", default-features = false }
+# end Tchap-specific
+
 [workspace.lints.rust]
 rust_2018_idioms = "warn"
 semicolon_in_expressions_from_macros = "warn"
