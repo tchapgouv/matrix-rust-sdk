@@ -18,6 +18,9 @@ use matrix_sdk::{
     },
     deserialized_responses::RawAnySyncOrStrippedTimelineEvent,
     media::{MediaFormat, MediaRequestParameters, MediaRetentionPolicy, MediaThumbnailSettings},
+    // Tchap-specific : access_rules
+    room::access_rules::{AccessRule, RoomAccessRulesEventContent},
+    // end Tchap-specific
     ruma::{
         api::client::{
             discovery::{
@@ -2294,6 +2297,10 @@ pub struct CreateRoomParameters {
     #[uniffi(default = false)]
     pub is_direct: bool,
     pub visibility: RoomVisibility,
+    // Tchap-specific : access_rules
+    #[uniffi(default = None)]
+    pub access_rule_override: Option<AccessRule>,
+    // end Tchap-specific
     pub preset: RoomPreset,
     #[uniffi(default = None)]
     pub invite: Option<Vec<String>>,
@@ -2337,6 +2344,23 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
         };
 
         let mut initial_state: Vec<Raw<AnyInitialStateEvent>> = vec![];
+
+        // Tchap-specific : access_rules
+        let access_rule = if let Some(access_rule_override) = value.access_rule_override {
+            access_rule_override
+        } else {
+            AccessRule::Restricted
+        };
+
+        let mut content = RoomAccessRulesEventContent::new(access_rule);
+        if !value.is_encrypted {
+            content.encrypted = Some(value.is_encrypted);
+        }
+        if request.visibility != Visibility::Private {
+            content.visibility = Some(request.visibility.clone());
+        }
+        initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
+        // end Tchap-specific
 
         if value.is_encrypted {
             let content =
@@ -2906,6 +2930,7 @@ impl From<matrix_sdk::StoreSizes> for StoreSizes {
 
 #[cfg(test)]
 mod tests {
+    use matrix_sdk::room::access_rules::AccessRule;
     use ruma::{
         api::client::room::{create_room, Visibility},
         events::StateEventType,
@@ -2925,6 +2950,9 @@ mod tests {
             is_encrypted: true,
             is_direct: true,
             visibility: RoomVisibility::Public,
+            // Tchap-specific
+            access_rule_override: Some(AccessRule::Restricted),
+            // end Tchap-specific
             preset: RoomPreset::PublicChat,
             invite: Some(vec!["@user:example.com".to_owned()]),
             avatar: Some("http://example.com/avatar.jpg".to_owned()),

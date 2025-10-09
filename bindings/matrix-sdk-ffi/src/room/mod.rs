@@ -5,7 +5,13 @@ use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
     encryption::LocalTrust,
     room::{
-        edit::EditedContent, power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole,
+        // Tchap-specific : access_rules
+        access_rules::AccessRule,
+        // end Tchap-specific
+        edit::EditedContent,
+        power_levels::RoomPowerLevelChanges,
+        Room as SdkRoom,
+        RoomMemberRole,
         TryFromReportedContentScoreError,
     },
     send_queue::RoomSendQueueUpdate as SdkRoomSendQueueUpdate,
@@ -518,6 +524,29 @@ impl Room {
         self.inner.join().await?;
         Ok(())
     }
+
+    // Tchap-specific : access_rules
+    // Set or update the room access rule.
+    pub async fn set_access_rule(&self, rule: AccessRule) -> Result<(), ClientError> {
+        self.inner.set_access_rule(rule).await?;
+        Ok(())
+    }
+
+    // Get the room access rule
+    pub async fn get_access_rule(&self) -> Result<AccessRule, ClientError> {
+        Ok(self.inner.access_rule().await?)
+    }
+
+    // Get the room access rule
+    pub async fn get_is_encrypted(&self) -> bool {
+        self.inner.is_encrypted().await
+    }
+
+    // Get the room access rule
+    pub async fn get_visibility(&self) -> RoomVisibility {
+        self.inner.visibility().await.into()
+    }
+    // end Tchap-specific
 
     /// Sets a new name to the room.
     pub async fn set_name(&self, name: String) -> Result<(), ClientError> {
