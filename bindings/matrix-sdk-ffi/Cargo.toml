@@ -65,6 +65,11 @@ matrix-sdk-common.workspace = true
 matrix-sdk-ffi-macros.workspace = true
 matrix-sdk-ui = { workspace = true, features = ["uniffi"] }
 mime = { version = "0.3.17", default-features = false }
+
+# Tchap-specific
+matrix-sdk-tchap = { workspace = true }
+# end Tchap-specific
+
 ruma = { workspace = true, features = [
     "html",
     "unstable-msc3488",
