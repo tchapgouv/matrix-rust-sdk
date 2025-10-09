@@ -85,6 +85,7 @@ into your language of choice.
 
 [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0)
 
+[Matrix Rust SDK](https://github.com/matrix-org/matrix-rust-sdk)
 
 [Matrix]: https://matrix.org/
 [Rust]: https://www.rust-lang.org/

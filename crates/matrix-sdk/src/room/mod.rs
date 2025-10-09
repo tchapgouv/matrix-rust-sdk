@@ -23,6 +23,9 @@ use std::{
     time::Duration,
 };
 
+// Tchap-specific : access_rules
+use access_rules::{AccessRule, RoomAccessRulesEventContent};
+// end Tchap-specific
 use async_stream::stream;
 use eyeball::SharedObservable;
 use futures_core::Stream;
@@ -197,6 +200,10 @@ pub mod privacy_settings;
 
 #[cfg(feature = "e2e-encryption")]
 pub(crate) mod shared_room_history;
+
+// Tchap-specific : access_rules
+pub mod access_rules;
+// end Tchap-specific
 
 /// A struct containing methods that are common for Joined, Invited and Left
 /// Rooms
@@ -2770,6 +2777,41 @@ impl Room {
         user_power_levels
     }
 
+    // Tchap-specific : access_rules
+    /// Set or update the access rule for this room.
+    pub async fn set_access_rule(
+        &self,
+        access_rule: AccessRule,
+    ) -> Result<send_state_event::v3::Response> {
+        self.send_state_event(RoomAccessRulesEventContent::new(access_rule)).await
+    }
+
+    /// Get the access rule for this room.
+    pub async fn access_rule(&self) -> Result<AccessRule, Error> {
+        let access_rule_event = self
+            .client
+            .base_client()
+            .state_store()
+            .get_state_event_static::<RoomAccessRulesEventContent>(self.room_id())
+            .await?
+            .ok_or(Error::InsufficientData)?
+            .deserialize()?;
+
+        match access_rule_event {
+            SyncOrStrippedState::Sync(SyncStateEvent::Original(e)) => {
+                return Ok(e.content.access_rule.clone());
+            }
+            SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_)) => {
+                return Err(Error::InsufficientData);
+            }
+            SyncOrStrippedState::Stripped(e) => match e.content.access_rule {
+                Some(rule) => Ok(rule),
+                None => Err(Error::InsufficientData),
+            },
+        }
+    }
+    // end Tchap-specific : access_rules
+
     /// Sets the name of this room.
     pub async fn set_name(&self, name: String) -> Result<send_state_event::v3::Response> {
         self.send_state_event(RoomNameEventContent::new(name)).await
@@ -4671,7 +4713,11 @@ mod tests {
     use crate::{
         Client,
         config::RequestConfig,
+        // Tchap-specific : access_rules
+        room::AccessRule,
         room::messages::{IncludeRelations, ListThreadsOptions, RelationsOptions},
+
+        // end Tchap-specific
         test_utils::{
             client::mock_matrix_session,
             logged_in_client,

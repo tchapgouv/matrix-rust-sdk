@@ -5,7 +5,13 @@ use futures_util::{pin_mut, StreamExt};
 use matrix_sdk::{
     crypto::LocalTrust,
     room::{
-        edit::EditedContent, power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole,
+        // Tchap-specific : access_rules
+        access_rules::AccessRule,
+        // end Tchap-specific
+        edit::EditedContent,
+        power_levels::RoomPowerLevelChanges,
+        Room as SdkRoom,
+        RoomMemberRole,
         TryFromReportedContentScoreError,
     },
     ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType, EncryptionState,
@@ -520,6 +526,19 @@ impl Room {
         self.inner.join().await?;
         Ok(())
     }
+
+    // Tchap-specific : access_rules
+    // Set or update the room access rule.
+    pub async fn set_access_rule(&self, rule: AccessRule) -> Result<(), ClientError> {
+        self.inner.set_access_rule(rule).await?;
+        Ok(())
+    }
+
+    // Get the room access rule
+    pub async fn get_access_rule(&self) -> Result<AccessRule, ClientError> {
+        Ok(self.inner.access_rule().await?)
+    }
+    // end Tchap-specific
 
     /// Sets a new name to the room.
     pub async fn set_name(&self, name: String) -> Result<(), ClientError> {

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use matrix_sdk::{EncryptionState, RoomState};
+use matrix_sdk::{room::access_rules::AccessRule, EncryptionState, RoomState};
 use tracing::warn;
 
 use crate::{
@@ -79,6 +79,12 @@ pub struct RoomInfo {
     /// Whether creators are privileged over every other user (have infinite
     /// power level).
     privileged_creators_role: bool,
+
+    // Tchap-specific
+    ///  Tchap: add access_rule to RoomInfo to get additional info on room:
+    ///    - access_rule: is the room open to external user
+    access_rule: Option<AccessRule>,
+    // end Tchap-specific
 }
 
 impl RoomInfo {
@@ -103,6 +109,11 @@ impl RoomInfo {
             .await
             .ok()
             .map(|p| RoomPowerLevels::new(p, room.own_user_id().to_owned()));
+
+        // Tchap-specific
+        // Get AccessRule value.
+        let access_rule = room.access_rule().await.ok();
+        // end Tchap-specific
 
         Ok(Self {
             id: room.room_id().to_string(),
@@ -163,6 +174,8 @@ impl RoomInfo {
                 .and_then(|version| version.rules())
                 .map(|rules| rules.authorization.explicitly_privilege_room_creators)
                 .unwrap_or_default(),
+            // Tchap-specific
+            access_rule: access_rule, // end Tchap-specific
         })
     }
 }
