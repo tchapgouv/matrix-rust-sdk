@@ -304,10 +304,17 @@ impl TimelineAction {
                         ))
                     }
                 },
-                ev => Self::add_item(TimelineItemContent::OtherState(OtherState {
-                    state_key: ev.state_key().to_owned(),
-                    content: AnyOtherFullStateEventContent::with_event_content(ev.content()),
-                })),
+
+                // Tchap-specific : associate event value with custom event.
+                ev => {
+                    Self::add_item(TimelineItemContent::OtherState(OtherState {
+                        state_key: ev.state_key().to_owned(),
+                        content: AnyOtherFullStateEventContent::with_event_content(
+                            ev.content(),
+                            None,
+                        ),
+                    }))
+                } // end Tchap-specific
             },
         })
     }
