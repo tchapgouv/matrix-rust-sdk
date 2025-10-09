@@ -2137,8 +2137,8 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
         if !value.is_encrypted {
             content.encrypted = Some(value.is_encrypted);
         }
-        if value.visibility != RoomVisibility::Private {
-            content.visibility = Some(value.visibility);
+        if request.visibility != Visibility::Private {
+            content.visibility = Some(request.visibility);
         }
         initial_state.push(InitialStateEvent::new(content).to_raw_any());
         // end Tchap-specific

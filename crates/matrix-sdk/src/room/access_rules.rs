@@ -6,6 +6,9 @@ use ruma::{
 };
 use serde::{Deserialize, Serialize};
 
+/// The rule event type for access rules events.
+pub const ACCESS_RULES_EVENT_TYPE: &str = "im.vector.room.access_rules";
+
 /// The rule used for Tchap external users wishing to join this room.
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
