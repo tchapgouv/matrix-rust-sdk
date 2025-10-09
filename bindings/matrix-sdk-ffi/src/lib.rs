@@ -28,6 +28,11 @@ mod session_verification;
 mod spaces;
 mod sync_service;
 mod task_handle;
+
+// Tchap-specific
+mod tchap_bindings;
+// end Tchap-specific
+
 mod timeline;
 mod tracing;
 mod utd;
