@@ -3433,6 +3433,7 @@ dependencies = [
  "matrix-sdk-base",
  "matrix-sdk-common",
  "matrix-sdk-ffi-macros",
+ "matrix-sdk-tchap",
  "matrix-sdk-ui",
  "mime",
  "oauth2",
@@ -3624,6 +3625,23 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "zeroize",
+]
+
+[[package]]
+name = "matrix-sdk-tchap"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-core",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uniffi",
+ "url",
 ]
 
 [[package]]
