@@ -63,6 +63,11 @@ matrix-sdk-base.workspace = true
 matrix-sdk-common.workspace = true
 matrix-sdk-ffi-macros.workspace = true
 matrix-sdk-ui = { workspace = true, features = ["uniffi"] }
+
+# Tchap-specific
+matrix-sdk-tchap = { workspace = true }
+# end Tchap-specific
+
 mime = "0.3.17"
 once_cell.workspace = true
 ruma = { workspace = true, features = [

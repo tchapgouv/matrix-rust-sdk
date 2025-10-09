@@ -29,6 +29,11 @@ mod spaces;
 mod store;
 mod sync_service;
 mod task_handle;
+
+// Tchap-specific
+mod tchap_bindings;
+// end Tchap-specific
+
 mod timeline;
 mod tracing;
 mod utd;
