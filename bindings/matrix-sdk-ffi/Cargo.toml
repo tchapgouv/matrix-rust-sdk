@@ -73,6 +73,11 @@ matrix-sdk-contentscanner = { workspace = true, features = ["uniffi", "e2e-encry
 matrix-sdk-ui = { workspace = true, features = ["uniffi", "unstable-msc4426"] }
 matrix-sdk-crypto = { workspace = true, optional = true }
 mime = { version = "0.3.17", default-features = false }
+
+# Tchap-specific
+matrix-sdk-tchap = { workspace = true }
+# end Tchap-specific
+
 ruma = { workspace = true, features = [
     "html",
     "unstable-msc3488",
