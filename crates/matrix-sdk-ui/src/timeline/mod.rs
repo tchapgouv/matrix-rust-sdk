@@ -24,10 +24,21 @@ use eyeball_im::VectorDiff;
 #[cfg(feature = "unstable-msc4274")]
 use futures::SendGallery;
 use futures_core::Stream;
+
+// BWI-specific
+use futures_util::{StreamExt, future, pin_mut};
+// end BWI-specific
+
 use imbl::Vector;
 use matrix_sdk::{
+    // BWI-specific
+    Error::{self as MatrixSDKError, AttachmentSizeExceededMaxSize, AttachmentSizeNotDefined},
+    // end BWI-specific
     Result,
     attachment::{AttachmentInfo, Thumbnail},
+    // BWI-specific
+    bwi_extensions::attachment::FileSize,
+    // end BWI-specific
     deserialized_responses::TimelineEvent,
     event_cache::{EventCacheDropHandles, RoomEventCache},
     executor::JoinHandle,
@@ -60,7 +71,11 @@ use ruma::{
 };
 use subscriber::TimelineWithDropHandle;
 use thiserror::Error;
-use tracing::{instrument, trace, warn};
+
+// BWI-specific
+// use tracing::{instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
+// end BWI-specific
 
 use self::{
     algorithms::rfind_event_by_id, controller::TimelineController, futures::SendAttachment,
@@ -190,6 +205,49 @@ pub struct AttachmentConfig {
     pub in_reply_to: Option<OwnedEventId>,
 }
 
+// BWI-specific
+impl AttachmentConfig {
+    /// Create a new attachment configuration.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// TODO Technical Debt: needed as this class can not usefully initialized outside of this crate
+    pub fn set_info(&mut self, info: AttachmentInfo) {
+        self.info = Some(info);
+    }
+
+    /// Assert, that the file does not exceed the maximal file size
+    pub fn assert_valid_file_size(
+        &self,
+        max_valid_file_size: FileSize,
+    ) -> Result<(), MatrixSDKError> {
+        let file_size_is_allowed = self.get_attachment_size()? < max_valid_file_size;
+        if file_size_is_allowed { Ok(()) } else { Err(AttachmentSizeExceededMaxSize) }
+    }
+
+    /// Get the size of the attachment
+    pub fn get_attachment_size(&self) -> Result<FileSize, MatrixSDKError> {
+        FileSize::try_from(self)
+    }
+}
+
+impl TryFrom<&AttachmentConfig> for FileSize {
+    type Error = MatrixSDKError;
+
+    fn try_from(value: &AttachmentConfig) -> Result<Self, Self::Error> {
+        match &value.info {
+            Some(AttachmentInfo::Image(info)) => FileSize::try_from(info),
+            Some(AttachmentInfo::Video(info)) => FileSize::try_from(info),
+            Some(AttachmentInfo::Audio(info)) => FileSize::try_from(info),
+            Some(AttachmentInfo::File(info)) => FileSize::try_from(info),
+            Some(AttachmentInfo::Voice(info)) => FileSize::try_from(info),
+            _ => Err(AttachmentSizeNotDefined),
+        }
+    }
+}
+// end BWI-specific
+
 impl Timeline {
     /// Returns the room for this timeline.
     pub fn room(&self) -> &Room {
@@ -233,6 +291,71 @@ impl Timeline {
             .retry_event_decryption(Some(session_ids.into_iter().map(Into::into).collect()))
             .await;
     }
+
+    // BWI-specific
+    #[cfg(feature = "enable_external_content_scanner_setup")]
+    pub async fn setup_content_scanner_hook_ext(&self) -> &Self {
+        self.setup_content_scanner_hook().await
+    }
+
+    pub(crate) async fn setup_content_scanner_hook(&self) -> &Self {
+        info!("###BWI### setup content scanner hook");
+        let (timeline_items, timeline_stream) = self.subscribe().await;
+
+        let timeline_controller = self.controller.clone();
+
+        tokio::spawn(async move {
+            pin_mut!(timeline_stream);
+
+            future::join_all(
+                timeline_items
+                    .iter()
+                    .map(|item| timeline_controller.handle_single_timeline_item(item)),
+            )
+            .await;
+
+            while let Some(diffs) = timeline_stream.next().await {
+                for diff in diffs {
+                    Timeline::handle_diff(&timeline_controller, diff).await;
+                }
+            }
+        });
+        self
+    }
+
+    async fn handle_diff(
+        timeline_controller: &TimelineController,
+        diff: VectorDiff<Arc<TimelineItem>>,
+    ) {
+        match diff {
+            VectorDiff::PushBack { value } => {
+                debug!("###BWI### Push back: {value:?}");
+                timeline_controller.handle_single_timeline_item(&value).await
+            }
+            VectorDiff::PushFront { value } => {
+                debug!("###BWI### Push front: {value:?}");
+                timeline_controller.handle_single_timeline_item(&value).await
+            }
+            VectorDiff::Insert { index, value } => {
+                debug!("###BWI### Insert at {index:?}: {value:?}");
+                timeline_controller.handle_single_timeline_item(&value).await
+            }
+            VectorDiff::Set { index, value } => {
+                debug!("###BWI### Set at {index:?}: {value:?}");
+                timeline_controller.handle_single_timeline_item(&value).await
+            }
+            VectorDiff::Append { values } => {
+                debug!("###BWI### Append: {values:?}");
+                for value in values {
+                    timeline_controller.handle_single_timeline_item(&value).await;
+                }
+            }
+            _ => {
+                info!("###BWI### handle unhandled diff: {:?}", diff);
+            }
+        }
+    }
+    // end BWI-specific
 
     #[tracing::instrument(skip(self))]
     async fn retry_decryption_for_all_events(&self) {

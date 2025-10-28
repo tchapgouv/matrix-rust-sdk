@@ -34,6 +34,9 @@ use crate::{
     },
     unable_to_decrypt_hook::UtdHookManager,
 };
+// BWI-specific
+use matrix_sdk::bwi_content_scanner::BWIContentScannerWrapper;
+// end BWI-specific
 
 /// Builder that allows creating and configuring various parts of a
 /// [`Timeline`].
@@ -174,6 +177,11 @@ impl TimelineBuilder {
             .ok()
             .unwrap_or_default();
 
+        // BWI-specific
+        let client = room.client();
+        let content_scanner = BWIContentScannerWrapper::new(client.clone());
+        // end BWI-specific
+
         let controller = TimelineController::new(
             room.clone(),
             focus.clone(),
@@ -181,6 +189,9 @@ impl TimelineBuilder {
             unable_to_decrypt_hook,
             is_room_encrypted,
             settings,
+            // BWI-specific
+            content_scanner.to_owned(),
+            // end BWI-specific
         );
 
         let has_events = controller.init_focus(&focus, &room_event_cache).await?;

@@ -62,7 +62,13 @@ matrix-sdk = { workspace = true, features = [
 matrix-sdk-base.workspace = true
 matrix-sdk-common.workspace = true
 matrix-sdk-ffi-macros.workspace = true
-matrix-sdk-ui = { workspace = true, features = ["uniffi"] }
+
+# BWI-specific
+# matrix-sdk-ui = { workspace = true, features = ["uniffi"] }
+matrix-sdk-ui = { workspace = true, features = ["uniffi", "enable_external_content_scanner_setup"] }
+matrix-sdk-bwi = { workspace = true }
+matrix-sdk-base-bwi = { workspace = true }
+# BWI Tchap-specific
 
 # Tchap-specific
 matrix-sdk-tchap = { workspace = true, features = ["client"] }
