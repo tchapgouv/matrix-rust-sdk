@@ -1767,7 +1767,11 @@ impl QueueStorage {
                 DependentQueuedRequestKind::FinishUpload {
                     local_echo,
                     file_upload,
-                    thumbnail_info,
+
+                    // BWI-specific
+                    // thumbnail_info,
+                    thumbnail_info: _,
+                    // end BWI-specific
                 } => {
                     // Materialize as an event local echo.
                     Some(LocalEcho {
@@ -1779,7 +1783,10 @@ impl QueueStorage {
                                 room: room.clone(),
                                 transaction_id: dep.own_transaction_id.into(),
                                 media_handles: vec![MediaHandles {
-                                    upload_thumbnail_txn: thumbnail_info.map(|info| info.txn),
+                                    // BWI-specific
+                                    // upload_thumbnail_txn: thumbnail_info.map(|info| info.txn),
+                                    upload_thumbnail_txn: None,
+                                    // end BWI-specific
                                     upload_file_txn: file_upload,
                                 }],
                                 created_at: dep.created_at,

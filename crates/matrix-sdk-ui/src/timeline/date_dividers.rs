@@ -154,7 +154,11 @@ impl DateDividerAdjuster {
                 }
 
                 TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker)
-                | TimelineItemKind::Virtual(VirtualTimelineItem::TimelineStart) => {
+                | TimelineItemKind::Virtual(VirtualTimelineItem::TimelineStart)
+                // BWI-specific
+                | TimelineItemKind::Virtual(VirtualTimelineItem::ScanStateChanged(_, _))
+                // end BWI-specific
+                => {
                     // Nothing to do.
                 }
             }
@@ -251,8 +255,12 @@ impl DateDividerAdjuster {
             }
 
             TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker)
-            | TimelineItemKind::Virtual(VirtualTimelineItem::TimelineStart) => {
-                // Nothing to do.
+            | TimelineItemKind::Virtual(VirtualTimelineItem::TimelineStart)
+            // BWI-specific
+            | TimelineItemKind::Virtual(VirtualTimelineItem::ScanStateChanged(_, _))
+            // end BWI-specific
+            => {
+                // Nothing to do for read markers.
             }
         }
 
@@ -317,7 +325,11 @@ impl DateDividerAdjuster {
             }
 
             TimelineItemKind::Virtual(VirtualTimelineItem::ReadMarker)
-            | TimelineItemKind::Virtual(VirtualTimelineItem::TimelineStart) => {
+            | TimelineItemKind::Virtual(VirtualTimelineItem::TimelineStart)
+            // BWI-specific
+            | TimelineItemKind::Virtual(VirtualTimelineItem::ScanStateChanged(_, _))
+            // end BWI-specific
+            => {
                 // Nothing to do.
             }
         }

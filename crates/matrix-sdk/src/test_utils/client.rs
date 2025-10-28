@@ -17,6 +17,14 @@
 use matrix_sdk_base::{SessionMeta, store::RoomLoadSettings};
 use ruma::{OwnedDeviceId, OwnedUserId, api::MatrixVersion, owned_device_id, owned_user_id};
 
+// BWI Specific
+use matrix_sdk_bwi::attachment::FILE_SIZE_LIMIT;
+use matrix_sdk_bwi::settings_cache::BWISettingsCache;
+
+/// The Bearer token for tests
+pub const TEST_BEARER_TOKEN: &str = "1234";
+// end BWI Specific
+
 use crate::{
     Client, ClientBuilder, SessionTokens, authentication::matrix::MatrixSession,
     config::RequestConfig,
@@ -134,6 +142,10 @@ impl MockClientBuilder {
         let client = builder.build().await.expect("building client failed");
 
         self.auth_state.maybe_restore_client(&client).await;
+
+        // BWI-specific
+        client.state_store().store(&FILE_SIZE_LIMIT, 5000u64).await.unwrap();
+        // end BWI-specific
 
         client
     }
