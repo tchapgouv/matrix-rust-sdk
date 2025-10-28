@@ -19,6 +19,10 @@ rustls-tls = ["matrix-sdk/rustls-tls"]
 js = ["matrix-sdk/js"]
 uniffi = ["dep:uniffi", "matrix-sdk/uniffi", "matrix-sdk-base/uniffi"]
 
+# BWI-specific
+enable_external_content_scanner_setup = []
+# end BWI-specific
+
 # Add support for encrypted extensible events.
 unstable-msc3956 = ["ruma/unstable-msc3956"]
 
@@ -55,6 +59,13 @@ matrix-sdk-common.workspace = true
 mime.workspace = true
 once_cell.workspace = true
 pin-project-lite.workspace = true
+
+# BWI-specific
+matrix-sdk-bwi = { workspace = true }
+matrix-sdk-base-bwi = { workspace = true }
+url = { workspace = true }
+# end BWI-specific
+
 ruma = { workspace = true, features = ["html", "unstable-msc3381"] }
 serde.workspace = true
 serde_json.workspace = true

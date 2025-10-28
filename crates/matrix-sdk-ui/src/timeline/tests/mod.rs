@@ -26,6 +26,11 @@ use eyeball_im::VectorDiff;
 use futures_core::Stream;
 use imbl::vector;
 use indexmap::IndexMap;
+
+// BWI-specific
+use matrix_sdk::bwi_content_scanner::BWIContentScannerWrapper;
+// end BWI-specific
+
 use matrix_sdk::{
     BoxFuture,
     config::RequestConfig,
@@ -80,6 +85,12 @@ mod read_receipts;
 mod redaction;
 mod shields;
 mod virt;
+
+// BWI-specific
+fn create_dummy_content_scanner() -> BWIContentScannerWrapper {
+    BWIContentScannerWrapper::test_wrapper()
+}
+// end BWI-specific
 
 /// A timeline instance used only for testing purposes in unit tests.
 #[derive(Default)]
@@ -137,6 +148,9 @@ impl TestTimelineBuilder {
             self.utd_hook,
             self.is_room_encrypted,
             self.settings.unwrap_or_default(),
+            // BWI-specific
+            create_dummy_content_scanner(),
+            // end BWI-specific
         );
         TestTimeline { controller, factory: EventFactory::new() }
     }

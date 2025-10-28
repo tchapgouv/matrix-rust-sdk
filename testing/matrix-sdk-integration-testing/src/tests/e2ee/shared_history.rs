@@ -61,9 +61,17 @@ async fn test_history_share_on_invite() -> Result<()> {
 
     // Alice creates a room ...
     let alice_room = alice
-        .create_room(assign!(CreateRoomRequest::new(), {
-            preset: Some(RoomPreset::PublicChat),
-        }))
+        // BWI-specific
+        // .create_room(assign!(CreateRoomRequest::new(), {
+        //     preset: Some(RoomPreset::PublicChat),
+        // }))
+        .create_room_with_federated(
+            assign!(CreateRoomRequest::new(), {
+                preset: Some(RoomPreset::PublicChat),
+            }),
+            false,
+        )
+        // end BWI-specific
         .await?;
     alice_room.enable_encryption().await?;
 
