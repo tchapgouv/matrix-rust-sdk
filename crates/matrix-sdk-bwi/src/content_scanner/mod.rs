@@ -21,16 +21,19 @@ use crate::content_scanner::dto::{
     BWIContentScannerPublicKey, BWIPublicKeyDto, BWIScanErrorResultDto, BWIScanStateResultDto,
     EncryptedMetadataRequestBuilder,
 };
+use crate::content_scanner::request::scan_unencrypted;
 use crate::content_scanner::url::BWIContentScannerUrl;
 use crate::content_scanner::BWIContentScannerError::{PublicKeyNotAvailable, PublicKeyParseFailed};
 use http::StatusCode;
 use matrix_sdk_base::ruma::events::room::EncryptedFile;
+use matrix_sdk_base::ruma::OwnedMxcUri;
 use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState;
 use matrix_sdk_base_bwi::http_client::HttpError;
 use matrix_sdk_base_bwi::http_client::HttpError::{Failed, NotFound};
 use request::download_encrypted::v1::Request as DownloadRequest;
 use request::scan_encrypted::v1::Request as ScanRequest;
 use reqwest::Response;
+use scan_unencrypted::v1::Request as ScanUnencryptedRequest;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -191,6 +194,15 @@ impl BWIContentScanner {
             .map_err(|_| BWIContentScannerError::DownloadFailed)?;
         debug!("###BWI### Downloading authenticated media with url {:?}", file.url);
         Ok(ScanRequest::from_encrypted_metadata(encrypted_metadata))
+    }
+
+    pub fn create_scan_unencrypted_media_request(
+        &self,
+        mxc_uri: &OwnedMxcUri,
+    ) -> Result<ScanUnencryptedRequest, BWIContentScannerError> {
+        debug!("###BWI### Scan unencrypted media with url {:?}", mxc_uri);
+        let request = scan_unencrypted::v1::Request::new(mxc_uri);
+        Ok(request)
     }
 
     pub fn map_success_to_state(body: BWIScanStateResultDto) -> BWIScanState {
