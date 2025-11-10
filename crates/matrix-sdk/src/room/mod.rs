@@ -92,7 +92,7 @@ use ruma::{
         read_marker::set_read_marker,
         receipt::create_receipt,
         redact::redact_event,
-        room::{get_room_event, report_content, report_room},
+        room::{Visibility, get_room_event, report_content, report_room},
         state::{get_state_event_for_key, send_state_event},
         tag::{create_tag, delete_tag},
         threads::{get_thread_subscription, subscribe_thread, unsubscribe_thread},
@@ -173,9 +173,7 @@ use crate::{
     media::{MediaFormat, MediaRequestParameters},
     notification_settings::{IsEncrypted, IsOneToOne, RoomNotificationMode},
     room::{
-        knock_requests::{KnockRequest, KnockRequestMemberInfo},
-        power_levels::{RoomPowerLevelChanges, RoomPowerLevelsExt},
-        privacy_settings::RoomPrivacySettings,
+        access_rules::PossiblyRedactedRoomAccessRulesEventContent, knock_requests::{KnockRequest, KnockRequestMemberInfo}, power_levels::{RoomPowerLevelChanges, RoomPowerLevelsExt}, privacy_settings::RoomPrivacySettings
     },
     sync::RoomUpdate,
     utils::{IntoRawMessageLikeEventContent, IntoRawStateEventContent},
@@ -2786,29 +2784,102 @@ impl Room {
         self.send_state_event(RoomAccessRulesEventContent::new(access_rule)).await
     }
 
-    /// Get the access rule for this room.
-    pub async fn access_rule(&self) -> Result<AccessRule, Error> {
-        let access_rule_event = self
-            .client
+    /// Get the access rule event content for this room.
+    async fn full_access_rules(&self) -> Result<SyncOrStrippedState<RoomAccessRulesEventContent>, Error> {
+        Ok(self.client
             .base_client()
             .state_store()
             .get_state_event_static::<RoomAccessRulesEventContent>(self.room_id())
             .await?
             .ok_or(Error::InsufficientData)?
-            .deserialize()?;
+            .deserialize()?)
+    }
 
-        match access_rule_event {
-            SyncOrStrippedState::Sync(SyncStateEvent::Original(e)) => {
-                return Ok(e.content.access_rule.clone());
-            }
-            SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_)) => {
-                return Err(Error::InsufficientData);
-            }
-            SyncOrStrippedState::Stripped(e) => match e.content.access_rule {
-                Some(rule) => Ok(rule),
-                None => Err(Error::InsufficientData),
+    /// Get the access rule for this room.
+    pub async fn access_rule(&self) -> Result<AccessRule, Error> {
+        match self.full_access_rules().await {
+            Err(e) => return Err(e),
+            Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) =>
+                Ok(e.content.access_rule.clone()),
+            Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) =>
+                Err(Error::InsufficientData),
+            Ok(SyncOrStrippedState::Stripped(e)) => match e.content {
+                PossiblyRedactedRoomAccessRulesEventContent { access_rule, .. } => match access_rule {
+                    Some(value) => Ok(value),
+                    None => Err(Error::InsufficientData),
+                },
             },
         }
+    }
+
+    /// Get the encrypted status for this room. Force to true if not defined.
+    pub async fn is_encrypted(&self) -> bool {
+        let result = match self.full_access_rules().await {
+            Err(e) => Err(e),
+            Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) => {
+                match e.content.encrypted {
+                    None => Err(Error::InsufficientData),
+                    Some(encrypted_value) => Ok(encrypted_value),
+                }
+            }
+            Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) => Err(Error::InsufficientData),
+            Ok(SyncOrStrippedState::Stripped(e)) =>  match e.content {
+                PossiblyRedactedRoomAccessRulesEventContent { encrypted, .. } => match encrypted {
+                    Some(value) => Ok(value),
+                    None => Err(Error::InsufficientData),
+                },
+            }
+        };
+        match result {
+            Ok(encrypted_value) => encrypted_value,
+            Err(_) => self.get_fallback_is_encrypted_value().await,
+        }
+    }
+
+    /// Get the latest encrypted status for this room.
+    /// This method is used as a last chance to get a value in `is_encrypted()` method 
+    /// if the access rules event in the local store in unable to give a valid value.
+    /// This method makes a request to the server if necessary.
+    /// Consider the room to be not encrypted if real encryption state can't be resolved.
+    async fn get_fallback_is_encrypted_value(&self) -> bool {
+        self.latest_encryption_state()
+            .await
+            .map(|state| state.is_encrypted())
+            .unwrap_or(false)
+    }
+
+    /// Get the visibility status for this room in the room directory.
+    pub async fn visibility(&self) -> Visibility {
+        let result = match self.full_access_rules().await {
+            Err(e) => Err(e),
+            Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) => {
+                match e.content.visibility {
+                    None => Err(Error::InsufficientData),
+                    Some(visibility_value) => Ok(visibility_value),
+                }
+            }
+            Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) =>
+                Err(Error::InsufficientData),
+            Ok(SyncOrStrippedState::Stripped(e)) => match e.content {
+                PossiblyRedactedRoomAccessRulesEventContent { visibility, .. } => match visibility {
+                    Some(value) => Ok(value),
+                    None => Err(Error::InsufficientData),
+                },
+            },
+        };
+        match result {
+            Ok(visibility_value) => visibility_value,
+            Err(_) => self.get_fallback_room_visibility_value().await
+        }
+    }
+
+    /// Requets the room visibility status for this room.
+    /// This method is used as a last chance to get a value in `visibility()` method 
+    /// if the access rules event in the local store in unable to give a valid value.
+    /// This method makes a request to the server if necessary.
+    /// Consider the room to be Public if real visibility can't be resolved.
+    async fn get_fallback_room_visibility_value(&self) -> Visibility {
+        self.privacy_settings().get_room_visibility().await.unwrap_or(Visibility::Public)
     }
     // end Tchap-specific : access_rules
 

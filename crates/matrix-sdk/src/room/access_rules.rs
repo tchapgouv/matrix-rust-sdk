@@ -65,12 +65,6 @@ mod tests {
 
     #[test]
     fn unrestricted_access_rule_room() {
-        // let a = RoomAccessRulesEventContent { access_rule: AccessRule::Unrestricted
-        // }; println!("RoomAccessRulesEventContent: {}",
-        // serde_json::to_string(&a).unwrap_or("???".to_owned()));
-        // let a = AccessRule::Unrestricted;
-        // println!("AccessRule: {}",
-        // serde_json::to_string(&a).unwrap_or("???".to_owned()));
         let json = r#"{"rule":"unrestricted"}"#;
         let event: RoomAccessRulesEventContent = serde_json::from_str(json).unwrap();
         assert_matches!(
@@ -110,22 +104,4 @@ mod tests {
             }
         );
     }
-
-    // Copied from Join Rule
-    //
-    // #[test]
-    // fn access_rule_to_space_room_access_rule() {
-    //     assert_eq!(SpaceRoomJoinRule::Invite, JoinRule::Invite.into());
-    //     assert_eq!(SpaceRoomJoinRule::Knock, JoinRule::Knock.into());
-    //     assert_eq!(
-    //         SpaceRoomJoinRule::KnockRestricted,
-    //         JoinRule::KnockRestricted(Restricted::default()).into()
-    //     );
-    //     assert_eq!(SpaceRoomJoinRule::Public, JoinRule::Public.into());
-    //     assert_eq!(SpaceRoomJoinRule::Private, JoinRule::Private.into());
-    //     assert_eq!(
-    //         SpaceRoomJoinRule::Restricted,
-    //         JoinRule::Restricted(Restricted::default()).into()
-    //     );
-    // }
 }

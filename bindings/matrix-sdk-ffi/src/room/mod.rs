@@ -25,18 +25,11 @@ use matrix_sdk_ui::{
 };
 use mime::Mime;
 use ruma::{
-    assign,
-    events::{
-        room::{
-            avatar::ImageInfo as RumaAvatarImageInfo,
-            history_visibility::HistoryVisibility as RumaHistoryVisibility,
-            join_rules::JoinRule as RumaJoinRule, message::RoomMessageEventContentWithoutRelation,
-            MediaSource,
-        },
-        AnyMessageLikeEventContent, AnySyncTimelineEvent,
-    },
-    EventId, Int, OwnedDeviceId, OwnedRoomOrAliasId, OwnedServerName, OwnedUserId, RoomAliasId,
-    ServerName, UserId,
+    EventId, Int, OwnedDeviceId, OwnedRoomOrAliasId, OwnedServerName, OwnedUserId, RoomAliasId, ServerName, UserId, assign, events::{
+        AnyMessageLikeEventContent, AnySyncTimelineEvent, room::{
+            MediaSource, avatar::ImageInfo as RumaAvatarImageInfo, history_visibility::HistoryVisibility as RumaHistoryVisibility, join_rules::JoinRule as RumaJoinRule, message::RoomMessageEventContentWithoutRelation
+        }
+    }
 };
 use tracing::{error, warn};
 
@@ -551,6 +544,16 @@ impl Room {
     // Get the room access rule
     pub async fn get_access_rule(&self) -> Result<AccessRule, ClientError> {
         Ok(self.inner.access_rule().await?)
+    }
+
+    // Get the room access rule
+    pub async fn get_is_encrypted(&self) -> bool {
+        self.inner.is_encrypted().await
+    }
+
+    // Get the room access rule
+    pub async fn get_visibility(&self) -> RoomVisibility {
+        self.inner.visibility().await.into()
     }
     // end Tchap-specific
 

@@ -4,11 +4,11 @@ use matrix_sdk::{room::access_rules::AccessRule, EncryptionState, RoomState};
 use tracing::warn;
 
 use crate::{
-    client::JoinRule,
+    client::{JoinRule, RoomVisibility},
     error::ClientError,
     notification_settings::RoomNotificationMode,
     room::{
-        power_levels::RoomPowerLevels, Membership, RoomHero, RoomHistoryVisibility, SuccessorRoom,
+        Membership, RoomHero, RoomHistoryVisibility, SuccessorRoom, power_levels::RoomPowerLevels
     },
     room_member::RoomMember,
 };
@@ -83,7 +83,11 @@ pub struct RoomInfo {
     // Tchap-specific
     ///  Tchap: add access_rule to RoomInfo to get additional info on room:
     ///    - access_rule: is the room open to external user
+    ///    - is_encrypted: is the room encrypted or not
+    ///    - visiblity: is the room visible in public directories
     access_rule: Option<AccessRule>,
+    is_encrypted: bool,
+    visiblity: RoomVisibility
     // end Tchap-specific
 }
 
@@ -113,6 +117,8 @@ impl RoomInfo {
         // Tchap-specific
         // Get AccessRule value.
         let access_rule = room.access_rule().await.ok();
+        let is_encrypted = room.is_encrypted().await;
+        let visibility = room.visibility().await; 
         // end Tchap-specific
 
         Ok(Self {
@@ -175,7 +181,10 @@ impl RoomInfo {
                 .map(|rules| rules.authorization.explicitly_privilege_room_creators)
                 .unwrap_or_default(),
             // Tchap-specific
-            access_rule: access_rule, // end Tchap-specific
+            access_rule: access_rule, 
+            is_encrypted: is_encrypted,
+            visiblity: visibility.into()
+            // end Tchap-specific
         })
     }
 }
