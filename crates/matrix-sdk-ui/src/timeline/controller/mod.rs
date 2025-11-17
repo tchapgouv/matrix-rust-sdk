@@ -1659,7 +1659,20 @@ impl TimelineController {
                     }
                 }
             }
-            Some(MediaSource::Plain(_)) => { /* nothing to do as local echo*/ }
+            Some(MediaSource::Plain(mxc_uri)) => {
+                match self.content_scanner.scan_uri(&mxc_uri).await {
+                    Ok(scan_state) => {
+                        self.finish_content_scan_for_item_with_state(
+                            diff.internal_id.clone(),
+                            scan_state,
+                        )
+                        .await
+                    }
+                    Err(err) => {
+                        error!("###BWI### ContentScanner failed: {:?}", err)
+                    }
+                }
+            }
             None => { /* nothing to do */ }
         }
     }
@@ -1704,7 +1717,6 @@ impl TimelineController {
             scan_state_after_scanning, id_of_event_with_attachment.0
         );
     }
-
     // end BWI-specific
 
     #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
