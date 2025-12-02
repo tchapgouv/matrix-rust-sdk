@@ -112,6 +112,7 @@ mod read_receipts;
 mod state;
 mod state_transaction;
 
+use crate::timeline::event_item::EventTimelineItemKind::Remote;
 pub(super) use aggregations::*;
 pub(super) use decryption_retry_task::{CryptoDropHandles, spawn_crypto_tasks};
 
@@ -1817,7 +1818,8 @@ impl TimelineController {
     }
 
     fn filter_for_media_events(&self, diff: &Arc<TimelineItem>) -> Option<MediaSource> {
-        if let Some(item) = diff.as_event() {
+        let filter_for_remote_events = |item: &&EventTimelineItem| matches!(item.kind, Remote(_));
+        if let Some(item) = diff.as_event().filter(filter_for_remote_events) {
             if let TimelineItemContent::MsgLike(message_like_content) = &item.content {
                 if let MsgLikeKind::Message(message) = &message_like_content.kind {
                     return match message.msgtype() {
@@ -1838,18 +1840,35 @@ impl TimelineController {
         id_of_event_with_attachment: TimelineUniqueId,
         scan_state_after_scanning: BWIScanState,
     ) {
+        let scan_state_id =
+            TimelineUniqueId(id_of_event_with_attachment.clone().0 + "__scan_state");
         let scan_state_event = TimelineItem::new(
             Virtual(ScanStateChanged(
                 id_of_event_with_attachment.clone(),
                 scan_state_after_scanning.clone(),
             )),
             // possible solution: is there an item with this timelineUniqueId
-            TimelineUniqueId(id_of_event_with_attachment.clone().0 + "__scan_state"),
+            scan_state_id.clone(),
         );
 
         let mut state = self.state.write().await;
         let mut transaction = state.items.transaction();
-        transaction.push_back(scan_state_event, None);
+
+        if let Some((existing_idx, _)) =
+            transaction.iter_all_regions().find(|(_, item)| item.internal_id == scan_state_id)
+        {
+            // Update the existing scan state if it is already in the timeline
+            transaction.replace(existing_idx, scan_state_event);
+        } else if let Some((index, _)) = transaction
+            .iter_remotes_region()
+            .find(|(_index, item)| item.internal_id == id_of_event_with_attachment)
+        {
+            // Insert the scan state immediately after the event it belongs to
+            transaction.insert(index + 1, scan_state_event, None);
+        } else {
+            // Fallback: append the scan state to the end of the timeline
+            transaction.push_back(scan_state_event, None);
+        }
         transaction.commit();
         info!(
             "###BWI###: virtual Event with state {:?} and id {:?}",
