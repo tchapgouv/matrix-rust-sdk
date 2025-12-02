@@ -2777,11 +2777,19 @@ impl Room {
 
     // Tchap-specific : access_rules
     /// Set or update the access rule for this room.
+    /// We get the value of other acces rule properties (visiblity and encrypted)
+    /// to transmit them to the new RoomAccessRulesEventContent in order to not replace
+    /// existing values with default ones.
+    /// This method is called by client only on an existing room (it is not used on room creation).
+    /// So, the 2 other properties already have a meaningfull value.
     pub async fn set_access_rule(
         &self,
         access_rule: AccessRule,
     ) -> Result<send_state_event::v3::Response> {
-        self.send_state_event(RoomAccessRulesEventContent::new(access_rule)).await
+        self.send_state_event(RoomAccessRulesEventContent { 
+            access_rule: access_rule,
+            visibility: Some(self.visibility().await),
+            encrypted: Some(self.is_encrypted().await) }).await
     }
 
     /// Get the access rule event content for this room.
