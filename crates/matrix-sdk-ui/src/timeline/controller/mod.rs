@@ -112,6 +112,7 @@ mod read_receipts;
 mod state;
 mod state_transaction;
 
+use crate::timeline::event_item::EventTimelineItemKind::Remote;
 pub(super) use aggregations::*;
 pub(super) use decryption_retry_task::{CryptoDropHandles, spawn_crypto_tasks};
 
@@ -1817,7 +1818,8 @@ impl TimelineController {
     }
 
     fn filter_for_media_events(&self, diff: &Arc<TimelineItem>) -> Option<MediaSource> {
-        if let Some(item) = diff.as_event() {
+        let filter_for_remote_events = |item: &&EventTimelineItem| matches!(item.kind, Remote(_));
+        if let Some(item) = diff.as_event().filter(filter_for_remote_events) {
             if let TimelineItemContent::MsgLike(message_like_content) = &item.content {
                 if let MsgLikeKind::Message(message) = &message_like_content.kind {
                     return match message.msgtype() {
@@ -1849,7 +1851,15 @@ impl TimelineController {
 
         let mut state = self.state.write().await;
         let mut transaction = state.items.transaction();
-        transaction.push_back(scan_state_event, None);
+        // transaction.push_back(scan_state_event, None);
+        if let Some(index) = transaction
+            .iter_remotes_region()
+            .position(|(_index, item)| item.internal_id == id_of_event_with_attachment)
+        {
+            transaction.insert(index + 1, scan_state_event, None);
+        } else {
+            transaction.push_back(scan_state_event, None);
+        }
         transaction.commit();
         info!(
             "###BWI###: virtual Event with state {:?} and id {:?}",
