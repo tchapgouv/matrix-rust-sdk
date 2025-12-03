@@ -2786,10 +2786,20 @@ impl Room {
         &self,
         access_rule: AccessRule,
     ) -> Result<send_state_event::v3::Response> {
-        self.send_state_event(RoomAccessRulesEventContent { 
-            access_rule: access_rule,
-            visibility: Some(self.visibility().await),
-            encrypted: Some(self.is_encrypted().await) }).await
+        let (encrypted, visibility) = match self.full_access_rules().await {
+            Err(_) | Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) => (None, None),
+            Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) => {
+                (e.content.encrypted, e.content.visibility)
+            }
+            Ok(SyncOrStrippedState::Stripped(e)) => match e.content {
+                PossiblyRedactedRoomAccessRulesEventContent { encrypted, visibility, .. } => {
+                    (encrypted, visibility)
+                }
+            },
+        };
+
+        self.send_state_event(RoomAccessRulesEventContent { access_rule, visibility, encrypted })
+            .await
     }
 
     /// Get the access rule event content for this room.
@@ -2808,7 +2818,7 @@ impl Room {
         match self.full_access_rules().await {
             Err(e) => return Err(e),
             Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) =>
-                Ok(e.content.access_rule.clone()),
+                Ok(e.content.access_rule),
             Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) =>
                 Err(Error::InsufficientData),
             Ok(SyncOrStrippedState::Stripped(e)) => match e.content {
