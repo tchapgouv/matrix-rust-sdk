@@ -1756,6 +1756,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
+name = "email_address"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e079f19b08ca6239f47f8ba8509c11cf3ea30095831f7fed61441475edd8c449"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "emojis"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3864,8 +3873,10 @@ dependencies = [
  "anyhow",
  "async-compat",
  "async-trait",
+ "base64 0.23.1",
  "chrono",
  "console_error_panic_hook",
+ "email_address",
  "extension-trait",
  "eyeball-im",
  "futures-executor",
@@ -3893,6 +3904,7 @@ dependencies = [
  "sentry-tracing",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "similar-asserts",
  "tempfile",
  "thiserror 2.0.20",
@@ -4094,6 +4106,9 @@ dependencies = [
  "futures-util",
  "reqwest",
  "ruma",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -4101,6 +4116,7 @@ dependencies = [
  "tracing",
  "uniffi",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5808,6 +5824,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -7913,6 +7930,15 @@ name = "webpki-root-certs"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e4ffd8df1c57e87c325000a3d6ef93db75279dc3a231125aac571650f22b12a"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]
