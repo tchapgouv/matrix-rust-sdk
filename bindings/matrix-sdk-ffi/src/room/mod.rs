@@ -23,10 +23,13 @@ use matrix_sdk::{
     RoomMemberships, RoomState, SuccessorRoom as SdkSuccessorRoom,
     encryption::LocalTrust,
     room::{
-        Room as SdkRoom, RoomMemberRole, edit::EditedContent, power_levels::RoomPowerLevelChanges,
+        Room as SdkRoom,
+        RoomMemberRole,
         // Tchap-specific : access_rules
         access_rules::AccessRule,
         // end Tchap-specific
+        edit::EditedContent,
+        power_levels::RoomPowerLevelChanges,
     },
     send_queue::RoomSendQueueUpdate as SdkRoomSendQueueUpdate,
 };
@@ -38,7 +41,9 @@ use matrix_sdk_ui::{
 use mime::Mime;
 use ruma::{
     EventId, Int, OwnedDeviceId, OwnedRoomOrAliasId, OwnedServerName, OwnedUserId, RoomAliasId,
-    ServerName, UserId, assign,
+    ServerName, UserId,
+    api::client::membership::Invite3pidInit,
+    assign,
     events::{
         AnyMessageLikeEventContent, AnySyncTimelineEvent,
         receipt::ReceiptThread as RumaReceiptThread,
@@ -78,8 +83,10 @@ use crate::{
     utils::{AsyncRuntimeDropped, u64_to_uint},
 };
 
-// Tchap-specific : permalinks
+// Tchap-specific : permalinks & invite_users_by_email
+use email_address::EmailAddress;
 use matrix_sdk_tchap::permalinks::MatrixToUriToTchapString;
+use ruma::api::client::account::request_openid_token::v3::Request as OpenIdRequest;
 // end Tchap-specific
 
 mod power_levels;
@@ -637,6 +644,76 @@ impl Room {
         self.inner.invite_user_by_id(user).await?;
         Ok(())
     }
+
+    // Tchap-specific : invite_users_by_email
+    pub async fn invite_user_by_email(&self, email_to_invite: String) -> Result<(), ClientError> {
+        self.invite_users_by_email(vec![email_to_invite]).await?;
+        Ok(())
+    }
+
+    pub async fn invite_users_by_email(
+        &self,
+        emails_to_invite: Vec<String>,
+    ) -> Result<(), ClientError> {
+        // Get openIdToken
+        let user_id = self.inner.own_user_id().to_owned();
+        let open_id_response = self.inner.client().send(OpenIdRequest::new(user_id)).await?;
+
+        // Exchanges the OpenID token for an access token to access the identity server
+        let account_register_response = self
+            .inner
+            .client()
+            .send(matrix_sdk_tchap::request::identity_account_register::v1::Request::new(
+                open_id_response,
+            ))
+            .await?;
+
+        if account_register_response.token.is_empty() {
+            return Err(ClientError::Generic {
+                msg: "No identity server token given back".to_owned(),
+                details: None,
+            });
+        }
+
+        let homeserver =
+            matrix_sdk::sanitize_server_name(&self.inner.client().homeserver().as_str())
+                .unwrap()
+                .to_string();
+
+        // For email in emails_to_invite, send the invite
+        let (valid_emails, mut invalid_emails): (Vec<_>, Vec<_>) =
+            emails_to_invite.into_iter().partition(|email| EmailAddress::is_valid(email.as_str()));
+
+        for email in valid_emails {
+            if self
+                .inner
+                .invite_user_by_3pid(
+                    Invite3pidInit {
+                        id_server: homeserver.clone(),
+                        id_access_token: account_register_response.token.clone(),
+                        medium: ruma::thirdparty::Medium::Email,
+                        address: email.to_owned(),
+                    }
+                    .into(),
+                )
+                .await
+                .is_err()
+            {
+                invalid_emails.push(email);
+            }
+        }
+
+        // If one or more invitations failed, return an error
+        if !invalid_emails.is_empty() {
+            return Err(ClientError::Generic {
+                msg: "Some emails were not valid".to_owned(),
+                details: Some(invalid_emails.join(";")),
+            });
+        }
+
+        Ok(())
+    }
+    // end Tchap-specific
 
     pub async fn ban_user(
         &self,

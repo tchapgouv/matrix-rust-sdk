@@ -1907,20 +1907,28 @@ impl Client {
     pub async fn create_room(&self, request: create_room::v3::Request) -> Result<Room> {
         let invite = request.invite.clone();
         let is_direct_room = request.is_direct;
-        let response = self.send(request).await?;
 
+        // Tchap-specific : invite_users_by_email
+        let invite_3pid = request.invite_3pid.clone();
+        // end Tchap-specific
+
+        let response = self.send(request).await?;
         let base_room = self.base_client().get_or_create_room(&response.room_id, RoomState::Joined);
 
         let joined_room = Room::new(self.clone(), base_room);
 
+        // Tchap-specific : invite_users_by_email
         if is_direct_room
-            && !invite.is_empty()
-            && let Err(error) =
-                self.account().mark_as_dm(joined_room.room_id(), invite.as_slice()).await
+            && (!invite.is_empty() || !invite_3pid.is_empty())
+            && let Err(error) = self
+                .account()
+                .mark_as_dm(joined_room.room_id(), invite.as_slice(), invite_3pid.as_slice())
+                .await
         {
             // FIXME: Retry in the background
             error!("Failed to mark room as DM: {error}");
         }
+        // end Tchap-specific
 
         Ok(joined_room)
     }
