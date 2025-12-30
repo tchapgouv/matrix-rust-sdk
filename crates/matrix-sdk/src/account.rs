@@ -41,6 +41,9 @@ use ruma::{
             },
             config::{get_global_account_data, set_global_account_data},
             error::ErrorKind,
+            // Tchap-specific : invite_users_by_email
+            membership::Invite3pid,
+            // end Tchap-specific
             profile::{
                 DisplayName, ProfileFieldName, ProfileFieldValue, StaticProfileField,
                 delete_profile_field, get_avatar_url, get_profile, get_profile_field,
@@ -1014,7 +1017,14 @@ impl Account {
     /// * `room_id` - The room ID of the direct message room.
     /// * `user_ids` - The user IDs to be associated with this direct message
     ///   room.
-    pub async fn mark_as_dm(&self, room_id: &RoomId, user_ids: &[OwnedUserId]) -> Result<()> {
+    pub async fn mark_as_dm(
+        &self,
+        room_id: &RoomId,
+        user_ids: &[OwnedUserId],
+        // Tchap-specific : invite_users_by_email
+        user_invite_emails: &[Invite3pid],
+        // end Tchap-specific
+    ) -> Result<()> {
         use ruma::events::direct::DirectEventContent;
 
         // This function does a read/update/store of an account data event stored on the
@@ -1050,6 +1060,15 @@ impl Account {
         for user_id in user_ids {
             content.entry(user_id.into()).or_default().push(room_id.to_owned());
         }
+
+        // Tchap-specific : invite_users_by_email
+        for user_invite_email in user_invite_emails {
+            content
+                .entry(user_invite_email.address.clone().into())
+                .or_default()
+                .push(room_id.to_owned());
+        }
+        // end Tchap-specific
 
         // TODO: We should probably save the fact that we need to send this out
         // because otherwise we might end up in a state where we have a DM that
