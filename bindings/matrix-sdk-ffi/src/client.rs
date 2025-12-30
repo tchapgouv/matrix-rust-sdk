@@ -73,6 +73,23 @@ use matrix_sdk_ui::{
     spaces::SpaceService as UISpaceService,
     unable_to_decrypt_hook::UtdHookManager,
 };
+
+// Tchap-specific
+use base64::{engine::general_purpose, Engine as _};
+use email_address::EmailAddress;
+use matrix_sdk_tchap::get_instance_from_email::{TchapGetInstance, TchapGetInstanceConfig};
+use oauth2::{http, reqwest};
+use ruma::api::client::account::request_openid_token::v3::Request as OpenIdRequest;
+use ruma::{
+    api::client::membership::Invite3pidInit,
+    events::{
+        direct::DirectEvent, room::member::RoomMemberEventContent, GlobalAccountDataEventType,
+    },
+};
+use sha2::{Digest, Sha256};
+use std::borrow::Cow;
+// end Tchap-specific
+
 use mime::Mime;
 use oauth2::Scope;
 use ruma::{
@@ -322,6 +339,28 @@ struct ClientDelegateData {
     // jobs to the delegate.
     _background_error_listener_task: Arc<AbortOnDrop<()>>,
 }
+
+// Tchap-specific
+#[derive(uniffi::Object)]
+pub struct TchapConstants {}
+
+// TchapConstants is used to make some values available to client applications.
+#[matrix_sdk_ffi_macros::export]
+impl TchapConstants {
+    #[uniffi::constructor]
+    fn new() -> Self {
+        TchapConstants {}
+    }
+
+    // Not possible to define this function as an associated function (without (&self) argument,
+    // because the uniFFI export doesn't currently support this functionality.
+    //
+    // In Swift, use it like this : `let marker = TchapConstants().inviteByEmailSuffixMarker()`
+    fn invite_by_email_suffix_marker(&self) -> String {
+        "tchap-email-invitation".to_string()
+    }
+}
+// end Tchap-specific
 
 #[derive(uniffi::Object)]
 pub struct Client {
@@ -1385,8 +1424,140 @@ impl Client {
         Ok(device_id.to_string())
     }
 
-    pub async fn create_room(&self, request: CreateRoomParameters) -> Result<String, ClientError> {
-        let response = self.inner.create_room(request.try_into()?).await?;
+    pub async fn create_room(
+        &self,
+        request: CreateRoomParameters,
+        // Tchap-specific : invite_users_by_email
+        is_tchap_invite: bool,
+        is_tchap_invite_external: bool,
+        // end Tchap-specific
+    ) -> Result<String, ClientError> {
+        // Tchap-specific : invite_users_by_email
+        let mut request_with_invites: create_room::v3::Request = request.try_into()?;
+
+        if is_tchap_invite {
+            // Retrieve the email to invite from the user_id
+            let user_id_to_invite = request_with_invites
+                .invite
+                .first()
+                .ok_or_else(|| ClientError::Generic {
+                    msg: "Missing email for Tchap invite".to_owned(),
+                    details: None,
+                })?
+                .to_string();
+
+            if !user_id_to_invite.starts_with('@') || !user_id_to_invite.contains(':') {
+                return Err(ClientError::Generic {
+                    msg: "Bad userId for Tchap invite".to_owned(),
+                    details: None,
+                });
+            }
+
+            let colon_pos = user_id_to_invite.find(':').unwrap();
+            let email_to_invite = user_id_to_invite[1..colon_pos].to_string();
+
+            // Search if a DM already exists for the email
+            // Retrieve m.direct account event
+            let m_direct_event = self
+                .inner
+                .state_store()
+                .get_account_data_event(GlobalAccountDataEventType::Direct)
+                .await?
+                .map(|event| event.deserialize_as_unchecked::<DirectEvent>())
+                .transpose()?
+                .map(|get_raw| get_raw.content)
+                .unwrap_or_default();
+
+            // Find if a DM already exists with a key corresponding to the email
+            let existing_dm_room = m_direct_event
+                .into_iter()
+                .find(|(user_id, _)| user_id.to_string() == email_to_invite);
+
+            if let Some((_, room_ids)) = existing_dm_room {
+                if is_tchap_invite_external {
+                    // If DM exist and is_tchap_invite_external, remove existing invite and leave existing room
+                    for room_id in room_ids {
+                        if let Some(room) = self.inner.get_room(&room_id) {
+                            // TODO : Get the third_party_invite state event
+                            let room_members =
+                                room.get_state_events_static::<RoomMemberEventContent>().await?;
+
+                            // TODO : sendStateEvent for third_party_invite state event with empty body
+                            // return Err(ClientError::Generic {
+                            //     msg: room_members
+                            //         .iter()
+                            //         .map(|member| {
+                            //             member.deserialize().unwrap().state_key().to_string()
+                            //         })
+                            //         .collect::<Vec<_>>()
+                            //         .join("")
+                            //         .to_owned(),
+                            //     details: None,
+                            // });
+
+                            // Leave the existing room
+                            room.leave().await?;
+                        }
+                    }
+
+                    // let invite_state_event = self.inner.state_store().get_state_event(
+                    //     first_existing_room,
+                    //     MembershipState::Invite,
+                    //     state_key,
+                    // );
+
+                    // if (!invite_state_event.isNullOrEmpty()) {
+                    // self
+                    // .inner
+                    // .state_store()
+                    // .sends
+                    // }
+
+                    // val token = room.stateService().getStateEvent(EventType.STATE_ROOM_THIRD_PARTY_INVITE, QueryStringValue.IsNotNull)?.stateKey
+                    // if (!token.isNullOrEmpty()) {
+                    // room.stateService().sendStateEvent(
+                    //         eventType = EventType.STATE_ROOM_THIRD_PARTY_INVITE,
+                    //         stateKey = token,
+                    //         body = emptyMap()
+                    // )
+                } else if let Some(room_id) = room_ids.first() {
+                    // Else if at least one room exists for the DM, return the room_id of the first room
+                    return Ok(room_id.to_string());
+                }
+            }
+
+            // Get openIdToken
+            let user_id = self.inner.user_id().context("No User ID found")?;
+            let open_id_response = self.inner.send(OpenIdRequest::new(user_id.to_owned())).await?;
+
+            // Exchanges the OpenID token for an access token to access the identity server
+            let account_register_response = self
+                .inner
+                .send(matrix_sdk_tchap::request::identity_account_register::v1::Request::new(
+                    open_id_response,
+                ))
+                .await?;
+
+            // Get current user homeserver
+            let homeserver =
+                matrix_sdk::sanitize_server_name(self.homeserver().as_str()).unwrap().to_string();
+
+            // Add the email to invite in the invite_3pid list of the request
+            request_with_invites.invite_3pid = vec![Invite3pidInit {
+                id_server: homeserver,
+                id_access_token: account_register_response.token,
+                medium: ruma::thirdparty::Medium::Email,
+                address: email_to_invite,
+            }
+            .into()]
+            .into();
+
+            // The user is invited by email, we can remove them from the user list
+            request_with_invites.invite = vec![].into();
+        }
+        // end Tchap-specific
+
+        let response = self.inner.create_room(request_with_invites).await?;
         Ok(String::from(response.room_id()))
     }
 
@@ -1598,6 +1769,150 @@ impl Client {
         search_term: String,
         limit: u64,
     ) -> Result<SearchUsersResults, ClientError> {
+        // Tchap-specific : invite_users_by_email
+        let email_address = search_term.as_str().trim().to_lowercase();
+
+        if EmailAddress::is_valid(&email_address) {
+            // Get openIdToken
+            let user_id = self.inner.user_id().context("No User ID found")?;
+            let open_id_response = self.inner.send(OpenIdRequest::new(user_id.to_owned())).await?;
+
+            // Exchanges the OpenID token for an access token to access the identity server
+            let account_register_response = self
+                .inner
+                .send(matrix_sdk_tchap::request::identity_account_register::v1::Request::new(
+                    open_id_response,
+                ))
+                .await?;
+
+            if account_register_response.token.is_empty() {
+                return Err(ClientError::Generic {
+                    msg: "No identity server token given back".to_owned(),
+                    details: None,
+                });
+            }
+
+            // Get the lookup_pepper hash details to encode the email address in query
+            let hash_details = {
+                let identity_server_url = self.homeserver();
+                let supported_versions = self.inner.supported_versions().await?;
+
+                let request = matrix_sdk_tchap::request::identity_hash_details::v1::Request::new();
+
+                use ruma::api::{IncomingResponse, OutgoingRequest};
+                let http_request = request
+                    .try_into_http_request::<Vec<u8>>(
+                        identity_server_url.as_str(),
+                        ruma::api::auth_scheme::SendAccessToken::Always(
+                            &account_register_response.token,
+                        ),
+                        Cow::Owned(supported_versions),
+                    )
+                    .map_err(ClientError::from_err)?;
+
+                let reqwest_request =
+                    reqwest::Request::try_from(http_request).map_err(ClientError::from_err)?;
+
+                let response = self.inner.http_client().execute(reqwest_request).await?;
+
+                let status = response.status();
+                let mut http_response_builder = http::Response::builder().status(status);
+                for (name, value) in response.headers() {
+                    http_response_builder = http_response_builder.header(name, value);
+                }
+                let body = response.bytes().await?.to_vec();
+                let http_response =
+                    http_response_builder.body(body.clone()).map_err(ClientError::from_err)?;
+
+                type Incoming =
+                <matrix_sdk_tchap::request::identity_hash_details::v1::Request as OutgoingRequest>::IncomingResponse;
+                Incoming::try_from_http_response(http_response).map_err(ClientError::from_err)?
+            };
+
+            // Prepare the query and hash it in sha256 (see https://spec.matrix.org/latest/identity-service-api/#sha256)
+            let hashed_address_query = {
+                let lookup_address =
+                    format!("{} email {}", &email_address, &hash_details.lookup_pepper);
+
+                let mut hasher = Sha256::new();
+                hasher.update(lookup_address.as_bytes());
+                general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+            };
+
+            // Fetch the MatrixId user associated to the email if exist
+            let identity_lookup = {
+                let identity_server_url = self.homeserver();
+                let supported_versions = self.inner.supported_versions().await?;
+
+                let request = matrix_sdk_tchap::request::identity_lookup::v1::Request::new(
+                    hashed_address_query.clone(),
+                    hash_details.lookup_pepper,
+                );
+
+                use ruma::api::{IncomingResponse, OutgoingRequest};
+                let http_request = request
+                    .try_into_http_request::<Vec<u8>>(
+                        identity_server_url.as_str(),
+                        ruma::api::auth_scheme::SendAccessToken::Always(
+                            &account_register_response.token,
+                        ),
+                        Cow::Owned(supported_versions),
+                    )
+                    .map_err(ClientError::from_err)?;
+
+                let reqwest_request =
+                    reqwest::Request::try_from(http_request).map_err(ClientError::from_err)?;
+
+                let response = self.inner.http_client().execute(reqwest_request).await?;
+
+                let status = response.status();
+                let mut http_response_builder = http::Response::builder().status(status);
+                for (name, value) in response.headers() {
+                    http_response_builder = http_response_builder.header(name, value);
+                }
+                let body = response.bytes().await?.to_vec();
+                let http_response =
+                    http_response_builder.body(body.clone()).map_err(ClientError::from_err)?;
+
+                type Incoming =
+                <matrix_sdk_tchap::request::identity_lookup::v1::Request as OutgoingRequest>::IncomingResponse;
+                Incoming::try_from_http_response(http_response).map_err(ClientError::from_err)?
+            };
+
+            // Retrieve the MatrixId user if returned by the identity server
+            if let Some(user_id) = identity_lookup.mappings.get(hashed_address_query.as_str()) {
+                let user_from_email = self.get_profile(user_id.to_string()).await?;
+                return Ok(SearchUsersResults { results: vec![user_from_email], limited: false });
+            }
+
+            // Else, retrieve the future instance of the homeserver for the email address
+            let get_instance_config = TchapGetInstanceConfig::new(self.homeserver());
+            let home_serveur_from_email = TchapGetInstance::new(&get_instance_config)
+                .get_instance(email_address.clone())
+                .unwrap()
+                .hs;
+
+            // If we have a response for the homeserver, create a custom response entry with a fake UserId
+            let mut custom_results: Vec<UserProfile> = vec![];
+            if !home_serveur_from_email.is_empty() {
+                custom_results.push(UserProfile {
+                    user_id: format!(
+                        "@{}:{}.{}",
+                        &email_address,
+                        home_serveur_from_email,
+                        TchapConstants::new().invite_by_email_suffix_marker()
+                    ),
+                    display_name: Some(email_address),
+                    avatar_url: None,
+                });
+            }
+
+            let results = SearchUsersResults { results: custom_results, limited: false };
+
+            return Ok(results);
+        }
+        // end Tchap-specific
+
         let response = self.inner.search_users(&search_term, limit).await?;
         Ok(SearchUsersResults::from(response))
     }

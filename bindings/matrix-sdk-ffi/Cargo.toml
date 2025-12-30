@@ -67,7 +67,10 @@ matrix-sdk-ui = { workspace = true, features = ["uniffi"] }
 mime = { version = "0.3.17", default-features = false }
 
 # Tchap-specific
-matrix-sdk-tchap = { workspace = true }
+matrix-sdk-tchap = { workspace = true, features = ["client"] }
+email_address = "0.2.9"
+sha2.workspace = true
+base64.workspace = true
 # end Tchap-specific
 
 ruma = { workspace = true, features = [
