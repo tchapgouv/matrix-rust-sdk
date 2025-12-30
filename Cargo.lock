@@ -1519,6 +1519,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60b1af1c220855b6ceac025d3f6ecdd2b7c4894bfe9cd9bda4fbb4bc7c0d4cf0"
 
 [[package]]
+name = "email_address"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e079f19b08ca6239f47f8ba8509c11cf3ea30095831f7fed61441475edd8c449"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "emojis"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3416,6 +3425,7 @@ dependencies = [
  "anyhow",
  "async-compat",
  "console_error_panic_hook",
+ "email_address",
  "extension-trait",
  "eyeball-im",
  "futures-executor",
@@ -3628,6 +3638,7 @@ dependencies = [
  "futures-util",
  "reqwest",
  "ruma",
+ "ruma-common",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
