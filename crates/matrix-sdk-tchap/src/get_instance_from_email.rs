@@ -9,12 +9,15 @@ use url::Url;
 //--------------------------------------------------------------------------------
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct TchapGetInstanceConfig {
-    pub home_server: String, // host name without `https://matrix.`
+    pub home_server: String,
     pub user_agent: String,
 }
 
 impl TchapGetInstanceConfig {
     // `impl` needed to generate uniffi init() for the struct (iOS side at least).
+    pub fn new(home_server: String) -> Self {
+        Self { home_server: home_server, user_agent: "Tchap-rust-default-user-agent".to_string() }
+    }
 }
 
 impl Default for TchapGetInstanceConfig {
@@ -44,7 +47,7 @@ pub struct TchapGetInstanceResult {
 
 #[derive(uniffi::Object)]
 pub struct TchapGetInstance {
-    home_server: String, // host name without `https://matrix.`
+    home_server: String,
     client: Option<Client>,
 }
 
@@ -74,7 +77,13 @@ impl TchapGetInstance {
 
     /// Construct the full url from the email requested.
     fn url(&self, for_email: &str) -> Result<Url, url::ParseError> {
-        let home_server_address = format!("https://matrix.{}", self.home_server);
+        // Check if the homeserver starts with "https://matrix.", else add it.
+        let home_server_address = if self.home_server.starts_with("https://matrix.") {
+            // Clean the trailing '/' if any.
+            self.home_server.clone().strip_suffix('/').unwrap_or(&self.home_server).to_owned()
+        } else {
+            format!("https://matrix.{}", self.home_server)
+        };
         let kmxidentity_apiprefix_path_v1 = "_matrix/identity/api/v1";
         let info_path_and_query = format!("info?medium=email&address={}", for_email);
         Url::parse(

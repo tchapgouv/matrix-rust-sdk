@@ -16,6 +16,12 @@ use std::fmt;
 
 use as_variant::as_variant;
 use regex::Regex;
+// Tchap-specific : invite_users_by_email
+use ruma::events::{
+    GlobalAccountDataEventType,
+    direct::{DirectEvent, OwnedDirectUserIdentifier},
+};
+// end Tchap-specific
 use ruma::{
     OwnedMxcUri, OwnedUserId, RoomAliasId, UserId,
     events::{SyncStateEvent, member_hints::MemberHintsEventContent},
@@ -194,6 +200,19 @@ impl Room {
             heroes.iter().map(|hero| hero.as_str()).collect(),
         );
 
+        // Tchap-specific : invite_users_by_email
+        // If the room is DM and we have an empty name, try to calculate the name from three_pid_invites (non-tchap user invited by email)
+        let is_direct_room = self.is_direct().await.unwrap();
+
+        if is_direct_room && display_name == RoomDisplayName::Empty {
+            let user_id_for_room = self.get_dm_user_id_for_room().await;
+
+            if !user_id_for_room.is_empty() {
+                return Ok(RoomDisplayName::Calculated(user_id_for_room));
+            }
+        }
+        // end Tchap-specific
+
         Ok(display_name)
     }
 
@@ -342,6 +361,39 @@ impl Room {
             .and_then(|event| as_variant!(event, SyncOrStrippedState::Sync(SyncStateEvent::Original(e)) => e.content))
             .unwrap_or_default())
     }
+
+    // Tchap-specific : invite_users_by_email
+    async fn get_direct_user_ids_for_room(&self) -> StoreResult<Vec<OwnedDirectUserIdentifier>> {
+        // Retrieve m.direct account event
+        let m_direct_event = self
+            .store
+            .get_account_data_event(GlobalAccountDataEventType::Direct)
+            .await?
+            .map(|event| event.deserialize_as_unchecked::<DirectEvent>())
+            .transpose()?
+            .map(|get_raw| get_raw.content)
+            .unwrap_or_default();
+
+        // Filter m.direct keys when value contains the current room
+        let m_direct_user_ids_for_room = m_direct_event
+            .into_iter()
+            .filter(|(_, room_ids)| room_ids.iter().any(|id| id == self.room_id()))
+            .map(|(user_id, _)| user_id)
+            .collect();
+
+        Ok(m_direct_user_ids_for_room)
+    }
+
+    async fn get_dm_user_id_for_room(&self) -> String {
+        let direct_user_ids = self.get_direct_user_ids_for_room().await.unwrap();
+
+        if direct_user_ids.is_empty() || direct_user_ids.len() > 1 {
+            return "".to_owned();
+        }
+
+        return direct_user_ids[0].to_string();
+    }
+    // end Tchap-specific
 }
 
 /// The result of a room summary computation.
