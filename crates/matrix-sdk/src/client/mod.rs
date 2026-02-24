@@ -1787,7 +1787,7 @@ impl Client {
 
     // BWI-specific
     pub async fn create_room(&self, request: create_room::v3::Request) -> Result<Room> {
-        self.create_room_with_federated(request, true).await
+        self.create_room_with_federated(request).await
     }
     // end BWI-specific
 
@@ -1796,9 +1796,8 @@ impl Client {
     pub async fn create_room_with_federated(
         &self,
         mut request: create_room::v3::Request,
-
         // BWI-specific
-        is_federated: bool,
+        // is_federated: bool,
         // end BWI-specific
     ) -> Result<Room> {
         let invite = request.invite.clone();
@@ -1814,8 +1813,9 @@ impl Client {
             Client::add_room_alias(&mut request);
             // END BWI specific
 
+            // TCHAP : disable ACL Server for the moment
             // BWI specific: add acl initial state event
-            self.add_acl_initial_state_event(&mut request, is_federated);
+            // self.add_acl_initial_state_event(&mut request, is_federated);
             // END #6880 BWI specific
         }
 
@@ -1919,7 +1919,7 @@ impl Client {
 
         // BWI-specific
         // self.create_room(request).await
-        self.create_room_with_federated(request, false).await
+        self.create_room_with_federated(request).await
         // end BWI-specific
     }
 

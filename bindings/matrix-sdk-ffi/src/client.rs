@@ -1389,7 +1389,7 @@ impl Client {
     pub async fn create_room(
         &self,
         request: CreateRoomParameters,
-        is_federated: bool,
+        // is_federated: bool,
         // Tchap-specific : invite_users_by_email
         is_tchap_invite: bool,
         is_tchap_invite_external: bool,
@@ -1520,8 +1520,7 @@ impl Client {
         }
         // end Tchap-specific
 
-        let response =
-            self.inner.create_room_with_federated(request_with_invites, is_federated).await?;
+        let response = self.inner.create_room_with_federated(request_with_invites).await?;
         Ok(String::from(response.room_id()))
     }
     // end BWI-specific
@@ -2717,6 +2716,10 @@ pub struct CreateRoomParameters {
     #[uniffi(default = None)]
     pub access_rule_override: Option<AccessRule>,
     // end Tchap-specific
+    // Tchap-specific : federated param
+    #[uniffi(default = None)]
+    pub is_room_federated: Option<bool>,
+    // end Tchap-specific
     pub preset: RoomPreset,
     #[uniffi(default = None)]
     pub invite: Option<Vec<String>>,
@@ -2803,11 +2806,17 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
 
         request.initial_state = initial_state;
 
+        let mut creation_content = CreationContent::new();
+
         if value.is_space {
-            let mut creation_content = CreationContent::new();
             creation_content.room_type = Some(RoomType::Space);
-            request.creation_content = Some(Raw::new(&creation_content)?);
         }
+
+        if let Some(is_room_federated) = value.is_room_federated {
+            creation_content.federate = is_room_federated;
+        }
+
+        request.creation_content = Some(Raw::new(&creation_content)?);
 
         if let Some(power_levels) = value.power_level_content_override {
             match Raw::new(&power_levels.into()) {
