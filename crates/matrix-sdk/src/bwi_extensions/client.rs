@@ -16,8 +16,8 @@
 
 //! Extension Traits for the client
 
-use crate::Error;
 use crate::bwi_extensions::attachment::FileSize;
+use crate::Error;
 use async_trait::async_trait;
 use matrix_sdk_bwi::attachment::FILE_SIZE_LIMIT;
 use matrix_sdk_bwi::settings_cache::BWISettingsCache;

@@ -20,6 +20,12 @@ use std::{
     time::Duration,
 };
 
+// BWI-specific
+use crate::client::BWIScanState::Infected;
+use matrix_sdk::bwi_extensions::attachment::ClientAttachmentExt;
+use matrix_sdk::bwi_extensions::client::BWIClientSetupExt;
+// end BWI-specific
+
 use anyhow::{anyhow, Context as _};
 use futures_util::pin_mut;
 #[cfg(not(target_family = "wasm"))]
@@ -80,6 +86,10 @@ use matrix_sdk_ui::{
     unable_to_decrypt_hook::UtdHookManager,
 };
 
+// BWI-specific
+use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState as SDKScanState;
+// end BWI-specific
+
 // Tchap-specific
 use base64::{engine::general_purpose, Engine as _};
 use email_address::EmailAddress;
@@ -138,7 +148,13 @@ use ruma::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
-use tracing::{debug, error};
+use tracing::{
+    debug,
+    error,
+    // BWI-specific
+    warn,
+    // end BWI-specific
+};
 use url::Url;
 
 use super::{
@@ -195,6 +211,47 @@ pub enum PusherKind {
     Http { data: HttpPusherData },
     Email,
 }
+
+// BWI-specific
+/// The State that is indicated by the BWI Content Scanner
+#[derive(Clone, uniffi::Enum)]
+pub enum BWIScanState {
+    /// The Content is marked as safe
+    Trusted,
+
+    /// The content is marked as infected and must not be loaded
+    Infected,
+
+    /// The mime type of the file is not allowed
+    MimeTypeNotAllowed,
+
+    /**
+    The content can not be scanned.
+    That could happen because the ContentScanner is not available
+    or the content can not be uploaded.
+    */
+    Error,
+
+    /// The scan process is triggered bug not finished
+    InProgress,
+
+    /// The file can no longer be found and can therefore not be scanned
+    NotFound,
+}
+
+impl From<SDKScanState> for BWIScanState {
+    fn from(value: SDKScanState) -> Self {
+        match value {
+            SDKScanState::Trusted => BWIScanState::Trusted,
+            SDKScanState::Infected => BWIScanState::Infected,
+            SDKScanState::Error => BWIScanState::Error,
+            SDKScanState::InProgress => BWIScanState::InProgress,
+            SDKScanState::NotFound => BWIScanState::NotFound,
+            SDKScanState::MimeTypeNotAllowed => BWIScanState::MimeTypeNotAllowed,
+        }
+    }
+}
+// end BWI-specific
 
 impl TryFrom<PusherKind> for RumaPusherKind {
     type Error = anyhow::Error;
@@ -753,6 +810,12 @@ impl Client {
             )
             .await?;
         self.inner.set_sliding_sync_version(sliding_sync_version.try_into()?);
+
+        // BWI-specific
+        if let Err(err) = self.inner.sync_settings().await {
+            warn!("###BWI### Sync settings failed with error: {}", err)
+        }
+        // end BWI-specific
 
         Ok(())
     }
@@ -1432,9 +1495,15 @@ impl Client {
         Ok(device_id.to_string())
     }
 
+    // BWI-specific
+    // pub async fn create_room(&self, request: CreateRoomParameters) -> Result<String, ClientError> {
+    //     let response = self.inner.create_room(request.try_into()?).await?;
+    //     Ok(String::from(response.room_id()))
+    // }
     pub async fn create_room(
         &self,
         request: CreateRoomParameters,
+        // is_federated: bool,
         // Tchap-specific : invite_users_by_email
         is_tchap_invite: bool,
         is_tchap_invite_external: bool,
@@ -1550,9 +1619,10 @@ impl Client {
         }
         // end Tchap-specific
 
-        let response = self.inner.create_room(request_with_invites).await?;
+        let response = self.inner.create_room_with_federated(request_with_invites).await?;
         Ok(String::from(response.room_id()))
     }
+    // end BWI-specific
 
     /// Get the content of the event of the given type out of the account data
     /// store.
@@ -1575,6 +1645,14 @@ impl Client {
         self.inner.account().set_account_data_raw(event_type.into(), raw_content).await?;
         Ok(())
     }
+
+    // BWI-specific
+    pub async fn get_file_size_limit_for_file_upload(&self) -> Result<u64, ClientError> {
+        self.inner.get_size_limit_for_file_upload().await.map(|size| size.0).ok_or(
+            ClientError::Generic { msg: "File size limit not synced".to_string(), details: None },
+        )
+    }
+    // end BWI-specific
 
     pub async fn upload_media(
         &self,
@@ -1637,6 +1715,22 @@ impl Client {
             )
             .await?)
     }
+
+    // BWI-specific
+    pub async fn get_content_scanner_result_for_attachment(
+        &self,
+        _media_source: Arc<MediaSource>,
+    ) -> Result<BWIScanState, ClientError> {
+        Ok(Infected)
+    }
+
+    pub async fn download_attachment_from_content_scanner(
+        &self,
+        _media_source: Arc<MediaSource>,
+    ) -> Result<Vec<u8>, ClientError> {
+        Err(anyhow!("This method is not implemented, but your file is infected anyway!").into())
+    }
+    // end BWI-specific
 
     pub async fn get_session_verification_controller(
         &self,

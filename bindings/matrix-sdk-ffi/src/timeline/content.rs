@@ -307,6 +307,9 @@ pub enum OtherState {
     SpaceParent,
     Custom {
         event_type: String,
+        // BWI-specific
+        event_value: String,
+        // end BWI-specific
     },
 }
 
@@ -442,7 +445,11 @@ impl From<&matrix_sdk_ui::timeline::AnyOtherFullStateEventContent> for OtherStat
             }
             Content::SpaceChild(_) => Self::SpaceChild,
             Content::SpaceParent(_) => Self::SpaceParent,
-            Content::_Custom { event_type, .. } => Self::Custom { event_type: event_type.clone() },
+            // BWI-specific
+            // Content::_Custom { event_type, .. } => Self::Custom { event_type: event_type.clone() },
+            Content::_Custom { event_type, event_value, .. } => {
+                Self::Custom { event_type: event_type.clone(), event_value: event_value.clone() }
+            } // end BWI-specific
         }
     }
 }
