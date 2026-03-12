@@ -60,7 +60,13 @@ use matrix_sdk::{
     sliding_sync::Version as SdkSlidingSyncVersion,
     store::RoomLoadSettings as SdkRoomLoadSettings,
     task_monitor::BackgroundTaskFailureReason,
-    Account, AuthApi, AuthSession, Client as MatrixClient, Error, SessionChange, SessionTokens,
+    Account,
+    AuthApi,
+    AuthSession,
+    Client as MatrixClient,
+    Error,
+    SessionChange,
+    SessionTokens,
 };
 use matrix_sdk_common::{
     cross_process_lock::CrossProcessLockConfig, stream::StreamExt, SendOutsideWasm, SyncOutsideWasm,
@@ -79,11 +85,13 @@ use base64::{engine::general_purpose, Engine as _};
 use email_address::EmailAddress;
 use matrix_sdk_tchap::get_instance_from_email::{TchapGetInstance, TchapGetInstanceConfig};
 use oauth2::{http, reqwest};
-use ruma::api::client::account::request_openid_token::v3::Request as OpenIdRequest;
 use ruma::{
-    api::client::membership::Invite3pidInit,
+    api::client::{
+        account::request_openid_token::v3::Request as OpenIdRequest, membership::Invite3pidInit,
+    },
     events::{
-        direct::DirectEvent, room::member::RoomMemberEventContent, GlobalAccountDataEventType,
+        direct::DirectEvent, room::third_party_invite::RoomThirdPartyInviteEventContent,
+        GlobalAccountDataEventType, StateEventType,
     },
 };
 use sha2::{Digest, Sha256};
@@ -1468,62 +1476,47 @@ impl Client {
                 .map(|get_raw| get_raw.content)
                 .unwrap_or_default();
 
-            // Find if a DM already exists with a key corresponding to the email
-            let existing_dm_room = m_direct_event
+            // Find if one or more DM already exists with a key corresponding to the email
+            let existing_dm_rooms = m_direct_event
                 .into_iter()
-                .find(|(user_id, _)| user_id.to_string() == email_to_invite);
-
-            if let Some((_, room_ids)) = existing_dm_room {
-                if is_tchap_invite_external {
-                    // If DM exist and is_tchap_invite_external, remove existing invite and leave existing room
-                    for room_id in room_ids {
-                        if let Some(room) = self.inner.get_room(&room_id) {
-                            // TODO : Get the third_party_invite state event
-                            let room_members =
-                                room.get_state_events_static::<RoomMemberEventContent>().await?;
-
-                            // TODO : sendStateEvent for third_party_invite state event with empty body
-                            // return Err(ClientError::Generic {
-                            //     msg: room_members
-                            //         .iter()
-                            //         .map(|member| {
-                            //             member.deserialize().unwrap().state_key().to_string()
-                            //         })
-                            //         .collect::<Vec<_>>()
-                            //         .join("")
-                            //         .to_owned(),
-                            //     details: None,
-                            // });
-
-                            // Leave the existing room
-                            room.leave().await?;
-                        }
+                .filter_map(|(user_id, room_ids)| {
+                    if user_id.to_string() == email_to_invite {
+                        Some(room_ids)
+                    } else {
+                        None
                     }
+                })
+                .flatten();
 
-                    // let invite_state_event = self.inner.state_store().get_state_event(
-                    //     first_existing_room,
-                    //     MembershipState::Invite,
-                    //     state_key,
-                    // );
+            if is_tchap_invite_external {
+                // When is_tchap_invite_external, for each existing DM, remove thirdPartyInvite content and leave existing room
+                for room_id in existing_dm_rooms {
+                    if let Some(room) = self.inner.get_room(&room_id) {
+                        // Get the existing third_party_invite state events
+                        let third_party_invite_state_keys = room
+                            .get_state_events_static::<RoomThirdPartyInviteEventContent>()
+                            .await?;
 
-                    // if (!invite_state_event.isNullOrEmpty()) {
-                    // self
-                    // .inner
-                    // .state_store()
-                    // .sends
-                    // }
+                        // Replace existing third_party_invite state content by an empty body
+                        for invite in third_party_invite_state_keys
+                            .into_iter()
+                            .flat_map(|i| i.deserialize().ok())
+                        {
+                            room.send_state_event_raw(
+                                StateEventType::RoomThirdPartyInvite.to_string().as_str(),
+                                invite.state_key().as_str(),
+                                json!({}),
+                            )
+                            .await?;
+                        }
 
-                    // val token = room.stateService().getStateEvent(EventType.STATE_ROOM_THIRD_PARTY_INVITE, QueryStringValue.IsNotNull)?.stateKey
-                    // if (!token.isNullOrEmpty()) {
-                    // room.stateService().sendStateEvent(
-                    //         eventType = EventType.STATE_ROOM_THIRD_PARTY_INVITE,
-                    //         stateKey = token,
-                    //         body = emptyMap()
-                    // )
-                } else if let Some(room_id) = room_ids.first() {
-                    // Else if at least one room exists for the DM, return the room_id of the first room
-                    return Ok(room_id.to_string());
+                        // Leave the existing room
+                        room.leave().await?;
+                    }
                 }
+            } else if let Some(room_id) = existing_dm_rooms.into_iter().next() {
+                // Else if at least one room exists for the DM, return the room_id of the first room
+                return Ok(room_id.to_string());
             }
 
             // Get openIdToken

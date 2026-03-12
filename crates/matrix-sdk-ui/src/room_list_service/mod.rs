@@ -112,10 +112,11 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     (StateEventType::SpaceChild, "*"),
 ];
 
-// Tchap-specific : access_rules
+// Tchap-specific : access_rules & third_party_invite
 static TCHAP_REQUIRED_STATE: LazyLock<Vec<(StateEventType, &str)>> = LazyLock::new(|| {
     let mut vec = Vec::from(DEFAULT_REQUIRED_STATE);
     vec.push((StateEventType::from(access_rules::ACCESS_RULES_EVENT_TYPE), ""));
+    vec.push((StateEventType::RoomThirdPartyInvite, "*"));
     vec
 });
 // end Tchap-specific
