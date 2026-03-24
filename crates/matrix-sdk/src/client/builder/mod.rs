@@ -34,6 +34,11 @@ use matrix_sdk_base::{
     BaseClient, DmRoomDefinition, ThreadingSupport, store::StoreConfig, ttl::TtlValue,
 };
 use matrix_sdk_common::cross_process_lock::CrossProcessLockConfig;
+
+// BWI-specific
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
+// end BWI-specific
+
 #[cfg(feature = "sqlite")]
 use matrix_sdk_sqlite::SqliteStoreConfig;
 #[cfg(not(target_family = "wasm"))]
@@ -109,6 +114,9 @@ use crate::{
 #[must_use]
 #[derive(Clone, Debug)]
 pub struct ClientBuilder {
+    // BWI specific
+    use_content_scanner: bool,
+    // end BWI specific
     homeserver_cfg: Option<HomeserverConfig>,
     sliding_sync_version_builder: SlidingSyncVersionBuilder,
     http_cfg: Option<HttpConfig>,
@@ -138,6 +146,9 @@ impl ClientBuilder {
 
     pub(crate) fn new() -> Self {
         Self {
+            // BWI specific
+            use_content_scanner: true,
+            // end BWI specific
             homeserver_cfg: None,
             sliding_sync_version_builder: SlidingSyncVersionBuilder::Native,
             http_cfg: None,
@@ -240,6 +251,14 @@ impl ClientBuilder {
         ));
         self
     }
+
+    // BWI-specific
+    /// Disable the content scanner extension for a specific client
+    pub fn without_content_scanner(mut self) -> Self {
+        self.use_content_scanner = false;
+        self
+    }
+    // end BWI specific
 
     /// Set sliding sync to a specific version.
     pub fn sliding_sync_version_builder(
@@ -635,6 +654,11 @@ impl ClientBuilder {
             None => NotSet,
         };
 
+        // BWI-specific
+        let content_scanner =
+            Arc::from(BWIContentScanner::new_with_url(&http_client.inner, &homeserver));
+        // end BWI-specific
+
         let event_cache = OnceCell::new();
         let latest_events = OnceCell::new();
         let thread_subscriptions_catchup = OnceCell::new();
@@ -649,6 +673,9 @@ impl ClientBuilder {
             homeserver,
             sliding_sync_version,
             http_client,
+            // BWI-specific
+            content_scanner,
+            // end BWI-specific
             base_client,
             supported_versions,
             well_known,
@@ -872,11 +899,23 @@ pub enum ClientBuildError {
     #[cfg(feature = "sqlite")]
     #[error(transparent)]
     SqliteStore(#[from] matrix_sdk_sqlite::OpenStoreError),
+
+    // BWI specific
+    /// Error for a failed validation of the JWT-Token authentication
+    /// The supplied server name was invalid.
+    #[error("None of the provided public keys verifies the signatur of the server")]
+    ServerIsNotVerified,
+    // end BWI specific
 }
 
 // The http mocking library is not supported for wasm32
 #[cfg(all(test, not(target_family = "wasm")))]
 pub(crate) mod tests {
+    // BWI-specific
+    use super::*;
+    #[cfg(feature = "experimental-sliding-sync")]
+    use crate::sliding_sync::Version as SlidingSyncVersion;
+    // end BWI-specific
     use assert_matches::assert_matches;
     use assert_matches2::assert_let;
     use matrix_sdk_test::{async_test, test_json};

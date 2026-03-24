@@ -42,6 +42,17 @@ use matrix_sdk_base::{
     task_monitor::TaskMonitor,
 };
 use matrix_sdk_common::{cross_process_lock::CrossProcessLockConfig, ttl::TtlValue};
+
+// BWI-specific
+use matrix_sdk_base_bwi::room_alias::BWIRoomAlias;
+use matrix_sdk_bwi::content_scanner::BWIContentScanner;
+use matrix_sdk_bwi::federation::BWIFederationHandler;
+use ruma::events::room::history_visibility::{
+    HistoryVisibility, RoomHistoryVisibilityEventContent,
+};
+use ruma::events::room::server_acl::RoomServerAclEventContent;
+// end BWI-specific
+
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{InitialStateEvent, room::encryption::RoomEncryptionEventContent};
 use ruma::{
@@ -295,6 +306,9 @@ pub(crate) struct ClientInner {
     /// The underlying HTTP client.
     pub(crate) http_client: HttpClient,
 
+    // BWI-specific
+    pub(crate) content_scanner: Arc<BWIContentScanner>,
+    // end BWI-specific
     /// User session data.
     pub(super) base_client: BaseClient,
 
@@ -409,6 +423,9 @@ impl ClientInner {
         homeserver: Url,
         sliding_sync_version: SlidingSyncVersion,
         http_client: HttpClient,
+        // BWI-specific
+        content_scanner: Arc<BWIContentScanner>,
+        // end BWI-specific
         base_client: BaseClient,
         supported_versions: CachedValue<TtlValue<SupportedVersions>>,
         well_known: CachedValue<TtlValue<Option<WellKnownResponse>>>,
@@ -435,6 +452,9 @@ impl ClientInner {
             auth_ctx,
             sliding_sync_version: StdRwLock::new(sliding_sync_version),
             http_client,
+            // BWI-specific
+            content_scanner,
+            // end BWI-specific
             base_client,
             caches,
             locks: Default::default(),
@@ -523,6 +543,13 @@ impl Client {
     pub fn http_client(&self) -> &reqwest::Client {
         &self.inner.http_client.inner
     }
+
+    // BWI-specific
+    /// The content scanner
+    pub fn content_scanner(&self) -> &Arc<BWIContentScanner> {
+        &self.inner.content_scanner
+    }
+    // end BWI-specific
 
     pub(crate) fn locks(&self) -> &ClientLocks {
         &self.inner.locks
@@ -1777,16 +1804,48 @@ impl Client {
     /// # let homeserver = Url::parse("http://example.com").unwrap();
     /// let request = CreateRoomRequest::new();
     /// let client = Client::new(homeserver).await.unwrap();
-    /// assert!(client.create_room(request).await.is_ok());
+    /// assert!(client.create_room_with_federated(request, false).await.is_ok());
     /// # };
     /// ```
+
+    // BWI-specific
     pub async fn create_room(&self, request: create_room::v3::Request) -> Result<Room> {
+        self.create_room_with_federated(request).await
+    }
+    // end BWI-specific
+
+    /// Create a room with the given parameters.
+    /// See documentation above "create_room_federated"
+    pub async fn create_room_with_federated(
+        &self,
+        mut request: create_room::v3::Request,
+        // BWI-specific
+        // is_federated: bool,
+        // end BWI-specific
+    ) -> Result<Room> {
         let invite = request.invite.clone();
         let is_direct_room = request.is_direct;
 
         // Tchap-specific : invite_users_by_email
         let invite_3pid = request.invite_3pid.clone();
         // end Tchap-specific
+
+        // BWI-specific
+        if !is_direct_room {
+            // BWI specific: create room alias
+            Client::add_room_alias(&mut request);
+            // END BWI specific
+
+            // TCHAP : disable ACL Server for the moment
+            // BWI specific: add acl initial state event
+            // self.add_acl_initial_state_event(&mut request, is_federated);
+            // END #6880 BWI specific
+        }
+
+        // BWI specific: #5991 create room with HistoryVisibility set to invite
+        Client::add_history_visibility_initial_state_event(&mut request);
+        // END #5991 BWI specific
+        // end BWI-specific
 
         let response = self.send(request).await?;
         let base_room = self.base_client().get_or_create_room(&response.room_id, RoomState::Joined);
@@ -1808,6 +1867,47 @@ impl Client {
 
         Ok(joined_room)
     }
+
+    // BWI specific: create room alias
+    pub(self) fn add_room_alias(request: &mut create_room::v3::Request) {
+        if let Some(room_name) = &request.name {
+            request.room_alias_name = Some(BWIRoomAlias::alias_for_room_name(room_name));
+        }
+    }
+    // END BWI specific
+
+    // BWI specific: #5991 create room with HistoryVisibility set to invite
+    pub(self) fn add_history_visibility_initial_state_event(
+        request: &mut create_room::v3::Request,
+    ) {
+        request.initial_state.push(
+            InitialStateEvent::with_empty_state_key(RoomHistoryVisibilityEventContent::new(
+                HistoryVisibility::Invited,
+            ))
+            .to_raw_any(),
+        );
+    }
+    // END #5991 BWI specific
+
+    // BWI specific: #6880 add acl initial state event
+    pub(self) fn add_acl_initial_state_event(
+        &self,
+        request: &mut create_room::v3::Request,
+        is_federated: bool,
+    ) {
+        let federation_handler =
+            BWIFederationHandler::for_user_id(self.user_id().expect("Server should be set"));
+
+        request.initial_state.push(
+            InitialStateEvent::with_empty_state_key(RoomServerAclEventContent::new(
+                false,
+                federation_handler.create_server_acl(is_federated),
+                Vec::new(),
+            ))
+            .to_raw_any(),
+        );
+    }
+    // END #6880 BWI specific
 
     /// Create a DM room.
     ///
@@ -1840,7 +1940,10 @@ impl Client {
             initial_state,
         });
 
-        self.create_room(request).await
+        // BWI-specific
+        // self.create_room(request).await
+        self.create_room_with_federated(request).await
+        // end BWI-specific
     }
 
     /// Get the first existing DM room with the given user, if any.
@@ -3229,6 +3332,9 @@ impl Client {
                 self.homeserver(),
                 self.sliding_sync_version(),
                 self.inner.http_client.clone(),
+                // BWI-specific
+                self.inner.content_scanner.clone(),
+                // end BWI-specific
                 self.inner
                     .base_client
                     .clone_with_in_memory_state_store(cross_process_lock_config.clone(), false)
@@ -4270,10 +4376,19 @@ pub(crate) mod tests {
 
         // Create a room in the internal store
         let room = client
-            .create_room(assign!(CreateRoomRequest::new(), {
-                invite: vec![],
-                is_direct: false,
-            }))
+            // BWI-specific
+            // .create_room(assign!(CreateRoomRequest::new(), {
+            //     invite: vec![],
+            //     is_direct: false,
+            // }))
+            .create_room_with_federated(
+                assign!(CreateRoomRequest::new(), {
+                    invite: vec![],
+                    is_direct: false,
+                }),
+                false,
+            )
+            // end BWI-specific
             .await
             .unwrap();
 
