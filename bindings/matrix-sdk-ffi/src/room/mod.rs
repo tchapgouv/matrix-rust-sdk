@@ -24,6 +24,9 @@ use matrix_sdk::{
     encryption::LocalTrust,
     room::{
         Room as SdkRoom, RoomMemberRole, edit::EditedContent, power_levels::RoomPowerLevelChanges,
+        // Tchap-specific : access_rules
+        access_rules::AccessRule,
+        // end Tchap-specific
     },
     send_queue::RoomSendQueueUpdate as SdkRoomSendQueueUpdate,
 };
@@ -561,6 +564,14 @@ impl Room {
         self.inner.join().await?;
         Ok(())
     }
+
+    // Tchap-specific : access_rules
+    // Set or update the room access rule.
+    pub async fn set_access_rule(&self, rule: AccessRule) -> Result<(), ClientError> {
+        self.inner.set_access_rule(rule).await?;
+        Ok(())
+    }
+    // end Tchap-specific
 
     /// Sets a new name to the room.
     pub async fn set_name(&self, name: String) -> Result<(), ClientError> {
