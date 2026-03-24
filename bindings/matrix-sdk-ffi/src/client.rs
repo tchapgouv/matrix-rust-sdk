@@ -37,6 +37,9 @@ use matrix_sdk::{
         DefaultMediaFetcher, MediaFormat, MediaRequestParameters, MediaRetentionPolicy,
         MediaThumbnailSettings,
     },
+    // Tchap-specific : access_rules
+    room::access_rules::{AccessRule, RoomAccessRulesEventContent},
+    // end Tchap-specific
     ruma::{
         EventEncryptionAlgorithm, RoomId, TransactionId, UInt, UserId,
         api::client::{
@@ -2832,6 +2835,10 @@ pub struct CreateRoomParameters {
     #[uniffi(default = false)]
     pub is_direct: bool,
     pub visibility: RoomVisibility,
+    // Tchap-specific : federated param
+    #[uniffi(default = None)]
+    pub is_room_federated: Option<bool>,
+    // end Tchap-specific
     pub preset: RoomPreset,
     #[uniffi(default = None)]
     pub invite: Option<Vec<String>>,
@@ -2876,6 +2883,24 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
 
         let mut initial_state: Vec<Raw<AnyInitialStateEvent>> = vec![];
 
+        // Tchap-specific : access_rules
+        // Rule is always Restricted at creation for private & public rooms, and Direct for DM.
+        // Can be Unrestricted later, when opening to extrernal users.
+        let access_rule =
+            if request.is_direct { AccessRule::Direct } else { AccessRule::Restricted };
+
+        let mut content = RoomAccessRulesEventContent::new(access_rule);
+        content.visibility = Some(request.visibility.clone());
+
+        // By default Tchap servers will force encryption at creation for private room.
+        // Set this attribute to true for private unencrypted rooms type.
+        if request.visibility == Visibility::Private && !value.is_encrypted {
+            content.force_unencrypted_at_creation = Some(true);
+        }
+
+        initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
+        // end Tchap-specific
+
         if value.is_encrypted {
             let content =
                 RoomEncryptionEventContent::new(EventEncryptionAlgorithm::MegolmV1AesSha2);
@@ -2901,11 +2926,17 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
 
         request.initial_state = initial_state;
 
+        let mut creation_content = CreationContent::new();
+
         if value.is_space {
-            let mut creation_content = CreationContent::new();
             creation_content.room_type = Some(RoomType::Space);
-            request.creation_content = Some(Raw::new(&creation_content)?);
         }
+
+        if let Some(is_room_federated) = value.is_room_federated {
+            creation_content.federate = is_room_federated;
+        }
+
+        request.creation_content = Some(Raw::new(&creation_content)?);
 
         if let Some(power_levels) = value.power_level_content_override {
             match Raw::<RoomPowerLevelsContentOverride>::new(&power_levels.into()) {
@@ -3526,6 +3557,9 @@ mod tests {
             is_encrypted: true,
             is_direct: true,
             visibility: RoomVisibility::Public,
+            // Tchap-specific
+            is_room_federated: Some(true),
+            // end Tchap-specific
             preset: RoomPreset::PublicChat,
             invite: Some(vec!["@user:example.com".to_owned()]),
             avatar: Some("http://example.com/avatar.jpg".to_owned()),

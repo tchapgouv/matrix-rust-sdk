@@ -397,6 +397,9 @@ impl TimelineAction {
                     state_key: ev.state_key().to_owned(),
                     content: AnyOtherStateEventContentChange::with_event_content(
                         ev.content_change(),
+                        // Tchap-specific : associate event value with custom event.
+                        None,
+                        // end Tchap-specific
                     ),
                 }))],
             },
