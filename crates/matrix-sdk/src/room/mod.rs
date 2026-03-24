@@ -23,6 +23,9 @@ use std::{
     time::Duration,
 };
 
+// Tchap-specific : access_rules
+use access_rules::{AccessRule, RoomAccessRulesEventContent};
+// end Tchap-specific
 use async_stream::stream;
 use eyeball::SharedObservable;
 use futures_core::Stream;
@@ -95,7 +98,7 @@ use ruma::{
         read_marker::set_read_marker,
         receipt::create_receipt,
         redact::redact_event,
-        room::{get_room_event, report_content, report_room},
+        room::{Visibility, get_room_event, report_content, report_room},
         state::{get_state_event_for_key, send_state_event},
         tag::{create_tag, delete_tag},
         threads::{get_thread_subscription, subscribe_thread, unsubscribe_thread},
@@ -183,6 +186,7 @@ use crate::{
     media::{MediaFormat, MediaRequestParameters},
     notification_settings::{IsEncrypted, IsOneToOne, RoomNotificationMode},
     room::{
+        access_rules::PossiblyRedactedRoomAccessRulesEventContent,
         knock_requests::{KnockRequest, KnockRequestMemberInfo},
         power_levels::{RoomPowerLevelChanges, RoomPowerLevelsExt},
         privacy_settings::RoomPrivacySettings,
@@ -208,6 +212,10 @@ pub mod privacy_settings;
 
 #[cfg(feature = "e2e-encryption")]
 pub(crate) mod shared_room_history;
+
+// Tchap-specific : access_rules
+pub mod access_rules;
+// end Tchap-specific
 
 /// A struct containing methods that are common for Joined, Invited and Left
 /// Rooms
@@ -2944,6 +2952,92 @@ impl Room {
         user_power_levels
     }
 
+    // Tchap-specific : access_rules
+    /// Set or update the access rule for this room.
+    /// We get the value of other acces rule properties (visiblity and encrypted)
+    /// to transmit them to the new RoomAccessRulesEventContent in order to not replace
+    /// existing values with default ones.
+    /// This method is called by client only on an existing room (it is not used on room creation).
+    /// So, the 2 other properties already have a meaningfull value.
+    pub async fn set_access_rule(
+        &self,
+        access_rule: AccessRule,
+    ) -> Result<send_state_event::v3::Response> {
+        let (encrypted, visibility) = match self.get_access_rules_event_content().await {
+            Err(_) | Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) => (None, None),
+            Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) => {
+                (e.content.encrypted, e.content.visibility)
+            }
+            Ok(SyncOrStrippedState::Stripped(e)) => match e.content {
+                PossiblyRedactedRoomAccessRulesEventContent { encrypted, visibility, .. } => {
+                    (encrypted, visibility)
+                }
+            },
+        };
+
+        self.send_state_event(RoomAccessRulesEventContent { access_rule, visibility, encrypted })
+            .await
+    }
+
+    /// Get the access_rules event content for this room.
+    async fn get_access_rules_event_content(
+        &self,
+    ) -> Result<SyncOrStrippedState<RoomAccessRulesEventContent>, Error> {
+        Ok(self
+            .client
+            .base_client()
+            .state_store()
+            .get_state_event_static::<RoomAccessRulesEventContent>(self.room_id())
+            .await?
+            .ok_or(Error::InsufficientData)?
+            .deserialize()?)
+    }
+
+    /// Get the access_rules details (access_rule, encrypted, visibility) for this room.
+    pub async fn get_access_rules(&self) -> (Result<AccessRule, Error>, bool, Visibility) {
+        let (access_rule, encrypted_res, visibility_res) =
+            match self.get_access_rules_event_content().await {
+                Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) => (
+                    Ok(e.content.access_rule),
+                    e.content.encrypted.ok_or(Error::InsufficientData),
+                    e.content.visibility.ok_or(Error::InsufficientData),
+                ),
+                Ok(SyncOrStrippedState::Stripped(e)) => (
+                    e.content.access_rule.ok_or(Error::InsufficientData),
+                    e.content.encrypted.ok_or(Error::InsufficientData),
+                    e.content.visibility.ok_or(Error::InsufficientData),
+                ),
+                Err(_) | Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) => (
+                    Err(Error::InsufficientData),
+                    Err(Error::InsufficientData),
+                    Err(Error::InsufficientData),
+                ),
+            };
+
+        // When encrypted_res is in error, check the content of the last room.state.is_encrypted event.
+        // Consider the room to be not encrypted if we can't find these type of event, or if the last event content is not valid.
+        let encrypted = match encrypted_res {
+            Ok(encrypted_value) => encrypted_value,
+            Err(_) => self
+                .latest_encryption_state()
+                .await
+                .map(|state| state.is_encrypted())
+                .unwrap_or(false),
+        };
+
+        // TCHAP TODO : Remove this ugly cheat code when the backend returns complete access_rules (containing visibility state).
+        // When visibility_res is in error, we returns :
+        //     Visibility::Public when room is unencrypted
+        //     Visibility::Private when the room is encrypted.
+        let visibility = match visibility_res {
+            Ok(visibility_value) => visibility_value,
+            Err(_) => encrypted.then_some(Visibility::Private).unwrap_or(Visibility::Public),
+        };
+
+        (access_rule, encrypted, visibility)
+    }
+    // end Tchap-specific : access_rules
+
     /// Sets the name of this room.
     pub async fn set_name(&self, name: String) -> Result<send_state_event::v3::Response> {
         self.send_state_event(RoomNameEventContent::new(name)).await
@@ -4782,7 +4876,9 @@ mod tests {
     use crate::{
         Client,
         config::RequestConfig,
+        // Tchap-specific : access_rules
         room::messages::{IncludeRelations, ListThreadsOptions, RelationsOptions},
+        // end Tchap-specific
         test_utils::{
             client::mock_matrix_session,
             logged_in_client,
