@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use matrix_sdk::{room::access_rules::AccessRule, EncryptionState, RoomState};
+use tokio::join;
 use tracing::warn;
 
 use crate::{
@@ -22,7 +23,7 @@ use crate::{
     error::ClientError,
     notification_settings::RoomNotificationMode,
     room::{
-        Membership, RoomHero, RoomHistoryVisibility, SuccessorRoom, power_levels::RoomPowerLevels
+        power_levels::RoomPowerLevels, Membership, RoomHero, RoomHistoryVisibility, SuccessorRoom,
     },
     room_member::RoomMember,
 };
@@ -103,7 +104,7 @@ pub struct RoomInfo {
     ///    - visiblity: is the room visible in public directories
     access_rule: Option<AccessRule>,
     is_encrypted: bool,
-    visiblity: RoomVisibility
+    visiblity: RoomVisibility,
     // end Tchap-specific
 }
 
@@ -132,9 +133,8 @@ impl RoomInfo {
 
         // Tchap-specific
         // Get AccessRule value.
-        let access_rule = room.access_rule().await.ok();
-        let is_encrypted = room.is_encrypted().await;
-        let visibility = room.visibility().await; 
+        let (access_rule, is_encrypted, visibility) =
+            join!(room.access_rule(), room.is_encrypted(), room.visibility());
         // end Tchap-specific
 
         Ok(Self {
@@ -204,9 +204,9 @@ impl RoomInfo {
                 .map(|rules| rules.authorization.explicitly_privilege_room_creators)
                 .unwrap_or_default(),
             // Tchap-specific
-            access_rule: access_rule, 
+            access_rule: access_rule.ok(),
             is_encrypted: is_encrypted,
-            visiblity: visibility.into()
+            visiblity: visibility.into(),
             // end Tchap-specific
         })
     }
