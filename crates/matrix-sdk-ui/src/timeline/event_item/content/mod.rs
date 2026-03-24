@@ -772,7 +772,10 @@ pub enum AnyOtherStateEventContentChange {
     SpaceParent(StateEventContentChange<SpaceParentEventContent>),
 
     #[doc(hidden)]
-    _Custom { event_type: String },
+    // Tchap-specific : access_rules
+    // _Custom { event_type: String },
+    _Custom { event_type: String, event_value: String },
+    // end Tchap-specific
 }
 
 impl AnyOtherStateEventContentChange {
@@ -781,7 +784,12 @@ impl AnyOtherStateEventContentChange {
     ///
     /// Panics if the event content does not match one of the variants.
     // This could be a `From` implementation but we don't want it in the public API.
-    pub(crate) fn with_event_content(content: AnyStateEventContentChange) -> Self {
+    pub(crate) fn with_event_content(
+        content: AnyStateEventContentChange,
+        // Tchap-specific : access_rules
+        associated_event_value: Option<String>,
+        // end Tchap-specific
+    ) -> Self {
         let event_type = content.event_type();
 
         match content {
@@ -805,7 +813,10 @@ impl AnyOtherStateEventContentChange {
             AnyStateEventContentChange::SpaceChild(c) => Self::SpaceChild(c),
             AnyStateEventContentChange::SpaceParent(c) => Self::SpaceParent(c),
             AnyStateEventContentChange::RoomMember(_) => unreachable!(),
-            _ => Self::_Custom { event_type: event_type.to_string() },
+            // Tchap-specific : access_rules
+            // _ => Self::_Custom { event_type: event_type.to_string() },
+            _ => Self::_Custom { event_type: event_type.to_string(), event_value: associated_event_value.unwrap_or("".to_owned())},
+            // end Tchap-specific
         }
     }
 
@@ -831,7 +842,10 @@ impl AnyOtherStateEventContentChange {
             Self::RoomTopic(c) => c.event_type(),
             Self::SpaceChild(c) => c.event_type(),
             Self::SpaceParent(c) => c.event_type(),
-            Self::_Custom { event_type } => event_type.as_str().into(),
+            // Tchap-specific : access_rules
+            // Self::_Custom { event_type } => event_type.as_str().into(),
+            Self::_Custom { event_type, .. } => event_type.as_str().into(),
+            // end Tchap-specific
         }
     }
 
@@ -894,7 +908,11 @@ impl AnyOtherStateEventContentChange {
             Self::SpaceParent(c) => {
                 Self::SpaceParent(StateEventContentChange::Redacted(c.clone().redact(rules)))
             }
-            Self::_Custom { event_type } => Self::_Custom { event_type: event_type.clone() },
+            // Tchap-specific : access_rules
+            // Self::_Custom { event_type } => Self::_Custom { event_type: event_type.clone() },
+            Self::_Custom { event_type, event_value } => {
+                Self::_Custom { event_type: event_type.clone(), event_value: event_value.clone() }
+            } // end Tchap-specific
         }
     }
 }

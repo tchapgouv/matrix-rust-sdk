@@ -31,6 +31,9 @@ use ruma::{
 };
 
 use crate::{
+    // Tchap-specific : access_rules
+    client::RoomVisibility,
+    // end Tchap-specific
     ClientError,
     room_member::MembershipState,
     ruma::{MessageType, RtcCallIntent, RtcNotificationType},
@@ -321,6 +324,10 @@ pub enum StateEventContent {
     RoomTopic { topic: String },
     SpaceChild,
     SpaceParent,
+
+    // Tchap-specific : access_rules
+    RoomAccessRules { rule: String, encrypted: Option<bool>, visibility: Option<RoomVisibility> },
+    // end Tchap-specific
 }
 
 impl TryFrom<AnySyncStateEvent> for StateEventContent {

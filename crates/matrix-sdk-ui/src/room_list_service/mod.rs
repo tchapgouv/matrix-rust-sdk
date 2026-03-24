@@ -56,14 +56,24 @@ mod room_list;
 pub mod sorters;
 mod state;
 
-use std::{sync::Arc, time::Duration};
+use std::{sync::Arc, sync::LazyLock, time::Duration};
 
 use async_stream::stream;
 use eyeball::Subscriber;
 use futures_util::{Stream, StreamExt, pin_mut};
 use matrix_sdk::{
-    Client, Error as SlidingSyncError, Room, SlidingSync, SlidingSyncList, SlidingSyncMode,
-    event_cache::EventCacheError, sliding_sync::PollTimeout, timeout::timeout,
+    Client,
+    Error as SlidingSyncError,
+    Room,
+    SlidingSync,
+    SlidingSyncList,
+    SlidingSyncMode,
+    event_cache::EventCacheError,
+    // Tchap-specific : access_rules
+    room::access_rules,
+    // end Tchap-specific
+    sliding_sync::PollTimeout,
+    timeout::timeout,
 };
 pub use room_list::*;
 use ruma::{
@@ -101,6 +111,14 @@ const DEFAULT_REQUIRED_STATE: &[(StateEventType, &str)] = &[
     // Required for live location sharing to work - beacon events reference this state.
     (StateEventType::BeaconInfo, "*"),
 ];
+
+// Tchap-specific : access_rules
+static TCHAP_REQUIRED_STATE: LazyLock<Vec<(StateEventType, &str)>> = LazyLock::new(|| {
+    let mut vec = Vec::from(DEFAULT_REQUIRED_STATE);
+    vec.push((StateEventType::from(access_rules::ACCESS_RULES_EVENT_TYPE), ""));
+    vec
+});
+// end Tchap-specific
 
 /// The default `required_state` constant value for sliding sync room
 /// subscriptions that must be added to `DEFAULT_REQUIRED_STATE`.
@@ -219,7 +237,10 @@ impl RoomListService {
                     )
                     .timeline_limit(timeline_limit)
                     .required_state(
-                        DEFAULT_REQUIRED_STATE
+                        // Tchap-specific : access_rules
+                        // DEFAULT_REQUIRED_STATE
+                        TCHAP_REQUIRED_STATE
+                            // end Tchap-specific
                             .iter()
                             .map(|(state_event, value)| (state_event.clone(), (*value).to_owned()))
                             .collect(),
