@@ -39,8 +39,8 @@ use matrix_sdk_ui::{
 };
 use mime::Mime;
 use ruma::{
-    api::client::threads::get_threads::v1::IncludeThreads as SdkIncludeThreads,
     api::client::membership::Invite3pidInit,
+    api::client::threads::get_threads::v1::IncludeThreads as SdkIncludeThreads,
     assign,
     events::{
         receipt::ReceiptThread,
@@ -568,21 +568,6 @@ impl Room {
     pub async fn set_access_rule(&self, rule: AccessRule) -> Result<(), ClientError> {
         self.inner.set_access_rule(rule).await?;
         Ok(())
-    }
-
-    // Get the room access rule
-    pub async fn get_access_rule(&self) -> Result<AccessRule, ClientError> {
-        Ok(self.inner.access_rule().await?)
-    }
-
-    // Get the room access rule
-    pub async fn get_is_encrypted(&self) -> bool {
-        self.inner.is_encrypted().await
-    }
-
-    // Get the room access rule
-    pub async fn get_visibility(&self) -> RoomVisibility {
-        self.inner.visibility().await.into()
     }
     // end Tchap-specific
 

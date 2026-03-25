@@ -15,7 +15,6 @@
 use std::sync::Arc;
 
 use matrix_sdk::{room::access_rules::AccessRule, EncryptionState, RoomState};
-use tokio::join;
 use tracing::warn;
 
 use crate::{
@@ -132,9 +131,8 @@ impl RoomInfo {
             .map(|p| RoomPowerLevels::new(p, room.own_user_id().to_owned()));
 
         // Tchap-specific
-        // Get AccessRule value.
-        let (access_rule, is_encrypted, visibility) =
-            join!(room.access_rule(), room.is_encrypted(), room.visibility());
+        // Get AccessRules values.
+        let (access_rule, is_encrypted, visibility) = room.get_access_rules().await;
         // end Tchap-specific
 
         Ok(Self {
