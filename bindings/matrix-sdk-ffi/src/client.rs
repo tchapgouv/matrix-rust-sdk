@@ -2853,12 +2853,9 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
         };
 
         let mut content = RoomAccessRulesEventContent::new(access_rule);
-        if !value.is_encrypted {
-            content.encrypted = Some(value.is_encrypted);
-        }
-        if request.visibility != Visibility::Private {
-            content.visibility = Some(request.visibility.clone());
-        }
+        content.encrypted = Some(value.is_encrypted);
+        content.visibility = Some(request.visibility.clone());
+
         initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         // end Tchap-specific
 
@@ -3458,6 +3455,7 @@ mod tests {
             visibility: RoomVisibility::Public,
             // Tchap-specific
             access_rule_override: Some(AccessRule::Restricted),
+            is_room_federated: Some(true),
             // end Tchap-specific
             preset: RoomPreset::PublicChat,
             invite: Some(vec!["@user:example.com".to_owned()]),
