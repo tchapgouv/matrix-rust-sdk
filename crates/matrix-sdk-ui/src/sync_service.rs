@@ -50,6 +50,10 @@ use crate::{
     room_list_service::{self, RoomListService},
 };
 
+// Tchap-specific : account_expired
+use ruma::api::client::error::ErrorBody;
+// end Tchap-specific
+
 /// Current state of the application.
 ///
 /// This is a high-level state indicating what's the status of the underlying
@@ -93,6 +97,11 @@ pub enum State {
     /// Calling [`SyncService::stop()`] will abort the offline mode and the
     /// [`SyncService`] will go into the [`State::Idle`] mode.
     Offline,
+
+    // Tchap-specific : account_expired
+    /// Any of the underlying syncs has ran into an error with the ORG_MATRIX_EXPIRED_ACCOUNT code.
+    AccountExpired,
+    // end Tchap-specific
 }
 
 enum MaybeAcquiredPermit {
@@ -308,7 +317,12 @@ impl SyncTaskSupervisor {
                     error!("when awaiting encryption sync: {err:#}");
                 }
 
-                if let Some(error) = report.error {
+                // Tchap-specific : account_expired
+                if report.has_account_expired() {
+                    state.set(State::AccountExpired);
+                    break;
+                // end Tchap-specific
+                } else if let Some(error) = report.error {
                     if offline_mode {
                         state.set(State::Offline);
 
@@ -632,7 +646,9 @@ impl SyncService {
             // If we're already running, there's nothing to do.
             State::Running => {}
             // If we're in the offline mode, first stop the service and then start it again.
-            State::Offline => {
+            // Tchap-specific : account_expired
+            // State::Offline => {
+            State::Offline | State::AccountExpired => {
                 inner
                     .restart(self.room_list_service.clone(), self.encryption_sync_permit.clone())
                     .await
@@ -660,7 +676,9 @@ impl SyncService {
                 // No need to stop if we were not running.
                 return;
             }
-            State::Running | State::Offline => {}
+            // Tchap-specific : account_expired
+            // State::Running | State::Offline => {}
+            State::Running | State::Offline | State::AccountExpired => {}
         }
 
         inner.stop().await;
@@ -748,6 +766,28 @@ impl TerminationReport {
             _ => false,
         }
     }
+
+    // Tchap-specific : account_expired
+    /// Check whether the termination is due to an expired account.
+    fn has_account_expired(&self) -> bool {
+        match &self.error {
+            Some(Error::RoomList(room_list_service::Error::SlidingSync(error)))
+            | Some(Error::EncryptionSync(encryption_sync_service::Error::SlidingSync(error))) => {
+                error
+                    .as_client_api_error()
+                    .and_then(|api_err| {
+                        if let ErrorBody::Standard(body) = &api_err.body {
+                            Some(body.kind.errcode().as_str() == "ORG_MATRIX_EXPIRED_ACCOUNT")
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    // end Tchap-specific
 }
 
 // Testing helpers, mostly.
