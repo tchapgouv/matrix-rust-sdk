@@ -101,7 +101,7 @@ pub struct RoomInfo {
     ///    - access_rule: is the room open to external user
     ///    - is_encrypted: is the room encrypted or not
     ///    - visiblity: is the room visible in public directories
-    access_rule: Option<AccessRule>,
+    access_rule: AccessRule,
     is_encrypted: bool,
     visiblity: RoomVisibility,
     // end Tchap-specific
@@ -202,7 +202,7 @@ impl RoomInfo {
                 .map(|rules| rules.authorization.explicitly_privilege_room_creators)
                 .unwrap_or_default(),
             // Tchap-specific
-            access_rule: access_rule.ok(),
+            access_rule: access_rule,
             is_encrypted: is_encrypted,
             visiblity: visibility.into(),
             // end Tchap-specific

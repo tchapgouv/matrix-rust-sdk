@@ -38,7 +38,7 @@ impl AccessRule {}
 pub struct RoomAccessRulesEventContent {
     /// The type of rules used for external users wishing to join this room.
     #[serde(rename = "rule")] // The key name awaited by Synapse. Mandatory!
-    pub access_rule: AccessRule,
+    pub access_rule: Option<AccessRule>,
     /// Allow to specify if a room should be unencrypted.
     /// By default Tchap servers will force encryption when creating a private room or a DM,
     /// except if this attribute is explicitly set to false.
@@ -53,7 +53,7 @@ pub struct RoomAccessRulesEventContent {
 impl RoomAccessRulesEventContent {
     /// Creates a new `RoomAccessRulesEventContent` with the given rule.
     pub fn new(access_rule: AccessRule) -> Self {
-        Self { access_rule, encrypted: None, visibility: None }
+        Self { access_rule: Some(access_rule), encrypted: None, visibility: None }
     }
 }
 
@@ -70,7 +70,7 @@ mod tests {
         assert_matches!(
             event,
             RoomAccessRulesEventContent {
-                access_rule: AccessRule::Unrestricted,
+                access_rule: Some(AccessRule::Unrestricted),
                 encrypted: None,
                 visibility: None
             }
@@ -84,7 +84,7 @@ mod tests {
         assert_matches!(
             access_rules,
             RoomAccessRulesEventContent {
-                access_rule: AccessRule::Restricted,
+                access_rule: Some(AccessRule::Restricted),
                 encrypted: None,
                 visibility: None
             }
@@ -98,7 +98,7 @@ mod tests {
         assert_matches!(
             access_rules,
             RoomAccessRulesEventContent {
-                access_rule: AccessRule::Direct,
+                access_rule: Some(AccessRule::Direct),
                 encrypted: None,
                 visibility: None
             }
