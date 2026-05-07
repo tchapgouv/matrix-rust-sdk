@@ -2951,22 +2951,25 @@ impl Room {
         &self,
         access_rule: AccessRule,
     ) -> Result<send_state_event::v3::Response> {
-        let (encrypted, visibility) = match self.get_access_rules_event_content().await {
-            Err(_) | Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) => (None, None),
-            Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) => {
-                (e.content.encrypted, e.content.visibility)
-            }
-            Ok(SyncOrStrippedState::Stripped(e)) => match e.content {
-                PossiblyRedactedRoomAccessRulesEventContent { encrypted, visibility, .. } => {
-                    (encrypted, visibility)
+        let (force_unencrypted_at_creation, visibility) =
+            match self.get_access_rules_event_content().await {
+                Err(_) | Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) => (None, None),
+                Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) => {
+                    (e.content.force_unencrypted_at_creation, e.content.visibility)
                 }
-            },
-        };
+                Ok(SyncOrStrippedState::Stripped(e)) => match e.content {
+                    PossiblyRedactedRoomAccessRulesEventContent {
+                        force_unencrypted_at_creation,
+                        visibility,
+                        ..
+                    } => (force_unencrypted_at_creation, visibility),
+                },
+            };
 
         self.send_state_event(RoomAccessRulesEventContent {
             access_rule: Some(access_rule),
             visibility,
-            encrypted,
+            force_unencrypted_at_creation,
         })
         .await
     }
@@ -2987,33 +2990,24 @@ impl Room {
 
     /// Get the access_rules details (access_rule, encrypted, visibility) for this room.
     pub async fn get_access_rules(&self) -> (AccessRule, bool, Visibility) {
-        let (access_rule, encrypted_res, visibility) =
-            match self.get_access_rules_event_content().await {
-                Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) => (
-                    e.content.access_rule.unwrap_or(AccessRule::Restricted),
-                    e.content.encrypted.ok_or(Error::InsufficientData),
-                    e.content.visibility.unwrap_or(Visibility::Private),
-                ),
-                Ok(SyncOrStrippedState::Stripped(e)) => (
-                    e.content.access_rule.unwrap_or(AccessRule::Restricted),
-                    e.content.encrypted.ok_or(Error::InsufficientData),
-                    e.content.visibility.unwrap_or(Visibility::Private),
-                ),
-                Err(_) | Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) => {
-                    (AccessRule::Restricted, Err(Error::InsufficientData), Visibility::Private)
-                }
-            };
-
-        // When encrypted_res is in error, check the content of the last room.state.is_encrypted event.
-        // Consider the room to be not encrypted if we can't find these type of event, or if the last event content is not valid.
-        let encrypted = match encrypted_res {
-            Ok(encrypted_value) => encrypted_value,
-            Err(_) => self
-                .latest_encryption_state()
-                .await
-                .map(|state| state.is_encrypted())
-                .unwrap_or(false),
+        let (access_rule, visibility) = match self.get_access_rules_event_content().await {
+            Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e))) => (
+                e.content.access_rule.unwrap_or(AccessRule::Restricted),
+                e.content.visibility.unwrap_or(Visibility::Private),
+            ),
+            Ok(SyncOrStrippedState::Stripped(e)) => (
+                e.content.access_rule.unwrap_or(AccessRule::Restricted),
+                e.content.visibility.unwrap_or(Visibility::Private),
+            ),
+            Err(_) | Ok(SyncOrStrippedState::Sync(SyncStateEvent::Redacted(_))) => {
+                (AccessRule::Restricted, Visibility::Private)
+            }
         };
+
+        // Check the content of the last room.state.is_encrypted event.
+        // Consider the room to be not encrypted if we can't find these type of event, or if the last event content is not valid.
+        let encrypted =
+            self.latest_encryption_state().await.map(|state| state.is_encrypted()).unwrap_or(false);
 
         (access_rule, encrypted, visibility)
     }
