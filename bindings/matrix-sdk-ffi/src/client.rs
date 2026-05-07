@@ -2790,10 +2790,6 @@ pub struct CreateRoomParameters {
     #[uniffi(default = false)]
     pub is_direct: bool,
     pub visibility: RoomVisibility,
-    // Tchap-specific : access_rules
-    #[uniffi(default = None)]
-    pub access_rule_override: Option<AccessRule>,
-    // end Tchap-specific
     // Tchap-specific : federated param
     #[uniffi(default = None)]
     pub is_room_federated: Option<bool>,
@@ -2843,15 +2839,19 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
         let mut initial_state: Vec<Raw<AnyInitialStateEvent>> = vec![];
 
         // Tchap-specific : access_rules
-        let access_rule = if let Some(access_rule_override) = value.access_rule_override {
-            access_rule_override
-        } else {
-            AccessRule::Restricted
-        };
+        // Rule is always Restricted at creation for private & public rooms, and Direct for DM.
+        // Can be Unrestricted later, when opening to extrernal users.
+        let access_rule =
+            if request.is_direct { AccessRule::Direct } else { AccessRule::Restricted };
 
         let mut content = RoomAccessRulesEventContent::new(access_rule);
-        content.encrypted = Some(value.is_encrypted);
         content.visibility = Some(request.visibility.clone());
+
+        // By default Tchap servers will force encryption at creation for private room.
+        // Set this attribute to true for private unencrypted rooms type.
+        if request.visibility == Visibility::Private && !value.is_encrypted {
+            content.force_unencrypted_at_creation = Some(true);
+        }
 
         initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         // end Tchap-specific

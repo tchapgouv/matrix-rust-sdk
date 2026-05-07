@@ -2,7 +2,7 @@
 
 use ruma::{
     api::client::room::Visibility,
-    events::{macros::EventContent, EmptyStateKey},
+    events::{EmptyStateKey, macros::EventContent},
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,10 +39,10 @@ pub struct RoomAccessRulesEventContent {
     /// The type of rules used for external users wishing to join this room.
     #[serde(rename = "rule")] // The key name awaited by Synapse. Mandatory!
     pub access_rule: Option<AccessRule>,
-    /// Allow to specify if a room should be unencrypted.
+    /// Allow to specify if a private room should be forced to be unencrypted.
     /// By default Tchap servers will force encryption when creating a private room or a DM,
-    /// except if this attribute is explicitly set to false.
-    pub encrypted: Option<bool>,
+    /// except if this attribute is explicitly set to true for private unencrypted rooms type.
+    pub force_unencrypted_at_creation: Option<bool>,
     /// This reflects if the room is visible in the public room directory.
     /// We need this in a room state event, otherwise we have to manually regularly pull
     /// the public dir endpoint, which is inefficient, not real time and error prone.
@@ -53,7 +53,11 @@ pub struct RoomAccessRulesEventContent {
 impl RoomAccessRulesEventContent {
     /// Creates a new `RoomAccessRulesEventContent` with the given rule.
     pub fn new(access_rule: AccessRule) -> Self {
-        Self { access_rule: Some(access_rule), encrypted: None, visibility: None }
+        Self {
+            access_rule: Some(access_rule),
+            force_unencrypted_at_creation: None,
+            visibility: None,
+        }
     }
 }
 
@@ -71,7 +75,7 @@ mod tests {
             event,
             RoomAccessRulesEventContent {
                 access_rule: Some(AccessRule::Unrestricted),
-                encrypted: None,
+                force_unencrypted_at_creation: None,
                 visibility: None
             }
         );
@@ -85,7 +89,7 @@ mod tests {
             access_rules,
             RoomAccessRulesEventContent {
                 access_rule: Some(AccessRule::Restricted),
-                encrypted: None,
+                force_unencrypted_at_creation: None,
                 visibility: None
             }
         );
@@ -99,7 +103,7 @@ mod tests {
             access_rules,
             RoomAccessRulesEventContent {
                 access_rule: Some(AccessRule::Direct),
-                encrypted: None,
+                force_unencrypted_at_creation: None,
                 visibility: None
             }
         );
