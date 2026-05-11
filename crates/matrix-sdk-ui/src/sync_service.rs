@@ -521,6 +521,43 @@ impl SyncServiceInner {
         self.state.set(State::Running);
     }
 
+    // Tchap-specific : account_expired
+    async fn restart_with_sync_check(
+        &mut self,
+        room_list_service: Arc<RoomListService>,
+        encryption_sync_permit: Arc<AsyncMutex<EncryptionSyncPermit>>,
+    ) {
+        trace!("starting sync service and waiting for first iteration");
+
+        self.stop().await;
+
+        // Subscribe to states changes
+        let mut room_list_state = room_list_service.state();
+        let mut sync_state = self.state.subscribe();
+
+        self.supervisor =
+            Some(SyncTaskSupervisor::new(self, room_list_service, encryption_sync_permit).await);
+
+        // Loop and wait until the room_list_service is successfull (SettingUp or Running),
+        // or until the global state is terminated (AccountExpired or Terminated).
+        loop {
+            tokio::select! {
+                Some(rl_state) = room_list_state.next() => {
+                    if rl_state == room_list_service::State::SettingUp || rl_state == room_list_service::State::Running {
+                        // If the room_list_service is successfull, set the global state to Running.
+                        self.state.set(State::Running);
+                        break;
+                    }
+                }
+                Some(s_state) = sync_state.next() => {
+                    if matches!(s_state, State::AccountExpired | State::Error(_) | State::Terminated) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     async fn stop(&mut self) {
         trace!("pausing sync service");
 
@@ -646,11 +683,19 @@ impl SyncService {
             // If we're already running, there's nothing to do.
             State::Running => {}
             // If we're in the offline mode, first stop the service and then start it again.
-            // Tchap-specific : account_expired
-            // State::Offline => {
-            State::Offline | State::AccountExpired => {
+            State::Offline => {
                 inner
                     .restart(self.room_list_service.clone(), self.encryption_sync_permit.clone())
+                    .await
+            }
+            // Tchap-specific : account_expired
+            // If we're in the AccountExpired mode, first stop the service and then start and wait for first sync check.
+            State::AccountExpired => {
+                inner
+                    .restart_with_sync_check(
+                        self.room_list_service.clone(),
+                        self.encryption_sync_permit.clone(),
+                    )
                     .await
             }
             // Otherwise just start.
