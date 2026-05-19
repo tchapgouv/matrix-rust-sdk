@@ -37,6 +37,10 @@ pub enum SyncServiceState {
     Terminated,
     Error,
     Offline,
+
+    // Tchap-specific : account_expired
+    AccountExpired,
+    // end Tchap-specific
 }
 
 impl From<MatrixSyncServiceState> for SyncServiceState {
@@ -47,6 +51,10 @@ impl From<MatrixSyncServiceState> for SyncServiceState {
             MatrixSyncServiceState::Terminated => Self::Terminated,
             MatrixSyncServiceState::Error(_error) => Self::Error,
             MatrixSyncServiceState::Offline => Self::Offline,
+
+            // Tchap-specific : account_expired
+            MatrixSyncServiceState::AccountExpired => Self::AccountExpired,
+            // end Tchap-specific
         }
     }
 }
@@ -71,8 +79,9 @@ impl SyncService {
         })
     }
 
-    pub async fn start(&self) {
-        self.inner.start().await
+    pub async fn start(&self) -> Result<(), ClientError> {
+        self.inner.start().await?;
+        Ok(())
     }
 
     pub async fn stop(&self) {
