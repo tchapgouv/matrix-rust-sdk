@@ -78,6 +78,10 @@ use crate::{
     utils::{AsyncRuntimeDropped, u64_to_uint},
 };
 
+// Tchap-specific : permalinks
+use matrix_sdk_tchap::permalinks::MatrixToUriToTchapString;
+// end Tchap-specific
+
 mod power_levels;
 pub mod room_info;
 
@@ -843,12 +847,19 @@ impl Room {
     }
 
     pub async fn matrix_to_permalink(&self) -> Result<String, ClientError> {
-        Ok(self.inner.matrix_to_permalink().await?.to_string())
+        // Tchap-specific : permalinks
+        // Ok(self.inner.matrix_to_permalink().await?.to_string())
+        Ok(self.inner.matrix_to_permalink().await?.to_tchap_string())
+        // end Tchap-specific
     }
 
     pub async fn matrix_to_event_permalink(&self, event_id: String) -> Result<String, ClientError> {
         let event_id = EventId::parse(event_id)?;
-        Ok(self.inner.matrix_to_event_permalink(event_id).await?.to_string())
+
+        // Tchap-specific : permalinks
+        // Ok(self.inner.matrix_to_event_permalink(event_id).await?.to_string())
+        Ok(self.inner.matrix_to_event_permalink(event_id).await?.to_tchap_string())
+        // end Tchap-specific
     }
 
     /// Returns whether the send queue for that particular room is enabled or
@@ -1420,7 +1431,11 @@ pub fn matrix_to_room_alias_permalink(
     room_alias: String,
 ) -> std::result::Result<String, ClientError> {
     let room_alias = RoomAliasId::parse(room_alias)?;
-    Ok(room_alias.matrix_to_uri().to_string())
+
+    // Tchap-specific : permalinks
+    // Ok(room_alias.matrix_to_uri().to_string())
+    Ok(room_alias.matrix_to_uri().to_tchap_string())
+    // end Tchap-specific
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]
