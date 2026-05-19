@@ -1,7 +1,7 @@
 /*
  * MIT License
  *
- * Copyright (c) 2025. DINUM
+ * Copyright (c) 2026. DINUM
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,7 +22,45 @@
  * OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-pub mod account_expired_send_email;
-pub mod identity_account_register;
-pub mod identity_hash_details;
-pub mod identity_lookup;
+//! `POST /_matrix/client/unstable/account_validity/send_mail`
+//!
+//! Request to send a new email to provide the user with an updated link to renew their account.
+
+pub mod v1 {
+
+    use ruma::{
+        api::{auth_scheme::AccessToken, client::uiaa::UiaaResponse, request, response},
+        metadata,
+    };
+
+    metadata! {
+        method: POST,
+        rate_limited: false,
+        authentication: AccessToken,
+        history: {
+            1.0 => "/_matrix/client/unstable/account_validity/send_mail",
+        }
+    }
+
+    /// Request type for the `account_expired_send_email` endpoint.
+    #[request(error = UiaaResponse)]
+    pub struct Request {}
+
+    /// Response type for the `account_expired_send_email` endpoint.
+    #[response(error = UiaaResponse)]
+    pub struct Response {}
+
+    impl Request {
+        /// Creates an empty `Request`.
+        pub fn new() -> Self {
+            Self {}
+        }
+    }
+
+    impl Response {
+        /// Creates an empty `Response`.
+        pub fn new() -> Self {
+            Self {}
+        }
+    }
+}
