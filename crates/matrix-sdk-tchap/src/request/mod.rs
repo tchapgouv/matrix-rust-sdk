@@ -22,6 +22,7 @@
  * OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+pub mod account_expired_send_email;
 pub mod identity_account_register;
 pub mod identity_hash_details;
 pub mod identity_lookup;
