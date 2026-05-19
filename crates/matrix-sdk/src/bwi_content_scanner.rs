@@ -26,6 +26,7 @@ use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState;
 use matrix_sdk_bwi::content_scanner::dto::BWIScanStateResult;
 use matrix_sdk_bwi::content_scanner::request::scan_encrypted::v1::Response as ScanResponse;
 use matrix_sdk_bwi::content_scanner::{BWIContentScanner, BWIContentScannerError};
+use ruma::OwnedMxcUri;
 use ruma::api::error::Error;
 use ruma::api::error::ErrorBody::Json;
 use ruma::api::error::FromHttpResponseError::Server;
@@ -63,6 +64,16 @@ impl BWIScanMediaExt for BWIContentScannerWrapper {
             panic!("You try to scan something with a test_dummy")
         }
     }
+    async fn scan_uri(
+        &self,
+        mxc_uri: &OwnedMxcUri,
+    ) -> Result<BWIScanState, BWIContentScannerError> {
+        if let Some(client) = &self.client {
+            client.scan_uri(mxc_uri).await
+        } else {
+            panic!("You try to scan something with a test_dummy")
+        }
+    }
 }
 
 /// Extension trait for downloading media files
@@ -91,6 +102,10 @@ pub trait BWIScanMediaExt {
         &self,
         media_source: &EncryptedFile,
     ) -> Result<BWIScanState, BWIContentScannerError>;
+
+    /// scan an unencrypted uri file
+    async fn scan_uri(&self, mxc_uri: &OwnedMxcUri)
+    -> Result<BWIScanState, BWIContentScannerError>;
 }
 
 /// The raw bytes of a file
@@ -149,9 +164,10 @@ impl BWIScanMediaExt for Client {
         debug!("###BWI### scan unauthenticated media {:?}", file);
         let content_scanner = self.content_scanner();
 
-        let mut guard = content_scanner.get_scanned_media().scanned_media.lock().await;
         let media_uri = file.url.to_string();
-        let optional_previous_scan_state = guard.get(&media_uri);
+        let optional_previous_scan_state = {
+            content_scanner.get_scanned_media().scanned_media.lock().await.get(&media_uri).cloned()
+        };
 
         match optional_previous_scan_state {
             None | Some(BWIScanState::Error) => {
@@ -167,8 +183,50 @@ impl BWIScanMediaExt for Client {
                         content_scanner.handle_scan_error(error)
                     }
                 };
+                content_scanner
+                    .get_scanned_media()
+                    .scanned_media
+                    .lock()
+                    .await
+                    .insert(media_uri, scan_state.clone());
+                Ok(scan_state)
+            }
+            Some(previous_scan_state) => Ok(previous_scan_state.clone()),
+        }
+    }
 
-                guard.insert(media_uri, scan_state.clone());
+    async fn scan_uri(
+        &self,
+        mxc_uri: &OwnedMxcUri,
+    ) -> Result<BWIScanState, BWIContentScannerError> {
+        debug!("###BWI### scan unauthenticated media {:?}", mxc_uri);
+        let content_scanner = self.content_scanner();
+
+        let media_uri = mxc_uri.to_string();
+        let optional_previous_scan_state = {
+            content_scanner.get_scanned_media().scanned_media.lock().await.get(&media_uri).cloned()
+        };
+
+        match optional_previous_scan_state {
+            None | Some(BWIScanState::Error) => {
+                let request = content_scanner.create_scan_unencrypted_media_request(mxc_uri)?;
+
+                let scan_state = match self.send(request).await {
+                    Ok(response) => {
+                        debug!("###BWI### Response for scan {:?}", response);
+                        content_scanner.handle_scan_response(response)
+                    }
+                    Err(error) => {
+                        error!("###BWI### Scan failed: {:?}", error);
+                        content_scanner.handle_scan_error(error)
+                    }
+                };
+                content_scanner
+                    .get_scanned_media()
+                    .scanned_media
+                    .lock()
+                    .await
+                    .insert(media_uri, scan_state.clone());
                 Ok(scan_state)
             }
             Some(previous_scan_state) => Ok(previous_scan_state.clone()),
