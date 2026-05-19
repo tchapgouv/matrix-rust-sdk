@@ -52,6 +52,10 @@ use crate::{
     },
 };
 
+// Tchap-specific : account_expired
+use ruma::api::error::ErrorBody;
+// end Tchap-specific
+
 /// Current state of the application.
 ///
 /// This is a high-level state indicating what's the status of the underlying
@@ -95,6 +99,11 @@ pub enum State {
     /// Calling [`SyncService::stop()`] will abort the offline mode and the
     /// [`SyncService`] will go into the [`State::Idle`] mode.
     Offline,
+
+    // Tchap-specific : account_expired
+    /// Any of the underlying syncs has ran into an error with the ORG_MATRIX_EXPIRED_ACCOUNT code.
+    AccountExpired,
+    // end Tchap-specific
 }
 
 enum MaybeAcquiredPermit {
@@ -310,7 +319,12 @@ impl SyncTaskSupervisor {
                     error!("when awaiting encryption sync: {err:#}");
                 }
 
-                if let Some(error) = report.error {
+                // Tchap-specific : account_expired
+                if report.has_account_expired() {
+                    state.set(State::AccountExpired);
+                    break;
+                // end Tchap-specific
+                } else if let Some(error) = report.error {
                     if offline_mode {
                         state.set(State::Offline);
 
@@ -509,6 +523,43 @@ impl SyncServiceInner {
         self.state.set(State::Running);
     }
 
+    // Tchap-specific : account_expired
+    async fn restart_with_sync_check(
+        &mut self,
+        room_list_service: Arc<RoomListService>,
+        encryption_sync_permit: Arc<AsyncMutex<EncryptionSyncPermit>>,
+    ) -> Result<(), Error> {
+        trace!("starting sync service and waiting for first iteration");
+
+        self.stop().await;
+
+        // Subscribe to states changes
+        let mut room_list_state = room_list_service.state();
+        let mut sync_state = self.state.subscribe();
+
+        self.supervisor =
+            Some(SyncTaskSupervisor::new(self, room_list_service, encryption_sync_permit).await);
+
+        // Loop and wait until the room_list_service is successfull (SettingUp or Running),
+        // or until the global state is terminated (AccountExpired or Terminated).
+        loop {
+            tokio::select! {
+                Some(rl_state) = room_list_state.next() => {
+                    if rl_state == room_list_service::State::SettingUp || rl_state == room_list_service::State::Running {
+                        // If the room_list_service is successfull, set the global state to Running.
+                        self.state.set(State::Running);
+                        return Ok(());
+                    }
+                }
+                Some(s_state) = sync_state.next() => {
+                    if matches!(s_state, State::AccountExpired | State::Error(_) | State::Terminated) {
+                        return Err(Error::Terminated);
+                    }
+                }
+            }
+        }
+    }
+
     async fn stop(&mut self) {
         trace!("pausing sync service");
 
@@ -626,24 +677,36 @@ impl SyncService {
     ///   mode and immediately attempt to sync again.
     /// - if the stream has been aborted before, it will be properly cleaned up
     ///   and restarted.
-    pub async fn start(&self) {
+    pub async fn start(&self) -> Result<(), Error> {
         let mut inner = self.inner.lock().await;
 
         // Only (re)start the tasks if it's stopped or if we're in the offline mode.
         match inner.state.get() {
             // If we're already running, there's nothing to do.
-            State::Running => {}
+            State::Running => Ok(()),
             // If we're in the offline mode, first stop the service and then start it again.
             State::Offline => {
                 inner
                     .restart(self.room_list_service.clone(), self.encryption_sync_permit.clone())
+                    .await;
+                Ok(())
+            }
+            // Tchap-specific : account_expired
+            // If we're in the AccountExpired mode, first stop the service and then start and wait for first sync check.
+            State::AccountExpired => {
+                inner
+                    .restart_with_sync_check(
+                        self.room_list_service.clone(),
+                        self.encryption_sync_permit.clone(),
+                    )
                     .await
             }
             // Otherwise just start.
             State::Idle | State::Terminated | State::Error(_) => {
                 inner
                     .start(self.room_list_service.clone(), self.encryption_sync_permit.clone())
-                    .await
+                    .await;
+                Ok(())
             }
         }
     }
@@ -662,7 +725,9 @@ impl SyncService {
                 // No need to stop if we were not running.
                 return;
             }
-            State::Running | State::Offline => {}
+            // Tchap-specific : account_expired
+            // State::Running | State::Offline => {}
+            State::Running | State::Offline | State::AccountExpired => {}
         }
 
         inner.stop().await;
@@ -749,6 +814,28 @@ impl TerminationReport {
             _ => false,
         }
     }
+
+    // Tchap-specific : account_expired
+    /// Check whether the termination is due to an expired account.
+    fn has_account_expired(&self) -> bool {
+        match &self.error {
+            Some(Error::RoomList(room_list_service::Error::SlidingSync(error)))
+            | Some(Error::EncryptionSync(encryption_sync_service::Error::SlidingSync(error))) => {
+                error
+                    .as_client_api_error()
+                    .and_then(|api_err| {
+                        if let ErrorBody::Standard(body) = &api_err.body {
+                            Some(body.kind.errcode().as_str() == "ORG_MATRIX_EXPIRED_ACCOUNT")
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    // end Tchap-specific
 }
 
 // Testing helpers, mostly.
@@ -919,4 +1006,8 @@ pub enum Error {
     /// An error had occurred in the sync task supervisor, likely due to a bug.
     #[error("the supervisor channel has run into an unexpected error")]
     Supervisor,
+
+    /// The sync service was terminated.
+    #[error("the sync service was terminated")]
+    Terminated,
 }

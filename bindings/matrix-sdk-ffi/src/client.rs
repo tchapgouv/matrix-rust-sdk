@@ -1499,6 +1499,15 @@ impl Client {
         Ok(device_id.to_string())
     }
 
+    // Tchap-specific : account_expired_send_email
+    pub async fn account_expired_send_email(&self) -> Result<(), ClientError> {
+        self.inner
+            .send(matrix_sdk_tchap::request::account_expired_send_email::v1::Request::new())
+            .await?;
+        Ok(())
+    }
+    // end Tchap-specific
+
     pub async fn create_room(
         &self,
         request: CreateRoomParameters,
