@@ -79,8 +79,9 @@ impl SyncService {
         })
     }
 
-    pub async fn start(&self) {
-        self.inner.start().await
+    pub async fn start(&self) -> Result<(), ClientError> {
+        self.inner.start().await?;
+        Ok(())
     }
 
     pub async fn stop(&self) {

@@ -526,7 +526,7 @@ impl SyncServiceInner {
         &mut self,
         room_list_service: Arc<RoomListService>,
         encryption_sync_permit: Arc<AsyncMutex<EncryptionSyncPermit>>,
-    ) {
+    ) -> Result<(), Error> {
         trace!("starting sync service and waiting for first iteration");
 
         self.stop().await;
@@ -546,12 +546,12 @@ impl SyncServiceInner {
                     if rl_state == room_list_service::State::SettingUp || rl_state == room_list_service::State::Running {
                         // If the room_list_service is successfull, set the global state to Running.
                         self.state.set(State::Running);
-                        break;
+                        return Ok(());
                     }
                 }
                 Some(s_state) = sync_state.next() => {
                     if matches!(s_state, State::AccountExpired | State::Error(_) | State::Terminated) {
-                        break;
+                        return Err(Error::Terminated);
                     }
                 }
             }
@@ -675,18 +675,19 @@ impl SyncService {
     ///   mode and immediately attempt to sync again.
     /// - if the stream has been aborted before, it will be properly cleaned up
     ///   and restarted.
-    pub async fn start(&self) {
+    pub async fn start(&self) -> Result<(), Error> {
         let mut inner = self.inner.lock().await;
 
         // Only (re)start the tasks if it's stopped or if we're in the offline mode.
         match inner.state.get() {
             // If we're already running, there's nothing to do.
-            State::Running => {}
+            State::Running => Ok(()),
             // If we're in the offline mode, first stop the service and then start it again.
             State::Offline => {
                 inner
                     .restart(self.room_list_service.clone(), self.encryption_sync_permit.clone())
-                    .await
+                    .await;
+                Ok(())
             }
             // Tchap-specific : account_expired
             // If we're in the AccountExpired mode, first stop the service and then start and wait for first sync check.
@@ -702,7 +703,8 @@ impl SyncService {
             State::Idle | State::Terminated | State::Error(_) => {
                 inner
                     .start(self.room_list_service.clone(), self.encryption_sync_permit.clone())
-                    .await
+                    .await;
+                Ok(())
             }
         }
     }
@@ -942,4 +944,8 @@ pub enum Error {
     /// An error had occurred in the sync task supervisor, likely due to a bug.
     #[error("the supervisor channel has run into an unexpected error")]
     Supervisor,
+
+    /// The sync service was terminated.
+    #[error("the sync service was terminated")]
+    Terminated,
 }
