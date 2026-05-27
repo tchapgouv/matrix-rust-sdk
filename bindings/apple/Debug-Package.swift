@@ -13,8 +13,11 @@ let package = Package(
     ],
     products: [
         .library(name: "MatrixRustSDK",
-                 type: .dynamic,
-                 targets: ["MatrixRustSDK"]),
+                // BWI-specific
+                // bwi 6881 our local build does not work on device with dynamic binding
+                // type: .dynamic,
+                // end BWI-specific
+                targets: ["MatrixRustSDK"]),
     ],
     targets: [
         .binaryTarget(name: "MatrixSDKFFI", path: "bindings/apple/generated/MatrixSDKFFI.xcframework"),

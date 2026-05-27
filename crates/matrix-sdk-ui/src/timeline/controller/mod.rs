@@ -18,11 +18,20 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+// BWI-specific
+use crate::timeline::TimelineItemKind::Virtual;
+use crate::timeline::VirtualTimelineItem::ScanStateChanged;
+// end BWI-specific
+
 use as_variant::as_variant;
 use eyeball_im::{VectorDiff, VectorSubscriberStream};
 use eyeball_im_util::vector::{FilterMap, VectorObserverExt};
 use futures_core::Stream;
 use imbl::Vector;
+// BWI-specific
+use matrix_sdk::bwi_content_scanner::{BWIContentScannerWrapper, BWIScanMediaExt};
+// end BWI-specific
+
 use matrix_sdk::{
     deserialized_responses::TimelineEvent,
     event_cache::{
@@ -34,6 +43,13 @@ use matrix_sdk::{
     },
     task_monitor::BackgroundTaskHandle,
 };
+
+// BWI-specific
+use matrix_sdk_base::media::MediaEventContent;
+use matrix_sdk_base_bwi::content_scanner::scan_state::BWIScanState;
+use ruma::events::room::MediaSource;
+// end BWI-specific
+
 #[cfg(test)]
 use ruma::events::receipt::ReceiptEventContent;
 use ruma::{
@@ -202,6 +218,11 @@ pub(super) struct TimelineController<P: RoomDataProvider = Room> {
 
     /// Settings applied to this timeline.
     pub(super) settings: TimelineSettings,
+
+    // BWI-specific
+    /// the used ContentScanner
+    content_scanner: BWIContentScannerWrapper,
+    // end BWI-specific
 }
 
 #[derive(Clone)]
@@ -348,6 +369,9 @@ impl<P: RoomDataProvider> TimelineController<P> {
         unable_to_decrypt_hook: Option<Arc<UtdHookManager>>,
         is_room_encrypted: bool,
         settings: TimelineSettings,
+        // BWI-specific
+        content_scanner: BWIContentScannerWrapper,
+        // end BWI-specific
     ) -> Self {
         let focus = match focus {
             TimelineFocus::Live { hide_threaded_events } => {
@@ -380,7 +404,14 @@ impl<P: RoomDataProvider> TimelineController<P> {
             is_room_encrypted,
         )));
 
-        Self { state, focus, room_data_provider, settings }
+        Self {
+            state,
+            focus,
+            room_data_provider,
+            settings,
+            // BWI-specific
+            content_scanner,
+        }
     }
 
     /// Listens to encryption state changes for the room in
@@ -1749,6 +1780,71 @@ impl TimelineController {
             })
             .next()
     }
+
+    // BWI-specific
+    pub(crate) async fn handle_single_timeline_item(&self, diff: &Arc<TimelineItem>) {
+        match self.filter_for_media_events(diff) {
+            Some(MediaSource::Encrypted(encrypted)) => {
+                match self.content_scanner.scan_media(&encrypted).await {
+                    Ok(scan_state) => {
+                        self.finish_content_scan_for_item_with_state(
+                            diff.internal_id.clone(),
+                            scan_state,
+                        )
+                        .await
+                    }
+                    Err(err) => {
+                        error!("###BWI### ContentScanner failed: {:?}", err)
+                    }
+                }
+            }
+            Some(MediaSource::Plain(_)) => { /* nothing to do as local echo*/ }
+            None => { /* nothing to do */ }
+        }
+    }
+
+    fn filter_for_media_events(&self, diff: &Arc<TimelineItem>) -> Option<MediaSource> {
+        if let Some(item) = diff.as_event() {
+            if let TimelineItemContent::MsgLike(message_like_content) = &item.content {
+                if let MsgLikeKind::Message(message) = &message_like_content.kind {
+                    return match message.msgtype() {
+                        MessageType::Image(content) => content.source(),
+                        MessageType::Video(content) => content.source(),
+                        MessageType::Audio(content) => content.source(),
+                        MessageType::File(content) => content.source(),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        None
+    }
+
+    async fn finish_content_scan_for_item_with_state(
+        &self,
+        id_of_event_with_attachment: TimelineUniqueId,
+        scan_state_after_scanning: BWIScanState,
+    ) {
+        let scan_state_event = TimelineItem::new(
+            Virtual(ScanStateChanged(
+                id_of_event_with_attachment.clone(),
+                scan_state_after_scanning.clone(),
+            )),
+            // possible solution: is there an item with this timelineUniqueId
+            TimelineUniqueId(id_of_event_with_attachment.clone().0 + "__scan_state"),
+        );
+
+        let mut state = self.state.write().await;
+        let mut transaction = state.items.transaction();
+        transaction.push_back(scan_state_event, None);
+        transaction.commit();
+        info!(
+            "###BWI###: virtual Event with state {:?} and id {:?}",
+            scan_state_after_scanning, id_of_event_with_attachment.0
+        );
+    }
+
+    // end BWI-specific
 
     #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
     pub(super) async fn retry_event_decryption(&self, session_ids: Option<BTreeSet<String>>) {
