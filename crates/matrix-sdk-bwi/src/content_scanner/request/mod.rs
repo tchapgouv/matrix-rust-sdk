@@ -16,3 +16,4 @@
 
 pub mod download_encrypted;
 pub mod scan_encrypted;
+pub mod scan_unencrypted;
