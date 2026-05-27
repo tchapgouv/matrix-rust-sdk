@@ -3,6 +3,10 @@
 #![allow(clippy::empty_line_after_doc_comments)]
 
 mod authentication;
+
+/// BWI extension for exposing api calls
+mod bwi_bindings;
+/// BWI end
 mod chunk_iterator;
 mod client;
 mod client_builder;
