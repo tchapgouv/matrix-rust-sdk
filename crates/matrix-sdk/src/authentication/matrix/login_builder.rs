@@ -24,9 +24,16 @@ use ruma::{
     assign,
     serde::JsonObject,
 };
-use tracing::{info, instrument};
+use tracing::{
+    info,
+    instrument,
+    // BWI-specific
+    warn,
+    // end BWI-specific
+};
 
 use super::MatrixAuth;
+use crate::bwi_extensions::client::BWIClientSetupExt;
 #[cfg(feature = "sso-login")]
 use crate::utils::local_server::LocalServerBuilder;
 use crate::{Result, config::RequestConfig};
@@ -193,6 +200,12 @@ impl LoginBuilder {
                 Some(login_info),
             )
             .await?;
+
+        // BWI-specific
+        if let Err(err) = client.sync_settings().await {
+            warn!("###BWI### Sync settings failed with error: {}", err)
+        }
+        // end BWI-specific
 
         Ok(response)
     }

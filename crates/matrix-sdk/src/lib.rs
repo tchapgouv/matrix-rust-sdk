@@ -34,6 +34,12 @@ pub use reqwest;
 
 mod account;
 pub mod attachment;
+
+// BWI-specific
+pub mod bwi_content_scanner;
+pub mod bwi_extensions;
+// end BWI-specific
+
 pub mod authentication;
 mod client;
 pub mod config;
