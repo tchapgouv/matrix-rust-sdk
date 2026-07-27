@@ -3535,6 +3535,7 @@ dependencies = [
  "ruma",
  "rustls",
  "rustls-native-certs",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
