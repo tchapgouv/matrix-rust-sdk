@@ -66,14 +66,45 @@ impl TchapGetInstance {
     }
 
     fn build_client(with_user_agent: &str) -> Result<Client, TchapGetInstanceError> {
-        let client = Client::builder()
-            .user_agent(with_user_agent)
-            // .use_rustls_tls()
-            // .tls_built_in_root_certs(false)
-            // .add_root_certificate(cert)
+        let builder = Client::builder()
+            .user_agent(with_user_agent);
+
+        #[cfg(target_os = "android")]
+        let builder = Self::android_setup_tls(builder)?;
+
+        builder
             .build()
-            .map_err(|_| TchapGetInstanceError::NoClient);
-        return client;
+            .map_err(|_| TchapGetInstanceError::NoClient)
+    }
+
+    #[cfg(target_os = "android")]
+    fn android_setup_tls(builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder, TchapGetInstanceError> {
+        use rustls::RootCertStore;
+        use rustls::client::WebPkiServerVerifier;
+        use std::sync::Arc;
+        use tracing::warn;
+
+        let mut root_store = RootCertStore::empty();
+
+        // Add webpki_roots to ensure Harica CRL-only certs work on older Android devices (API 33 and below)
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        // Also load the native certs
+        let native_certs = rustls_native_certs::load_native_certs().certs;
+        root_store.add_parsable_certificates(native_certs);
+
+        let verifier = WebPkiServerVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|error| {
+                warn!("WebPkiServerVerifier build error: {}", error);
+                TchapGetInstanceError::NoClient
+            })?;
+
+        let config = rustls::ClientConfig::builder()
+            .with_webpki_verifier(verifier)
+            .with_no_client_auth();
+
+        Ok(builder.use_preconfigured_tls(config))
     }
 
     /// Construct the full url from the email requested.
