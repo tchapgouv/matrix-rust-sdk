@@ -3784,6 +3784,8 @@ dependencies = [
  "futures-util",
  "reqwest",
  "ruma",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3791,6 +3793,7 @@ dependencies = [
  "tracing",
  "uniffi",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]
