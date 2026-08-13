@@ -14,6 +14,7 @@ pub struct TchapGetInstanceConfig {
     pub user_agent: String,
     pub disable_built_in_root_certificates: bool,
     pub additional_raw_root_certificates: Vec<Vec<u8>>,
+    pub proxy: Option<String>,
 }
 
 impl TchapGetInstanceConfig {
@@ -24,6 +25,7 @@ impl TchapGetInstanceConfig {
             user_agent: "Tchap-rust-default-user-agent".to_string(),
             disable_built_in_root_certificates: false,
             additional_raw_root_certificates: vec![],
+            proxy: None,
         }
     }
 }
@@ -35,6 +37,7 @@ impl Default for TchapGetInstanceConfig {
             user_agent: "Tchap-rust-default-user-agent".to_string(),
             disable_built_in_root_certificates: false,
             additional_raw_root_certificates: vec![],
+            proxy: None,
         }
     }
 }
@@ -77,6 +80,12 @@ impl TchapGetInstance {
     fn build_client(config: &TchapGetInstanceConfig) -> Result<Client, TchapGetInstanceError> {
         let mut builder = Client::builder()
             .user_agent(&config.user_agent);
+
+        if let Some(proxy) = &config.proxy {
+            let proxy_obj = reqwest::Proxy::all(proxy.as_str())
+                .map_err(|_| TchapGetInstanceError::NoClient)?;
+            builder = builder.proxy(proxy_obj);
+        }
 
         #[cfg(not(target_os = "android"))]
         {
