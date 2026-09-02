@@ -23,7 +23,7 @@ use vodozemac::{Curve25519PublicKey, pk_encryption::PkEncryption};
 use zeroize::Zeroizing;
 
 use super::decryption::DecodeError;
-use crate::{olm::InboundGroupSession, types::Signatures};
+use crate::{olm::InboundGroupSession, types::Signatures, utilities::rng};
 
 #[derive(Debug)]
 struct InnerBackupKey {
@@ -120,7 +120,7 @@ impl MegolmV1BackupKey {
         let key =
             Zeroizing::new(serde_json::to_vec(&key).expect("Can't serialize exported room key"));
 
-        let message = pk.encrypt(&key)?;
+        let message = pk.encrypt_with_rng(&key, &mut rng())?;
 
         let session_data = EncryptedSessionDataInit {
             ephemeral: Base64::new(message.ephemeral_key.to_vec()),

@@ -17,9 +17,7 @@ use std::future::IntoFuture;
 use eyeball::SharedObservable;
 use futures_core::Stream;
 use matrix_sdk_base::{
-    SessionMeta, boxed_into_future,
-    crypto::types::qr_login::{QrCodeData, QrCodeIntent},
-    store::RoomLoadSettings,
+    SessionMeta, boxed_into_future, crypto::{types::qr_login::{QrCodeData, QrCodeIntent}, utilities::rng}, store::RoomLoadSettings,
 };
 use oauth2::{DeviceCodeErrorResponseType, StandardDeviceAuthorizationResponse};
 use ruma::{
@@ -69,7 +67,7 @@ async fn finish_login<Q>(
 
     // We want to use the Curve25519 public key for the device ID, so let's generate
     // a new vodozemac `Account` now.
-    let account = vodozemac::olm::Account::new();
+    let account = vodozemac::olm::Account::new_with_rng(&mut rng());
     let public_key = account.identity_keys().curve25519;
     let device_id = public_key;
 

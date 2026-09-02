@@ -60,16 +60,10 @@ use crate::types::events::room::encrypted::OlmV2Curve25519AesSha2Content;
 #[cfg(feature = "experimental-x509-identity-verification")]
 use crate::x509::{RawX509Signer, X509Signer};
 use crate::{
-    DecryptionSettings, Device, OlmError, SignatureError, TrustRequirement,
-    dehydrated_devices::DehydrationError,
-    error::{EventError, OlmResult, SessionCreationError},
-    identities::DeviceData,
-    olm::SenderData,
-    store::{
+    DecryptionSettings, Device, OlmError, SignatureError, TrustRequirement, dehydrated_devices::DehydrationError, error::{EventError, OlmResult, SessionCreationError}, identities::DeviceData, olm::SenderData, store::{
         Store,
         types::{Changes, DeviceChanges},
-    },
-    types::{
+    }, types::{
         CrossSigningKey, DeviceKeys, EventEncryptionAlgorithm, OneTimeKey, SignedKey,
         events::{
             olm_v1::AnyDecryptedOlmEvent,
@@ -79,7 +73,7 @@ use crate::{
             },
         },
         requests::UploadSigningKeysRequest,
-    },
+    }, utilities::rng,
 };
 
 #[derive(Debug)]
@@ -434,7 +428,7 @@ impl Account {
         // It would be nice to do this for the fallback key as well but we can't assume
         // that the server supports fallback keys. Maybe one of these days we
         // will be able to do so.
-        account.generate_one_time_keys(account.max_number_of_one_time_keys());
+        account.generate_one_time_keys_with_rng(account.max_number_of_one_time_keys(), &mut rng());
 
         Self {
             static_data: StaticAccountData {
@@ -453,7 +447,7 @@ impl Account {
 
     /// Create a fresh new account, this will generate the identity key-pair.
     pub fn with_device_id(user_id: &UserId, device_id: &DeviceId) -> Self {
-        let account = InnerAccount::new();
+        let account = InnerAccount::new_with_rng(&mut rng());
 
         Self::new_helper(account, user_id, device_id)
     }
@@ -461,7 +455,7 @@ impl Account {
     /// Create a new random Olm Account, the long-term Curve25519 identity key
     /// encoded as base64 will be used for the device ID.
     pub fn new(user_id: &UserId) -> Self {
-        let account = InnerAccount::new();
+        let account = InnerAccount::new_with_rng(&mut rng());
         let device_id: OwnedDeviceId =
             base64_encode(account.identity_keys().curve25519.as_bytes()).into();
 
@@ -470,7 +464,7 @@ impl Account {
 
     /// Create a new random Olm Account for a dehydrated device
     pub fn new_dehydrated(user_id: &UserId) -> Self {
-        let account = InnerAccount::new();
+        let account = InnerAccount::new_with_rng(&mut rng());
         let device_id: OwnedDeviceId =
             base64_encode(account.identity_keys().curve25519.as_bytes()).into();
 
@@ -520,7 +514,7 @@ impl Account {
 
     /// Generate count number of one-time keys.
     pub fn generate_one_time_keys(&mut self, count: usize) -> OneTimeKeyGenerationResult {
-        self.inner.generate_one_time_keys(count)
+        self.inner.generate_one_time_keys_with_rng(count, &mut rng())
     }
 
     /// Get the maximum number of one-time keys the account can hold.
@@ -633,7 +627,7 @@ impl Account {
     /// [`Account::mark_keys_as_published()`] call.
     pub(crate) fn generate_fallback_key_if_needed(&mut self) {
         if self.inner.fallback_key().is_empty() && self.fallback_key_expired() {
-            let removed_fallback_key = self.inner.generate_fallback_key();
+            let removed_fallback_key = self.inner.generate_fallback_key_with_rng(&mut rng());
             self.fallback_creation_timestamp = Some(MilliSecondsSinceUnixEpoch::now());
 
             debug!(
@@ -986,7 +980,7 @@ impl Account {
         fallback_used: bool,
         our_device_keys: DeviceKeys,
     ) -> Result<Session, vodozemac::olm::SessionCreationError> {
-        let session = self.inner.create_outbound_session(config, identity_key, one_time_key)?;
+        let session = self.inner.create_outbound_session_with_rng(config, identity_key, one_time_key, &mut rng())?;
 
         let now = SecondsSinceUnixEpoch::now();
         let session_id = session.session_id();
@@ -1119,7 +1113,7 @@ impl Account {
         #[cfg(feature = "experimental-algorithms")]
         let config = SessionConfig::version_2();
 
-        let result = self.inner.create_inbound_session(config, their_identity_key, message)?;
+        let result = self.inner.create_inbound_session_with_rng(config, their_identity_key, message, &mut rng())?;
         let now = SecondsSinceUnixEpoch::now();
         let session_id = result.session.session_id();
 

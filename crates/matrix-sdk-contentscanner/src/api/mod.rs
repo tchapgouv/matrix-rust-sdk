@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use matrix_sdk::{RumaApiError, encryption::vodozemac::pk_encryption::PkEncryption};
-use matrix_sdk_crypto::vodozemac::Curve25519PublicKey;
+use matrix_sdk_crypto::{utilities::rng, vodozemac::Curve25519PublicKey};
 use ruma::{
     api::{
         IncomingResponse,
@@ -63,7 +63,7 @@ pub(crate) fn encrypted_file_request_from(
         let body_to_encrypt = EncryptedFileRequest::from_file_info(encrypted_file.clone());
         let json_body_to_encrypt = serde_json::to_string(&body_to_encrypt)?;
         let pk_message = encryption
-            .encrypt(json_body_to_encrypt.as_bytes())
+            .encrypt_with_rng(json_body_to_encrypt.as_bytes(), &mut rng())
             .map_err(|e| IntoHttpError::Authentication(e.into()))?;
         Ok(EncryptedFileRequest::from_encrypted_body(pk_message.into()))
     } else {

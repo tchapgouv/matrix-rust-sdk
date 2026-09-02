@@ -28,10 +28,9 @@
 //! [HPKE]: https://www.rfc-editor.org/rfc/rfc9180.html
 //! [MSC4108]: https://github.com/matrix-org/matrix-spec-proposals/pull/4108
 
+use matrix_sdk_base::crypto::utilities::rng;
 use vodozemac::{
-    Curve25519PublicKey,
-    ecies::{Ecies, EstablishedEcies, InboundCreationResult, InitialMessage, Message},
-    hpke::DigitMode,
+    Curve25519PublicKey, ecies::{Ecies, EstablishedEcies, InboundCreationResult, InitialMessage, MATRIX_QR_LOGIN_INFO_PREFIX, Message}, hpke::DigitMode,
 };
 
 use crate::authentication::oauth::qrcode::SecureChannelError as Error;
@@ -44,7 +43,7 @@ pub(super) enum CryptoChannel {
 impl CryptoChannel {
     /// Create a new ECIES-based [`CryptoChannel`].
     pub(super) fn new_ecies() -> Self {
-        CryptoChannel::Ecies(Ecies::new())
+        CryptoChannel::Ecies(Ecies::with_info_and_rng(MATRIX_QR_LOGIN_INFO_PREFIX, &mut rng()))
     }
 
     /// Get the [`Curve25519PublicKey`] of this cryptographic channel.

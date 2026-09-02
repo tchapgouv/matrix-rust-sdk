@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use crypto_channel::*;
-use matrix_sdk_base::crypto::types::qr_login::{
+use matrix_sdk_base::crypto::{types::qr_login::{
     Msc4108IntentData, QrCodeData, QrCodeIntent, QrCodeIntentData,
-};
+}, utilities::rng};
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::{instrument, trace};
 use url::Url;
-use vodozemac::ecies::{Ecies, EstablishedEcies, InboundCreationResult, OutboundCreationResult};
+use vodozemac::ecies::{Ecies, EstablishedEcies, InboundCreationResult, MATRIX_QR_LOGIN_INFO_PREFIX, OutboundCreationResult};
 
 use super::{
     SecureChannelError as Error,
@@ -175,7 +175,7 @@ impl EstablishedSecureChannel {
             // receives and successfully decrypts the initial message. We're here encrypting
             // the `LOGIN_INITIATE_MESSAGE`.
             let (crypto_channel, encoded_message) = {
-                let ecies = Ecies::new();
+                let ecies = Ecies::with_info_and_rng(MATRIX_QR_LOGIN_INFO_PREFIX, &mut rng());
 
                 let OutboundCreationResult { ecies, message } = ecies.establish_outbound_channel(
                     qr_code_data.public_key(),

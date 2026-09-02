@@ -31,7 +31,7 @@ pub mod secret_storage;
 mod session_manager;
 pub mod store;
 pub mod types;
-mod utilities;
+pub mod utilities;
 mod verification;
 pub mod x509;
 

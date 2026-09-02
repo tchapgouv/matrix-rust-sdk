@@ -285,7 +285,9 @@ mod tests {
     use serde_json::json;
     use vodozemac::{Curve25519PublicKey, Curve25519SecretKey};
 
-    use super::DeviceKeys;
+    use crate::utilities::rng;
+
+use super::DeviceKeys;
 
     #[test]
     fn serialization() {
@@ -351,7 +353,7 @@ mod tests {
         device_keys.check_self_signature().expect("Self-signature check failed");
 
         // Change one of the fields and verify that the signature check fails.
-        let new_curve_key = Curve25519SecretKey::new();
+        let new_curve_key = Curve25519SecretKey::new_with_rng(&mut rng());
         let key_id = OwnedDeviceKeyId::from_str("curve25519:BNYQQWUMXO").unwrap();
         device_keys.keys.insert(key_id, Curve25519PublicKey::from(&new_curve_key).into());
 

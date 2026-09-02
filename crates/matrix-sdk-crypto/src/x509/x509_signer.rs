@@ -179,8 +179,7 @@ mod tests {
     use vodozemac::Ed25519SecretKey;
 
     use crate::{
-        types::{CrossSigningKey, Signature, SigningKeys},
-        x509::{
+        types::{CrossSigningKey, Signature, SigningKeys}, utilities::rng, x509::{
             X509Signer, rust_raw_x509_signer::RustRawX509Signer,
             tests::subject_key_identifier_extension,
         },
@@ -197,7 +196,7 @@ mod tests {
         let user_id = user_id!("@vdh-x509test:sw1v.org").to_owned();
 
         let mut cross_signing_key = {
-            let secret_key = Ed25519SecretKey::new();
+            let secret_key = Ed25519SecretKey::new_with_rng(&mut rng());
             let public_key = secret_key.public_key();
             let keys = SigningKeys::from([(
                 DeviceKeyId::from_parts(
@@ -244,7 +243,7 @@ mod tests {
         let user_id = user_id!("@user:localhost");
         let signatures = {
             let mut cross_signing_key = {
-                let secret_key = Ed25519SecretKey::new();
+                let secret_key = Ed25519SecretKey::new_with_rng(&mut rng());
                 let public_key = secret_key.public_key();
                 let keys = SigningKeys::from([(
                     DeviceKeyId::from_parts(

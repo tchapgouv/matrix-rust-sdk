@@ -14,6 +14,7 @@
 
 use std::num::NonZeroU8;
 
+use rand::{CryptoRng, rand_core::UnwrapErr, rngs::SysRng};
 use ruma::MilliSecondsSinceUnixEpoch;
 use time::{
     OffsetDateTime,
@@ -62,6 +63,10 @@ pub fn timestamp_to_iso8601(ts: MilliSecondsSinceUnixEpoch) -> Option<String> {
     // in-memory buffer.
 
     Some(dt.format(&Iso8601::<ISO8601_WITH_MILLIS>).unwrap())
+}
+
+pub fn rng() -> impl CryptoRng {
+    UnwrapErr(SysRng)
 }
 
 #[cfg(test)]

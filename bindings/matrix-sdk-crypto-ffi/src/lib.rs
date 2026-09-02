@@ -35,18 +35,15 @@ pub use logger::{Logger, set_logger};
 pub use machine::{KeyRequestPair, OlmMachine, SignatureVerification};
 use matrix_sdk_common::deserialized_responses::{ShieldState as RustShieldState, ShieldStateCode};
 use matrix_sdk_crypto::{
-    CollectStrategy, EncryptionSettings as RustEncryptionSettings,
-    olm::{IdentityKeys, InboundGroupSession, SenderData, Session},
-    store::{
+    CollectStrategy, EncryptionSettings as RustEncryptionSettings, olm::{IdentityKeys, InboundGroupSession, SenderData, Session}, store::{
         CryptoStore,
         types::{
             Changes, DehydratedDeviceKey as InnerDehydratedDeviceKey, PendingChanges,
             RoomSettings as RustRoomSettings,
         },
-    },
-    types::{
+    }, types::{
         DeviceKey, DeviceKeys, EventEncryptionAlgorithm as RustEventEncryptionAlgorithm, SigningKey,
-    },
+    }, utilities::rng,
 };
 use matrix_sdk_sqlite::SqliteCryptoStore;
 pub use responses::{
@@ -1018,7 +1015,7 @@ impl PkEncryption {
     pub fn encrypt(&self, plaintext: &str) -> Option<PkMessage> {
         use vodozemac::base64_encode;
 
-        let message = self.inner.encrypt(plaintext.as_ref()).ok()?;
+        let message = self.inner.encrypt_with_rng(plaintext.as_ref(), &mut rng()).ok()?;
 
         let vodozemac::pk_encryption::Message { ciphertext, mac, ephemeral_key } = message;
 

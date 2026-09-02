@@ -27,16 +27,14 @@ use vodozemac::{
 #[cfg(feature = "experimental-algorithms")]
 use crate::types::events::room::encrypted::OlmV2Curve25519AesSha2Content;
 use crate::{
-    DeviceData,
-    error::{EventError, OlmResult, SessionUnpickleError},
-    types::{
+    DeviceData, error::{EventError, OlmResult, SessionUnpickleError}, types::{
         DeviceKeys, EventEncryptionAlgorithm,
         events::{
             EventType,
             olm_v1::{DecryptedOlmV1Event, OlmV1Keys},
             room::encrypted::{OlmV1Curve25519AesSha2Content, ToDeviceEncryptedEventContent},
         },
-    },
+    }, utilities::rng,
 };
 
 /// Cryptographic session that enables secure communication between two
@@ -82,7 +80,7 @@ impl Session {
         let mut inner = self.inner.lock().await;
         Span::current().record("session_id", inner.session_id());
 
-        let plaintext = inner.decrypt(message)?;
+        let plaintext = inner.decrypt_with_rng(message, &mut rng())?;
         debug!(session=?inner, "Decrypted an Olm message");
 
         let plaintext = String::from_utf8_lossy(&plaintext).to_string();
@@ -125,7 +123,7 @@ impl Session {
     /// * `plaintext` - The plaintext that should be encrypted.
     pub(crate) async fn encrypt_helper(&mut self, plaintext: &str) -> OlmResult<OlmMessage> {
         let mut session = self.inner.lock().await;
-        let message = session.encrypt(plaintext)?;
+        let message = session.encrypt_with_rng(plaintext, &mut rng())?;
 
         self.last_use_time = SecondsSinceUnixEpoch::now();
         debug!(?session, "Successfully encrypted an event");

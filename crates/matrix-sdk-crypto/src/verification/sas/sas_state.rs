@@ -54,10 +54,7 @@ use super::{
     },
 };
 use crate::{
-    OwnUserIdentityData,
-    identities::{DeviceData, UserIdentityData},
-    olm::StaticAccountData,
-    verification::{
+    OwnUserIdentityData, identities::{DeviceData, UserIdentityData}, olm::StaticAccountData, utilities::rng, verification::{
         Cancelled, Emoji, FlowId,
         cache::RequestInfo,
         event_enums::{
@@ -573,7 +570,7 @@ impl SasState<Created> {
         started_from_request: bool,
         short_auth_strings: Option<Vec<ShortAuthenticationString>>,
     ) -> SasState<Created> {
-        let sas = Sas::new();
+        let sas = Sas::new_with_rng(&mut rng());
         let our_public_key = sas.public_key();
 
         let protocol_definitions = the_protocol_definitions(short_auth_strings);
@@ -678,7 +675,7 @@ impl SasState<Started> {
     ) -> Result<SasState<Started>, SasState<Cancelled>> {
         let flow_id = Arc::new(flow_id);
 
-        let sas = Sas::new();
+        let sas = Sas::new_with_rng(&mut rng());
         let our_public_key = sas.public_key();
 
         let canceled = || SasState {

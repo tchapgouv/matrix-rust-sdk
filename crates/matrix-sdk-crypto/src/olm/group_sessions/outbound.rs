@@ -53,11 +53,7 @@ use super::SessionCreationError;
 #[cfg(feature = "experimental-algorithms")]
 use crate::types::events::room::encrypted::MegolmV2AesSha2Content;
 use crate::{
-    DeviceData,
-    olm::account::shared_history_from_history_visibility,
-    session_manager::CollectStrategy,
-    store::caches::SequenceNumber,
-    types::{
+    DeviceData, olm::account::shared_history_from_history_visibility, session_manager::CollectStrategy, store::caches::SequenceNumber, types::{
         EventEncryptionAlgorithm,
         events::{
             room::encrypted::{
@@ -67,7 +63,7 @@ use crate::{
             room_key_withheld::RoomKeyWithheldContent,
         },
         requests::ToDeviceRequest,
-    },
+    }, utilities::rng,
 };
 
 const ONE_HOUR: Duration = Duration::from_secs(60 * 60);
@@ -377,7 +373,7 @@ impl OutboundGroupSession {
     ) -> Result<Self, SessionCreationError> {
         let config = Self::session_config(&settings.algorithm)?;
 
-        let session = GroupSession::new(config);
+        let session = GroupSession::new_with_rng(config, &mut rng());
         let session_id = session.session_id();
 
         Ok(OutboundGroupSession {

@@ -23,13 +23,10 @@ use vodozemac::{DecodeError, Ed25519PublicKey, Ed25519SecretKey, Ed25519Signatur
 use zeroize::Zeroize;
 
 use crate::{
-    OtherUserIdentityData,
-    error::SignatureError,
-    olm::utility::SignJson,
-    types::{
+    OtherUserIdentityData, error::SignatureError, olm::utility::SignJson, types::{
         CrossSigningKey, DeviceKeys, MasterPubkey, SelfSigningPubkey, Signatures, SigningKeys,
         UserSigningPubkey,
-    },
+    }, utilities::rng,
 };
 
 /// Error type reporting failures in the signing operations.
@@ -339,7 +336,7 @@ pub struct PickledSigning(Ed25519SecretKey);
 
 impl Signing {
     pub fn new() -> Self {
-        let secret_key = Ed25519SecretKey::new();
+        let secret_key = Ed25519SecretKey::new_with_rng(&mut rng());
         Self::new_helper(secret_key)
     }
 
