@@ -94,7 +94,12 @@ uniffi = { version = "0.28.0" }
 uniffi_bindgen = { version = "0.28.0" }
 url = "2.5.4"
 uuid = "1.12.1"
-vodozemac = { version = "0.9.0", features = ["insecure-pk-encryption"] }
+
+# :tchap: Fix vodozemac for CSPN
+# vodozemac = { version = "0.9.0", features = ["insecure-pk-encryption"] }
+vodozemac = { git = "https://github.com/tchapgouv/vodozemac.git", rev = "5437c606caec25ade8af27883e89309ff11e2a2b", features = ["insecure-pk-encryption"] }
+# :tchap: end
+
 wasm-bindgen = "0.2.84"
 wasm-bindgen-test = "0.3.33"
 web-sys = "0.3.69"
