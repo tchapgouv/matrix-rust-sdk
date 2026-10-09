@@ -67,6 +67,7 @@ mod tests {
         let config = TchapGetInstanceConfig {
             home_server: "agent.dinum.tchap.gouv.fr".to_string(),
             user_agent: "Tchap-own-user-agent".to_string(),
+            ..Default::default()
         };
 
         assert_eq!(
