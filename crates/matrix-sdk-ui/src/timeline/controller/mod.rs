@@ -325,7 +325,18 @@ pub fn default_event_filter(event: &AnySyncTimelineEvent, rules: &RoomVersionRul
                                 | MessageType::VerificationRequest(_) => true,
                                 #[cfg(feature = "unstable-msc4274")]
                                 MessageType::Gallery(_) => true,
-                                _ => false,
+                                // :tchap: Allow Tchap specifics message types
+                                // _ => false,
+                                _ => match content.msgtype.msgtype() {
+                                    "nic.custom.confetti"
+                                    | "nic.custom.fireworks"
+                                    | "io.element.effect.rainfall"
+                                    | "io.element.effect.snowfall"
+                                    | "io.element.effects.space_invaders"
+                                    | "io.element.effect.hearts" => true,
+                                    _ => false,
+                                },
+                                // :tchap: end
                             }
                         }
 
