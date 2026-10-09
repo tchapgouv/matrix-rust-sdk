@@ -2200,6 +2200,10 @@ impl Client {
         let invite = request.invite.clone();
         let is_direct_room = request.is_direct;
 
+        // Tchap-specific : invite_users_by_email
+        let invite_3pid = request.invite_3pid.clone();
+        // end Tchap-specific
+
         let request_config = self.request_config().disable_retry();
         let response = self.send(request).with_request_config(request_config).await?;
 
@@ -2207,14 +2211,18 @@ impl Client {
 
         let joined_room = Room::new(self.clone(), base_room);
 
+        // Tchap-specific : invite_users_by_email
         if is_direct_room
-            && !invite.is_empty()
-            && let Err(error) =
-                self.account().mark_as_dm(joined_room.room_id(), invite.as_slice()).await
+            && (!invite.is_empty() || !invite_3pid.is_empty())
+            && let Err(error) = self
+                .account()
+                .mark_as_dm(joined_room.room_id(), invite.as_slice(), invite_3pid.as_slice())
+                .await
         {
             // FIXME: Retry in the background
             error!("Failed to mark room as DM: {error}");
         }
+        // end Tchap-specific
 
         Ok(joined_room)
     }
