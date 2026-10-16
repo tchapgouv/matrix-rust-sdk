@@ -5,8 +5,8 @@ use indexmap::IndexSet;
 use ruma::{
     RoomId,
     push::{
-        AnyPushRuleRef, PatternedPushRule, PredefinedContentRuleId, PredefinedOverrideRuleId,
-        PredefinedUnderrideRuleId, PushCondition, RuleKind, Ruleset,
+        AnyPushRuleRef, ConditionalPushRule, PatternedPushRule, PredefinedContentRuleId,
+        PredefinedOverrideRuleId, PredefinedUnderrideRuleId, PushCondition, RuleKind, Ruleset,
     },
 };
 
@@ -231,6 +231,21 @@ impl Rules {
         self.ruleset.content.iter().filter(|r| !r.default && r.pattern == keyword).collect()
     }
 
+    // :tchap: Allow to enable/disable account notifications
+    /// Get whether account-level notifications are enabled.
+    ///
+    /// The account notifications are controlled by the `.m.rule.master` rule.
+    /// - If the rule is present and enabled, account notifications are disabled (`false`).
+    /// - If the rule is disabled or absent, account notifications are enabled (`true`).
+    pub(crate) fn is_account_notifications_enabled(&self) -> bool {
+        if let Some(rule) = self.ruleset.get(RuleKind::Override, PredefinedOverrideRuleId::Master) {
+            !rule.enabled()
+        } else {
+            true
+        }
+    }
+    // :tchap: end
+
     /// Get whether a rule is enabled.
     pub(crate) fn is_enabled(
         &self,
@@ -266,6 +281,14 @@ impl Rules {
                     }
                 }
                 Command::SetPushRuleEnabled { kind, rule_id, enabled } => {
+                    // :tchap: Allow to enable/disable account notifications
+                    if kind == RuleKind::Override
+                    && rule_id == PredefinedOverrideRuleId::Master.as_str()
+                    && self.ruleset.get(RuleKind::Override, PredefinedOverrideRuleId::Master).is_none()
+                    {
+                        self.ruleset.override_.insert(ConditionalPushRule::master());
+                    }
+                    // :tchap: end
                     _ = self.ruleset.set_enabled(kind, rule_id, enabled);
                 }
                 Command::SetPushRuleActions { kind, rule_id, actions } => {
@@ -327,7 +350,7 @@ pub(crate) mod tests {
         push::{
             Action, EventMatchConditionData, NewConditionalPushRule, NewPushRule,
             PredefinedContentRuleId, PredefinedOverrideRuleId, PredefinedUnderrideRuleId,
-            PushCondition, RuleKind,
+            PushCondition, RuleKind, Ruleset,
         },
     };
 
@@ -743,4 +766,32 @@ pub(crate) mod tests {
             vec!["!room_a:matrix.org", "!room_d:matrix.org"].into_iter().collect();
         assert!(expected_set.symmetric_difference(HashSet::from(room_ids)).is_empty());
     }
+
+    // :tchap: Allow to enable/disable account notifications
+    #[async_test]
+    async fn test_is_account_notifications_enabled() {
+        // Initial state from default server ruleset: .m.rule.master is disabled,
+        // so account notifications are enabled.
+        let ruleset = get_server_default_ruleset();
+        let rules = Rules::new(ruleset);
+        assert!(rules.is_account_notifications_enabled());
+
+        // When .m.rule.master is enabled, account notifications are disabled.
+        let mut ruleset = get_server_default_ruleset();
+        ruleset.set_enabled(RuleKind::Override, PredefinedOverrideRuleId::Master, true).unwrap();
+        let rules = Rules::new(ruleset);
+        assert!(!rules.is_account_notifications_enabled());
+
+        // When .m.rule.master is disabled, account notifications are enabled.
+        let mut ruleset = get_server_default_ruleset();
+        ruleset.set_enabled(RuleKind::Override, PredefinedOverrideRuleId::Master, false).unwrap();
+        let rules = Rules::new(ruleset);
+        assert!(rules.is_account_notifications_enabled());
+
+        // When .m.rule.master is absent (e.g. empty ruleset), account notifications are enabled.
+        let ruleset = Ruleset::new();
+        let rules = Rules::new(ruleset);
+        assert!(rules.is_account_notifications_enabled());
+    }
+    // :tchap: end
 }
