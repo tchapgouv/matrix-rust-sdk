@@ -438,6 +438,9 @@ pub struct NotificationSettings {
     sdk_client: MatrixClient,
     sdk_notification_settings: Arc<AsyncRwLock<SdkNotificationSettings>>,
     pushrules_event_handler: Arc<RwLock<Option<EventHandlerHandle>>>,
+    // :tchap: Allow to enable/disable account notifications
+    delegate: Arc<RwLock<Option<Arc<dyn NotificationSettingsDelegate>>>>,
+    // :tchap: end
 }
 
 impl NotificationSettings {
@@ -449,8 +452,19 @@ impl NotificationSettings {
             sdk_client,
             sdk_notification_settings: Arc::new(AsyncRwLock::new(sdk_notification_settings)),
             pushrules_event_handler: Arc::new(RwLock::new(None)),
+            // :tchap: Allow to enable/disable account notifications
+            delegate: Arc::new(RwLock::new(None)),
+            // :tchap: end
         }
     }
+
+    // :tchap: Allow to enable/disable account notifications
+    fn notify_delegate(&self) {
+        if let Some(delegate) = self.delegate.read().unwrap().as_ref() {
+            delegate.settings_did_change();
+        }
+    }
+    // :tchap: end
 }
 
 impl Drop for NotificationSettings {
@@ -469,12 +483,19 @@ impl NotificationSettings {
             let delegate: Arc<dyn NotificationSettingsDelegate> = Arc::from(delegate);
 
             // Add an event handler to listen to `PushRulesEvent`
-            let event_handler =
+            let event_handler = {
+                // :tchap: Allow to enable/disable account notifications
+                let delegate = delegate.clone();
+                // :tchap: end
                 self.sdk_client.add_event_handler(move |_: PushRulesEvent| async move {
                     delegate.settings_did_change();
-                });
+                })
+            };
 
             *self.pushrules_event_handler.write().unwrap() = Some(event_handler);
+            // :tchap: Allow to enable/disable account notifications
+            *self.delegate.write().unwrap() = Some(delegate);
+            // :tchap: end
         } else {
             // Remove the event handler if there is no delegate
             let event_handler = &mut *self.pushrules_event_handler.write().unwrap();
@@ -482,6 +503,9 @@ impl NotificationSettings {
                 self.sdk_client.remove_event_handler(event_handler.clone());
             }
             *event_handler = None;
+            // :tchap: Allow to enable/disable account notifications
+            *self.delegate.write().unwrap() = None;
+            // :tchap: end
         }
     }
 
@@ -750,6 +774,29 @@ impl NotificationSettings {
         Ok(())
     }
 
+    // :tchap: Allow to enable/disable account notifications
+    /// Whether account-level notifications are enabled (`.m.rule.master` disabled).
+    pub async fn is_account_notifications_enabled(
+        &self,
+    ) -> Result<bool, NotificationSettingsError> {
+        let notification_settings = self.sdk_notification_settings.read().await;
+        Ok(notification_settings.is_account_notifications_enabled().await)
+    }
+    
+    /// Enable or disable account-level notifications (`.m.rule.master`).
+    /// - `enabled = true`  => disables `.m.rule.master` (notifications active)
+    /// - `enabled = false` => enables `.m.rule.master` (notifications muted)
+    pub async fn set_account_notifications_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<(), NotificationSettingsError> {
+        let notification_settings = self.sdk_notification_settings.read().await;
+        notification_settings.set_account_notifications_enabled(enabled).await?;
+        self.notify_delegate();
+        Ok(())
+    }
+    // :tchap: end
+
     /// Sets a custom push rule with the given actions and conditions.
     pub async fn set_custom_push_rule(
         &self,
@@ -804,3 +851,68 @@ impl NotificationSettings {
         Ok(raw_push_rules.map(|raw| serde_json::to_string(&raw)).transpose()?)
     }
 }
+
+// :tchap: Allow to enable/disable account notifications
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    
+    use matrix_sdk::test_utils::mocks::MatrixMockServer;
+    use ruma::push::{PredefinedOverrideRuleId, RuleKind};
+    
+    use super::*;
+    
+    struct TestDelegate {
+        call_count: Arc<AtomicUsize>,
+    }
+    
+    impl NotificationSettingsDelegate for TestDelegate {
+        fn settings_did_change(&self) {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_account_notifications_enabled_and_delegate() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let sdk_settings = client.notification_settings().await;
+        let ffi_settings = NotificationSettings::new(client.clone(), sdk_settings);
+        
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let delegate = Box::new(TestDelegate { call_count: call_count.clone() });
+        ffi_settings.set_delegate(Some(delegate));
+        
+        // Default state: master rule is disabled => account notifications are enabled
+        assert!(ffi_settings.is_account_notifications_enabled().await.unwrap());
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+        
+        // Disabling account notifications (enabled = false) => enables .m.rule.master
+        server
+        .mock_enable_push_rule(RuleKind::Override, PredefinedOverrideRuleId::Master)
+        .ok()
+        .mock_once()
+        .mount()
+        .await;
+        
+        ffi_settings.set_account_notifications_enabled(false).await.unwrap();
+        assert!(!ffi_settings.is_account_notifications_enabled().await.unwrap());
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        
+        // Enabling account notifications (enabled = true) => disables .m.rule.master
+        server
+        .mock_enable_push_rule(RuleKind::Override, PredefinedOverrideRuleId::Master)
+        .ok()
+        .mock_once()
+        .mount()
+        .await;
+        
+        ffi_settings.set_account_notifications_enabled(true).await.unwrap();
+        assert!(ffi_settings.is_account_notifications_enabled().await.unwrap());
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+}
+// :tchap: end

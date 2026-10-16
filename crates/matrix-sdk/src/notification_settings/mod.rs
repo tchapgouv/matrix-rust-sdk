@@ -24,7 +24,8 @@ use ruma::{
     },
     events::push_rules::PushRulesEvent,
     push::{
-        Action, NewPushRule, PredefinedUnderrideRuleId, RuleKind, Ruleset, SoundTweakValue, Tweak,
+        Action, NewPushRule, PredefinedOverrideRuleId, PredefinedUnderrideRuleId, RuleKind,
+        Ruleset, SoundTweakValue, Tweak,
     },
 };
 use tokio::sync::{
@@ -157,6 +158,33 @@ impl NotificationSettings {
     pub async fn contains_keyword_rules(&self) -> bool {
         self.rules.read().await.contains_keyword_rules()
     }
+
+    // :tchap: Allow to enable/disable account notifications
+    /// Get whether account-level notifications are enabled.
+    ///
+    /// The account notifications are controlled by the `.m.rule.master` rule.
+    /// - Returns `false` if `.m.rule.master` is present and enabled (notifications are suppressed).
+    /// - Returns `true` if `.m.rule.master` is disabled or absent.
+    pub async fn is_account_notifications_enabled(&self) -> bool {
+        self.rules.read().await.is_account_notifications_enabled()
+    }
+    
+    /// Set whether account-level notifications are enabled.
+    ///
+    /// - `enabled = true` => disables `.m.rule.master` (account notifications enabled)
+    /// - `enabled = false` => enables `.m.rule.master` (account notifications suppressed)
+    pub async fn set_account_notifications_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<(), NotificationSettingsError> {
+        self.set_push_rule_enabled(
+            RuleKind::Override,
+            PredefinedOverrideRuleId::Master,
+            !enabled,
+        )
+        .await
+    }
+    // :tchap: end
 
     /// Get whether a push rule is enabled.
     pub async fn is_push_rule_enabled(
@@ -883,6 +911,70 @@ mod tests {
         server.verify().await;
         Ok(())
     }
+
+    // :tchap: Allow to enable/disable account notifications
+    #[async_test]
+    async fn test_is_account_notifications_enabled() -> TestResult {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+
+        // Default state: .m.rule.master is disabled, so account notifications are enabled
+        let ruleset = get_server_default_ruleset();
+        let settings = NotificationSettings::new(client.clone(), ruleset);
+        assert!(settings.is_account_notifications_enabled().await);
+        
+        // State: .m.rule.master is enabled, so account notifications are disabled
+        let mut ruleset = get_server_default_ruleset();
+        ruleset.set_enabled(RuleKind::Override, PredefinedOverrideRuleId::Master, true)?;
+        let settings = NotificationSettings::new(client.clone(), ruleset);
+        assert!(!settings.is_account_notifications_enabled().await);
+        
+        // State: .m.rule.master is absent, account notifications default to enabled
+        let ruleset = Ruleset::new();
+        let settings = NotificationSettings::new(client, ruleset);
+        assert!(settings.is_account_notifications_enabled().await);
+        
+        Ok(())
+    }
+    
+    #[async_test]
+    async fn test_set_account_notifications_enabled() -> TestResult {
+        let server = MockServer::start().await;
+        let client = logged_in_client(Some(server.uri())).await;
+        let ruleset = client.account().push_rules().await?;
+        
+        // Initially .m.rule.master is disabled, so account notifications are enabled
+        let settings = NotificationSettings::new(client, ruleset);
+        assert!(settings.is_account_notifications_enabled().await);
+        
+        // 1. Disable account notifications (enabled = false) => sets .m.rule.master enabled = true
+        Mock::given(method("PUT"))
+        .and(path("/_matrix/client/r0/pushrules/global/override/.m.rule.master/enabled"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+        
+        settings.set_account_notifications_enabled(false).await?;
+        assert!(!settings.is_account_notifications_enabled().await);
+        
+        server.reset().await;
+        
+        // 2. Enable account notifications (enabled = true) => sets .m.rule.master enabled = false
+        Mock::given(method("PUT"))
+        .and(path("/_matrix/client/r0/pushrules/global/override/.m.rule.master/enabled"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+        
+        settings.set_account_notifications_enabled(true).await?;
+        assert!(settings.is_account_notifications_enabled().await);
+        
+        server.verify().await;
+        Ok(())
+    }
+    // :tchap: end
 
     #[async_test]
     async fn test_set_push_rule_enabled_api_error() -> TestResult {
