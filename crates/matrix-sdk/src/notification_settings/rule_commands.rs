@@ -1,8 +1,8 @@
 use ruma::{
     RoomId,
     push::{
-        Action, NewPushRule, PredefinedContentRuleId, PredefinedOverrideRuleId,
-        RemovePushRuleError, RuleKind, Ruleset,
+        Action, ConditionalPushRule, NewPushRule, PredefinedContentRuleId,
+        PredefinedOverrideRuleId, RemovePushRuleError, RuleKind, Ruleset,
     },
 };
 
@@ -120,6 +120,13 @@ impl RuleCommands {
         } else if rule_id == PredefinedOverrideRuleId::IsUserMention.as_str() {
             // Handle specific case for `PredefinedOverrideRuleId::IsUserMention`
             self.set_user_mention_enabled(enabled)
+        // :tchap: Allow to enable/disable account notifications
+        } else if rule_id == PredefinedOverrideRuleId::Master.as_str() {
+            if self.rules.get(RuleKind::Override, PredefinedOverrideRuleId::Master).is_none() {
+                self.rules.override_.insert(ConditionalPushRule::master());
+            }
+            self.set_enabled_internal(kind, rule_id, enabled)
+        // :tchap: end
         } else {
             self.set_enabled_internal(kind, rule_id, enabled)
         }
